@@ -2,7 +2,7 @@ build:
   deps:
     - dst: /opt/workspace-zulip-bridge
       path:
-        src: ..
+        src: ../../workspace_zulip_bridge
       exclude:
         - .git
         - .tox
