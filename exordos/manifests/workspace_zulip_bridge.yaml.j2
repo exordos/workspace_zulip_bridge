@@ -1,0 +1,166 @@
+name: "workspace_zulip_bridge"
+description: "Workspace bridge for personal Zulip accounts"
+schema_version: 1
+version: "{{ version }}"
+api_version: "v1"
+
+requirements:
+  core:
+    from_version: "0.0.0"
+  workspace:
+    from_version: "0.0.0"
+
+imports:
+  core_local_domain:
+    element: "$core"
+    kind: "resource"
+    link: "$core.dns.domains.$local_domain"
+  workspace_backend_node:
+    element: "$workspace"
+    kind: "resource"
+    link: "$core.compute.nodes.$workspace_backend"
+  workspace_zulip_bridge_enrollment_secret:
+    element: "$workspace"
+    kind: "resource"
+    link: "$core.secret.passwords.$workspace_zulip_bridge_enrollment_secret"
+
+resources:
+  $core.compute.nodes:
+    workspace_zulip_bridge:
+      name: "workspace-zulip-bridge"
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      cores: 2
+      ram: 2048
+      disk_spec:
+        kind: "disks"
+        disks:
+          - size: 10
+            image: "{{ images['workspace_zulip_bridge'] }}"
+            label: root
+          - size: 20
+            label: data
+
+  $core.config.configs:
+    workspace_zulip_bridge_config:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/workspace-zulip-bridge/bridge.conf
+      mode: "0640"
+      owner: root
+      group: workspace-zulip
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_zulip_bridge:uuid
+      on_change:
+        kind: shell
+        command: /usr/local/bin/workspace-zulip-bridge-restart
+      body:
+        kind: text
+        content: |
+          f"
+          [database]
+          dsn = postgresql:///workspace_zulip_bridge
+
+          [control]
+          base_url = https://workspace-bridge-control.{$workspace_zulip_bridge.imports.$core_local_domain:name}:21443
+          bootstrap_url = http://workspace-bridge-control.{$workspace_zulip_bridge.imports.$core_local_domain:name}:21085
+          hostname = workspace-bridge-control.{$workspace_zulip_bridge.imports.$core_local_domain:name}
+          ca_file = /var/lib/workspace-zulip-bridge/pki/control-ca.crt
+          certificate_file = /var/lib/workspace-zulip-bridge/pki/bridge.crt
+          private_key_file = /var/lib/workspace-zulip-bridge/pki/bridge.key
+          credential_private_key_file = /var/lib/workspace-zulip-bridge/pki/credential-x25519.key
+          poll_interval_seconds = 2
+          heartbeat_interval_seconds = 10
+          retry_base_seconds = 1
+          retry_cap_seconds = 30
+          retry_after_cap_seconds = 300
+
+          [identity]
+          realm_uuid = {$workspace_zulip_bridge.imports.$core_local_domain:uuid}
+          bridge_instance_uuid = {$workspace_zulip_bridge.imports.$workspace_zulip_bridge_enrollment_secret:uuid}
+          identity_generation = 1
+          enrollment_secret_file = /etc/workspace-zulip-bridge/secrets/enrollment-secret
+
+          [provider_api]
+          base_url = https://workspace-bridge-control.{$workspace_zulip_bridge.imports.$core_local_domain:name}:21443
+          ca_file = /var/lib/workspace-zulip-bridge/pki/control-ca.crt
+          certificate_file = /var/lib/workspace-zulip-bridge/pki/bridge.crt
+          private_key_file = /var/lib/workspace-zulip-bridge/pki/bridge.key
+          poll_interval_seconds = 2
+          lease_seconds = 300
+          batch_size = 20
+          timeout_seconds = 30
+          poll_workers = 16
+
+          [file_api]
+          base_url = https://workspace-bridge-control.{$workspace_zulip_bridge.imports.$core_local_domain:name}:21443
+          ca_file = /var/lib/workspace-zulip-bridge/pki/control-ca.crt
+          certificate_file = /var/lib/workspace-zulip-bridge/pki/bridge.crt
+          private_key_file = /var/lib/workspace-zulip-bridge/pki/bridge.key
+
+          [service]
+          health_file = /run/workspace-zulip-bridge/progress
+          worker_id = {$core.compute.nodes.$workspace_zulip_bridge:uuid}
+          "
+    workspace_zulip_bridge_enrollment_secret:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/workspace-zulip-bridge/secrets/enrollment-secret
+      mode: "0640"
+      owner: root
+      group: workspace-zulip
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_zulip_bridge:uuid
+      body:
+        kind: text
+        content: 'f"{$workspace_zulip_bridge.imports.$workspace_zulip_bridge_enrollment_secret:value}"'
+
+  $workspace_zulip_bridge.imports.$core_local_domain.records:
+    workspace_zulip_bridge:
+      domain: $workspace_zulip_bridge.imports.$core_local_domain:uuid
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      type: A
+      record:
+        kind: A
+        name: workspace-zulip-bridge
+        address: $core.compute.nodes.$workspace_zulip_bridge:default_network:ipv4
+    workspace_bridge_control:
+      domain: $workspace_zulip_bridge.imports.$core_local_domain:uuid
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      type: A
+      record:
+        kind: A
+        name: workspace-bridge-control
+        address: $workspace_zulip_bridge.imports.$workspace_backend_node:default_network:ipv4
+
+  $core.em.services:
+    workspace_zulip_bridge_bootstrap:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: "workspace-zulip-bridge-bootstrap"
+      path: /usr/local/bin/workspace-zulip-bridge-bootstrap
+      user: root
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_zulip_bridge:uuid
+      service_type:
+        kind: oneshot
+      target_status: enabled
+    workspace_zulip_bridge:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      name: "workspace-zulip-bridge"
+      path: /opt/workspace-zulip-bridge-venv/bin/workspace-zulip-bridge --config /etc/workspace-zulip-bridge/bridge.conf
+      user: workspace-zulip
+      target:
+        kind: node
+        node: $core.compute.nodes.$workspace_zulip_bridge:uuid
+      service_type:
+        kind: simple
+        count: 1
+      target_status: enabled
+      before:
+        - kind: shell
+          command: /usr/local/bin/workspace-zulip-bridge-bootstrap
+
+exports:
+  bridge_node:
+    link: "$core.compute.nodes.$workspace_zulip_bridge"
+    kind: "resource"

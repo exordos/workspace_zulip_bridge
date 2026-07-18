@@ -1,0 +1,56 @@
+{
+  "external_account_uuid": "40000000-0000-4000-8000-000000000004",
+  "generation": 7,
+  "history_depth": "30_days",
+  "project_id": "50000000-0000-4000-8000-000000000005",
+  "provider_chat": {
+    "chat_type": "channel",
+    "kind": "zulip",
+    "provider_chat_key": "channel:42"
+  },
+  "resource_type": "external_chat_assignment",
+  "selected": true,
+  "uuid": "30000000-0000-4000-8000-000000000003",
+  "workspace_projection": {
+    "participants": [
+      {
+        "avatar_urn": "urn:image:90000000-0000-4000-8000-000000000009",
+        "display_name": "Cassandra Volkova",
+        "email": "cassi@example.test",
+        "identity_uuid": "80000000-0000-4000-8000-000000000008",
+        "provider_user_id": "100",
+        "role": "owner"
+      },
+      {
+        "avatar_urn": null,
+        "display_name": "Eugene Frolov",
+        "email": "eugene@example.test",
+        "identity_uuid": "81000000-0000-4000-8000-000000000081",
+        "provider_user_id": "101",
+        "role": "member"
+      }
+    ],
+    "stream": {
+      "chat_kind": "channel",
+      "default_topic_uuid": "70000000-0000-4000-8000-000000000007",
+      "description": "Backend-owned engineering projection",
+      "name": "Engineering",
+      "private": false,
+      "uuid": "60000000-0000-4000-8000-000000000006"
+    },
+    "topics": [
+      {
+        "is_default": true,
+        "name": "general",
+        "provider_topic_id": "42:general",
+        "topic_uuid": "70000000-0000-4000-8000-000000000007"
+      },
+      {
+        "is_default": false,
+        "name": "deployments",
+        "provider_topic_id": "42:deployments",
+        "topic_uuid": "71000000-0000-4000-8000-000000000071"
+      }
+    ]
+  }
+}
