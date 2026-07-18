@@ -42,6 +42,13 @@ Repository administrators must configure `PUSH_CFG` as the base64-encoded
 contents of an `exordos.push.yaml` file. The workflow marks tag builds as
 `latest`; non-tag builds are published without changing `latest`.
 
+A manual `production_release` profile provides the immutable bridge artifact
+used by the Workspace PostgreSQL-canonical cutover. It refuses repository
+version collisions and records the exact build and publication evidence in a
+private runner-local archive configured by the
+`WORKSPACE_BRIDGE_RELEASE_EVIDENCE_DIR` repository secret. See
+[Production bridge release](docs/production_release_workflow.md).
+
 ## Runtime
 
 ```bash

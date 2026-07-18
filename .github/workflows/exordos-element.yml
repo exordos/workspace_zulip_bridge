@@ -8,6 +8,15 @@ on:
     tags:
       - "*"
   workflow_dispatch:
+    inputs:
+      profile:
+        description: "Build profile"
+        required: true
+        default: default
+        type: choice
+        options:
+          - default
+          - production_release
 
 env:
   ARTIFACTS_PATH: output
@@ -19,6 +28,8 @@ jobs:
     if: ${{ github.actor != 'dependabot[bot]' }}
     permissions:
       contents: read
+    outputs:
+      production_release_version: ${{ steps.production_release.outputs.version }}
 
     steps:
       - uses: actions/checkout@v4
@@ -34,8 +45,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          command -v curl
-          command -v sha256sum
+          command -v curl >/dev/null
+          command -v sha256sum >/dev/null
           exordos_bin="${RUNNER_TEMP}/exordos"
           exordos_download="${exordos_bin}.download"
           rm -f "${exordos_download}"
@@ -49,10 +60,12 @@ jobs:
             "${EXORDOS_RELEASE_URL}" \
             --output "${exordos_download}"
           printf "%s  %s\n" "${EXORDOS_RELEASE_SHA256}" "${exordos_download}" \
-            | sha256sum --check -
+            | sha256sum --check --status -
           mv "${exordos_download}" "${exordos_bin}"
           chmod 0755 "${exordos_bin}"
           printf "EXORDOS_BIN=%s\n" "${exordos_bin}" >> "${GITHUB_ENV}"
+          printf "EXORDOS_RELEASE_SHA256=%s\n" "${EXORDOS_RELEASE_SHA256}" \
+            >> "${GITHUB_ENV}"
           "${exordos_bin}" version
 
       - name: Check Exordos build prerequisites
@@ -60,12 +73,13 @@ jobs:
           set -euo pipefail
 
           "${EXORDOS_BIN}" version
-          command -v packer
-          command -v qemu-img
-          command -v qemu-system-x86_64
-          command -v mkisofs
+          command -v packer >/dev/null
+          command -v qemu-img >/dev/null
+          command -v qemu-system-x86_64 >/dev/null
+          command -v mkisofs >/dev/null
 
       - name: Build element
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.profile != 'production_release' }}
         run: |
           set -euo pipefail
 
@@ -76,6 +90,7 @@ jobs:
             --force
 
       - name: Show build output
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.profile != 'production_release' }}
         run: |
           set -euo pipefail
           find "${ARTIFACTS_PATH}" -maxdepth 4 -type f \
@@ -83,9 +98,15 @@ jobs:
 
       - name: Publish element
         env:
+          BUILD_PROFILE: ${{ inputs.profile }}
           PUSH_CFG: ${{ secrets.PUSH_CFG }}
         run: |
           set -euo pipefail
+
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" \
+            && "${BUILD_PROFILE:-default}" == "production_release" ]]; then
+            exit 0
+          fi
 
           : "${PUSH_CFG:?Set secret PUSH_CFG to base64-encoded exordos.push.yaml content}"
 
@@ -102,3 +123,306 @@ jobs:
             --element-dir "${ARTIFACTS_PATH}" \
             --force \
             "${latest_arg[@]}"
+
+      - name: Build, verify, and publish immutable production bridge
+        id: production_release
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.profile == 'production_release' }}
+        env:
+          EVIDENCE_ARCHIVE_ROOT: ${{ secrets.WORKSPACE_BRIDGE_RELEASE_EVIDENCE_DIR }}
+          PUSH_CFG: ${{ secrets.PUSH_CFG }}
+        run: |
+          set -euo pipefail
+          umask 077
+
+          command -v git >/dev/null
+          command -v python3 >/dev/null
+          command -v sha256sum >/dev/null
+          command -v zstd >/dev/null
+          : "${EVIDENCE_ARCHIVE_ROOT:?Set secret WORKSPACE_BRIDGE_RELEASE_EVIDENCE_DIR}"
+          : "${PUSH_CFG:?Set secret PUSH_CFG to base64-encoded exordos.push.yaml content}"
+          : "${EXORDOS_RELEASE_SHA256:?Exordos release digest is unavailable}"
+
+          original_head="$(git rev-parse HEAD)"
+          source_tree="$(git rev-parse "${original_head}^{tree}")"
+          test -z "$(git status --porcelain)"
+          git config --local user.name "CASSI CI"
+          git config --local user.email "cassi@exordos.com"
+
+          commit_list="$(git rev-list "${original_head}")"
+          test -n "${commit_list}"
+          base_version=""
+          while read -r commit; do
+            release_tag="$(
+              git tag --points-at "${commit}" --list \
+                | awk '/^[0-9]+\.[0-9]+\.[0-9]+$/ { print }' \
+                | sort -V | tail -n1
+            )"
+            if [[ -n "${release_tag}" ]]; then
+              base_version="${release_tag}"
+              break
+            fi
+          done <<< "${commit_list}"
+          base_version="${base_version:-0.0.0}"
+          IFS=. read -r version_major version_minor version_patch <<< "${base_version}"
+
+          git commit --quiet --allow-empty --message \
+            "CI production bridge release ${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+          release_head="$(git rev-parse HEAD)"
+          test "$(git rev-parse "${release_head}^{tree}")" = "${source_tree}"
+          release_timestamp="$(
+            date --utc --date="@$(git show --no-patch --format=%ct HEAD)" +%Y%m%d%H%M%S
+          )"
+          release_version="${version_major}.${version_minor}.$((10#${version_patch} + 1))-rc.${release_timestamp}+${release_head:0:8}"
+          [[ "${release_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]{14}\+[0-9a-f]{8}$ ]]
+          test -z "$(git tag --list "${release_version}")"
+          git tag "${release_version}"
+          test "$(git describe --tags --exact-match "${release_head}")" = "${release_version}"
+
+          release_root="${ARTIFACTS_PATH}/production-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          build_dir="${release_root}/element"
+          test ! -e "${release_root}"
+          mkdir -m 0700 -p "${release_root}"
+
+          archive_name="workspace-zulip-bridge-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          archive_tmp="${EVIDENCE_ARCHIVE_ROOT}/.${archive_name}.tmp"
+          archive_final="${EVIDENCE_ARCHIVE_ROOT}/${archive_name}"
+          set +e
+          (
+            set -euo pipefail
+            umask 077
+            mkdir -p "${EVIDENCE_ARCHIVE_ROOT}"
+            chmod 0700 "${EVIDENCE_ARCHIVE_ROOT}"
+            test ! -e "${archive_tmp}"
+            test ! -e "${archive_final}"
+            mkdir -m 0700 "${archive_tmp}"
+            test -w "${archive_tmp}"
+          ) 2>/dev/null
+          archive_status=$?
+          set -e
+          if (( archive_status != 0 )); then
+            echo "Private production bridge evidence preflight failed" >&2
+            exit 1
+          fi
+
+          push_cfg_path="${RUNNER_TEMP}/exordos-production-bridge-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.yaml"
+          set +e
+          (
+            set -euo pipefail
+            umask 077
+            printf "%s" "${PUSH_CFG}" | base64 -d > "${push_cfg_path}"
+            chmod 0600 "${push_cfg_path}"
+          ) 2>/dev/null
+          push_cfg_status=$?
+          set -e
+          if (( push_cfg_status != 0 )); then
+            echo "Private repository push configuration is invalid" >&2
+            exit 1
+          fi
+          trap 'rm -f "${push_cfg_path}"' EXIT
+
+          if ! "${EXORDOS_BIN}" build . \
+            --exordos-cfg-file "${EXORDOS_CFG}" \
+            --output-dir "${build_dir}" \
+            > "${archive_tmp}/build.log" 2>&1; then
+            echo "Production bridge build failed" >&2
+            exit 1
+          fi
+
+          element_dir="${build_dir}/exordos-elements/workspace_zulip_bridge/${release_version}"
+          manifest="${element_dir}/manifests/workspace_zulip_bridge.yaml"
+          inventory="${element_dir}/inventory.json"
+          test -f "${manifest}"
+          test -f "${inventory}"
+          EXPECTED_VERSION="${release_version}" python3 - "${manifest}" "${inventory}" \
+            2> "${archive_tmp}/verification.log" <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          import sys
+
+          manifest = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+          inventory = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+          expected = os.environ["EXPECTED_VERSION"]
+          if not re.search(r'^name:\s*["\']?workspace_zulip_bridge["\']?\s*$', manifest, re.MULTILINE):
+              raise SystemExit("unexpected element name")
+          if not re.search(rf'^version:\s*["\']?{re.escape(expected)}["\']?\s*$', manifest, re.MULTILINE):
+              raise SystemExit("unexpected element version")
+          if not isinstance(inventory, dict):
+              raise SystemExit("unexpected inventory document")
+          if inventory.get("version") != expected:
+              raise SystemExit("unexpected inventory version")
+          PY
+
+          mapfile -d '' compressed_images < <(
+            find "${build_dir}" -type f -name '*.zst' -print0 | sort -z
+          )
+          (( ${#compressed_images[@]} > 0 ))
+          for image in "${compressed_images[@]}"; do
+            zstd -t -q "${image}"
+          done 2>> "${archive_tmp}/verification.log"
+          printf '%s\n' "zstd -t: passed" \
+            > "${archive_tmp}/compression-check.txt"
+          (
+            cd "${build_dir}"
+            find . -type f -print0 | sort -z | xargs -0 sha256sum
+          ) > "${release_root}/artifact.sha256" \
+            2>> "${archive_tmp}/verification.log"
+
+          test "$(git rev-parse "${release_head}^{tree}")" = "${source_tree}"
+          git diff --quiet
+          git diff --cached --quiet
+
+          set +e
+          (
+            set -euo pipefail
+            umask 077
+            cp "${manifest}" "${archive_tmp}/workspace_zulip_bridge.yaml"
+            cp "${inventory}" "${archive_tmp}/inventory.json"
+            cp "${release_root}/artifact.sha256" "${archive_tmp}/artifact.sha256"
+            printf '%s\n' "${original_head}" > "${archive_tmp}/source-commit.txt"
+            printf '%s\n' "${source_tree}" > "${archive_tmp}/source-tree.txt"
+            printf '%s\n' "${release_head}" > "${archive_tmp}/release-commit.txt"
+            printf '%s\n' "${release_version}" > "${archive_tmp}/version.txt"
+            printf '%s\n' "${GITHUB_RUN_ID}" > "${archive_tmp}/github-run-id.txt"
+            printf '%s\n' "${GITHUB_RUN_ATTEMPT}" \
+              > "${archive_tmp}/github-run-attempt.txt"
+            printf '%s\n' "${EXORDOS_RELEASE_SHA256}" \
+              > "${archive_tmp}/exordos-download.sha256"
+            "${EXORDOS_BIN}" version > "${archive_tmp}/exordos-version.txt" 2>&1
+            printf '%s\n' "prepared" > "${archive_tmp}/state.txt"
+            date --utc +%Y-%m-%dT%H:%M:%SZ > "${archive_tmp}/prepared-at.txt"
+            find "${archive_tmp}" -type d -exec chmod 0700 {} +
+            find "${archive_tmp}" -type f -exec chmod 0600 {} +
+            (
+              cd "${archive_tmp}"
+              find . -type f ! -name evidence.sha256 -print0 | sort -z \
+                | xargs -0 sha256sum
+            ) > "${archive_tmp}/evidence.sha256"
+            chmod 0600 "${archive_tmp}/evidence.sha256"
+            mv "${archive_tmp}" "${archive_final}"
+          ) 2>/dev/null
+          archive_status=$?
+          set -e
+          if (( archive_status != 0 )); then
+            echo "Private production bridge evidence archival failed" >&2
+            exit 1
+          fi
+          echo "Private production bridge evidence prepared"
+
+          update_evidence_state() {
+            local requested_state="$1"
+            (
+              set -euo pipefail
+              umask 077
+              local state_tmp="${archive_final}/.state.txt.tmp"
+              local digest_tmp="${archive_final}/.evidence.sha256.tmp"
+              local completed_tmp="${archive_final}/.publication-completed-at.txt.tmp"
+              case "${requested_state}" in
+                published|publication_failed) ;;
+                *) exit 1 ;;
+              esac
+              test -d "${archive_final}"
+              test "$(cat "${archive_final}/state.txt")" = prepared
+              date --utc +%Y-%m-%dT%H:%M:%SZ > "${completed_tmp}"
+              printf '%s\n' "${requested_state}" > "${state_tmp}"
+              chmod 0600 "${completed_tmp}" "${state_tmp}"
+              mv "${completed_tmp}" \
+                "${archive_final}/publication-completed-at.txt"
+              mv "${state_tmp}" "${archive_final}/state.txt"
+              find "${archive_final}" -type d -exec chmod 0700 {} +
+              find "${archive_final}" -type f -exec chmod 0600 {} +
+              (
+                cd "${archive_final}"
+                find . -type f \
+                  ! -name evidence.sha256 \
+                  ! -name .evidence.sha256.tmp \
+                  ! -name .state.txt.tmp \
+                  ! -name .publication-completed-at.txt.tmp \
+                  -print0 | sort -z | xargs -0 sha256sum
+              ) > "${digest_tmp}"
+              chmod 0600 "${digest_tmp}"
+              mv "${digest_tmp}" "${archive_final}/evidence.sha256"
+            ) 2>/dev/null
+          }
+
+          verify_final_evidence() {
+            local expected_state="$1"
+            (
+              set -euo pipefail
+              test -d "${archive_final}"
+              test "$(cat "${archive_final}/state.txt")" = "${expected_state}"
+              (
+                cd "${archive_final}"
+                sha256sum --check --status evidence.sha256
+              )
+              test "$(cat "${archive_final}/version.txt")" = "${release_version}"
+              test "$(cat "${archive_final}/source-commit.txt")" = "${original_head}"
+              test "$(cat "${archive_final}/source-tree.txt")" = "${source_tree}"
+              test "$(cat "${archive_final}/release-commit.txt")" = "${release_head}"
+            ) 2>/dev/null
+          }
+
+          push_immutable() {
+            local push_log="$1"
+            set +e
+            "${EXORDOS_BIN}" push . \
+              --exordos-cfg-file "${push_cfg_path}" \
+              --element-dir "${build_dir}" > "${push_log}" 2>&1
+            local status=$?
+            set -e
+            if (( status != 0 )); then
+              echo "Immutable production bridge publication failed" >&2
+              return 1
+            fi
+            if grep -Fq " already exists." "${push_log}"; then
+              echo "Immutable production bridge version already exists" >&2
+              return 1
+            fi
+          }
+
+          publication_status=0
+          if push_immutable "${archive_final}/push.log"; then
+            :
+          else
+            publication_status=$?
+          fi
+          if (( publication_status != 0 )); then
+            set +e
+            update_evidence_state publication_failed
+            archive_status=$?
+            set -e
+            if (( archive_status != 0 )); then
+              echo "Private publication failure evidence update failed" >&2
+            else
+              set +e
+              verify_final_evidence publication_failed
+              archive_status=$?
+              set -e
+              if (( archive_status != 0 )); then
+                echo "Private publication failure evidence readback failed" >&2
+              fi
+            fi
+            echo "Production bridge publication failed" >&2
+            exit 1
+          fi
+
+          set +e
+          update_evidence_state published
+          archive_status=$?
+          set -e
+          if (( archive_status != 0 )); then
+            echo "Private production bridge evidence state update failed" >&2
+            exit 1
+          fi
+          set +e
+          verify_final_evidence published
+          archive_status=$?
+          set -e
+          if (( archive_status != 0 )); then
+            echo "Private production bridge evidence readback failed" >&2
+            exit 1
+          fi
+          echo "Immutable production bridge published"
+          printf 'version=%s\n' "${release_version}" >> "${GITHUB_OUTPUT}"
+          printf 'Production bridge version: %s\n' "${release_version}"

@@ -255,7 +255,13 @@ def test_image_uses_isolated_venv_for_install_and_all_python_entrypoints():
 
 def test_image_dependency_source_is_only_this_repository_and_excludes_bytecode():
     text = BUILD_CONFIG.read_text(encoding="utf-8")
-    assert "        src: ..\n" in text
-    assert "        src: ../..\n" not in text
+    source = re.search(r"^\s+src: (\S+)$", text, re.MULTILINE)
+
+    assert source is not None
+    declared_path = pathlib.PurePosixPath(source.group(1))
+    resolved_path = (BUILD_CONFIG.parent / declared_path).resolve()
+    assert declared_path.name == ROOT.name
+    assert declared_path.name not in {"", ".", ".."}
+    assert resolved_path == ROOT.resolve()
     assert '        - "*/__pycache__"' in text
     assert '        - "*.pyc"' in text
