@@ -1,0 +1,49 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  quality-and-tests:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: true
+      matrix:
+        python-version: ["3.11"]
+    services:
+      postgresql:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: workspace_bridge
+          POSTGRES_USER: workspace_bridge
+          POSTGRES_PASSWORD: pass
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Install tox with tox-uv
+        run: uv tool install tox --with tox-uv
+
+      - name: Lint
+        run: tox -e ruff
+
+      - name: Tests, including PostgreSQL integration
+        env:
+          WORKSPACE_BRIDGE_TEST_POSTGRES_DSN: >-
+            postgresql://workspace_bridge:pass@127.0.0.1:5432/workspace_bridge
+        run: tox -e py311

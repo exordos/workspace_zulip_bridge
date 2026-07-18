@@ -1,0 +1,43 @@
+[database]
+dsn = postgresql:///workspace_zulip_bridge
+
+[control]
+base_url = https://workspace-bridge-control.example.invalid:21443
+bootstrap_url = http://workspace-bridge-control.example.invalid:21085
+hostname = workspace-bridge-control.example.invalid
+ca_file = /var/lib/workspace-zulip-bridge/pki/control-ca.crt
+certificate_file = /var/lib/workspace-zulip-bridge/pki/bridge.crt
+private_key_file = /var/lib/workspace-zulip-bridge/pki/bridge.key
+credential_private_key_file = /var/lib/workspace-zulip-bridge/pki/credential-x25519.key
+poll_interval_seconds = 2
+heartbeat_interval_seconds = 10
+retry_base_seconds = 1
+retry_cap_seconds = 30
+retry_after_cap_seconds = 300
+
+[identity]
+realm_uuid = 00000000-0000-0000-0000-000000000000
+bridge_instance_uuid = 00000000-0000-0000-0000-000000000000
+identity_generation = 1
+enrollment_secret_file = /etc/workspace-zulip-bridge/secrets/enrollment-secret
+
+[provider_api]
+base_url = https://workspace-bridge-control.example.invalid:21443
+ca_file = /var/lib/workspace-zulip-bridge/pki/control-ca.crt
+certificate_file = /var/lib/workspace-zulip-bridge/pki/bridge.crt
+private_key_file = /var/lib/workspace-zulip-bridge/pki/bridge.key
+poll_interval_seconds = 2
+lease_seconds = 300
+batch_size = 20
+timeout_seconds = 30
+poll_workers = 16
+
+[file_api]
+base_url = https://workspace-bridge-control.example.invalid:21443
+ca_file = /var/lib/workspace-zulip-bridge/pki/control-ca.crt
+certificate_file = /var/lib/workspace-zulip-bridge/pki/bridge.crt
+private_key_file = /var/lib/workspace-zulip-bridge/pki/bridge.key
+
+[service]
+health_file = /run/workspace-zulip-bridge/progress
+worker_id = bridge-1
