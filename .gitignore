@@ -1,0 +1,12 @@
+.coverage*
+.pytest_cache/
+.ruff_cache/
+.tox/
+__pycache__/
+build/
+cover/
+dist/
+*.egg-info/
+*.pyc
+*.key
+**/fixtures/*private*.pem
