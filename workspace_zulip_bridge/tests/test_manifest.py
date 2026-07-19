@@ -93,7 +93,9 @@ def test_database_peer_identity_matches_runtime_service_user():
     text = MANIFEST.read_text(encoding="utf-8")
     bootstrap = (ROOT / "exordos/images/bootstrap.sh").read_text(encoding="utf-8")
 
-    assert "dsn = postgresql:///workspace_zulip_bridge" in text
+    assert "[db]" in text
+    assert "[database]" not in text
+    assert "connection_url = postgresql:///workspace_zulip_bridge" in text
     assert "user: workspace-zulip" in text
     assert "DATABASE_ROLE=workspace-zulip" in bootstrap
     assert 'createuser "$DATABASE_ROLE"' in bootstrap
@@ -250,7 +252,9 @@ def test_image_uses_isolated_venv_for_install_and_all_python_entrypoints():
     assert "python3 -m pip install" not in install
     assert f"VENV={venv}" in bootstrap
     assert '"$VENV/bin/workspace-zulip-bridge-enroll"' in bootstrap
-    assert '"$VENV/bin/workspace-zulip-bridge-migrate"' in bootstrap
+    assert '"$VENV/bin/ra-apply-migration"' in bootstrap
+    assert '--config-file "$CONFIG"' in bootstrap
+    assert '--path "$SOURCE/migrations"' in bootstrap
 
 
 def test_image_dependency_source_is_only_this_repository_and_excludes_bytecode():

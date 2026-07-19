@@ -8,6 +8,7 @@ source /usr/local/lib/workspace-zulip-bridge/bootstrap-persistence.sh
 
 CONFIG=/etc/workspace-zulip-bridge/bridge.conf
 RUN_DIR=/run/workspace-zulip-bridge
+SOURCE=/opt/workspace-zulip-bridge
 VENV=/opt/workspace-zulip-bridge-venv
 DATABASE_ROLE=workspace-zulip
 DATABASE_NAME=workspace_zulip_bridge
@@ -56,7 +57,8 @@ if ! runuser -u postgres -- psql -tAc \
     "SELECT 1 FROM pg_database WHERE datname='$DATABASE_NAME'" | grep -qx 1; then
     runuser -u postgres -- createdb -O "$DATABASE_ROLE" "$DATABASE_NAME"
 fi
-runuser -u workspace-zulip -- "$VENV/bin/workspace-zulip-bridge-migrate" \
-    --config "$CONFIG"
+runuser -u workspace-zulip -- "$VENV/bin/ra-apply-migration" \
+    --config-file "$CONFIG" \
+    --path "$SOURCE/migrations"
 
 echo "Workspace Zulip bridge bootstrap completed."

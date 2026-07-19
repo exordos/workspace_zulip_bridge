@@ -57,8 +57,8 @@ resources:
         kind: text
         content: |
           f"
-          [database]
-          dsn = postgresql:///workspace_zulip_bridge
+          [db]
+          connection_url = postgresql:///workspace_zulip_bridge
 
           [control]
           base_url = https://workspace-bridge-control.{$workspace_zulip_bridge.imports.$core_local_domain:name}:21443

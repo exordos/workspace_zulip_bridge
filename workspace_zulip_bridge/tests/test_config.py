@@ -21,8 +21,8 @@ def test_runtime_config_requires_provider_api_section(tmp_path: pathlib.Path):
     path = tmp_path / "bridge.conf"
     path.write_text(
         """
-[database]
-dsn = postgresql://bridge
+[db]
+connection_url = postgresql://bridge
 [control]
 base_url = https://backend/control
 bootstrap_url = https://backend/bootstrap
@@ -56,3 +56,21 @@ def test_example_config_sets_bounded_provider_poll_workers():
     path = pathlib.Path(__file__).parents[2] / "etc/bridge.conf.example"
 
     assert config.load(path).provider_api.poll_workers == 16
+
+
+def test_legacy_database_dsn_remains_readable_during_config_upgrade(
+    tmp_path: pathlib.Path,
+):
+    source = pathlib.Path(__file__).parents[2] / "etc/bridge.conf.example"
+    path = tmp_path / "bridge.conf"
+    path.write_text(
+        source.read_text(encoding="utf-8")
+        .replace("[db]", "[database]", 1)
+        .replace(
+            "connection_url = postgresql:///workspace_zulip_bridge",
+            "dsn = postgresql:///legacy_bridge",
+        ),
+        encoding="utf-8",
+    )
+
+    assert config.load(path).database.connection_url == "postgresql:///legacy_bridge"

@@ -2,6 +2,8 @@ import datetime
 import json
 import os
 import pathlib
+import subprocess
+import sys
 import uuid
 
 import pytest
@@ -14,16 +16,47 @@ from workspace_zulip_bridge import (
     storage,
 )
 
+ROOT = pathlib.Path(__file__).parents[2]
+MIGRATIONS = ROOT / "migrations"
 
-@pytest.fixture()
-def postgres_store():
+
+def _apply_migrations(connection_url: str, config_path: pathlib.Path) -> None:
+    config_path.write_text(
+        f"[db]\nconnection_url = {connection_url}\n",
+        encoding="utf-8",
+    )
+    config_path.chmod(0o600)
+    executable = pathlib.Path(sys.executable).with_name("ra-apply-migration")
+    result = subprocess.run(
+        [
+            str(executable),
+            "--config-file",
+            str(config_path),
+            "--path",
+            str(MIGRATIONS),
+        ],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.fixture(scope="session")
+def migrated_postgres_dsn(tmp_path_factory):
     dsn = os.environ.get("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN")
     if not dsn:
         pytest.skip("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN is not configured")
-    store = storage.PostgresStore(dsn)
-    store.migrate(pathlib.Path(__file__).parents[2] / "migrations")
-    with store.connection() as connection:
-        connection.execute(
+    config_path = tmp_path_factory.mktemp("bridge-migrations") / "bridge.conf"
+    _apply_migrations(dsn, config_path)
+    return dsn
+
+
+@pytest.fixture()
+def postgres_store(migrated_postgres_dsn):
+    store = storage.RestAlchemyStore(migrated_postgres_dsn)
+    with store.session() as session:
+        session.execute(
             """
             TRUNCATE desired_resources, provider_mappings,
                      provider_mapping_aliases, zulip_backfill_jobs,
@@ -37,7 +70,7 @@ def postgres_store():
 
 
 def _insert_account_and_assignment(
-    store: storage.PostgresStore, history_depth: str = "30_days"
+    store: storage.RestAlchemyStore, history_depth: str = "30_days"
 ) -> tuple[str, str]:
     account_uuid = str(uuid.uuid4())
     assignment_uuid = str(uuid.uuid4())
@@ -61,8 +94,8 @@ def _insert_account_and_assignment(
             "chat_type": "channel",
         },
     }
-    with store.connection() as connection:
-        connection.execute(
+    with store.session() as session:
+        session.execute(
             """
             INSERT INTO desired_resources (
                 resource_type, resource_uuid, generation, body, deleted
@@ -80,7 +113,7 @@ def _insert_account_and_assignment(
 
 
 def _materialize_channel_projection(
-    store: storage.PostgresStore, account_uuid: str, project_uuid: str
+    store: storage.RestAlchemyStore, account_uuid: str, project_uuid: str
 ) -> tuple[str, str, str]:
     account = store.account_resource(account_uuid)
     owner_uuid = str(account["owner_user_uuid"])
@@ -134,7 +167,7 @@ def _provider_history_message(provider_message_id: int) -> dict[str, object]:
     }
 
 
-def _backfill_service(store: storage.PostgresStore):
+def _backfill_service(store: storage.RestAlchemyStore):
     class Adapter:
         server_url = "https://zulip.example.invalid"
 
@@ -236,8 +269,8 @@ def test_reconcile_backfill_jobs_casts_json_account_uuid(postgres_store):
 
     postgres_store.reconcile_backfill_jobs()
 
-    with postgres_store.connection() as connection:
-        row = connection.execute(
+    with postgres_store.session() as session:
+        row = session.execute(
             """
             SELECT account_uuid, provider_chat_key, history_depth
             FROM zulip_backfill_jobs
@@ -250,8 +283,8 @@ def test_reconcile_backfill_jobs_casts_json_account_uuid(postgres_store):
 
 def test_queue_loss_recovery_keeps_selected_account_uuid_typed(postgres_store):
     account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
-    with postgres_store.connection() as connection:
-        connection.execute(
+    with postgres_store.session() as session:
+        session.execute(
             """
             INSERT INTO provider_mappings (
                 account_uuid, entity_kind, workspace_uuid, provider_id, metadata
@@ -271,8 +304,8 @@ def test_queue_loss_recovery_keeps_selected_account_uuid_typed(postgres_store):
 
     postgres_store.begin_provider_queue_catchup(account_uuid)
 
-    with postgres_store.connection() as connection:
-        row = connection.execute(
+    with postgres_store.session() as session:
+        row = session.execute(
             """
             SELECT account_uuid, provider_chat_key,
                    checkpoint_provider_message_id
@@ -292,8 +325,8 @@ def test_account_global_identity_delivery_uses_account_generation(postgres_store
 
     assert postgres_store.enqueue_workspace_delivery(record, 0, "queue", 7)
 
-    with postgres_store.connection() as connection:
-        row = connection.execute(
+    with postgres_store.session() as session:
+        row = session.execute(
             """
             SELECT account_generation, assignment_uuid
             FROM workspace_delivery_outbox
@@ -323,8 +356,8 @@ def test_outbound_commit_suppresses_queue_loss_history_duplicate(postgres_store)
         }
     )
     outbound["operation_sha256"] = canonical.operation_digest(outbound)
-    with postgres_store.connection() as connection:
-        postgres_store._persist_committed_mapping(connection, outbound, "601", None)
+    with postgres_store.session() as session:
+        postgres_store._persist_committed_mapping(session, outbound, "601", None)
 
     _backfill_service(postgres_store).enqueue_backfill(
         account_uuid, "channel:42", [_provider_history_message(601)]
@@ -333,8 +366,8 @@ def test_outbound_commit_suppresses_queue_loss_history_duplicate(postgres_store)
     mapping = postgres_store.provider_mapping(account_uuid, "message", "601")
     assert str(mapping["workspace_uuid"]) == workspace_message_uuid
     assert mapping["convergent_alias"] is True
-    with postgres_store.connection() as connection:
-        duplicate = connection.execute(
+    with postgres_store.session() as session:
+        duplicate = session.execute(
             """
             SELECT record FROM workspace_delivery_outbox
             WHERE record->'operation'->>'kind' = 'message.create'
@@ -368,8 +401,8 @@ def test_provider_mapping_written_before_event_delivery_recovers_same_message(
         account_uuid, "channel:42", [message]
     )
 
-    with postgres_store.connection() as connection:
-        recovered = connection.execute(
+    with postgres_store.session() as session:
+        recovered = session.execute(
             """
             SELECT record FROM workspace_delivery_outbox
             WHERE record->'operation'->>'kind' = 'message.create'
@@ -389,9 +422,9 @@ def test_lane_allocation_is_atomic_with_durable_outbox(postgres_store):
         0,
         None,
     )
-    with postgres_store.connection() as connection:
+    with postgres_store.session() as session:
         assert (
-            connection.execute(
+            session.execute(
                 "SELECT 1 FROM producer_lane_counters WHERE causal_lane = %s", (lane,)
             ).fetchone()
             is None
@@ -403,8 +436,8 @@ def test_lane_allocation_is_atomic_with_durable_outbox(postgres_store):
 
     assert record["sequence"] == 1
     assert record["predecessor_operation_uuid"] is None
-    with postgres_store.connection() as connection:
-        rows = connection.execute(
+    with postgres_store.session() as session:
+        rows = session.execute(
             """
             SELECT operation_uuid, lane_sequence
             FROM producer_operations ORDER BY lane_sequence
@@ -500,15 +533,15 @@ def test_exact_provider_read_lease_is_idempotent_and_ordered_in_postgres_schedul
     # Lease expiry is an independent fail-closed eligibility boundary. Exercise
     # it on the same otherwise-ready first causal-lane item, then restore the
     # active lease to verify the ordering path rather than bypassing it.
-    with postgres_store.connection() as connection:
-        connection.execute(
+    with postgres_store.session() as session:
+        session.execute(
             "UPDATE bridge_operations SET expires_at = now() - interval '1 second' "
             "WHERE record_uuid = %s",
             (record["record_uuid"],),
         )
     assert postgres_store.claim("expired-read-worker") is None
-    with postgres_store.connection() as connection:
-        connection.execute(
+    with postgres_store.session() as session:
+        session.execute(
             "UPDATE bridge_operations SET expires_at = %s WHERE record_uuid = %s",
             (lease_expires_at, record["record_uuid"]),
         )
@@ -527,8 +560,8 @@ def test_submitted_delivery_survives_assignment_change_as_ambiguous(postgres_sto
     record = _provider_record(account_uuid, project_uuid)
     assert postgres_store.enqueue_workspace_delivery(record, 0, "queue", 7)
     assert postgres_store.mark_workspace_delivery_submitting(record["record_uuid"])
-    with postgres_store.connection() as connection:
-        connection.execute(
+    with postgres_store.session() as session:
+        session.execute(
             """
             UPDATE desired_resources SET deleted = true
             WHERE resource_type = 'external_chat_assignment'
@@ -540,15 +573,15 @@ def test_submitted_delivery_survives_assignment_change_as_ambiguous(postgres_sto
     assert postgres_store.pending_workspace_deliveries() == []
     assert not postgres_store.mark_workspace_delivery_submitting(record["record_uuid"])
 
-    with postgres_store.connection() as connection:
-        delivery = connection.execute(
+    with postgres_store.session() as session:
+        delivery = session.execute(
             """
             SELECT submission_state FROM workspace_delivery_outbox
             WHERE record_uuid = %s
             """,
             (record["record_uuid"],),
         ).fetchone()
-        idempotency = connection.execute(
+        idempotency = session.execute(
             """
             SELECT operation_uuid FROM operation_idempotency
             WHERE operation_uuid = %s
@@ -559,8 +592,8 @@ def test_submitted_delivery_survives_assignment_change_as_ambiguous(postgres_sto
     assert idempotency is not None
     result = _committed_result(record)
     postgres_store.accept_result(result)
-    with postgres_store.connection() as connection:
-        resolved = connection.execute(
+    with postgres_store.session() as session:
+        resolved = session.execute(
             """
             SELECT submission_state, sent_at FROM workspace_delivery_outbox
             WHERE record_uuid = %s
@@ -589,15 +622,15 @@ def test_pre_provider_result_crash_retries_same_immutable_record_until_result(
         assert retry[0]["operation_uuid"] == record["operation_uuid"]
         assert retry[0]["operation_sha256"] == record["operation_sha256"]
 
-    with postgres_store.connection() as connection:
-        delivery = connection.execute(
+    with postgres_store.session() as session:
+        delivery = session.execute(
             """
             SELECT submission_state, sent_at, record
             FROM workspace_delivery_outbox WHERE record_uuid = %s
             """,
             (record["record_uuid"],),
         ).fetchone()
-        idempotency = connection.execute(
+        idempotency = session.execute(
             """
             SELECT operation_uuid, terminal_outcome
             FROM operation_idempotency WHERE operation_uuid = %s
@@ -615,8 +648,8 @@ def test_pre_provider_result_crash_retries_same_immutable_record_until_result(
     postgres_store.mark_workspace_delivery_submitted(record["record_uuid"])
     assert postgres_store.pending_workspace_deliveries() == []
 
-    with postgres_store.connection() as connection:
-        awaiting = connection.execute(
+    with postgres_store.session() as session:
+        awaiting = session.execute(
             """
             SELECT submission_state, submission_attempts, sent_at,
                    last_submitted_at, next_submission_at, record
@@ -624,7 +657,7 @@ def test_pre_provider_result_crash_retries_same_immutable_record_until_result(
             """,
             (record["record_uuid"],),
         ).fetchone()
-        connection.execute(
+        session.execute(
             """
             UPDATE workspace_delivery_outbox SET next_submission_at = now()
             WHERE record_uuid = %s
@@ -641,8 +674,8 @@ def test_pre_provider_result_crash_retries_same_immutable_record_until_result(
 
     postgres_store.accept_result(_committed_result(record))
     assert postgres_store.pending_workspace_deliveries() == []
-    with postgres_store.connection() as connection:
-        terminal = connection.execute(
+    with postgres_store.session() as session:
+        terminal = session.execute(
             """
             SELECT submission_state, sent_at FROM workspace_delivery_outbox
             WHERE record_uuid = %s
@@ -655,8 +688,8 @@ def test_pre_provider_result_crash_retries_same_immutable_record_until_result(
 
 def test_reselected_chat_restarts_cancelled_backfill(postgres_store):
     account_uuid, _ = _insert_account_and_assignment(postgres_store)
-    with postgres_store.connection() as connection:
-        connection.execute(
+    with postgres_store.session() as session:
+        session.execute(
             """
             INSERT INTO zulip_backfill_jobs (
                 account_uuid, provider_chat_key, history_depth, state
@@ -667,8 +700,8 @@ def test_reselected_chat_restarts_cancelled_backfill(postgres_store):
 
     postgres_store.reconcile_backfill_jobs()
 
-    with postgres_store.connection() as connection:
-        state = connection.execute("SELECT state FROM zulip_backfill_jobs").fetchone()[
+    with postgres_store.session() as session:
+        state = session.execute("SELECT state FROM zulip_backfill_jobs").fetchone()[
             "state"
         ]
     assert state == "pending"
@@ -690,8 +723,8 @@ def test_retryable_backfill_defer_is_durable_and_not_claimed_early(postgres_stor
     )
 
     assert postgres_store.claim_backfill_job() is None
-    with postgres_store.connection() as connection:
-        deferred = connection.execute(
+    with postgres_store.session() as session:
+        deferred = session.execute(
             """
             SELECT state, available_at, retry_count, last_error_code, lease_until
             FROM zulip_backfill_jobs
@@ -720,8 +753,8 @@ def test_non_retryable_backfill_failure_is_terminal_for_only_that_job(
     )
 
     assert postgres_store.claim_backfill_job() is None
-    with postgres_store.connection() as connection:
-        failed = connection.execute(
+    with postgres_store.session() as session:
+        failed = session.execute(
             """
             SELECT state, last_error_code, lease_until
             FROM zulip_backfill_jobs
@@ -741,14 +774,14 @@ def test_explicit_manual_retry_remains_claimable_after_lane_advanced(postgres_st
     record["sequence"] = 1
     record["operation_sha256"] = canonical.operation_digest(record)
     later_operation_uuid = str(uuid.uuid4())
-    with postgres_store.connection() as connection:
-        assignment = connection.execute(
+    with postgres_store.session() as session:
+        assignment = session.execute(
             """
             SELECT resource_uuid, generation FROM desired_resources
             WHERE resource_type = 'external_chat_assignment'
             """
         ).fetchone()
-        connection.execute(
+        session.execute(
             """
             INSERT INTO causal_lane_state (
                 origin, causal_lane, last_sequence, last_operation_uuid
@@ -756,7 +789,7 @@ def test_explicit_manual_retry_remains_claimable_after_lane_advanced(postgres_st
             """,
             (record["causal_lane"], later_operation_uuid),
         )
-        connection.execute(
+        session.execute(
             """
             INSERT INTO bridge_operations (
                 record_uuid, operation_uuid, attempt, operation_sha256,

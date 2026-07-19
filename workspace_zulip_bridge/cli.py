@@ -18,7 +18,7 @@ def build(
     runtime: config.RuntimeConfig,
     certificate_renewer=None,
 ) -> service.BridgeService:
-    store = storage.PostgresStore(runtime.database.dsn)
+    store = storage.RestAlchemyStore(runtime.database.connection_url)
     decryptor = credentials.CredentialDecryptor(
         runtime.control.credential_private_key_file,
         runtime.identity.realm_uuid,

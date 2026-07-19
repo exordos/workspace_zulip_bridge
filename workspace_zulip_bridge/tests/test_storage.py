@@ -19,7 +19,7 @@ class Result:
         return self.rows[0] if self.rows else None
 
 
-class Connection:
+class Session:
     def __init__(self, rows=()):
         self.rows = rows
         self.statements = []
@@ -29,14 +29,14 @@ class Connection:
         return Result(self.rows)
 
 
-def _store_with_connection(connection):
-    store = storage.PostgresStore("unused")
+def _store_with_session(session):
+    store = storage.RestAlchemyStore("unused")
 
     @contextlib.contextmanager
-    def open_connection():
-        yield connection
+    def open_session():
+        yield session
 
-    store.connection = open_connection
+    store.session = open_session
     return store
 
 
@@ -72,15 +72,15 @@ def _desired_change():
     ],
 )
 def test_incremental_desired_batch_fails_closed_before_cursor_commit(mutation):
-    connection = Connection()
-    store = _store_with_connection(connection)
+    session = Session()
+    store = _store_with_session(session)
     change = _desired_change()
     mutation(change)
 
     with pytest.raises(ValueError):
         store.apply_desired_changes([change], "cursor-2")
 
-    assert connection.statements == []
+    assert session.statements == []
 
 
 @pytest.mark.parametrize(
@@ -92,8 +92,8 @@ def test_incremental_desired_batch_fails_closed_before_cursor_commit(mutation):
     ids=("invalid-resource-uuid", "non-positive-generation"),
 )
 def test_incremental_desired_delete_fails_closed_before_any_sql(mutation):
-    connection = Connection()
-    store = _store_with_connection(connection)
+    session = Session()
+    store = _store_with_session(session)
     change = {
         "change_uuid": str(uuid.uuid4()),
         "sequence": 1,
@@ -107,12 +107,12 @@ def test_incremental_desired_delete_fails_closed_before_any_sql(mutation):
     with pytest.raises(ValueError):
         store.apply_desired_changes([change], "cursor-2")
 
-    assert connection.statements == []
+    assert session.statements == []
 
 
 def test_full_snapshot_fails_closed_before_materialization_or_cursor_commit():
-    connection = Connection()
-    store = _store_with_connection(connection)
+    session = Session()
+    store = _store_with_session(session)
     resource = _desired_change()["resource"]
     resource["required_capabilities"] = {
         "messenger.future": {"min_revision": 1, "limits": {}}
@@ -121,15 +121,15 @@ def test_full_snapshot_fails_closed_before_materialization_or_cursor_commit():
     with pytest.raises(ValueError, match="unsupported capability"):
         store.install_snapshot([resource], "anchor")
 
-    assert connection.statements == []
+    assert session.statements == []
 
 
 def test_expired_running_lease_reaper_is_atomic_and_idempotent():
-    connection = Connection(({"record_uuid": "one"}, {"record_uuid": "two"}))
-    store = _store_with_connection(connection)
+    session = Session(({"record_uuid": "one"}, {"record_uuid": "two"}))
+    store = _store_with_session(session)
 
     assert store.reap_expired_running() == 2
-    statement = connection.statements[0][0]
+    statement = session.statements[0][0]
     assert "WHERE state = 'running' AND lease_until < now()" in statement
     assert "provider_attempted_at IS NOT NULL" in statement
     assert "provider_queue_id IS NOT NULL" in statement
@@ -138,22 +138,22 @@ def test_expired_running_lease_reaper_is_atomic_and_idempotent():
     assert "ELSE 'pending'" in statement
     assert "lease_owner = NULL, lease_until = NULL" in statement
 
-    connection.rows = ()
+    session.rows = ()
     assert store.reap_expired_running() == 0
 
 
 def test_uncertain_claim_does_not_steal_a_live_reconciliation_lease():
-    connection = Connection()
-    store = _store_with_connection(connection)
+    session = Session()
+    store = _store_with_session(session)
 
     assert store.claim_uncertain("worker") is None
-    statement = connection.statements[0][0]
+    statement = session.statements[0][0]
     assert "lease_until IS NULL OR lease_until < now()" in statement
 
 
 def test_workspace_delivery_outbox_orders_live_before_backfill():
-    connection = Connection()
-    store = _store_with_connection(connection)
+    session = Session()
+    store = _store_with_session(session)
 
     assert (
         store.pending_workspace_deliveries(
@@ -161,16 +161,16 @@ def test_workspace_delivery_outbox_orders_live_before_backfill():
         )
         == []
     )
-    statement = connection.statements[0][0]
+    statement = session.statements[0][0]
     assert "submission_state IN ('pending', 'ambiguous')" in statement
     assert "submission_state = 'awaiting_result'" in statement
     assert "next_submission_at <= now()" in statement
     assert "delivery.priority BETWEEN %s AND %s" in statement
-    assert connection.statements[0][1] == (2, 2, 101)
+    assert session.statements[0][1] == (2, 2, 101)
     assert "ORDER BY priority, created_at" in statement
 
 
-class SharedDeliveryConnection:
+class SharedDeliverySession:
     def __init__(self):
         self.operations = {}
         self.deliveries = {}
@@ -215,8 +215,8 @@ class SharedDeliveryConnection:
 
 
 def test_workspace_delivery_result_survives_store_restart_round_trip():
-    connection = SharedDeliveryConnection()
-    first_store = _store_with_connection(connection)
+    session = SharedDeliverySession()
+    first_store = _store_with_session(session)
     operation_uuid = str(uuid.uuid4())
     record = {
         "record_uuid": str(uuid.uuid4()),
@@ -233,7 +233,7 @@ def test_workspace_delivery_result_survives_store_restart_round_trip():
 
     assert first_store.enqueue_workspace_delivery(record, 0)
 
-    restarted_store = _store_with_connection(connection)
+    restarted_store = _store_with_session(session)
     result = {
         "record_uuid": str(uuid.uuid4()),
         "operation_uuid": operation_uuid,
@@ -260,30 +260,30 @@ def test_workspace_delivery_result_survives_store_restart_round_trip():
     }
     restarted_store.accept_result(result)
 
-    assert connection.operations[operation_uuid]["terminal_outcome"] == "committed"
+    assert session.operations[operation_uuid]["terminal_outcome"] == "committed"
     assert (
-        connection.operations[operation_uuid]["result_record_uuid"]
+        session.operations[operation_uuid]["result_record_uuid"]
         == result["record_uuid"]
     )
 
 
 def test_initial_backfill_gate_ignores_delivery_outcomes_from_older_generation():
-    connection = Connection(({"ready": True},))
-    store = _store_with_connection(connection)
+    session = Session(({"ready": True},))
+    store = _store_with_session(session)
 
     assert store.initial_backfill_ready("00000000-0000-4000-8000-000000000001")
-    statement = connection.statements[0][0]
+    statement = session.statements[0][0]
     assert "account.resource_uuid = delivery.account_uuid" in statement
     assert "delivery.account_generation = account.generation" in statement
 
 
 def test_claim_allows_explicit_retry_after_lane_advanced_without_later_delete():
-    connection = Connection()
-    store = _store_with_connection(connection)
+    session = Session()
+    store = _store_with_session(session)
 
     assert store.claim("worker") is None
 
-    statement = connection.statements[0][0]
+    statement = session.statements[0][0]
     assert "assignment.generation = operation.assignment_generation" in statement
     assert "operation.lane_sequence" in statement
     assert "COALESCE(lane.last_sequence, 0) + 1" in statement
@@ -294,12 +294,12 @@ def test_claim_allows_explicit_retry_after_lane_advanced_without_later_delete():
 
 
 def test_terminal_claim_sweeps_expired_and_superseded_pending_work():
-    connection = Connection()
-    store = _store_with_connection(connection)
+    session = Session()
+    store = _store_with_session(session)
 
     assert store.claim_terminal("worker") is None
 
-    statement = connection.statements[0][0]
+    statement = session.statements[0][0]
     assert "operation.expires_at <= now()" in statement
     assert "assignment.generation <> operation.assignment_generation" in statement
     assert "assignment.body->>'project_id'" in statement
@@ -307,33 +307,33 @@ def test_terminal_claim_sweeps_expired_and_superseded_pending_work():
 
 
 def test_provider_send_attempt_never_replaces_live_queue_cursor(operation_record):
-    connection = Connection()
-    store = _store_with_connection(connection)
+    session = Session()
+    store = _store_with_session(session)
     item = storage.QueuedOperation(uuid.uuid4(), operation_record, 0)
 
     store.record_provider_attempt(item, "queue", "local", 7, "rendered")
 
-    assert len(connection.statements) == 1
-    assert "UPDATE bridge_operations" in connection.statements[0][0]
-    assert "zulip_event_cursors" not in connection.statements[0][0]
+    assert len(session.statements) == 1
+    assert "UPDATE bridge_operations" in session.statements[0][0]
+    assert "zulip_event_cursors" not in session.statements[0][0]
 
 
 def test_delete_tombstone_and_provider_journal_finalize_share_one_transaction():
-    connection = Connection()
-    store = _store_with_connection(connection)
+    session = Session()
+    store = _store_with_session(session)
 
     store.finalize_provider_event("account", "queue", 7, True, ["601"])
 
-    assert len(connection.statements) == 2
-    assert "UPDATE provider_mappings" in connection.statements[0][0]
-    assert "deleted = true" in connection.statements[0][0]
-    assert "UPDATE zulip_provider_events" in connection.statements[1][0]
-    assert "processing_state = 'pending'" in connection.statements[1][0]
+    assert len(session.statements) == 2
+    assert "UPDATE provider_mappings" in session.statements[0][0]
+    assert "deleted = true" in session.statements[0][0]
+    assert "UPDATE zulip_provider_events" in session.statements[1][0]
+    assert "processing_state = 'pending'" in session.statements[1][0]
 
 
 def test_stale_result_cannot_replace_terminal_result():
-    connection = SharedDeliveryConnection()
-    store = _store_with_connection(connection)
+    session = SharedDeliverySession()
+    store = _store_with_session(session)
     operation_uuid = str(uuid.uuid4())
     operation_record = {
         "record_uuid": str(uuid.uuid4()),
@@ -380,7 +380,7 @@ def test_stale_result_cannot_replace_terminal_result():
 
 
 def test_workspace_projection_contract_materializes_first_outbound_mappings():
-    connection = Connection()
+    session = Session()
     account_uuid = str(uuid.uuid4())
     stream_uuid = str(uuid.uuid4())
     topic_uuid = str(uuid.uuid4())
@@ -432,12 +432,12 @@ def test_workspace_projection_contract_materializes_first_outbound_mappings():
         },
     }
 
-    storage.PostgresStore._materialize_workspace_projection(connection, assignment)
+    storage.RestAlchemyStore._materialize_workspace_projection(session, assignment)
 
-    assert len(connection.statements) == 4
-    identity_parameters = connection.statements[0][1]
-    stream_parameters = connection.statements[2][1]
-    topic_parameters = connection.statements[3][1]
+    assert len(session.statements) == 4
+    identity_parameters = session.statements[0][1]
+    stream_parameters = session.statements[2][1]
+    topic_parameters = session.statements[3][1]
     assert identity_parameters[:3] == (account_uuid, owner_uuid, "1")
     assert stream_parameters[:3] == (account_uuid, stream_uuid, "direct:1,2")
     assert topic_parameters[:3] == (
@@ -458,11 +458,11 @@ def test_exact_backend_assignment_fixture_materializes_owned_topology():
             / "backend_external_chat_assignment.json"
         ).read_text(encoding="utf-8")
     )
-    connection = Connection()
-    storage.PostgresStore._materialize_workspace_projection(connection, fixture)
-    assert len(connection.statements) == 5
+    session = Session()
+    storage.RestAlchemyStore._materialize_workspace_projection(session, fixture)
+    assert len(session.statements) == 5
     materialized = []
-    for statement, parameters in connection.statements:
+    for statement, parameters in session.statements:
         entity_kind = next(
             kind for kind in ("identity", "stream", "topic") if f"'{kind}'" in statement
         )
@@ -509,9 +509,9 @@ def test_projection_tombstone_includes_all_assignment_owned_entities():
             / "backend_external_chat_assignment.json"
         ).read_text(encoding="utf-8")
     )
-    connection = Connection()
-    storage.PostgresStore._tombstone_workspace_projection(connection, fixture)
-    statement, parameters = connection.statements[0]
+    session = Session()
+    storage.RestAlchemyStore._tombstone_workspace_projection(session, fixture)
+    statement, parameters = session.statements[0]
     assert "entity_kind = 'identity'" in statement
     assert "entity_kind = 'stream'" in statement
     assert "entity_kind = 'topic'" in statement
@@ -522,16 +522,16 @@ def test_projection_tombstone_includes_all_assignment_owned_entities():
 
 
 def test_backfill_depth_is_assignment_owned():
-    connection = Connection()
-    store = _store_with_connection(connection)
+    session = Session()
+    store = _store_with_session(session)
     store.reconcile_backfill_jobs()
-    statement = connection.statements[0][0]
+    statement = session.statements[0][0]
     assert "assignment.body->>'history_depth'" in statement
     assert "account.body->'settings'->>'history_depth'" not in statement
 
 
 def test_committed_message_mapping_preserves_workspace_alias():
-    connection = Connection()
+    session = Session()
     record = {
         "account_uuid": str(uuid.uuid4()),
         "project_uuid": str(uuid.uuid4()),
@@ -547,19 +547,19 @@ def test_committed_message_mapping_preserves_workspace_alias():
             },
         },
     }
-    storage.PostgresStore._persist_committed_mapping(connection, record, "99", None)
+    storage.RestAlchemyStore._persist_committed_mapping(session, record, "99", None)
     assert (
         "ON CONFLICT (account_uuid, entity_kind, provider_id)"
-        in connection.statements[0][0]
+        in session.statements[0][0]
     )
-    assert "INSERT INTO provider_mapping_aliases" in connection.statements[1][0]
+    assert "INSERT INTO provider_mapping_aliases" in session.statements[1][0]
 
 
 def test_stale_assignment_delivery_is_removed_and_provider_event_replayed():
-    connection = Connection()
-    store = _store_with_connection(connection)
+    session = Session()
+    store = _store_with_session(session)
     assert store.reset_stale_workspace_deliveries() == 0
-    statement = connection.statements[0][0]
+    statement = session.statements[0][0]
     assert "assignment.generation" in statement
     assert "delivery.assignment_generation" in statement
     assert "assignment.body->>'project_id'" in statement

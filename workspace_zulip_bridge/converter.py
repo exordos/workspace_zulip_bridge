@@ -192,7 +192,7 @@ def convert_markdown(
     if "/user_uploads/" in converted:
         lossy = True
         converted = converted.replace("/user_uploads/", original_url + "#file-")
-    if lossy and original_url not in converted:
+    if lossy and original_url and original_url not in converted:
         converted = f"{converted}\n\n[Open original]({original_url})"
     return converted, lossy
 

@@ -12,7 +12,7 @@ def check(runtime: config.RuntimeConfig) -> None:
     age = datetime.datetime.now(datetime.UTC) - timestamp
     if age > datetime.timedelta(seconds=60):
         raise RuntimeError("Bridge worker has not progressed in 60 seconds")
-    rows = storage.PostgresStore(runtime.database.dsn).health()
+    rows = storage.RestAlchemyStore(runtime.database.connection_url).health()
     states = {str(row["component"]): str(row["status"]) for row in rows}
     if states.get("control") != "healthy":
         raise RuntimeError("Bridge control heartbeat is not healthy")

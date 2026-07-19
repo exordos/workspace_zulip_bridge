@@ -172,7 +172,7 @@ def test_private_object_put_and_get_reuse_mtls_client_and_frame_get():
             return httpx.Response(200, json={"file_urn": f"urn:file:{file_uuid}"})
         if request.url.path == f"/v1/file-objects/{file_uuid}":
             if request.method == "GET":
-                assert request.headers.get_list("Content-Length") == ["0"]
+                assert "Content-Length" not in request.headers
                 return httpx.Response(200, content=content)
             return httpx.Response(200)
         return httpx.Response(

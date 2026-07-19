@@ -213,6 +213,14 @@ def test_dm_conversion_has_owner_membership_identity_urn_and_copied_file():
     assert "> quoted" in markdown
 
 
+def test_lossy_markdown_without_original_url_does_not_add_empty_link():
+    converted, lossy = converter.convert_markdown("@**Unknown User**", {}, "")
+
+    assert lossy
+    assert converted == "@Unknown User"
+    assert "[Open original]" not in converted
+
+
 def test_new_chat_waits_for_backend_assignment_before_materialization():
     event = {"id": 10, "type": "message", "message": _stream_message()}
     with pytest.raises(ValueError, match="provider_chat_not_selected"):

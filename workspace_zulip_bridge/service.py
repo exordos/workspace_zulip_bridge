@@ -30,7 +30,7 @@ from workspace_zulip_bridge import (
 class AdapterRegistry:
     def __init__(
         self,
-        store: storage.PostgresStore,
+        store: storage.RestAlchemyStore,
         decryptor: credentials.CredentialDecryptor,
         custom_ca_dir: pathlib.Path = pathlib.Path(
             "/run/workspace-zulip-bridge/provider-ca"
@@ -112,7 +112,7 @@ class AdapterRegistry:
 
 
 class _AccountRouting:
-    def __init__(self, store: storage.PostgresStore, account_uuid: str):
+    def __init__(self, store: storage.RestAlchemyStore, account_uuid: str):
         self.store = store
         self.account_uuid = account_uuid
 
@@ -158,7 +158,7 @@ class BridgeService:
 
     def __init__(
         self,
-        store: storage.PostgresStore,
+        store: storage.RestAlchemyStore,
         control_client: control.ControlClient,
         operation_scheduler: scheduler.Scheduler,
         provider_adapters: AdapterRegistry,
@@ -1080,13 +1080,14 @@ class BridgeService:
         )
         complete = reached_checkpoint or len(messages) < 100
 
+        unmapped_messages = []
         for message in converter.newest_first(messages):
             provider_message_id = str(message["id"])
             mapping = self.store.provider_mapping(
                 account_uuid, "message", provider_message_id
             )
             if mapping is None:
-                self.enqueue_backfill(account_uuid, chat_key, [message])
+                unmapped_messages.append(message)
                 continue
             metadata = typing.cast(dict[str, object], mapping["metadata"])
             provider_content_sha256 = hashlib.sha256(
@@ -1131,6 +1132,9 @@ class BridgeService:
             )
             for record in records:
                 self.store.enqueue_workspace_delivery(record, 2)
+
+        if unmapped_messages:
+            self.enqueue_backfill(account_uuid, chat_key, unmapped_messages)
 
         if complete and checkpoint is not None:
             known = self.store.mapped_provider_messages(

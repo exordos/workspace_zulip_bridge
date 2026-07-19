@@ -5,7 +5,7 @@ import pathlib
 
 @dataclasses.dataclass(frozen=True)
 class DatabaseConfig:
-    dsn: str
+    connection_url: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -78,14 +78,15 @@ def load(path: str | pathlib.Path) -> RuntimeConfig:
     read = parser.read(path)
     if not read:
         raise FileNotFoundError(path)
-    database = parser["database"]
+    database = parser["db"] if parser.has_section("db") else parser["database"]
+    connection_url = database.get("connection_url") or database["dsn"]
     control = parser["control"]
     identity = parser["identity"]
     provider_api = parser["provider_api"]
     file_api = parser["file_api"]
     service = parser["service"]
     return RuntimeConfig(
-        database=DatabaseConfig(dsn=database["dsn"]),
+        database=DatabaseConfig(connection_url=connection_url),
         control=ControlConfig(
             base_url=control["base_url"].rstrip("/"),
             bootstrap_url=control["bootstrap_url"].rstrip("/"),

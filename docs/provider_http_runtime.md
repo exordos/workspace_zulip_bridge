@@ -73,7 +73,8 @@ Non-retryable history errors mark only the affected account/chat job as
 `failed`, retain its safe error code, and emit scoped degraded health plus an
 account observed report. Other accounts continue polling and synchronizing.
 
-`PostgresStore` does not retain a shared connection: each store operation opens
-its own context-managed connection. Concurrent account poll tasks also
-construct separate adapter/client instances, so neither database connections
-nor Zulip client state crosses worker-thread boundaries.
+`RestAlchemyStore` obtains each transaction from the RestAlchemy PostgreSQL
+engine and scopes it with `session_manager()`. The engine pool may reuse
+connections, but a session never crosses a store-operation or worker-thread
+boundary. Concurrent account poll tasks also construct separate adapter/client
+instances, so Zulip client state does not cross worker-thread boundaries.

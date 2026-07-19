@@ -14,5 +14,10 @@
   canonical resource metadata and references.
 - PostgreSQL is persistent bridge operational state. Workspace backend owns
   Workspace resources and transaction boundaries.
+- Manage bridge schema changes with RestAlchemy migrations. Create migrations
+  with `ra-new-migration`, keep explicit migration IDs and dependencies, and
+  apply them with `ra-apply-migration`; do not add a custom SQL migration runner.
+- Use the RestAlchemy PostgreSQL engine and scoped sessions for runtime database
+  access; do not add a direct `psycopg` storage or transaction boundary.
 - Do not create a remote repository, commit, push, or deploy without an explicit
   user request.

@@ -1,13 +1,13 @@
 import contextlib
 import dataclasses
 import datetime
+import hashlib
 import json
-import pathlib
+import threading
 import typing
 import uuid
 
-import psycopg
-import psycopg.rows
+from restalchemy.storage.sql import engines, sessions
 
 from workspace_zulip_bridge import canonical, control
 
@@ -177,33 +177,45 @@ class QueueStore(typing.Protocol):
     ) -> None: ...
 
 
-class PostgresStore:
-    def __init__(self, dsn: str):
-        self.dsn = dsn
+_ENGINE_LOCK = threading.Lock()
+_ENGINE_POOL_CONFIG = {"min_size": 1, "max_size": 20}
+
+
+def _engine_for(connection_url: str) -> engines.AbstractEngine:
+    engine_name = "workspace_zulip_bridge_" + hashlib.sha256(
+        connection_url.encode("utf-8")
+    ).hexdigest()
+    with _ENGINE_LOCK:
+        try:
+            return engines.engine_factory.get_engine(engine_name)
+        except ValueError:
+            engines.engine_factory.configure_factory(
+                db_url=connection_url,
+                config=_ENGINE_POOL_CONFIG,
+                name=engine_name,
+            )
+            return engines.engine_factory.get_engine(engine_name)
+
+
+class RestAlchemyStore:
+    def __init__(self, connection_url: str):
+        self.connection_url = connection_url
 
     @contextlib.contextmanager
-    def connection(self) -> typing.Iterator[psycopg.Connection[dict[str, object]]]:
-        with psycopg.connect(
-            self.dsn,
-            row_factory=psycopg.rows.dict_row,
-        ) as connection:
-            yield connection
-
-    def migrate(self, migrations: pathlib.Path) -> None:
-        with self.connection() as connection:
-            for path in sorted(migrations.glob("*.sql")):
-                connection.execute(path.read_text(encoding="utf-8"))
+    def session(self) -> typing.Iterator[sessions.PgSQLSession]:
+        with _engine_for(self.connection_url).session_manager() as session:
+            yield session
 
     def control_cursor(self) -> str:
-        with self.connection() as connection:
-            row = connection.execute(
+        with self.session() as session:
+            row = session.execute(
                 "SELECT control_cursor FROM bridge_metadata WHERE singleton"
             ).fetchone()
             return str(row["control_cursor"])
 
     def blocked_batch(self) -> dict[str, object] | None:
-        with self.connection() as connection:
-            row = connection.execute(
+        with self.session() as session:
+            row = session.execute(
                 "SELECT blocked_batch FROM bridge_metadata WHERE singleton"
             ).fetchone()
             return (
@@ -213,8 +225,8 @@ class PostgresStore:
             )
 
     def set_blocked_batch(self, cursor: str, next_cursor: str, code: str) -> None:
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 UPDATE bridge_metadata
                 SET blocked_batch = %s, updated_at = now()
@@ -235,8 +247,8 @@ class PostgresStore:
             )
 
     def clear_blocked_batch(self) -> None:
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 UPDATE bridge_metadata
                 SET blocked_batch = NULL, updated_at = now()
@@ -252,8 +264,8 @@ class PostgresStore:
         topics: list[dict[str, object]],
     ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
         """Accumulate the complete replacement catalog view transactionally."""
-        with self.connection() as connection:
-            row = connection.execute(
+        with self.session() as session:
+            row = session.execute(
                 """
                 SELECT participants, topics FROM external_chat_catalog_state
                 WHERE account_uuid = %s AND provider_chat_key = %s
@@ -278,7 +290,7 @@ class PostgresStore:
                 participant_map[key] for key in sorted(participant_map)
             ]
             merged_topics = [topic_map[key] for key in sorted(topic_map)]
-            connection.execute(
+            session.execute(
                 """
                 INSERT INTO external_chat_catalog_state (
                     account_uuid, provider_chat_key, participants, topics
@@ -300,8 +312,8 @@ class PostgresStore:
     def delete_catalog_topology(
         self, account_uuid: str, provider_chat_key: str
     ) -> None:
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 DELETE FROM external_chat_catalog_state
                 WHERE account_uuid = %s AND provider_chat_key = %s
@@ -333,7 +345,7 @@ class PostgresStore:
                 )
             else:
                 raise ValueError("Unsupported desired-state operation")
-        with self.connection() as connection:
+        with self.session() as session:
             for change in changes:
                 resource_type = str(change["resource_type"])
                 resource_uuid = str(change["resource_uuid"])
@@ -344,14 +356,14 @@ class PostgresStore:
                 if operation not in {"upsert", "delete"}:
                     raise ValueError("Unsupported desired-state operation")
                 body = change.get("resource") if operation == "upsert" else None
-                previous = connection.execute(
+                previous = session.execute(
                     """
                     SELECT body FROM desired_resources
                     WHERE resource_type = %s AND resource_uuid = %s
                     """,
                     (resource_type, resource_uuid),
                 ).fetchone()
-                applied = connection.execute(
+                applied = session.execute(
                     """
                     INSERT INTO desired_resources (
                         resource_type, resource_uuid, generation, body, deleted
@@ -378,18 +390,18 @@ class PostgresStore:
                     if operation == "upsert":
                         if previous is not None and previous["body"] is not None:
                             self._tombstone_workspace_projection(
-                                connection,
+                                session,
                                 typing.cast(dict[str, object], previous["body"]),
                             )
                         self._materialize_workspace_projection(
-                            connection, typing.cast(dict[str, object], body)
+                            session, typing.cast(dict[str, object], body)
                         )
                     elif previous is not None and previous["body"] is not None:
                         self._tombstone_workspace_projection(
-                            connection,
+                            session,
                             typing.cast(dict[str, object], previous["body"]),
                         )
-            connection.execute(
+            session.execute(
                 """
                 UPDATE bridge_metadata
                 SET control_cursor = %s, updated_at = now()
@@ -402,17 +414,17 @@ class PostgresStore:
         self, resources: list[dict[str, object]], anchor_cursor: str
     ) -> None:
         validated = [_validated_snapshot_resource(resource) for resource in resources]
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 UPDATE provider_mappings
                 SET deleted = true, updated_at = now()
                 WHERE entity_kind IN ('identity', 'stream', 'topic') AND NOT deleted
                 """
             )
-            connection.execute("DELETE FROM desired_resources")
+            session.execute("DELETE FROM desired_resources")
             for resource in validated:
-                connection.execute(
+                session.execute(
                     """
                     INSERT INTO desired_resources (
                         resource_type, resource_uuid, generation, body, deleted
@@ -426,8 +438,8 @@ class PostgresStore:
                     ),
                 )
                 if resource["resource_type"] == "external_chat_assignment":
-                    self._materialize_workspace_projection(connection, resource)
-            connection.execute(
+                    self._materialize_workspace_projection(session, resource)
+            session.execute(
                 """
                 UPDATE bridge_metadata SET control_cursor = %s, updated_at = now()
                 WHERE singleton
@@ -437,7 +449,7 @@ class PostgresStore:
 
     @staticmethod
     def _materialize_workspace_projection(
-        connection: psycopg.Connection[dict[str, object]],
+        session: sessions.PgSQLSession,
         assignment: dict[str, object],
     ) -> None:
         projection = assignment.get("workspace_projection")
@@ -462,7 +474,7 @@ class PostgresStore:
                 raise ValueError("Invalid workspace projection participant")
             identity_uuid = str(raw_participant["identity_uuid"])
             participant_uuids.append(identity_uuid)
-            connection.execute(
+            session.execute(
                 """
                 WITH removed_stale_workspace_mapping AS (
                     DELETE FROM provider_mappings
@@ -497,7 +509,7 @@ class PostgresStore:
                 ),
             )
         stream_uuid = str(stream["uuid"])
-        connection.execute(
+        session.execute(
             """
             WITH removed_stale_workspace_mapping AS (
                 DELETE FROM provider_mappings
@@ -536,7 +548,7 @@ class PostgresStore:
         for raw_topic in topics:
             if not isinstance(raw_topic, dict):
                 raise ValueError("Invalid workspace projection topic")
-            connection.execute(
+            session.execute(
                 """
                 WITH removed_stale_workspace_mapping AS (
                     DELETE FROM provider_mappings
@@ -572,7 +584,7 @@ class PostgresStore:
 
     @staticmethod
     def _tombstone_workspace_projection(
-        connection: psycopg.Connection[dict[str, object]],
+        session: sessions.PgSQLSession,
         assignment: dict[str, object],
     ) -> None:
         projection = assignment.get("workspace_projection")
@@ -587,7 +599,7 @@ class PostgresStore:
             for participant in participants
             if isinstance(participant, dict) and participant.get("identity_uuid")
         ]
-        connection.execute(
+        session.execute(
             """
             UPDATE provider_mappings
             SET deleted = true, updated_at = now()
@@ -626,8 +638,8 @@ class PostgresStore:
     def desired_resource(
         self, resource_type: str, resource_uuid: str
     ) -> dict[str, object] | None:
-        with self.connection() as connection:
-            row = connection.execute(
+        with self.session() as session:
+            row = session.execute(
                 """
                 SELECT body FROM desired_resources
                 WHERE resource_type = %s AND resource_uuid = %s AND NOT deleted
@@ -646,8 +658,8 @@ class PostgresStore:
         return self.desired_resource("external_account", account_uuid)
 
     def provider_policy(self, provider_kind: str = "zulip") -> dict[str, object] | None:
-        with self.connection() as connection:
-            row = connection.execute(
+        with self.session() as session:
+            row = session.execute(
                 """
                 SELECT body FROM desired_resources
                 WHERE resource_type = 'external_provider_policy'
@@ -699,8 +711,8 @@ class PostgresStore:
     def assignment_for_provider_chat(
         self, account_uuid: str, provider_chat_key: str
     ) -> dict[str, object] | None:
-        with self.connection() as connection:
-            row = connection.execute(
+        with self.session() as session:
+            row = session.execute(
                 """
                 SELECT body FROM desired_resources
                 WHERE resource_type = 'external_chat_assignment'
@@ -716,8 +728,8 @@ class PostgresStore:
     def provider_mapping(
         self, account_uuid: str, entity_kind: str, provider_id: str
     ) -> dict[str, object] | None:
-        with self.connection() as connection:
-            return connection.execute(
+        with self.session() as session:
+            return session.execute(
                 """
                 SELECT mapping.workspace_uuid, mapping.provider_id,
                        mapping.provider_revision, mapping.metadata,
@@ -739,8 +751,8 @@ class PostgresStore:
     def workspace_mapping(
         self, account_uuid: str, entity_kind: str, workspace_uuid: str
     ) -> dict[str, object] | None:
-        with self.connection() as connection:
-            return connection.execute(
+        with self.session() as session:
+            return session.execute(
                 """
                 SELECT workspace_uuid, provider_id, provider_revision, metadata
                 FROM (
@@ -777,8 +789,8 @@ class PostgresStore:
     def topic_message_mapping(
         self, account_uuid: str, topic_uuid: str
     ) -> dict[str, object] | None:
-        with self.connection() as connection:
-            return connection.execute(
+        with self.session() as session:
+            return session.execute(
                 """
                 SELECT workspace_uuid, provider_id, provider_revision, metadata
                 FROM provider_mappings
@@ -798,8 +810,8 @@ class PostgresStore:
         topic_uuid: str | None,
         through_workspace_uuid: str,
     ) -> list[dict[str, object]]:
-        with self.connection() as connection:
-            boundary = connection.execute(
+        with self.session() as session:
+            boundary = session.execute(
                 """
                 SELECT provider_id FROM provider_mappings
                 WHERE account_uuid = %s AND entity_kind = 'message'
@@ -829,7 +841,7 @@ class PostgresStore:
                 topic_clause = "AND metadata->>'topic_uuid' = %s"
                 parameters.append(topic_uuid)
             return list(
-                connection.execute(
+                session.execute(
                     f"""
                     SELECT workspace_uuid, provider_id, provider_revision, metadata
                     FROM provider_mappings
@@ -853,8 +865,8 @@ class PostgresStore:
         metadata: dict[str, object],
         provider_revision: str | None = None,
     ) -> None:
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 INSERT INTO provider_mappings (
                     account_uuid, entity_kind, workspace_uuid, provider_id,
@@ -888,8 +900,8 @@ class PostgresStore:
         metadata: dict[str, object],
         provider_revision: str | None = None,
     ) -> dict[str, object] | None:
-        with self.connection() as connection:
-            row = connection.execute(
+        with self.session() as session:
+            row = session.execute(
                 """
                 UPDATE provider_mappings
                 SET provider_id = %s, provider_revision = %s, metadata = %s,
@@ -912,8 +924,8 @@ class PostgresStore:
     def mark_provider_mapping_deleted(
         self, account_uuid: str, entity_kind: str, provider_id: str
     ) -> None:
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 UPDATE provider_mappings
                 SET deleted = true, updated_at = now()
@@ -923,9 +935,9 @@ class PostgresStore:
             )
 
     def pending_provider_events(self, limit: int = 100) -> list[dict[str, object]]:
-        with self.connection() as connection:
+        with self.session() as session:
             return list(
-                connection.execute(
+                session.execute(
                     """
                     SELECT account_uuid, queue_id, event_id, body
                     FROM zulip_provider_events
@@ -943,8 +955,8 @@ class PostgresStore:
         event_id: int,
         reason: str,
     ) -> None:
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 UPDATE zulip_provider_events
                 SET retry_count = retry_count + 1,
@@ -972,8 +984,8 @@ class PostgresStore:
         supported: bool,
         reason: str | None = None,
     ) -> None:
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 UPDATE zulip_provider_events
                 SET processing_state = %s, processing_reason = %s
@@ -998,9 +1010,9 @@ class PostgresStore:
         reason: str | None = None,
     ) -> None:
         """Atomically publish delete tombstones after delivery is durable."""
-        with self.connection() as connection:
+        with self.session() as session:
             if deleted_message_ids:
-                connection.execute(
+                session.execute(
                     """
                     UPDATE provider_mappings
                     SET deleted = true, updated_at = now()
@@ -1009,7 +1021,7 @@ class PostgresStore:
                     """,
                     (account_uuid, deleted_message_ids),
                 )
-            connection.execute(
+            session.execute(
                 """
                 UPDATE zulip_provider_events
                 SET processing_state = %s, processing_reason = %s
@@ -1028,8 +1040,8 @@ class PostgresStore:
     def mark_provider_event_invalid(
         self, account_uuid: str, queue_id: str, event_id: int, reason: str
     ) -> None:
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 UPDATE zulip_provider_events
                 SET processing_state = 'invalid', processing_reason = %s
@@ -1046,8 +1058,8 @@ class PostgresStore:
     def producer_lane_position(
         self, operation_uuid: str, origin: str, causal_lane: str
     ) -> tuple[int, str | None]:
-        with self.connection() as connection:
-            existing = connection.execute(
+        with self.session() as session:
+            existing = session.execute(
                 """
                 SELECT lane_sequence, predecessor_operation_uuid
                 FROM producer_operations WHERE operation_uuid = %s
@@ -1064,7 +1076,7 @@ class PostgresStore:
 
     @staticmethod
     def _allocate_producer_lane(
-        connection: psycopg.Connection[dict[str, object]],
+        session: sessions.PgSQLSession,
         record: dict[str, object],
     ) -> None:
         if int(record["sequence"]) != 0:
@@ -1072,7 +1084,7 @@ class PostgresStore:
         operation_uuid = str(record["operation_uuid"])
         origin = str(record["origin"])
         causal_lane = str(record["causal_lane"])
-        counter = connection.execute(
+        counter = session.execute(
             """
                 INSERT INTO producer_lane_counters (origin, causal_lane)
                 VALUES (%s, %s)
@@ -1084,7 +1096,7 @@ class PostgresStore:
         ).fetchone()
         sequence = int(counter["last_sequence"]) + 1
         predecessor = counter["last_operation_uuid"]
-        connection.execute(
+        session.execute(
             """
                 INSERT INTO producer_operations (
                     operation_uuid, origin, causal_lane, lane_sequence,
@@ -1093,7 +1105,7 @@ class PostgresStore:
                 """,
             (operation_uuid, origin, causal_lane, sequence, predecessor),
         )
-        connection.execute(
+        session.execute(
             """
                 UPDATE producer_lane_counters
                 SET last_sequence = %s, last_operation_uuid = %s, updated_at = now()
@@ -1114,11 +1126,11 @@ class PostgresStore:
         provider_queue_id: str | None = None,
         provider_event_id: int | None = None,
     ) -> bool:
-        with self.connection() as connection:
+        with self.session() as session:
             operation_uuid = str(record["operation_uuid"])
-            self._allocate_producer_lane(connection, record)
+            self._allocate_producer_lane(session, record)
             operation_sha256 = str(record["operation_sha256"])
-            account = connection.execute(
+            account = session.execute(
                 """
                 SELECT generation FROM desired_resources
                 WHERE resource_type = 'external_account'
@@ -1129,7 +1141,7 @@ class PostgresStore:
             if account is None:
                 raise ValueError("Unknown external account")
             account_generation = int(account["generation"])
-            existing = connection.execute(
+            existing = session.execute(
                 "SELECT operation_sha256 FROM operation_idempotency "
                 "WHERE operation_uuid = %s",
                 (operation_uuid,),
@@ -1139,7 +1151,7 @@ class PostgresStore:
                 and existing["operation_sha256"] != operation_sha256
             ):
                 raise ValueError("Operation UUID reused with a different digest")
-            connection.execute(
+            session.execute(
                 """
                 INSERT INTO operation_idempotency (operation_uuid, operation_sha256)
                 VALUES (%s, %s)
@@ -1149,7 +1161,7 @@ class PostgresStore:
             )
             operation = typing.cast(dict[str, object] | None, record.get("operation"))
             if operation is None:
-                result = connection.execute(
+                result = session.execute(
                     """
                     INSERT INTO workspace_delivery_outbox (
                         record_uuid, operation_uuid, account_uuid,
@@ -1175,7 +1187,7 @@ class PostgresStore:
             )
             assignment = None
             if not account_global:
-                assignment = connection.execute(
+                assignment = session.execute(
                     """
                     SELECT resource_uuid, generation,
                            body->>'project_id' AS project_uuid
@@ -1196,7 +1208,7 @@ class PostgresStore:
                 ).fetchone()
                 if assignment is None:
                     raise ValueError("provider_chat_assignment_pending")
-            result = connection.execute(
+            result = session.execute(
                 """
                 INSERT INTO workspace_delivery_outbox (
                     record_uuid, operation_uuid, account_uuid,
@@ -1231,8 +1243,8 @@ class PostgresStore:
     ) -> list[dict[str, object]]:
         if not 0 <= minimum_priority <= maximum_priority <= 2:
             raise ValueError("Invalid workspace delivery priority range")
-        with self.connection() as connection:
-            rows = connection.execute(
+        with self.session() as session:
+            rows = session.execute(
                 """
                     SELECT delivery.record FROM workspace_delivery_outbox AS delivery
                     JOIN desired_resources AS account
@@ -1270,8 +1282,8 @@ class PostgresStore:
             return [typing.cast(dict[str, object], row["record"]) for row in rows]
 
     def reset_stale_workspace_deliveries(self) -> int:
-        with self.connection() as connection:
-            stale = connection.execute(
+        with self.session() as session:
+            stale = session.execute(
                 """
                 DELETE FROM workspace_delivery_outbox AS delivery
                 WHERE delivery.sent_at IS NULL
@@ -1309,7 +1321,7 @@ class PostgresStore:
             if not stale:
                 return 0
             operation_ids = [row["operation_uuid"] for row in stale]
-            connection.execute(
+            session.execute(
                 """
                 DELETE FROM operation_idempotency
                 WHERE operation_uuid = ANY(%s)
@@ -1320,7 +1332,7 @@ class PostgresStore:
             for row in stale:
                 if row["provider_queue_id"] is None:
                     continue
-                connection.execute(
+                session.execute(
                     """
                     UPDATE zulip_provider_events
                     SET processing_state = 'pending', available_at = now(),
@@ -1337,8 +1349,8 @@ class PostgresStore:
             return len(stale)
 
     def mark_interrupted_workspace_deliveries_ambiguous(self) -> int:
-        with self.connection() as connection:
-            rows = connection.execute(
+        with self.session() as session:
+            rows = session.execute(
                 """
                 UPDATE workspace_delivery_outbox
                 SET submission_state = 'ambiguous', next_submission_at = now()
@@ -1349,7 +1361,7 @@ class PostgresStore:
             for row in rows:
                 if row["provider_queue_id"] is None:
                     continue
-                connection.execute(
+                session.execute(
                     """
                     UPDATE zulip_provider_events
                     SET processing_reason = 'workspace_delivery_ambiguous'
@@ -1365,8 +1377,8 @@ class PostgresStore:
             return len(rows)
 
     def mark_workspace_delivery_submitting(self, record_uuid: str) -> bool:
-        with self.connection() as connection:
-            row = connection.execute(
+        with self.session() as session:
+            row = session.execute(
                 """
                 UPDATE workspace_delivery_outbox AS delivery
                 SET submission_state = 'submitting',
@@ -1412,8 +1424,8 @@ class PostgresStore:
     def mark_provider_event_delivering(
         self, account_uuid: str, queue_id: str, event_id: int
     ) -> None:
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 UPDATE zulip_provider_events
                 SET processing_state = 'delivering', processing_reason = NULL
@@ -1424,8 +1436,8 @@ class PostgresStore:
             )
 
     def finalize_ready_provider_events(self) -> int:
-        with self.connection() as connection:
-            rows = connection.execute(
+        with self.session() as session:
+            rows = session.execute(
                 """
                 SELECT event.account_uuid, event.queue_id, event.event_id, event.body
                 FROM zulip_provider_events AS event
@@ -1446,7 +1458,7 @@ class PostgresStore:
                     raw_ids = event.get("message_ids")
                     if raw_ids is None and event.get("message_id") is not None:
                         raw_ids = [event["message_id"]]
-                    connection.execute(
+                    session.execute(
                         """
                         UPDATE provider_mappings
                         SET deleted = true, updated_at = now()
@@ -1458,7 +1470,7 @@ class PostgresStore:
                             [str(value) for value in raw_ids or []],
                         ),
                     )
-                connection.execute(
+                session.execute(
                     """
                     UPDATE zulip_provider_events SET processing_state = 'processed'
                     WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
@@ -1469,8 +1481,8 @@ class PostgresStore:
             return len(rows)
 
     def mark_workspace_delivery_submitted(self, record_uuid: str) -> None:
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 UPDATE workspace_delivery_outbox
                 SET submission_state = 'awaiting_result',
@@ -1490,8 +1502,8 @@ class PostgresStore:
     def active_account_uuids(self) -> list[str]:
         if not self.provider_is_enabled("zulip"):
             return []
-        with self.connection() as connection:
-            rows = connection.execute(
+        with self.session() as session:
+            rows = session.execute(
                 """
                 SELECT resource_uuid FROM desired_resources
                 WHERE resource_type = 'external_account' AND NOT deleted
@@ -1502,8 +1514,8 @@ class PostgresStore:
             return [str(row["resource_uuid"]) for row in rows]
 
     def reconcile_backfill_jobs(self) -> None:
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 INSERT INTO zulip_backfill_jobs (
                     account_uuid, provider_chat_key, history_depth, cutoff_at, state
@@ -1544,7 +1556,7 @@ class PostgresStore:
                     updated_at = now()
                 """
             )
-            connection.execute(
+            session.execute(
                 """
                 UPDATE zulip_backfill_jobs AS job
                 SET state = 'cancelled', updated_at = now()
@@ -1564,8 +1576,8 @@ class PostgresStore:
             )
 
     def catalog_reports_accepted(self, account_uuid: str, generation: int) -> bool:
-        with self.connection() as connection:
-            row = connection.execute(
+        with self.session() as session:
+            row = session.execute(
                 """
                 WITH latest AS (
                     SELECT DISTINCT ON (body->>'resource_uuid') result_status
@@ -1601,8 +1613,8 @@ class PostgresStore:
         )
         if not isinstance(maximum, int) or isinstance(maximum, bool):
             maximum = 0
-        with self.connection() as connection:
-            catalog_count = connection.execute(
+        with self.session() as session:
+            catalog_count = session.execute(
                 """
                 WITH latest AS (
                     SELECT DISTINCT ON (body->>'resource_uuid') body, result_status
@@ -1618,7 +1630,7 @@ class PostgresStore:
                 """,
                 (account_uuid, generation),
             ).fetchone()["count"]
-            assignment_count = connection.execute(
+            assignment_count = session.execute(
                 """
                 SELECT COUNT(*) AS count FROM desired_resources
                 WHERE resource_type = 'external_chat_assignment'
@@ -1631,8 +1643,8 @@ class PostgresStore:
         return int(assignment_count) >= min(int(catalog_count), maximum)
 
     def initial_backfill_ready(self, account_uuid: str) -> bool:
-        with self.connection() as connection:
-            row = connection.execute(
+        with self.session() as session:
+            row = session.execute(
                 """
                 SELECT
                     NOT EXISTS (
@@ -1670,8 +1682,8 @@ class PostgresStore:
             return bool(row["ready"])
 
     def claim_backfill_job(self) -> dict[str, object] | None:
-        with self.connection() as connection:
-            return connection.execute(
+        with self.session() as session:
+            return session.execute(
                 """
                 WITH candidate AS (
                     SELECT account_uuid, provider_chat_key
@@ -1703,8 +1715,8 @@ class PostgresStore:
         next_anchor: int | None,
         complete: bool,
     ) -> None:
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 UPDATE zulip_backfill_jobs
                 SET next_anchor = %s, state = %s, lease_until = NULL,
@@ -1721,8 +1733,8 @@ class PostgresStore:
             )
 
     def release_backfill_job(self, account_uuid: str, provider_chat_key: str) -> None:
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 UPDATE zulip_backfill_jobs
                 SET state = 'pending', lease_until = NULL,
@@ -1740,8 +1752,8 @@ class PostgresStore:
         available_at: datetime.datetime,
         code: str,
     ) -> None:
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 UPDATE zulip_backfill_jobs
                 SET state = 'pending', lease_until = NULL,
@@ -1759,8 +1771,8 @@ class PostgresStore:
         provider_chat_key: str,
         code: str,
     ) -> None:
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 UPDATE zulip_backfill_jobs
                 SET state = 'failed', lease_until = NULL,
@@ -1774,11 +1786,11 @@ class PostgresStore:
     def enqueue(self, record: dict[str, object], priority: int) -> bool:
         if priority not in {0, 1, 2}:
             raise ValueError("Invalid operation priority")
-        with self.connection() as connection:
-            self._allocate_producer_lane(connection, record)
+        with self.session() as session:
+            self._allocate_producer_lane(session, record)
             operation_uuid = str(record["operation_uuid"])
             operation_sha256 = str(record["operation_sha256"])
-            prior = connection.execute(
+            prior = session.execute(
                 """
                 SELECT operation_sha256, terminal_outcome, manual_retry_allowed
                 FROM operation_idempotency
@@ -1797,7 +1809,7 @@ class PostgresStore:
                 raise ValueError("Higher attempt is not authorized by prior result")
             operation = typing.cast(dict[str, object], record["operation"])
             provider = typing.cast(dict[str, object], operation["provider"])
-            assignment = connection.execute(
+            assignment = session.execute(
                 """
                 SELECT resource_uuid, generation
                 FROM desired_resources
@@ -1818,7 +1830,7 @@ class PostgresStore:
             if assignment is None:
                 raise ValueError("Operation does not match an active assignment")
             if attempt > 1:
-                previous_attempt = connection.execute(
+                previous_attempt = session.execute(
                     """
                     SELECT max(attempt) AS attempt FROM bridge_operations
                     WHERE operation_uuid = %s
@@ -1831,7 +1843,7 @@ class PostgresStore:
                     or attempt != int(previous_attempt["attempt"]) + 1
                 ):
                     raise ValueError("Manual retry attempt is not consecutive")
-            connection.execute(
+            session.execute(
                 """
                 INSERT INTO operation_idempotency (operation_uuid, operation_sha256)
                 VALUES (%s, %s)
@@ -1839,7 +1851,7 @@ class PostgresStore:
                 """,
                 (operation_uuid, operation_sha256),
             )
-            result = connection.execute(
+            result = session.execute(
                 """
                 INSERT INTO bridge_operations (
                     record_uuid, operation_uuid, attempt, operation_sha256,
@@ -1877,8 +1889,8 @@ class PostgresStore:
     def bind_provider_lease(self, record: dict[str, object]) -> bool:
         """Attach a renewed backend lease to existing durable work or outcome."""
         transport = typing.cast(dict[str, object], record["transport"])
-        with self.connection() as connection:
-            updated = connection.execute(
+        with self.session() as session:
+            updated = session.execute(
                 """
                 UPDATE bridge_operations
                 SET record = jsonb_set(
@@ -1915,8 +1927,8 @@ class PostgresStore:
     def release_provider_event_submissions(self, record_uuids: list[str]) -> None:
         if not record_uuids:
             return
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 UPDATE workspace_delivery_outbox
                 SET submission_state = 'pending', next_submission_at = now()
@@ -1948,8 +1960,8 @@ class PostgresStore:
         self, worker_id: str, lease_seconds: int = 60
     ) -> tuple[QueuedOperation, str] | None:
         """Claim pending work that can no longer call the provider safely."""
-        with self.connection() as connection:
-            row = connection.execute(
+        with self.session() as session:
+            row = session.execute(
                 """
                 WITH candidate AS (
                     SELECT operation.record_uuid,
@@ -2009,8 +2021,8 @@ class PostgresStore:
             return self._queued_operation(row), str(row["terminal_reason"])
 
     def claim(self, worker_id: str, lease_seconds: int = 60) -> QueuedOperation | None:
-        with self.connection() as connection:
-            row = connection.execute(
+        with self.session() as session:
+            row = session.execute(
                 """
                 WITH candidates AS (
                     SELECT operation.record_uuid
@@ -2088,7 +2100,7 @@ class PostgresStore:
             if row is None:
                 return None
             record = typing.cast(dict[str, object], row["record"])
-            connection.execute(
+            session.execute(
                 """
                 INSERT INTO scheduler_accounts (account_uuid, last_dispatched_at)
                 VALUES (%s, now())
@@ -2107,8 +2119,8 @@ class PostgresStore:
         It is moved to reconciliation instead. Operations that provably did
         not reach the provider become pending again.
         """
-        with self.connection() as connection:
-            rows = connection.execute(
+        with self.session() as session:
+            rows = session.execute(
                 """
                 UPDATE bridge_operations
                 SET state = CASE
@@ -2151,8 +2163,8 @@ class PostgresStore:
     ) -> None:
         if outcome not in {"committed", "rejected", "expired", "cancelled"}:
             raise ValueError("Invalid terminal outcome")
-        with self.connection() as connection:
-            current = connection.execute(
+        with self.session() as session:
+            current = session.execute(
                 """
                 SELECT state FROM bridge_operations
                 WHERE record_uuid = %s
@@ -2168,7 +2180,7 @@ class PostgresStore:
             target_entity_id = result_body.get("provider_entity_id")
             target_revision = result_body.get("provider_revision")
             manual_retry_allowed = result_body.get("manual_retry_allowed") is True
-            connection.execute(
+            session.execute(
                 """
                 UPDATE bridge_operations
                 SET state = %s, result_record = %s, lease_owner = NULL,
@@ -2177,7 +2189,7 @@ class PostgresStore:
                 """,
                 (outcome, json.dumps(result), str(item.record_uuid)),
             )
-            connection.execute(
+            session.execute(
                 """
                 UPDATE operation_idempotency
                 SET terminal_outcome = %s, result_record_uuid = %s,
@@ -2196,7 +2208,7 @@ class PostgresStore:
                 ),
             )
             if int(item.record["attempt"]) == 1:
-                connection.execute(
+                session.execute(
                     """
                     INSERT INTO causal_lane_state (
                         origin, causal_lane, last_sequence, last_operation_uuid
@@ -2205,7 +2217,7 @@ class PostgresStore:
                     """,
                     (str(item.record["origin"]), str(item.record["causal_lane"])),
                 )
-                advanced = connection.execute(
+                advanced = session.execute(
                     """
                     UPDATE causal_lane_state
                     SET last_sequence = %s, last_operation_uuid = %s,
@@ -2228,7 +2240,7 @@ class PostgresStore:
                     raise ValueError("Causal lane state changed before completion")
             if outcome == "committed":
                 self._persist_committed_mapping(
-                    connection,
+                    session,
                     item.record,
                     None if target_entity_id is None else str(target_entity_id),
                     None if target_revision is None else str(target_revision),
@@ -2236,7 +2248,7 @@ class PostgresStore:
 
     @staticmethod
     def _persist_committed_mapping(
-        connection: psycopg.Connection[dict[str, object]],
+        session: sessions.PgSQLSession,
         record: dict[str, object],
         provider_entity_id: str | None,
         provider_revision: str | None,
@@ -2250,7 +2262,7 @@ class PostgresStore:
         if kind == "message.create":
             if provider_entity_id is None:
                 raise ValueError("Committed message create has no provider identifier")
-            connection.execute(
+            session.execute(
                 """
                 INSERT INTO provider_mappings (
                     account_uuid, entity_kind, workspace_uuid, provider_id,
@@ -2279,7 +2291,7 @@ class PostgresStore:
                     ),
                 ),
             )
-            connection.execute(
+            session.execute(
                 """
                 INSERT INTO provider_mapping_aliases (
                     account_uuid, entity_kind, workspace_uuid, provider_id,
@@ -2310,7 +2322,7 @@ class PostgresStore:
             )
         elif kind in {"message.update", "topic.upsert", "stream.upsert"}:
             entity_kind = kind.partition(".")[0]
-            connection.execute(
+            session.execute(
                 """
                 UPDATE provider_mappings
                 SET provider_revision = COALESCE(%s, provider_revision),
@@ -2321,7 +2333,7 @@ class PostgresStore:
                 (provider_revision, account_uuid, entity_kind, workspace_uuid),
             )
         elif kind == "message.delete":
-            connection.execute(
+            session.execute(
                 """
                 UPDATE provider_mappings
                 SET deleted = true, updated_at = now()
@@ -2330,7 +2342,7 @@ class PostgresStore:
                 """,
                 (account_uuid, workspace_uuid),
             )
-            connection.execute(
+            session.execute(
                 """
                 UPDATE provider_mapping_aliases
                 SET deleted = true, updated_at = now()
@@ -2343,8 +2355,8 @@ class PostgresStore:
     def retry(
         self, item: QueuedOperation, available_at: datetime.datetime, code: str
     ) -> None:
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 UPDATE bridge_operations
                 SET state = 'pending', available_at = %s, last_error_code = %s,
@@ -2363,8 +2375,8 @@ class PostgresStore:
         last_event_id: int,
         provider_rendered_content: str,
     ) -> None:
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 UPDATE bridge_operations
                 SET provider_queue_id = %s, provider_local_id = %s,
@@ -2387,8 +2399,8 @@ class PostgresStore:
             # long-lived provider poller. Send correlation is operation-local.
 
     def mark_uncertain(self, item: QueuedOperation, code: str) -> None:
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 UPDATE bridge_operations
                 SET state = 'uncertain', last_error_code = %s,
@@ -2401,8 +2413,8 @@ class PostgresStore:
             )
 
     def claim_uncertain(self, worker_id: str) -> QueuedOperation | None:
-        with self.connection() as connection:
-            row = connection.execute(
+        with self.session() as session:
+            row = session.execute(
                 """
                 WITH candidate AS (
                     SELECT record_uuid FROM bridge_operations
@@ -2448,8 +2460,8 @@ class PostgresStore:
         after: datetime.datetime,
         evidence: dict[str, object],
     ) -> None:
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 UPDATE bridge_operations
                 SET reconciliation_check_count = reconciliation_check_count + 1,
@@ -2464,8 +2476,8 @@ class PostgresStore:
     def schedule_single_resend(
         self, item: QueuedOperation, evidence: dict[str, object]
     ) -> None:
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 UPDATE bridge_operations
                 SET state = 'pending', available_at = now(),
@@ -2515,8 +2527,8 @@ class PostgresStore:
         }
         if "transport" in record:
             result["transport"] = record["transport"]
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 UPDATE bridge_operations
                 SET state = 'rejected',
@@ -2543,7 +2555,7 @@ class PostgresStore:
                     str(item.record_uuid),
                 ),
             )
-            connection.execute(
+            session.execute(
                 """
                 UPDATE operation_idempotency
                 SET terminal_outcome = 'rejected',
@@ -2557,8 +2569,8 @@ class PostgresStore:
             )
 
     def provider_event_cursor(self, account_uuid: str) -> dict[str, object] | None:
-        with self.connection() as connection:
-            return connection.execute(
+        with self.session() as session:
+            return session.execute(
                 """
                 SELECT queue_id, last_event_id FROM zulip_event_cursors
                 WHERE account_uuid = %s
@@ -2569,8 +2581,8 @@ class PostgresStore:
     def update_provider_event_cursor(
         self, account_uuid: str, queue_id: str, last_event_id: int
     ) -> None:
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 INSERT INTO zulip_event_cursors (
                     account_uuid, queue_id, last_event_id
@@ -2593,8 +2605,8 @@ class PostgresStore:
     def record_provider_event(
         self, account_uuid: str, queue_id: str, event: dict[str, object]
     ) -> bool:
-        with self.connection() as connection:
-            result = connection.execute(
+        with self.session() as session:
+            result = session.execute(
                 """
                 INSERT INTO zulip_provider_events (
                     account_uuid, queue_id, event_id, event_type, body
@@ -2613,16 +2625,16 @@ class PostgresStore:
             return result is not None
 
     def invalidate_provider_event_cursor(self, account_uuid: str) -> None:
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 "DELETE FROM zulip_event_cursors WHERE account_uuid = %s",
                 (account_uuid,),
             )
 
     def begin_provider_queue_catchup(self, account_uuid: str) -> None:
         """Persist the recovery boundary before discarding a dead queue."""
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 WITH selected_chats AS (
                     SELECT
@@ -2683,8 +2695,8 @@ class PostgresStore:
             )
 
     def pending_provider_catchup(self, account_uuid: str) -> dict[str, object] | None:
-        with self.connection() as connection:
-            return connection.execute(
+        with self.session() as session:
+            return session.execute(
                 """
                 SELECT account_uuid, provider_chat_key,
                        checkpoint_provider_message_id, next_anchor,
@@ -2698,8 +2710,8 @@ class PostgresStore:
             ).fetchone()
 
     def provider_catchup_ready(self, account_uuid: str) -> bool:
-        with self.connection() as connection:
-            row = connection.execute(
+        with self.session() as session:
+            row = session.execute(
                 """
                 SELECT NOT EXISTS (
                     SELECT 1 FROM zulip_queue_catchup_jobs
@@ -2713,9 +2725,9 @@ class PostgresStore:
     def mapped_provider_messages(
         self, account_uuid: str, provider_chat_key: str, minimum_id: int
     ) -> list[dict[str, object]]:
-        with self.connection() as connection:
+        with self.session() as session:
             return list(
-                connection.execute(
+                session.execute(
                     """
                     SELECT workspace_uuid, provider_id, provider_revision, metadata
                     FROM provider_mappings
@@ -2739,8 +2751,8 @@ class PostgresStore:
         complete: bool,
         safe_error_code: str | None = None,
     ) -> None:
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 UPDATE zulip_queue_catchup_jobs
                 SET seen_provider_message_ids = (
@@ -2774,8 +2786,8 @@ class PostgresStore:
     def uncertain_by_local_id(
         self, account_uuid: str, queue_id: str, local_id: str
     ) -> QueuedOperation | None:
-        with self.connection() as connection:
-            row = connection.execute(
+        with self.session() as session:
+            row = session.execute(
                 """
                 SELECT record_uuid, record, priority, retry_count
                      , provider_attempted_at, auto_resend_count
@@ -2802,8 +2814,8 @@ class PostgresStore:
             )
 
     def require_manual_reconciliation(self, account_uuid: str, code: str) -> None:
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 UPDATE bridge_operations
                 SET manual_reconciliation_required = true,
@@ -2823,8 +2835,8 @@ class PostgresStore:
             )
 
     def pending_results(self, limit: int = 100) -> list[dict[str, object]]:
-        with self.connection() as connection:
-            rows = connection.execute(
+        with self.session() as session:
+            rows = session.execute(
                 """
                 SELECT result_record FROM bridge_operations
                 WHERE result_record IS NOT NULL AND result_sent_at IS NULL
@@ -2837,8 +2849,8 @@ class PostgresStore:
             ]
 
     def mark_result_sent(self, record_uuid: str) -> None:
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 UPDATE bridge_operations SET result_sent_at = now(), updated_at = now()
                 WHERE result_record->>'record_uuid' = %s
@@ -2861,8 +2873,8 @@ class PostgresStore:
         code = (
             None if status in {"applied", "duplicate"} else f"provider_result_{status}"
         )
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 UPDATE bridge_operations
                 SET result_sent_at = now(),
@@ -2887,8 +2899,8 @@ class PostgresStore:
     def accept_result(self, result: dict[str, object]) -> None:
         result_body = typing.cast(dict[str, object], result["result"])
         outcome = str(result_body["outcome"])
-        with self.connection() as connection:
-            row = connection.execute(
+        with self.session() as session:
+            row = session.execute(
                 """
                 SELECT operation.operation_sha256, operation.terminal_outcome,
                        operation.result_record_uuid, delivery.record
@@ -2933,7 +2945,7 @@ class PostgresStore:
                 ):
                     return
                 raise ValueError("Stale result cannot replace terminal outcome")
-            connection.execute(
+            session.execute(
                 """
                 UPDATE operation_idempotency
                 SET terminal_outcome = %s, result_record_uuid = %s,
@@ -2951,7 +2963,7 @@ class PostgresStore:
                     str(result["operation_uuid"]),
                 ),
             )
-            connection.execute(
+            session.execute(
                 """
                 UPDATE workspace_delivery_outbox
                 SET sent_at = COALESCE(sent_at, now()), submission_state = 'sent'
@@ -2969,7 +2981,7 @@ class PostgresStore:
                 and operation.get("kind") == "message.create"
             ):
                 provider = typing.cast(dict[str, object], operation["provider"])
-                connection.execute(
+                session.execute(
                     """
                     UPDATE provider_mappings
                     SET metadata = jsonb_set(
@@ -2991,8 +3003,8 @@ class PostgresStore:
                 )
 
     def enqueue_observed_report(self, report: dict[str, object]) -> bool:
-        with self.connection() as connection:
-            row = connection.execute(
+        with self.session() as session:
+            row = session.execute(
                 """
                 INSERT INTO observed_report_outbox (report_uuid, body)
                 VALUES (%s, %s)
@@ -3004,8 +3016,8 @@ class PostgresStore:
             return row is not None
 
     def pending_observed_reports(self, limit: int = 500) -> list[dict[str, object]]:
-        with self.connection() as connection:
-            rows = connection.execute(
+        with self.session() as session:
+            rows = session.execute(
                 """
                 SELECT body FROM observed_report_outbox
                 WHERE completed_at IS NULL AND available_at <= now()
@@ -3017,7 +3029,7 @@ class PostgresStore:
 
     def apply_observed_report_results(self, results: list[dict[str, object]]) -> None:
         terminal_statuses = {"applied", "duplicate", "stale"}
-        with self.connection() as connection:
+        with self.session() as session:
             for result in results:
                 report_uuid = str(result["report_uuid"])
                 status = str(result["status"])
@@ -3028,7 +3040,7 @@ class PostgresStore:
                 if status in terminal_statuses or (
                     status == "rejected" and not retryable
                 ):
-                    connection.execute(
+                    session.execute(
                         """
                         UPDATE observed_report_outbox
                         SET completed_at = now(), result_status = %s
@@ -3037,7 +3049,7 @@ class PostgresStore:
                         (status, report_uuid),
                     )
                     continue
-                connection.execute(
+                session.execute(
                     """
                     UPDATE observed_report_outbox
                     SET attempts = attempts + 1,
@@ -3050,8 +3062,8 @@ class PostgresStore:
                 )
 
     def mark_health(self, component: str, status: str, code: str | None = None) -> None:
-        with self.connection() as connection:
-            connection.execute(
+        with self.session() as session:
+            session.execute(
                 """
                 INSERT INTO bridge_health (
                     component, status, progressed_at, safe_error_code
@@ -3066,9 +3078,9 @@ class PostgresStore:
             )
 
     def health(self) -> list[dict[str, object]]:
-        with self.connection() as connection:
+        with self.session() as session:
             return list(
-                connection.execute(
+                session.execute(
                     """
                     SELECT component, status, progressed_at, safe_error_code
                     FROM bridge_health ORDER BY component

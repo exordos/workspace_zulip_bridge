@@ -13,7 +13,8 @@ The service implements the contracts maintained by the sibling
 
 Workspace messages and operations cross the private Provider HTTP API. The
 bridge has no IMAP, SMTP, Maildir, or Workspace mail-server dependency.
-PostgreSQL on the element's persistent disk stores the durable scheduler,
+The bridge VM runs its own PostgreSQL instance on the element's persistent
+disk. Its local `workspace_zulip_bridge` database stores the durable scheduler,
 leases, idempotency records, provider cursors, mappings, and outboxes. The
 Workspace backend remains authoritative for Workspace resources and applies
 Provider events in its own database transactions.
@@ -63,14 +64,18 @@ The image installs the application into the isolated
 services:
 
 - `workspace-zulip-bridge-bootstrap.service` initializes the persistent data
-  directory and applies SQL migrations;
+  directory and applies versioned RestAlchemy migrations;
 - `workspace-zulip-bridge.service` runs control polling, heartbeat, Provider
   HTTP operation leasing and event/result delivery, Zulip event ingestion, and
   the fair live/retry/backfill scheduler.
 
 The worker also invokes the serialized bootstrap entrypoint as a `before` hook.
 Repeated bootstrap invocations preserve the persistent PostgreSQL data and wait
-for its local socket before starting the worker.
+for its local socket before starting the worker. Applied schema revisions are
+tracked in `ra_migrations`; the bootstrap applies only unapplied dependency
+steps through `ra-apply-migration`. Runtime transactions use the RestAlchemy
+PostgreSQL engine and `session_manager()`; the bridge has no direct `psycopg`
+storage layer.
 
 ## Current implementation boundary
 

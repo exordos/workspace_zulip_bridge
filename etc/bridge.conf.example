@@ -1,5 +1,5 @@
-[database]
-dsn = postgresql:///workspace_zulip_bridge
+[db]
+connection_url = postgresql:///workspace_zulip_bridge
 
 [control]
 base_url = https://workspace-bridge-control.example.invalid:21443

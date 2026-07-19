@@ -156,7 +156,6 @@ class FileApiClient:
         download_headers = dict(
             typing.cast(dict[str, str], download.get("headers", {}))
         )
-        download_headers["Content-Length"] = "0"
         with self._transfer_client(str(download["url"])).stream(
             "GET",
             str(download["url"]),

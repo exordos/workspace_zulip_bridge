@@ -465,6 +465,7 @@ class CatchupAdapter(ProviderAdapter):
     def message_history(self, chat_key, anchor="newest"):
         return [
             {"id": 12, "timestamp": 12, "content": "new", "subject": "Topic"},
+            {"id": 13, "timestamp": 13, "content": "newer", "subject": "Topic"},
             {
                 "id": 10,
                 "timestamp": 10,
@@ -1412,9 +1413,15 @@ def test_queue_loss_catchup_recovers_create_edit_delete_before_live_ready(
 ):
     store = CatchupStore()
     instance = _delivery_service(store)
-    instance.enqueue_backfill = lambda account_uuid, chat_key, messages: (
-        store.created.extend(message["id"] for message in messages) or len(messages)
-    )
+    created_batches = []
+
+    def enqueue_backfill(account_uuid, chat_key, messages):
+        message_ids = [message["id"] for message in messages]
+        created_batches.append(message_ids)
+        store.created.extend(message_ids)
+        return len(messages)
+
+    instance.enqueue_backfill = enqueue_backfill
     converted_events = []
 
     def records(*args, **kwargs):
@@ -1432,7 +1439,8 @@ def test_queue_loss_catchup_recovers_create_edit_delete_before_live_ready(
     assert instance._run_provider_queue_catchup(
         "00000000-0000-0000-0000-000000000001", CatchupAdapter()
     )
-    assert store.created == [12]
+    assert created_batches == [[13, 12]]
+    assert store.created == [13, 12]
     assert [
         (event_type, message_id) for event_type, message_id, _ in converted_events
     ] == [
@@ -1440,7 +1448,7 @@ def test_queue_loss_catchup_recovers_create_edit_delete_before_live_ready(
         ("delete_message", None),
     ]
     assert {priority for _, priority in store.enqueued} == {2}
-    assert store.advanced == [([10, 12], 9, True, None)]
+    assert store.advanced == [([10, 12, 13], 9, True, None)]
 
 
 def test_ready_live_work_preempts_slow_history_and_backfill_delivery(tmp_path):
