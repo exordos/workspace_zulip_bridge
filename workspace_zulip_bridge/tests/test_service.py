@@ -285,6 +285,89 @@ def test_retryable_provider_error_defers_only_failing_account(monkeypatch):
     ]
 
 
+def test_adapter_connection_failure_degrades_only_affected_account(monkeypatch):
+    failed_account = "00000000-0000-4000-8000-000000000001"
+    healthy_account = "00000000-0000-4000-8000-000000000002"
+
+    class Store:
+        def __init__(self):
+            self.recorded = []
+            self.reports = []
+            self.health = []
+
+        def active_account_uuids(self):
+            return [failed_account, healthy_account]
+
+        def provider_event_cursor(self, account_uuid):
+            return {"queue_id": f"queue-{account_uuid}", "last_event_id": 4}
+
+        def account_resource(self, account_uuid):
+            if account_uuid == failed_account:
+                return {"generation": 7}
+            return None
+
+        def record_provider_event(self, account_uuid, queue_id, event):
+            self.recorded.append((account_uuid, queue_id, event["id"]))
+
+        def update_provider_event_cursor(self, account_uuid, queue_id, event_id):
+            return None
+
+        def enqueue_observed_report(self, report):
+            self.reports.append(report)
+
+        def mark_health(self, component, status, code=None):
+            self.health.append((component, status, code))
+
+    class UnreachableClient:
+        def __init__(self, **kwargs):
+            raise zulip_adapter.zulip.UnrecoverableNetworkError("offline")
+
+    class HealthyAdapter:
+        def restore_queue(self, queue_id, last_event_id):
+            return None
+
+        def events(self, queue_id, last_event_id):
+            return [{"id": 5, "type": "realm_user"}]
+
+    def adapter_factory(account_uuid):
+        if account_uuid == failed_account:
+            return zulip_adapter.OfficialZulipAdapter(
+                credentials=zulip_adapter.ZulipCredentials(
+                    "https://unresolvable.example.invalid",
+                    "user@example.invalid",
+                    "opaque-api-key",
+                )
+            )
+        return HealthyAdapter()
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance.provider_adapters = adapter_factory
+    instance.scheduler = type(
+        "Scheduler", (), {"reconcile_local_echo": lambda *args: None}
+    )()
+    instance.provider_retry_attempts = {}
+    instance.provider_retry_after = {}
+    instance.provider_random = type(
+        "Random", (), {"uniform": lambda self, lower, upper: upper}
+    )()
+    monkeypatch.setattr(zulip_adapter.zulip, "Client", UnreachableClient)
+    monkeypatch.setattr(time, "monotonic", lambda: 100.0)
+
+    assert instance.poll_provider_events() == 1
+    assert instance.store.recorded == [
+        (healthy_account, f"queue-{healthy_account}", 5)
+    ]
+    assert instance.provider_retry_attempts == {failed_account: 1}
+    assert instance.provider_retry_after[failed_account] > 100.0
+    assert len(instance.store.reports) == 1
+    assert instance.store.reports[0]["resource_uuid"] == failed_account
+    assert instance.store.reports[0]["status"] == "degraded"
+    assert instance.store.reports[0]["safe_error"]["code"] == (
+        "provider_unavailable"
+    )
+
+
 def test_150_account_poll_is_bounded_by_worker_pool_not_serial_latency():
     accounts = [str(uuid.UUID(int=index + 1)) for index in range(150)]
 

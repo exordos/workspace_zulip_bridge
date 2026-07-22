@@ -146,13 +146,16 @@ class OfficialZulipAdapter:
         if client is None:
             if credentials is None:
                 raise ValueError("Zulip credentials are required")
-            client = zulip.Client(
-                email=credentials.email,
-                api_key=credentials.api_key,
-                site=credentials.site,
-                client="workspace-zulip-bridge/0.1",
-                cert_bundle=credentials.cert_bundle,
-            )
+            try:
+                client = zulip.Client(
+                    email=credentials.email,
+                    api_key=credentials.api_key,
+                    site=credentials.site,
+                    client="workspace-zulip-bridge/0.1",
+                    cert_bundle=credentials.cert_bundle,
+                )
+            except PROVIDER_NETWORK_ERRORS as exc:
+                raise ZulipOperationError("provider_unavailable", True) from exc
         self.client = client
         self.credentials = credentials
         self.routing = routing
