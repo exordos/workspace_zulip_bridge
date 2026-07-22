@@ -283,6 +283,53 @@ def test_retryable_provider_error_defers_only_failing_account(monkeypatch):
         ("account-b", "queue-account-b", 5),
         ("account-b", "queue-account-b", 5),
     ]
+    assert ("provider", "healthy", None) not in instance.store.health
+
+
+def test_empty_successful_provider_poll_recovers_health():
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+
+    class Store:
+        def __init__(self):
+            self.health = []
+
+        def active_account_uuids(self):
+            return [account_uuid]
+
+        def provider_event_cursor(self, requested):
+            assert requested == account_uuid
+            return {"queue_id": "queue", "last_event_id": -1}
+
+        def account_resource(self, requested):
+            assert requested == account_uuid
+            return None
+
+        def mark_health(self, component, status, code=None):
+            self.health.append((component, status, code))
+
+    class Adapter:
+        def restore_queue(self, queue_id, last_event_id):
+            assert (queue_id, last_event_id) == ("queue", -1)
+
+        def events(self, queue_id, last_event_id):
+            return []
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance.provider_adapters = lambda requested: Adapter()
+    instance.scheduler = type(
+        "Scheduler", (), {"reconcile_local_echo": lambda *args: None}
+    )()
+    instance.provider_retry_attempts = {account_uuid: 1}
+    instance.provider_retry_after = {account_uuid: 0.0}
+    instance.provider_random = type(
+        "Random", (), {"uniform": lambda self, lower, upper: lower}
+    )()
+
+    assert instance.poll_provider_events() == 0
+    assert instance.provider_retry_attempts == {}
+    assert instance.provider_retry_after == {}
+    assert instance.store.health == [("provider", "healthy", None)]
 
 
 def test_adapter_connection_failure_degrades_only_affected_account(monkeypatch):
@@ -1447,6 +1494,46 @@ def test_permanent_attachment_failure_uses_loss_aware_fallback(monkeypatch):
     assert store.processed == [(account_uuid, "queue", 7, True)]
 
 
+@pytest.mark.parametrize(
+    ("status_code", "retryable"),
+    [(403, False), (503, True)],
+)
+def test_workspace_file_import_http_failure_is_classified(status_code, retryable):
+    account_uuid = "00000000-0000-0000-0000-000000000001"
+
+    class Store(DeliveryStore):
+        def effective_file_limit(self, hard_limit):
+            return min(hard_limit, 1024)
+
+    class Adapter(ProviderAdapter):
+        def download_file(self, provider_url, max_bytes):
+            return zulip_adapter.ProviderFile("report.pdf", "application/pdf", b"pdf")
+
+    class FileClient:
+        def import_file(self, *args, **kwargs):
+            request = httpx.Request("PUT", "https://object.example.invalid/upload")
+            raise httpx.HTTPStatusError(
+                "file import failed",
+                request=request,
+                response=httpx.Response(status_code, request=request),
+            )
+
+    instance = _delivery_service(Store())
+    instance.file_client = FileClient()
+    resolver = instance._file_resolver(
+        Adapter(),
+        account_uuid,
+        "00000000-0000-0000-0000-000000000090",
+        7,
+    )
+
+    with pytest.raises(zulip_adapter.ZulipOperationError) as captured:
+        resolver("/user_uploads/report.pdf", "report.pdf")
+
+    assert captured.value.code == "workspace_file_import_unavailable"
+    assert captured.value.retryable is retryable
+
+
 def test_backfill_is_discovered_newest_first_and_queued_at_priority_two(
     monkeypatch,
 ):
@@ -1491,6 +1578,80 @@ def test_backfill_is_discovered_newest_first_and_queued_at_priority_two(
     }
 
 
+def test_backfill_uses_loss_aware_fallback_for_unavailable_attachment(monkeypatch):
+    store = DeliveryStore()
+    instance = _delivery_service(store)
+
+    def records(*args, **kwargs):
+        resolver = args[6]
+        if resolver is not None:
+            resolver("/user_uploads/report.pdf", "report.pdf")
+        return [{"record_uuid": "fallback-record"}]
+
+    monkeypatch.setattr(converter, "event_records", records)
+    monkeypatch.setattr(
+        converter, "provider_chat_reference", lambda message: ("channel", "channel:42")
+    )
+    instance._file_resolver = lambda *args: (
+        lambda *resolver_args: (_ for _ in ()).throw(
+            zulip_adapter.ZulipOperationError(
+                "workspace_file_import_unavailable", False
+            )
+        )
+    )
+
+    assert (
+        instance.enqueue_backfill(
+            "00000000-0000-0000-0000-000000000001",
+            "channel:42",
+            [{"id": 7, "timestamp": 7}],
+        )
+        == 1
+    )
+    assert store.enqueued == [({"record_uuid": "fallback-record"}, 2)]
+
+
+def test_backfill_discovers_all_topics_before_waiting_for_workspace_mappings(
+    monkeypatch,
+):
+    instance = _delivery_service(DeliveryStore())
+    discovered = []
+    instance._queue_event_catalog = lambda account, event, server: discovered.append(
+        event["message"]["subject"]
+    )
+    monkeypatch.setattr(
+        converter,
+        "event_records",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            ValueError("provider_chat_assignment_pending")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="provider_chat_assignment_pending"):
+        instance.enqueue_backfill(
+            "00000000-0000-0000-0000-000000000001",
+            "channel:42",
+            [
+                {
+                    "id": 1,
+                    "timestamp": 10,
+                    "type": "stream",
+                    "stream_id": 42,
+                    "subject": "older",
+                },
+                {
+                    "id": 2,
+                    "timestamp": 11,
+                    "type": "stream",
+                    "stream_id": 42,
+                    "subject": "newer",
+                },
+            ],
+        )
+
+    assert discovered == ["newer", "older"]
+
+
 def test_queue_loss_catchup_recovers_create_edit_delete_before_live_ready(
     monkeypatch,
 ):
@@ -1532,6 +1693,20 @@ def test_queue_loss_catchup_recovers_create_edit_delete_before_live_ready(
     ]
     assert {priority for _, priority in store.enqueued} == {2}
     assert store.advanced == [([10, 12, 13], 9, True, None)]
+
+
+def test_queue_loss_catchup_waits_for_workspace_chat_mappings():
+    store = CatchupStore()
+    store.mappings = {}
+    instance = _delivery_service(store)
+    instance.enqueue_backfill = lambda *args: (_ for _ in ()).throw(
+        ValueError("provider_chat_assignment_pending")
+    )
+
+    assert not instance._run_provider_queue_catchup(
+        "00000000-0000-0000-0000-000000000001", CatchupAdapter()
+    )
+    assert store.advanced == []
 
 
 def test_ready_live_work_preempts_slow_history_and_backfill_delivery(tmp_path):
@@ -1659,6 +1834,90 @@ def test_retryable_backfill_error_is_durably_deferred_with_full_jitter():
     assert deferred[0][2].timestamp() - after <= 4.1
     assert deferred[0][3] == "provider_unavailable"
     assert health == [("provider", "degraded", "provider_unavailable")]
+
+
+def test_retryable_file_import_during_backfill_is_durably_deferred():
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+    deferred = []
+
+    class Store:
+        def claim_backfill_job(self):
+            return {
+                "account_uuid": account_uuid,
+                "provider_chat_key": "channel:42",
+                "next_anchor": None,
+                "cutoff_at": None,
+                "retry_count": 0,
+            }
+
+        def account_is_active(self, requested):
+            return True
+
+        def defer_backfill_job(self, *args):
+            deferred.append(args)
+
+        def mark_health(self, *args):
+            return None
+
+    class Adapter:
+        def message_history(self, provider_chat_key, anchor):
+            return [{"id": 7, "timestamp": 7}]
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance.provider_adapters = lambda requested: Adapter()
+    instance.provider_random = type(
+        "Random", (), {"uniform": lambda self, lower, upper: upper}
+    )()
+    instance.enqueue_backfill = lambda *args: (_ for _ in ()).throw(
+        zulip_adapter.ZulipOperationError(
+            "workspace_file_import_unavailable", True
+        )
+    )
+
+    assert instance.run_backfill_once()
+    assert deferred[0][0:2] == (account_uuid, "channel:42")
+    assert deferred[0][3] == "workspace_file_import_unavailable"
+
+
+def test_backfill_waits_for_workspace_chat_mappings_without_crashing():
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+    released = []
+    advanced = []
+
+    class Store:
+        def claim_backfill_job(self):
+            return {
+                "account_uuid": account_uuid,
+                "provider_chat_key": "channel:42",
+                "next_anchor": None,
+                "cutoff_at": None,
+                "retry_count": 0,
+            }
+
+        def account_is_active(self, requested):
+            return True
+
+        def release_backfill_job(self, *args):
+            released.append(args)
+
+        def advance_backfill_job(self, *args):
+            advanced.append(args)
+
+    class Adapter:
+        def message_history(self, provider_chat_key, anchor):
+            return [{"id": 7, "timestamp": 7}]
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance.provider_adapters = lambda requested: Adapter()
+    instance.enqueue_backfill = lambda *args: (_ for _ in ()).throw(
+        ValueError("provider_chat_assignment_pending")
+    )
+
+    assert not instance.run_backfill_once()
+    assert released == [(account_uuid, "channel:42")]
+    assert advanced == []
 
 
 def test_non_retryable_backfill_error_fails_only_affected_job_and_reports_it():

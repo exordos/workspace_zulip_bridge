@@ -647,6 +647,11 @@ def test_registration_requests_and_retains_catalog_snapshot_fields():
         "realm_user",
         "recent_private_conversations",
     ]
+    assert client.registration_request["client_capabilities"] == {
+        "notification_settings_null": True,
+        "bulk_message_deletion": True,
+        "empty_topic_name": True,
+    }
     assert adapter.take_registration_snapshot() is None
 
 

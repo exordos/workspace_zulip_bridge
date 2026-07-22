@@ -63,7 +63,7 @@ def postgres_store(migrated_postgres_dsn):
                      zulip_queue_catchup_jobs, workspace_delivery_outbox,
                      operation_idempotency, producer_lane_counters,
                      producer_operations, causal_lane_state, bridge_operations,
-                     scheduler_accounts CASCADE
+                     scheduler_accounts, observed_report_outbox CASCADE
             """
         )
     return store
@@ -80,7 +80,10 @@ def _insert_account_and_assignment(
         "generation": 1,
         "owner_user_uuid": str(uuid.uuid4()),
         "synchronization_enabled": True,
-        "settings": {"selection_mode": "all"},
+        "settings": {
+            "selection_mode": "all",
+            "default_project_id": project_uuid,
+        },
     }
     assignment = {
         "uuid": assignment_uuid,
@@ -178,6 +181,90 @@ def _backfill_service(store: storage.RestAlchemyStore):
     return instance
 
 
+def test_observed_report_state_can_recover_to_a_previous_value(postgres_store):
+    resource_uuid = str(uuid.uuid4())
+    instance = object.__new__(service.BridgeService)
+    instance.store = postgres_store
+
+    instance._queue_observed_report(
+        "external_account", resource_uuid, 1, "live_ready", "live"
+    )
+    instance._queue_observed_report(
+        "external_account", resource_uuid, 1, "live_ready", "live"
+    )
+    instance._queue_observed_report(
+        "external_account",
+        resource_uuid,
+        1,
+        "degraded",
+        "retry",
+        safe_error_code="bad_event_queue_id",
+    )
+    instance._queue_observed_report(
+        "external_account", resource_uuid, 1, "live_ready", "live"
+    )
+
+    with postgres_store.session() as session:
+        rows = session.execute(
+            """
+            SELECT report_uuid, body->>'status' AS status
+            FROM observed_report_outbox
+            WHERE body->>'resource_uuid' = %s
+            ORDER BY created_at
+            """,
+            (resource_uuid,),
+        ).fetchall()
+
+    assert [row["status"] for row in rows] == [
+        "live_ready",
+        "degraded",
+        "live_ready",
+    ]
+    assert len({row["report_uuid"] for row in rows}) == 3
+
+
+def test_pending_observed_reports_supersede_older_unsent_resource_states(
+    postgres_store,
+):
+    resource_uuid = str(uuid.uuid4())
+    instance = object.__new__(service.BridgeService)
+    instance.store = postgres_store
+    instance._queue_observed_report(
+        "external_account", resource_uuid, 1, "live_ready", "live"
+    )
+    instance._queue_observed_report(
+        "external_account",
+        resource_uuid,
+        1,
+        "degraded",
+        "retry",
+        safe_error_code="provider_unavailable",
+    )
+    instance._queue_observed_report(
+        "external_account", resource_uuid, 1, "live_ready", "live"
+    )
+
+    pending = postgres_store.pending_observed_reports()
+
+    assert len(pending) == 1
+    assert pending[0]["status"] == "live_ready"
+    with postgres_store.session() as session:
+        rows = session.execute(
+            """
+            SELECT result_status, count(*) AS count
+            FROM observed_report_outbox
+            WHERE body->>'resource_uuid' = %s
+            GROUP BY result_status
+            ORDER BY result_status NULLS FIRST
+            """,
+            (resource_uuid,),
+        ).fetchall()
+    assert rows == [
+        {"result_status": None, "count": 1},
+        {"result_status": "superseded", "count": 2},
+    ]
+
+
 def _provider_record(
     account_uuid: str,
     project_uuid: str,
@@ -264,6 +351,68 @@ def _committed_result(record: dict[str, object]) -> dict[str, object]:
     }
 
 
+@pytest.mark.parametrize(
+    ("status", "expected_code", "expected_manual", "expected_evidence"),
+    [
+        ("applied", None, False, []),
+        (
+            "rejected",
+            "provider_result_rejected",
+            True,
+            [{"kind": "provider_result_response", "status": "rejected"}],
+        ),
+    ],
+)
+def test_provider_result_acknowledgement_types_nullable_sql_parameters(
+    postgres_store,
+    status,
+    expected_code,
+    expected_manual,
+    expected_evidence,
+):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    record = _provider_record(account_uuid, project_uuid)
+    record["sequence"] = 1
+    result_uuid = str(uuid.uuid4())
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            INSERT INTO bridge_operations (
+                record_uuid, operation_uuid, attempt, operation_sha256,
+                account_uuid, project_uuid, origin, causal_lane, lane_sequence,
+                priority, state, record, result_record
+            ) VALUES (%s, %s, 1, %s, %s, %s, 'zulip', %s, 1, 0,
+                      'committed', %s::jsonb, %s::jsonb)
+            """,
+            (
+                record["record_uuid"],
+                record["operation_uuid"],
+                record["operation_sha256"],
+                account_uuid,
+                project_uuid,
+                record["causal_lane"],
+                json.dumps(record),
+                json.dumps({"record_uuid": result_uuid}),
+            ),
+        )
+
+    postgres_store.finalize_provider_result_response(result_uuid, status)
+
+    with postgres_store.session() as session:
+        row = session.execute(
+            """
+            SELECT result_sent_at, last_error_code,
+                   manual_reconciliation_required, reconciliation_evidence
+            FROM bridge_operations WHERE record_uuid = %s
+            """,
+            (record["record_uuid"],),
+        ).fetchone()
+    assert row["result_sent_at"] is not None
+    assert row["last_error_code"] == expected_code
+    assert row["manual_reconciliation_required"] is expected_manual
+    assert row["reconciliation_evidence"] == expected_evidence
+
+
 def test_reconcile_backfill_jobs_casts_json_account_uuid(postgres_store):
     account_uuid, _ = _insert_account_and_assignment(postgres_store)
 
@@ -315,6 +464,21 @@ def test_queue_loss_recovery_keeps_selected_account_uuid_typed(postgres_store):
     assert str(row["account_uuid"]) == account_uuid
     assert row["provider_chat_key"] == "channel:42"
     assert row["checkpoint_provider_message_id"] == 99
+
+
+def test_queue_loss_catchup_completes_without_a_safe_error(postgres_store):
+    account_uuid, _ = _insert_account_and_assignment(postgres_store)
+    postgres_store.begin_provider_queue_catchup(account_uuid)
+
+    postgres_store.advance_provider_catchup(
+        account_uuid,
+        "channel:42",
+        [99],
+        None,
+        True,
+    )
+
+    assert postgres_store.provider_catchup_ready(account_uuid)
 
 
 def test_account_global_identity_delivery_uses_account_generation(postgres_store):

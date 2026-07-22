@@ -21,9 +21,11 @@ that branch's `zerver/openapi/python_examples.py` and generated OpenAPI:
 - files use `upload_file` with an opened binary file object and the returned URL
   is embedded only after Workspace file-plane authorization/copy.
 
-The bridge requests `bulk_message_deletion` and `empty_topic_name` client
-capabilities. It does not assume event IDs are gapless and persists each queue's
-last acknowledged event ID on the element's persistent PostgreSQL disk.
+The bridge requests `notification_settings_null`, `bulk_message_deletion`, and
+`empty_topic_name` client capabilities. It accepts `null` channel notification
+settings as an instruction to inherit the user's global notification settings.
+It does not assume event IDs are gapless and persists each queue's last
+acknowledged event ID on the element's persistent PostgreSQL disk.
 
 Zulip does not provide a general idempotency key for every mutation. For
 outgoing messages the bridge registers an event queue and persists `queue_id`

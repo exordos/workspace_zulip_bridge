@@ -21,6 +21,7 @@ class Store:
         self.finalized = []
         self.accepted = []
         self.released = []
+        self.health = []
 
     def workspace_mapping(self, account_uuid, kind, workspace_uuid):
         return {
@@ -44,8 +45,8 @@ class Store:
         self.enqueued.append((record, priority))
         return True
 
-    def mark_health(self, *args):
-        pass
+    def mark_health(self, component, status, code=None):
+        self.health.append((component, status, code))
 
     def pending_results(self, limit):
         return self.results
@@ -167,6 +168,14 @@ def test_poll_provider_operations_durably_enqueues_exact_lease_binding():
         == (leased["provider_operation_uuid"])
     )
     assert instance.provider_lease_request_uuid is None
+    assert instance.store.health == [("provider_api", "healthy", None)]
+
+
+def test_empty_provider_operation_poll_recovers_api_health():
+    instance = _instance()
+
+    assert instance.poll_provider_operations() == 0
+    assert instance.store.health == [("provider_api", "healthy", None)]
 
 
 def test_poll_provider_operations_durably_enqueues_exact_read_state_selector():

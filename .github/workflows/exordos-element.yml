@@ -39,9 +39,9 @@ jobs:
       - name: Install compatible Exordos CLI
         env:
           EXORDOS_RELEASE_URL: >-
-            https://github.com/exordos/exordos/releases/download/3.0.2/exordos-linux
+            https://github.com/exordos/exordos/releases/download/3.1.3/exordos-linux
           EXORDOS_RELEASE_SHA256: >-
-            469007b01253f69b5fcf540b8f6605a360c2539019a5b148fbabb0353bee6a5b
+            166c193394263996723393ad79f0133e956bae1c3b7bb8d5bcb02ee532bd91ee
         run: |
           set -euo pipefail
 

@@ -35,9 +35,9 @@ def test_element_workflow_pins_cli_and_always_publishes_build() -> None:
     workflow = _read("exordos-element.yml")
 
     assert "runs-on: [self-hosted, vm]" in workflow
-    assert "releases/download/3.0.2/exordos-linux" in workflow
+    assert "releases/download/3.1.3/exordos-linux" in workflow
     assert (
-        "469007b01253f69b5fcf540b8f6605a360c2539019a5b148fbabb0353bee6a5b" in workflow
+        "166c193394263996723393ad79f0133e956bae1c3b7bb8d5bcb02ee532bd91ee" in workflow
     )
     assert '"${EXORDOS_BIN}" build .' in workflow
     assert '"${EXORDOS_BIN}" push .' in workflow

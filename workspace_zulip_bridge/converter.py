@@ -360,9 +360,9 @@ def _message_context(
     store: ConversionStore,
     account_uuid: str,
     message: dict[str, object],
-) -> tuple[str, str, str, str, str, bool]:
+) -> tuple[str, str, str, str, str]:
     chat_type, chat_key = provider_chat_reference(message)
-    project_uuid, assignment_exists = _assignment(store, account_uuid, chat_key)
+    project_uuid, _assignment_exists = _assignment(store, account_uuid, chat_key)
     stream_mapping = store.provider_mapping(account_uuid, "stream", chat_key)
     if stream_mapping is None:
         raise ValueError("provider_chat_assignment_pending")
@@ -376,7 +376,7 @@ def _message_context(
     if topic_mapping is None:
         raise ValueError("provider_chat_assignment_pending")
     topic_uuid = str(topic_mapping["workspace_uuid"])
-    return chat_type, chat_key, project_uuid, stream_uuid, topic_uuid, assignment_exists
+    return chat_type, chat_key, project_uuid, stream_uuid, topic_uuid
 
 
 def message_event_records(
@@ -401,7 +401,6 @@ def message_event_records(
         project_uuid,
         stream_uuid,
         topic_uuid,
-        assignment_exists,
     ) = _message_context(store, account_uuid, message)
     provider_message_id = str(message["id"])
     existing_message = store.provider_mapping(
@@ -533,31 +532,11 @@ def message_event_records(
             ),
         },
     }
+    # Control-plane assignments materialize the stream projection. Provider
+    # messages still need a topic upsert because the backend-owned topic UUID
+    # mapping can precede materialization of that topic in Messenger storage.
     operations = [
         *identity_operations,
-        {
-            "kind": "stream.upsert",
-            "entity_uuid": stream_uuid,
-            "actor_uuid": owner_uuid,
-            "occurred_at": occurred_at,
-            "provider": _provider(chat_key, chat_key),
-            "payload": {
-                "name": stream_name,
-                "description": stream_description,
-                "private": stream_private,
-                "chat_kind": {
-                    "channel": "channel",
-                    "direct": "personal_dm",
-                    "group_direct": "group_dm",
-                }[chat_type],
-                "participant_uuids": participants,
-                "default_topic_uuid": default_topic_uuid,
-            },
-            "extensions": {
-                "assignment_materialized": assignment_exists,
-                "provider_badge": "zulip",
-            },
-        },
         {
             "kind": "topic.upsert",
             "entity_uuid": topic_uuid,
