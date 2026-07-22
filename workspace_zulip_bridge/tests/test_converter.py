@@ -200,9 +200,10 @@ def test_dm_conversion_has_owner_membership_identity_urn_and_copied_file():
         file_resolver=lambda url, name: "urn:file:00000000-0000-0000-0000-000000000001",
     )
     operations = _operations(records)
-    stream = next(op for op in operations if op["kind"] == "stream.upsert")
     message = next(op for op in operations if op["kind"] == "message.create")
-    participants = stream["payload"]["participant_uuids"]
+    participants = store.mappings[("stream", "direct:1,2")]["metadata"][
+        "participants"
+    ]
     assert len(participants) == 2
     assert OWNER_UUID in participants
     assert message["actor_uuid"] != OWNER_UUID
@@ -233,11 +234,14 @@ def test_new_chat_waits_for_backend_assignment_before_materialization():
     operations = _operations(
         converter.event_records(materialized, ACCOUNT_UUID, "queue", event)
     )
-    stream = next(op for op in operations if op["kind"] == "stream.upsert")
-    assert stream["extensions"]["assignment_materialized"] is True
-    assert stream["payload"]["participant_uuids"] == sorted(
-        materialized.mappings[("stream", "channel:42")]["metadata"]["participants"]
-    )
+    assert any(op["kind"] == "message.create" for op in operations)
+    assert any(op["kind"] == "topic.upsert" for op in operations)
+    assert not any(op["kind"] == "stream.upsert" for op in operations)
+    participants = materialized.mappings[("stream", "channel:42")]["metadata"][
+        "participants"
+    ]
+    assert OWNER_UUID in participants
+    assert converter.stable_entity_uuid(ACCOUNT_UUID, "identity", "2") in participants
 
 
 def test_channel_message_waits_for_exact_author_and_topic_projection():
@@ -289,6 +293,7 @@ def test_channel_message_waits_for_exact_author_and_topic_projection():
     assert message["actor_uuid"] == author_uuid
     assert message["payload"]["topic_uuid"] == topic_uuid
     assert topic["entity_uuid"] == topic_uuid
+    assert not any(value["kind"] == "stream.upsert" for value in operations)
 
 
 def test_message_mutations_and_topic_rename_reuse_stable_mappings():
@@ -301,9 +306,9 @@ def test_message_mutations_and_topic_rename_reuse_stable_mappings():
         if operation["kind"] == "message.create"
     )
     external_author_uuid = created_message["payload"]["author_uuid"]
-    topic_uuid = next(
-        op["entity_uuid"] for op in _operations(created) if op["kind"] == "topic.upsert"
-    )
+    topic_uuid = store.provider_mapping(ACCOUNT_UUID, "topic", "42:Topic")[
+        "workspace_uuid"
+    ]
     update = {
         "id": 11,
         "type": "update_message",
@@ -361,7 +366,7 @@ def test_message_mutations_and_topic_rename_reuse_stable_mappings():
     assert "through_message_uuid" not in read[0]["payload"]
 
 
-def test_channel_event_preserves_backend_owned_privacy_and_topology():
+def test_channel_message_does_not_overwrite_backend_owned_stream_projection():
     store = FakeStore()
     stream_uuid = str(uuid.uuid4())
     topic_uuid = str(uuid.uuid4())
@@ -398,15 +403,17 @@ def test_channel_event_preserves_backend_owned_privacy_and_topology():
         "queue",
         {"id": 30, "type": "message", "message": _stream_message()},
     )
-    stream = next(
-        operation
-        for operation in _operations(records)
-        if operation["kind"] == "stream.upsert"
-    )
-    assert stream["payload"]["private"] is False
-    assert stream["payload"]["name"] == "Canonical name"
-    assert stream["payload"]["description"] == "Canonical description"
-    assert set(stream["payload"]["participant_uuids"]).issuperset(participant_uuids)
+    operations = _operations(records)
+    assert any(operation["kind"] == "message.create" for operation in operations)
+    assert any(operation["kind"] == "topic.upsert" for operation in operations)
+    assert not any(operation["kind"] == "stream.upsert" for operation in operations)
+    metadata = store.provider_mapping(ACCOUNT_UUID, "stream", "channel:42")[
+        "metadata"
+    ]
+    assert metadata["private"] is False
+    assert metadata["name"] == "Canonical name"
+    assert metadata["description"] == "Canonical description"
+    assert set(metadata["participants"]).issuperset(participant_uuids)
 
 
 def test_message_create_and_update_mentions_use_provider_identity_ids_and_urns():

@@ -454,8 +454,7 @@ class BridgeService:
             self.provider_api.report_results(immediate_results)
             processed += len(immediate_results)
         self.provider_lease_request_uuid = None
-        if operations:
-            self.store.mark_health("provider_api", "healthy")
+        self.store.mark_health("provider_api", "healthy")
         return processed
 
     def flush_provider_results(self) -> int:
@@ -540,15 +539,17 @@ class BridgeService:
 
     def poll_provider_events(self) -> int:
         now = time.monotonic()
+        active_accounts = self.store.active_account_uuids()
         accounts = [
             account_uuid
-            for account_uuid in self.store.active_account_uuids()
+            for account_uuid in active_accounts
             if self.provider_retry_after.get(account_uuid, 0.0) <= now
         ]
         if not accounts:
             return 0
         workers = min(getattr(self, "provider_poll_workers", 16), len(accounts))
         processed = 0
+        failed = len(accounts) < len(active_accounts)
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
                 executor.submit(self._poll_provider_account, account_uuid): account_uuid
@@ -561,6 +562,7 @@ class BridgeService:
                     self._clear_provider_retry(account_uuid)
                     processed += account_processed
                     continue
+                failed = True
                 self._defer_provider_account(account_uuid, now)
                 self.store.mark_health("provider", "degraded", error.code)
                 self._queue_account_report(
@@ -568,24 +570,13 @@ class BridgeService:
                     "degraded",
                     error.code,
                 )
-        if processed:
+        if not failed:
             self.store.mark_health("provider", "healthy")
         return processed
 
     @staticmethod
     def _observed_report_uuid(report: dict[str, object]) -> str:
-        semantic = {
-            key: value
-            for key, value in report.items()
-            if key not in {"report_uuid", "observed_at"}
-        }
-        progress = semantic.get("progress")
-        if isinstance(progress, dict):
-            semantic["progress"] = {
-                key: value
-                for key, value in progress.items()
-                if key != "last_progress_at"
-            }
+        semantic = {key: value for key, value in report.items() if key != "report_uuid"}
         digest = hashlib.sha256(canonical.canonical_json(semantic)).hexdigest()
         return str(uuid.uuid5(converter.OPERATION_NAMESPACE, f"observed:{digest}"))
 
@@ -1117,29 +1108,32 @@ class BridgeService:
                 "orig_subject": metadata.get("subject", current_subject),
                 "subject": current_subject,
             }
-            records = converter.event_records(
-                self.store,
+            records = self._event_records_with_file_fallback(
+                adapter,
                 account_uuid,
+                converter.stable_entity_uuid(
+                    account_uuid,
+                    "external_chat",
+                    str(metadata["chat_key"]),
+                ),
                 f"catchup:{chat_key}",
                 event,
                 "backfill",
-                adapter.server_url,
-                self._file_resolver(
-                    adapter,
-                    account_uuid,
-                    converter.stable_entity_uuid(
-                        account_uuid,
-                        "external_chat",
-                        str(metadata["chat_key"]),
-                    ),
-                    int(message["id"]),
-                ),
             )
             for record in records:
                 self.store.enqueue_workspace_delivery(record, 2)
 
         if unmapped_messages:
-            self.enqueue_backfill(account_uuid, chat_key, unmapped_messages)
+            try:
+                self.enqueue_backfill(account_uuid, chat_key, unmapped_messages)
+            except ValueError as exc:
+                if str(exc) != "provider_chat_assignment_pending":
+                    raise
+                # Queue recovery can overlap the Workspace control-plane work
+                # that creates stream/topic mappings for a newly selected chat.
+                # Leave the catch-up checkpoint untouched and retry after those
+                # mappings have arrived.
+                return False
 
         if complete and checkpoint is not None:
             known = self.store.mapped_provider_messages(
@@ -1199,20 +1193,68 @@ class BridgeService:
                 converter.OPERATION_NAMESPACE,
                 f"zulip-file-import:{account_uuid}:{event_id}:{provider_url}",
             )
-            return self.file_client.import_file(
-                transfer_operation_uuid,
-                uuid.UUID(account_uuid),
-                uuid.UUID(external_chat_uuid),
-                file_api.IncomingFile(
-                    incoming_uuid,
-                    display_name or downloaded.name,
-                    downloaded.content_type,
-                    downloaded.content,
-                ),
-                max_bytes=max_bytes,
-            )
+            try:
+                return self.file_client.import_file(
+                    transfer_operation_uuid,
+                    uuid.UUID(account_uuid),
+                    uuid.UUID(external_chat_uuid),
+                    file_api.IncomingFile(
+                        incoming_uuid,
+                        display_name or downloaded.name,
+                        downloaded.content_type,
+                        downloaded.content,
+                    ),
+                    max_bytes=max_bytes,
+                )
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                retryable = status in {408, 425, 429} or status >= 500
+                raise zulip_adapter.ZulipOperationError(
+                    "workspace_file_import_unavailable", retryable
+                ) from exc
+            except httpx.TransportError as exc:
+                raise zulip_adapter.ZulipOperationError(
+                    "workspace_file_import_unavailable", True
+                ) from exc
 
         return resolve
+
+    def _event_records_with_file_fallback(
+        self,
+        adapter: zulip_adapter.OfficialZulipAdapter,
+        account_uuid: str,
+        external_chat_uuid: str,
+        queue_id: str,
+        event: dict[str, object],
+        delivery_class: str,
+    ) -> list[dict[str, object]]:
+        try:
+            return converter.event_records(
+                self.store,
+                account_uuid,
+                queue_id,
+                event,
+                delivery_class,
+                adapter.server_url,
+                self._file_resolver(
+                    adapter,
+                    account_uuid,
+                    external_chat_uuid,
+                    int(event["id"]),
+                ),
+            )
+        except zulip_adapter.ZulipOperationError as exc:
+            if exc.retryable:
+                raise
+            return converter.event_records(
+                self.store,
+                account_uuid,
+                queue_id,
+                event,
+                delivery_class,
+                adapter.server_url,
+                None,
+            )
 
     def process_provider_journal(self) -> int:
         processed = 0
@@ -1276,16 +1318,13 @@ class BridgeService:
                                     self.store, account_uuid
                                 ).external_chat_uuid(chat_key)
                             )
-                records = converter.event_records(
-                    self.store,
+                records = self._event_records_with_file_fallback(
+                    adapter,
                     account_uuid,
+                    str(external_chat_uuid),
                     queue_id,
                     event,
                     "live",
-                    adapter.server_url,
-                    self._file_resolver(
-                        adapter, account_uuid, str(external_chat_uuid), event_id
-                    ),
                 )
                 supported = str(event["type"]) in supported_types
             except zulip_adapter.ZulipOperationError as exc:
@@ -1381,7 +1420,18 @@ class BridgeService:
             f"backfill:{provider_chat_key}:"
             f"{assignment['uuid']}:{assignment['generation']}"
         )
-        for message in converter.newest_first(messages):
+        ordered_messages = converter.newest_first(messages)
+        for message in ordered_messages:
+            self._queue_event_catalog(
+                account_uuid,
+                {
+                    "id": int(message["id"]),
+                    "type": "message",
+                    "message": message,
+                },
+                adapter.server_url,
+            )
+        for message in ordered_messages:
             event = {
                 "id": int(message["id"]),
                 "type": "message",
@@ -1391,19 +1441,13 @@ class BridgeService:
             external_chat_uuid = converter.stable_entity_uuid(
                 account_uuid, "external_chat", chat_key
             )
-            records = converter.event_records(
-                self.store,
+            records = self._event_records_with_file_fallback(
+                adapter,
                 account_uuid,
+                external_chat_uuid,
                 queue_id,
                 event,
                 "backfill",
-                adapter.server_url,
-                self._file_resolver(
-                    adapter,
-                    account_uuid,
-                    external_chat_uuid,
-                    int(message["id"]),
-                ),
             )
             for record in records:
                 enqueued += int(self.store.enqueue_workspace_delivery(record, 2))
@@ -1461,7 +1505,43 @@ class BridgeService:
                 >= cutoff
             ]
             reached_cutoff = len(eligible) != len(messages)
-        self.enqueue_backfill(account_uuid, provider_chat_key, eligible)
+        try:
+            self.enqueue_backfill(account_uuid, provider_chat_key, eligible)
+        except zulip_adapter.ZulipOperationError as exc:
+            if not exc.retryable:
+                self.store.fail_backfill_job(
+                    account_uuid,
+                    provider_chat_key,
+                    exc.code,
+                )
+                self.store.mark_health(
+                    f"provider:{account_uuid}:{provider_chat_key}",
+                    "degraded",
+                    exc.code,
+                )
+                self._queue_account_report(account_uuid, "degraded", exc.code)
+                return True
+            attempts = int(job.get("retry_count", 0)) + 1
+            ceiling = min(300.0, float(2 ** min(attempts - 1, 8)))
+            random_source = getattr(self, "provider_random", random)
+            delay = random_source.uniform(0.0, ceiling)
+            self.store.defer_backfill_job(
+                account_uuid,
+                provider_chat_key,
+                datetime.datetime.now(datetime.UTC)
+                + datetime.timedelta(seconds=delay),
+                exc.code,
+            )
+            self.store.mark_health("provider", "degraded", exc.code)
+            return True
+        except ValueError as exc:
+            if str(exc) != "provider_chat_assignment_pending":
+                raise
+            # Selecting a chat and receiving the resulting Workspace stream/topic
+            # mappings are separate control-plane steps. Keep the history job
+            # pending until those mappings arrive instead of crashing the worker.
+            self.store.release_backfill_job(account_uuid, provider_chat_key)
+            return False
         complete = reached_cutoff or len(messages) < 100 or not messages
         next_anchor = (
             None

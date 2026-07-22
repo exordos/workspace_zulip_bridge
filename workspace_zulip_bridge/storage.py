@@ -1738,7 +1738,7 @@ class RestAlchemyStore:
                 """
                 UPDATE zulip_backfill_jobs
                 SET state = 'pending', lease_until = NULL,
-                    available_at = now(), updated_at = now()
+                    available_at = now() + interval '1 second', updated_at = now()
                 WHERE account_uuid = %s AND provider_chat_key = %s
                   AND state = 'running'
                 """,
@@ -2764,7 +2764,7 @@ class RestAlchemyStore:
                     next_anchor = %s,
                     page_count = page_count + 1,
                     state = CASE
-                        WHEN %s IS NOT NULL THEN 'manual'
+                        WHEN %s::text IS NOT NULL THEN 'manual'
                         WHEN %s THEN 'complete'
                         ELSE 'pending'
                     END,
@@ -2879,14 +2879,14 @@ class RestAlchemyStore:
                 UPDATE bridge_operations
                 SET result_sent_at = now(),
                     manual_reconciliation_required =
-                        manual_reconciliation_required OR %s,
-                    last_error_code = COALESCE(%s, last_error_code),
+                        manual_reconciliation_required OR %s::boolean,
+                    last_error_code = COALESCE(%s::text, last_error_code),
                     reconciliation_evidence = CASE
-                        WHEN %s IS NULL THEN reconciliation_evidence
+                        WHEN %s::text IS NULL THEN reconciliation_evidence
                         ELSE reconciliation_evidence || jsonb_build_array(
                             jsonb_build_object(
                                 'kind', 'provider_result_response',
-                                'status', %s
+                                'status', %s::text
                             )
                         )
                     END,
@@ -3004,6 +3004,38 @@ class RestAlchemyStore:
 
     def enqueue_observed_report(self, report: dict[str, object]) -> bool:
         with self.session() as session:
+            previous = session.execute(
+                """
+                SELECT body FROM observed_report_outbox
+                WHERE body->>'resource_type' = %s
+                  AND body->>'resource_uuid' = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (str(report["resource_type"]), str(report["resource_uuid"])),
+            ).fetchone()
+            if previous is not None:
+                previous_body = typing.cast(dict[str, object], previous["body"])
+                previous_semantic = {
+                    key: value
+                    for key, value in previous_body.items()
+                    if key not in {"report_uuid", "observed_at"}
+                }
+                report_semantic = {
+                    key: value
+                    for key, value in report.items()
+                    if key not in {"report_uuid", "observed_at"}
+                }
+                for semantic in (previous_semantic, report_semantic):
+                    progress = semantic.get("progress")
+                    if isinstance(progress, dict):
+                        semantic["progress"] = {
+                            key: value
+                            for key, value in progress.items()
+                            if key != "last_progress_at"
+                        }
+                if previous_semantic == report_semantic:
+                    return False
             row = session.execute(
                 """
                 INSERT INTO observed_report_outbox (report_uuid, body)
@@ -3017,6 +3049,25 @@ class RestAlchemyStore:
 
     def pending_observed_reports(self, limit: int = 500) -> list[dict[str, object]]:
         with self.session() as session:
+            session.execute(
+                """
+                WITH ranked AS (
+                    SELECT report_uuid,
+                           row_number() OVER (
+                               PARTITION BY body->>'resource_type',
+                                            body->>'resource_uuid'
+                               ORDER BY created_at DESC, report_uuid DESC
+                           ) AS position
+                    FROM observed_report_outbox
+                    WHERE completed_at IS NULL
+                )
+                UPDATE observed_report_outbox AS report
+                SET completed_at = now(), result_status = 'superseded'
+                FROM ranked
+                WHERE report.report_uuid = ranked.report_uuid
+                  AND ranked.position > 1
+                """
+            )
             rows = session.execute(
                 """
                 SELECT body FROM observed_report_outbox

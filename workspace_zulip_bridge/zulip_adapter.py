@@ -417,6 +417,7 @@ class OfficialZulipAdapter:
                     ],
                     apply_markdown=False,
                     client_capabilities={
+                        "notification_settings_null": True,
                         "bulk_message_deletion": True,
                         "empty_topic_name": True,
                     },
