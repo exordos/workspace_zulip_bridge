@@ -563,6 +563,11 @@ class BridgeService:
                     continue
                 self._defer_provider_account(account_uuid, now)
                 self.store.mark_health("provider", "degraded", error.code)
+                self._queue_account_report(
+                    account_uuid,
+                    "degraded",
+                    error.code,
+                )
         if processed:
             self.store.mark_health("provider", "healthy")
         return processed
