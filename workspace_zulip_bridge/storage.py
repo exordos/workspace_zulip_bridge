@@ -725,6 +725,51 @@ class RestAlchemyStore:
             ).fetchone()
             return None if row is None else typing.cast(dict[str, object], row["body"])
 
+    def assignments_needing_live_report(
+        self, account_uuid: str
+    ) -> list[dict[str, object]]:
+        with self.session() as session:
+            rows = session.execute(
+                """
+                SELECT assignment.body
+                FROM desired_resources AS assignment
+                JOIN zulip_backfill_jobs AS job
+                  ON job.account_uuid::text =
+                     assignment.body->>'external_account_uuid'
+                 AND job.provider_chat_key =
+                     assignment.body->'provider_chat'->>'provider_chat_key'
+                 AND job.state = 'complete'
+                WHERE assignment.resource_type = 'external_chat_assignment'
+                  AND NOT assignment.deleted
+                  AND assignment.body->>'external_account_uuid' = %s
+                  AND COALESCE(
+                      (assignment.body->>'selected')::boolean, true
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM observed_report_outbox AS report
+                      WHERE report.body->>'resource_type' =
+                            'external_chat_assignment'
+                        AND report.body->>'resource_uuid' =
+                            assignment.resource_uuid::text
+                        AND (
+                            report.body->>'observed_generation'
+                        )::bigint = assignment.generation
+                        AND report.body->>'status' = 'live_ready'
+                        AND (
+                            report.result_status IS NULL
+                            OR report.result_status IN ('applied', 'duplicate')
+                        )
+                  )
+                ORDER BY assignment.resource_uuid
+                """,
+                (account_uuid,),
+            ).fetchall()
+            return [
+                typing.cast(dict[str, object], row["body"])
+                for row in rows
+            ]
+
     def provider_mapping(
         self, account_uuid: str, entity_kind: str, provider_id: str
     ) -> dict[str, object] | None:
@@ -1315,7 +1360,7 @@ class RestAlchemyStore:
                     )
                 )
                 RETURNING operation_uuid, account_uuid,
-                          provider_queue_id, provider_event_id
+                          provider_queue_id, provider_event_id, priority, record
                 """
             ).fetchall()
             if not stale:
@@ -1330,6 +1375,32 @@ class RestAlchemyStore:
                 (operation_ids,),
             )
             for row in stale:
+                if row["priority"] == 2:
+                    record = typing.cast(dict[str, object], row["record"])
+                    operation = typing.cast(
+                        dict[str, object] | None,
+                        record.get("operation"),
+                    )
+                    if operation is not None:
+                        provider = typing.cast(
+                            dict[str, object],
+                            operation["provider"],
+                        )
+                        session.execute(
+                            """
+                            UPDATE zulip_backfill_jobs
+                            SET state = 'pending', next_anchor = NULL,
+                                lease_until = NULL, available_at = now(),
+                                retry_count = 0, last_error_code = NULL,
+                                updated_at = now()
+                            WHERE account_uuid = %s AND provider_chat_key = %s
+                              AND state != 'cancelled'
+                            """,
+                            (
+                                row["account_uuid"],
+                                str(provider["chat_id"]),
+                            ),
+                        )
                 if row["provider_queue_id"] is None:
                     continue
                 session.execute(
@@ -1544,6 +1615,12 @@ class RestAlchemyStore:
                   AND NOT assignment.deleted
                   AND COALESCE((assignment.body->>'selected')::boolean, true)
                 ON CONFLICT (account_uuid, provider_chat_key) DO UPDATE SET
+                    next_anchor = CASE
+                        WHEN zulip_backfill_jobs.history_depth =
+                             EXCLUDED.history_depth
+                        THEN zulip_backfill_jobs.next_anchor
+                        ELSE NULL
+                    END,
                     history_depth = EXCLUDED.history_depth,
                     cutoff_at = EXCLUDED.cutoff_at,
                     state = CASE

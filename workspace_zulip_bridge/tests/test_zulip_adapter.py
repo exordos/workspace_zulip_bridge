@@ -31,6 +31,7 @@ class FakeClient:
         self.read_topics = []
         self.uploads = []
         self.registration_request = None
+        self.subscriptions_request = None
 
     def register(self, **kwargs):
         self.registration_request = kwargs
@@ -39,6 +40,19 @@ class FakeClient:
             "queue_id": "queue-1",
             "last_event_id": 7,
             "user_id": 1,
+        }
+
+    def get_subscriptions(self, request=None):
+        self.subscriptions_request = request
+        return {
+            "result": "success",
+            "subscriptions": [
+                {
+                    "stream_id": 42,
+                    "name": "Engineering",
+                    "subscribers": [1, 2],
+                }
+            ],
         }
 
     def get_events(self, **kwargs):
@@ -641,6 +655,14 @@ def test_registration_requests_and_retains_catalog_snapshot_fields():
     snapshot = adapter.take_registration_snapshot()
     assert snapshot is not None
     assert snapshot["user_id"] == 1
+    assert snapshot["subscriptions"] == [
+        {
+            "stream_id": 42,
+            "name": "Engineering",
+            "subscribers": [1, 2],
+        }
+    ]
+    assert client.subscriptions_request == {"include_subscribers": True}
     assert client.registration_request["fetch_event_types"] == [
         "message",
         "subscription",

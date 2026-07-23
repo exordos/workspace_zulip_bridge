@@ -277,6 +277,26 @@ def test_initial_backfill_gate_ignores_delivery_outcomes_from_older_generation()
     assert "delivery.account_generation = account.generation" in statement
 
 
+def test_live_assignment_report_is_queued_once_per_completed_generation():
+    assignment = {
+        "uuid": "00000000-0000-4000-8000-000000000042",
+        "generation": 5,
+    }
+    session = Session(({"body": assignment},))
+    store = _store_with_session(session)
+
+    assert store.assignments_needing_live_report("account") == [assignment]
+
+    statement, parameters = session.statements[0]
+    assert "job.state = 'complete'" in statement
+    assert "report.body->>'observed_generation'" in statement
+    assert "assignment.generation" in statement
+    assert "report.body->>'status' = 'live_ready'" in statement
+    assert "report.result_status IS NULL" in statement
+    assert "report.result_status IN ('applied', 'duplicate')" in statement
+    assert parameters == ("account",)
+
+
 def test_claim_allows_explicit_retry_after_lane_advanced_without_later_delete():
     session = Session()
     store = _store_with_session(session)
@@ -564,3 +584,4 @@ def test_stale_assignment_delivery_is_removed_and_provider_event_replayed():
     assert "delivery.assignment_generation" in statement
     assert "assignment.body->>'project_id'" in statement
     assert "RETURNING operation_uuid" in statement
+    assert "priority, record" in statement

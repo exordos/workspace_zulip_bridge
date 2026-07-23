@@ -719,6 +719,43 @@ def test_exact_provider_read_lease_is_idempotent_and_ordered_in_postgres_schedul
     assert claimed.record["operation"]["entity_uuid"] == last_message_uuid
 
 
+def test_stale_backfill_delivery_restarts_chat_history(postgres_store):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    postgres_store.reconcile_backfill_jobs()
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_backfill_jobs
+            SET next_anchor = 42, state = 'complete'
+            WHERE account_uuid = %s AND provider_chat_key = 'channel:42'
+            """,
+            (account_uuid,),
+        )
+    record = _provider_record(account_uuid, project_uuid)
+    assert postgres_store.enqueue_workspace_delivery(record, 2)
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE desired_resources
+            SET generation = generation + 1
+            WHERE resource_type = 'external_chat_assignment'
+            """
+        )
+
+    assert postgres_store.reset_stale_workspace_deliveries() == 1
+
+    with postgres_store.session() as session:
+        job = session.execute(
+            """
+            SELECT state, next_anchor
+            FROM zulip_backfill_jobs
+            WHERE account_uuid = %s AND provider_chat_key = 'channel:42'
+            """,
+            (account_uuid,),
+        ).fetchone()
+    assert job == {"state": "pending", "next_anchor": None}
+
+
 def test_submitted_delivery_survives_assignment_change_as_ambiguous(postgres_store):
     account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
     record = _provider_record(account_uuid, project_uuid)
@@ -869,6 +906,46 @@ def test_reselected_chat_restarts_cancelled_backfill(postgres_store):
             "state"
         ]
     assert state == "pending"
+
+
+def test_changed_history_depth_restarts_backfill_from_newest(postgres_store):
+    account_uuid, _ = _insert_account_and_assignment(postgres_store)
+    postgres_store.reconcile_backfill_jobs()
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_backfill_jobs
+            SET next_anchor = 42, state = 'complete'
+            WHERE account_uuid = %s AND provider_chat_key = 'channel:42'
+            """,
+            (account_uuid,),
+        )
+        session.execute(
+            """
+            UPDATE desired_resources
+            SET body = jsonb_set(body, '{history_depth}', '"all"'::jsonb)
+            WHERE resource_type = 'external_chat_assignment'
+              AND body->>'external_account_uuid' = %s
+            """,
+            (account_uuid,),
+        )
+
+    postgres_store.reconcile_backfill_jobs()
+
+    with postgres_store.session() as session:
+        job = session.execute(
+            """
+            SELECT history_depth, next_anchor, state
+            FROM zulip_backfill_jobs
+            WHERE account_uuid = %s AND provider_chat_key = 'channel:42'
+            """,
+            (account_uuid,),
+        ).fetchone()
+    assert job == {
+        "history_depth": "all",
+        "next_anchor": None,
+        "state": "pending",
+    }
 
 
 def test_retryable_backfill_defer_is_durable_and_not_claimed_early(postgres_store):

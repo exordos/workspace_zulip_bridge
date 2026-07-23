@@ -89,14 +89,32 @@ class AdapterRegistry:
         resource = self.store.desired_resource("external_account", account_uuid)
         if resource is None or not resource["synchronization_enabled"]:
             raise zulip_adapter.ZulipOperationError("unauthorized_account", False)
-        generation = int(resource["generation"])
-        envelope = typing.cast(dict[str, object], resource["credential_envelope"])
-        account_credentials = self.decryptor.decrypt(
-            account_uuid,
-            str(resource["owner_user_uuid"]),
-            generation,
-            envelope,
-        )
+        try:
+            generation = int(resource["generation"])
+            if generation < 1:
+                raise ValueError("Account generation must be positive")
+            envelope = typing.cast(dict[str, object], resource["credential_envelope"])
+            associated_data = typing.cast(
+                dict[str, object], envelope["associated_data"]
+            )
+            credential_generation = associated_data["account_generation"]
+            if (
+                isinstance(credential_generation, bool)
+                or not isinstance(credential_generation, int)
+                or credential_generation < 1
+                or credential_generation > generation
+            ):
+                raise ValueError("Invalid credential account generation")
+            account_credentials = self.decryptor.decrypt(
+                account_uuid,
+                str(resource["owner_user_uuid"]),
+                credential_generation,
+                envelope,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise zulip_adapter.ZulipOperationError(
+                "unauthorized_account", False
+            ) from exc
         account_credentials = dataclasses.replace(
             account_credentials,
             cert_bundle=self._cert_bundle(),
@@ -507,10 +525,13 @@ class BridgeService:
                 last_event_id = int(cursor["last_event_id"])
                 adapter.restore_queue(queue_id, last_event_id)
             events = adapter.events(queue_id, last_event_id)
+            initial_sync_ready = self._initial_sync_ready(account_uuid)
             self._queue_account_report(
                 account_uuid,
-                "live_ready" if self._initial_sync_ready(account_uuid) else "backfill",
+                "live_ready" if initial_sync_ready else "backfill",
             )
+            if initial_sync_ready:
+                self._queue_ready_assignment_reports(account_uuid)
         except zulip_adapter.ZulipOperationError as exc:
             if exc.code == "bad_event_queue_id":
                 self.store.begin_provider_queue_catchup(account_uuid)
@@ -644,6 +665,16 @@ class BridgeService:
             safe_error_code=safe_error_code,
         )
 
+    def _queue_ready_assignment_reports(self, account_uuid: str) -> None:
+        for assignment in self.store.assignments_needing_live_report(account_uuid):
+            self._queue_observed_report(
+                "external_chat_assignment",
+                str(assignment["uuid"]),
+                int(assignment["generation"]),
+                "live_ready",
+                "live",
+            )
+
     def _queue_registration_reports(
         self,
         account_uuid: str,
@@ -695,12 +726,25 @@ class BridgeService:
             stream_id = subscription.get("stream_id")
             name = subscription.get("name")
             if isinstance(stream_id, int) and isinstance(name, str) and name:
-                owner = people.get(provider_user_id) if provider_user_id else None
-                channel_participants = (
-                    [self._catalog_participant(owner, True)]
-                    if isinstance(owner, dict)
-                    else []
-                )
+                subscribers = subscription.get("subscribers")
+                participant_ids = {
+                    value
+                    for value in (
+                        typing.cast(list[object], subscribers)
+                        if isinstance(subscribers, list)
+                        else []
+                    )
+                    if isinstance(value, int)
+                }
+                if isinstance(provider_user_id, int):
+                    participant_ids.add(provider_user_id)
+                channel_participants = [
+                    self._catalog_participant(
+                        people.get(value, {"user_id": value}),
+                        value == provider_user_id,
+                    )
+                    for value in sorted(participant_ids)
+                ]
                 catalog[f"channel:{stream_id}"] = (
                     "channel",
                     name,
@@ -1282,6 +1326,7 @@ class BridgeService:
             except zulip_adapter.ZulipOperationError as exc:
                 self.store.mark_health("provider", "degraded", exc.code)
                 continue
+            supported = str(event["type"]) in supported_types
             try:
                 self._queue_event_catalog(account_uuid, event, adapter.server_url)
                 external_chat_uuid = uuid.UUID(int=0)
@@ -1326,7 +1371,6 @@ class BridgeService:
                     event,
                     "live",
                 )
-                supported = str(event["type"]) in supported_types
             except zulip_adapter.ZulipOperationError as exc:
                 if exc.retryable:
                     self.store.retry_provider_event(
@@ -1344,7 +1388,6 @@ class BridgeService:
                         adapter.server_url,
                         None,
                     )
-                    supported = str(event["type"]) in supported_types
                 except (KeyError, TypeError, ValueError):
                     self.store.mark_provider_event_invalid(
                         account_uuid, queue_id, event_id, exc.code

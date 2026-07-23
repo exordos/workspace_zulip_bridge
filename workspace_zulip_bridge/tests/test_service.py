@@ -69,7 +69,10 @@ def test_adapter_registry_does_not_retain_decrypted_credentials(monkeypatch):
                 "synchronization_enabled": True,
                 "generation": 7,
                 "owner_user_uuid": "00000000-0000-0000-0000-000000000002",
-                "credential_envelope": {"ciphertext": "opaque"},
+                "credential_envelope": {
+                    "associated_data": {"account_generation": 7},
+                    "ciphertext": "opaque",
+                },
             }
 
     class Decryptor:
@@ -96,6 +99,110 @@ def test_adapter_registry_does_not_retain_decrypted_credentials(monkeypatch):
     assert not hasattr(registry, "cache")
 
 
+def test_adapter_registry_uses_encrypted_credential_generation(monkeypatch):
+    account_uuid = "00000000-0000-0000-0000-000000000001"
+    owner_uuid = "00000000-0000-0000-0000-000000000002"
+    envelope = {
+        "associated_data": {"account_generation": 7},
+        "ciphertext": "opaque",
+    }
+
+    class Store:
+        def provider_is_enabled(self, provider_kind):
+            return True
+
+        def custom_ca_bundle(self, provider_kind):
+            return None
+
+        def desired_resource(self, resource_type, resource_uuid):
+            return {
+                "synchronization_enabled": True,
+                "generation": 8,
+                "owner_user_uuid": owner_uuid,
+                "credential_envelope": envelope,
+            }
+
+    class Decryptor:
+        def __init__(self):
+            self.calls = []
+
+        def decrypt(self, *args):
+            self.calls.append(args)
+            return zulip_adapter.ZulipCredentials("https://zulip.invalid", "e", "k")
+
+    class Adapter:
+        def __init__(self, credentials, **kwargs):
+            pass
+
+    monkeypatch.setattr(zulip_adapter, "OfficialZulipAdapter", Adapter)
+    decryptor = Decryptor()
+    service.AdapterRegistry(Store(), decryptor)(account_uuid)
+
+    assert decryptor.calls == [(account_uuid, owner_uuid, 7, envelope)]
+
+
+@pytest.mark.parametrize(
+    "credential_generation",
+    [0, 8, True, "7"],
+)
+def test_adapter_registry_rejects_invalid_credential_generation(
+    monkeypatch, credential_generation
+):
+    class Store:
+        def provider_is_enabled(self, provider_kind):
+            return True
+
+        def desired_resource(self, resource_type, resource_uuid):
+            return {
+                "synchronization_enabled": True,
+                "generation": 7,
+                "owner_user_uuid": "00000000-0000-0000-0000-000000000002",
+                "credential_envelope": {
+                    "associated_data": {
+                        "account_generation": credential_generation,
+                    }
+                },
+            }
+
+    class Decryptor:
+        def decrypt(self, *args):
+            raise AssertionError("invalid credential generation must fail closed")
+
+    registry = service.AdapterRegistry(Store(), Decryptor())
+    with pytest.raises(zulip_adapter.ZulipOperationError) as error:
+        registry("00000000-0000-0000-0000-000000000001")
+
+    assert error.value.code == "unauthorized_account"
+    assert not error.value.retryable
+
+
+def test_adapter_registry_isolates_credential_decryption_failure():
+    class Store:
+        def provider_is_enabled(self, provider_kind):
+            return True
+
+        def desired_resource(self, resource_type, resource_uuid):
+            return {
+                "synchronization_enabled": True,
+                "generation": 7,
+                "owner_user_uuid": "00000000-0000-0000-0000-000000000002",
+                "credential_envelope": {
+                    "associated_data": {"account_generation": 7},
+                },
+            }
+
+    class Decryptor:
+        def decrypt(self, *args):
+            raise ValueError("Credential associated data mismatch")
+
+    registry = service.AdapterRegistry(Store(), Decryptor())
+    with pytest.raises(zulip_adapter.ZulipOperationError) as error:
+        registry("00000000-0000-0000-0000-000000000001")
+
+    assert error.value.code == "unauthorized_account"
+    assert not error.value.retryable
+
+
 def test_adapter_registry_combines_system_and_managed_provider_ca(
     tmp_path, monkeypatch
 ):
@@ -118,7 +225,7 @@ def test_adapter_registry_combines_system_and_managed_provider_ca(
                 "synchronization_enabled": True,
                 "generation": 1,
                 "owner_user_uuid": "00000000-0000-0000-0000-000000000002",
-                "credential_envelope": {},
+                "credential_envelope": {"associated_data": {"account_generation": 1}},
             }
 
     class Decryptor:
@@ -638,6 +745,34 @@ def test_provider_journal_enqueues_live_before_marking_event(monkeypatch):
     ]
 
 
+def test_unselected_provider_event_is_finalized_without_crashing(monkeypatch):
+    account_uuid = "00000000-0000-0000-0000-000000000001"
+    store = DeliveryStore(
+        [
+            {
+                "account_uuid": account_uuid,
+                "queue_id": "queue",
+                "event_id": 7,
+                "body": {"id": 7, "type": "realm_user", "person": {}},
+            }
+        ]
+    )
+    instance = _delivery_service(store)
+
+    def reject_unselected(*_args, **_kwargs):
+        raise ValueError("provider_chat_not_selected")
+
+    monkeypatch.setattr(
+        instance,
+        "_event_records_with_file_fallback",
+        reject_unselected,
+    )
+
+    assert instance.process_provider_journal() == 1
+    assert store.enqueued == []
+    assert store.processed == [(account_uuid, "queue", 7, True)]
+
+
 def test_provider_journal_waits_for_assignment_bound_delivery(monkeypatch):
     class Store(DeliveryStore):
         def __init__(self, events):
@@ -891,7 +1026,13 @@ def test_registration_snapshot_queues_account_live_ready_and_chat_catalog_report
                     "email": "other@example.invalid",
                 },
             ],
-            "subscriptions": [{"stream_id": 42, "name": "Engineering"}],
+            "subscriptions": [
+                {
+                    "stream_id": 42,
+                    "name": "Engineering",
+                    "subscribers": [1, 2],
+                }
+            ],
             "recent_private_conversations": [{"user_ids": [2], "max_message_id": 99}],
         },
         "https://zulip.example.invalid",
@@ -926,6 +1067,7 @@ def test_registration_snapshot_queues_account_live_ready_and_chat_catalog_report
     )
     assert channel["catalog"]["source"]["original_url"].endswith("/#narrow/channel/42")
     assert direct["catalog"]["source"]["original_url"].endswith("/#narrow/dm/1,2-dm")
+    assert channel["catalog"]["participants"] == direct["catalog"]["participants"]
     assert channel["catalog"]["capabilities"]["messenger.stream.rename"]["available"]
     assert "messenger.stream.rename" not in direct["catalog"]["capabilities"]
     assert set(channel["catalog"]["source"]) == {
@@ -1100,6 +1242,16 @@ def test_first_provider_poll_processes_registration_and_reports_live_ready():
         def initial_backfill_ready(self, requested):
             return self.ready
 
+        def assignments_needing_live_report(self, requested):
+            if not self.ready:
+                return []
+            return [
+                {
+                    "uuid": "00000000-0000-4000-8000-000000000042",
+                    "generation": 5,
+                }
+            ]
+
         def mark_health(self, *args):
             return None
 
@@ -1156,6 +1308,17 @@ def test_first_provider_poll_processes_registration_and_reports_live_ready():
         if report["resource_type"] == "external_account"
     ][-1]
     assert account_report["status"] == "live_ready"
+    assignment_report = next(
+        report
+        for report in instance.store.reports
+        if report["resource_type"] == "external_chat_assignment"
+    )
+    assert assignment_report["resource_uuid"] == (
+        "00000000-0000-4000-8000-000000000042"
+    )
+    assert assignment_report["observed_generation"] == 5
+    assert assignment_report["status"] == "live_ready"
+    assert assignment_report["progress"]["phase"] == "live"
 
 
 def test_live_ready_requires_catalog_assignment_and_initial_backfill_gates():

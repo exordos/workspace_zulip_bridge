@@ -32,6 +32,10 @@ PROVIDER_NETWORK_ERRORS = (
 class ZulipClient(typing.Protocol):
     def register(self, **kwargs: object) -> dict[str, object]: ...
 
+    def get_subscriptions(
+        self, request: dict[str, object] | None = None
+    ) -> dict[str, object]: ...
+
     def get_events(self, **kwargs: object) -> dict[str, object]: ...
 
     def get_messages(self, request: dict[str, object]) -> dict[str, object]: ...
@@ -423,8 +427,26 @@ class OfficialZulipAdapter:
                     },
                 )
             )
+            subscriptions = _successful(
+                self.client.get_subscriptions({"include_subscribers": True})
+            ).get("subscriptions")
         except PROVIDER_NETWORK_ERRORS as exc:
             raise ZulipOperationError("provider_unavailable", True) from exc
+        if not isinstance(subscriptions, list) or not all(
+            isinstance(subscription, dict)
+            and isinstance(subscription.get("stream_id"), int)
+            and isinstance(subscription.get("name"), str)
+            and isinstance(subscription.get("subscribers"), list)
+            and all(
+                isinstance(user_id, int)
+                for user_id in typing.cast(
+                    list[object], subscription.get("subscribers")
+                )
+            )
+            for subscription in subscriptions
+        ):
+            raise ZulipOperationError("invalid_record", False)
+        result["subscriptions"] = subscriptions
         if result.get("user_id") is not None:
             self._user_id = int(result["user_id"])
         return (
