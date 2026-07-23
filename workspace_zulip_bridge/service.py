@@ -1225,12 +1225,15 @@ class BridgeService:
             try:
                 self.enqueue_backfill(account_uuid, chat_key, unmapped_messages)
             except ValueError as exc:
-                if str(exc) != "provider_chat_assignment_pending":
+                if str(exc) not in {
+                    "provider_chat_assignment_pending",
+                    "provider_chat_participants_pending",
+                }:
                     raise
                 # Queue recovery can overlap the Workspace control-plane work
-                # that creates stream/topic mappings for a newly selected chat.
-                # Leave the catch-up checkpoint untouched and retry after those
-                # mappings have arrived.
+                # that creates stream/topic mappings or projects the complete
+                # participant set for a newly selected chat. Leave the catch-up
+                # checkpoint untouched and retry after both gates are ready.
                 return False
 
         if complete and checkpoint is not None:

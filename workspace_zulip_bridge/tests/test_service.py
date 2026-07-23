@@ -2088,12 +2088,19 @@ def test_queue_loss_catchup_recovers_create_edit_delete_before_live_ready(
     assert store.advanced == [([10, 12, 13], 9, True, None)]
 
 
-def test_queue_loss_catchup_waits_for_workspace_chat_mappings():
+@pytest.mark.parametrize(
+    "pending_gate",
+    [
+        "provider_chat_assignment_pending",
+        "provider_chat_participants_pending",
+    ],
+)
+def test_queue_loss_catchup_waits_for_workspace_chat_gates(pending_gate):
     store = CatchupStore()
     store.mappings = {}
     instance = _delivery_service(store)
     instance.enqueue_backfill = lambda *args: (_ for _ in ()).throw(
-        ValueError("provider_chat_assignment_pending")
+        ValueError(pending_gate)
     )
 
     assert not instance._run_provider_queue_catchup(
