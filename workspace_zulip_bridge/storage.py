@@ -725,6 +725,51 @@ class RestAlchemyStore:
             ).fetchone()
             return None if row is None else typing.cast(dict[str, object], row["body"])
 
+    def assignments_needing_live_report(
+        self, account_uuid: str
+    ) -> list[dict[str, object]]:
+        with self.session() as session:
+            rows = session.execute(
+                """
+                SELECT assignment.body
+                FROM desired_resources AS assignment
+                JOIN zulip_backfill_jobs AS job
+                  ON job.account_uuid::text =
+                     assignment.body->>'external_account_uuid'
+                 AND job.provider_chat_key =
+                     assignment.body->'provider_chat'->>'provider_chat_key'
+                 AND job.state = 'complete'
+                WHERE assignment.resource_type = 'external_chat_assignment'
+                  AND NOT assignment.deleted
+                  AND assignment.body->>'external_account_uuid' = %s
+                  AND COALESCE(
+                      (assignment.body->>'selected')::boolean, true
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM observed_report_outbox AS report
+                      WHERE report.body->>'resource_type' =
+                            'external_chat_assignment'
+                        AND report.body->>'resource_uuid' =
+                            assignment.resource_uuid::text
+                        AND (
+                            report.body->>'observed_generation'
+                        )::bigint = assignment.generation
+                        AND report.body->>'status' = 'live_ready'
+                        AND (
+                            report.result_status IS NULL
+                            OR report.result_status IN ('applied', 'duplicate')
+                        )
+                  )
+                ORDER BY assignment.resource_uuid
+                """,
+                (account_uuid,),
+            ).fetchall()
+            return [
+                typing.cast(dict[str, object], row["body"])
+                for row in rows
+            ]
+
     def provider_mapping(
         self, account_uuid: str, entity_kind: str, provider_id: str
     ) -> dict[str, object] | None:
