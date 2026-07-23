@@ -14,6 +14,13 @@ import zulip
 from workspace_zulip_bridge import file_api
 
 MAX_PROVIDER_FILE_BYTES = 52_428_800
+PROVIDER_QUEUE_IDLE_TIMEOUT_SECONDS = 43_200
+# History runs in the main service thread. Keep each provider quantum small so
+# already captured live events return to delivery promptly between pages.
+# Zulip's message endpoint is paginated server-side. A production backfill
+# should amortize one request across a useful batch while the delivery outbox
+# still drains it in bounded Provider API quanta.
+HISTORY_PAGE_SIZE = 100
 TRANSFER_NAMESPACE = uuid.UUID("8aa58582-d782-4e98-bfc3-7b5ee96e3bd6")
 WORKSPACE_FILE_RE = re.compile(
     r"(?P<image>!?)\[(?P<name>[^\]]+)\]\("
@@ -31,6 +38,12 @@ PROVIDER_NETWORK_ERRORS = (
 
 class ZulipClient(typing.Protocol):
     def register(self, **kwargs: object) -> dict[str, object]: ...
+
+    def get_subscriptions(
+        self, request: dict[str, object] | None = None
+    ) -> dict[str, object]: ...
+
+    def get_users(self) -> dict[str, object]: ...
 
     def get_events(self, **kwargs: object) -> dict[str, object]: ...
 
@@ -153,6 +166,11 @@ class OfficialZulipAdapter:
                     site=credentials.site,
                     client="workspace-zulip-bridge/0.1",
                     cert_bundle=credentials.cert_bundle,
+                    # The bridge owns durable retry/backoff state. The official
+                    # client otherwise retries failed non-long-poll requests
+                    # inline for minutes instead of returning control to the
+                    # dedicated account worker.
+                    retry_on_errors=False,
                 )
             except PROVIDER_NETWORK_ERRORS as exc:
                 raise ZulipOperationError("provider_unavailable", True) from exc
@@ -319,7 +337,7 @@ class OfficialZulipAdapter:
         self,
         provider_chat_key: str,
         anchor: int | str = "newest",
-        page_size: int = 100,
+        page_size: int = HISTORY_PAGE_SIZE,
     ) -> list[dict[str, object]]:
         chat_type, _, identifiers = provider_chat_key.partition(":")
         if chat_type == "channel":
@@ -398,33 +416,59 @@ class OfficialZulipAdapter:
         return SendCorrelation(queue_id, operation_uuid, last_event_id, rendered)
 
     def register_queue(self) -> tuple[str, int, dict[str, object]]:
-        try:
-            result = _successful(
-                self.client.register(
-                    event_types=[
-                        "message",
-                        "update_message",
-                        "delete_message",
-                        "update_message_flags",
-                        "subscription",
-                        "realm_user",
-                    ],
-                    fetch_event_types=[
-                        "message",
-                        "subscription",
-                        "realm_user",
-                        "recent_private_conversations",
-                    ],
-                    apply_markdown=False,
-                    client_capabilities={
-                        "notification_settings_null": True,
-                        "bulk_message_deletion": True,
-                        "empty_topic_name": True,
-                    },
-                )
+        register_request: dict[str, object] = {
+            "event_types": [
+                "message",
+                "update_message",
+                "delete_message",
+                "update_message_flags",
+                "subscription",
+                "realm_user",
+            ],
+            "fetch_event_types": [
+                "message",
+                "subscription",
+                "realm_user",
+                "recent_private_conversations",
+            ],
+            "apply_markdown": False,
+            "client_capabilities": {
+                "notification_settings_null": True,
+                "bulk_message_deletion": True,
+                "empty_topic_name": True,
+            },
+        }
+        if int(getattr(self.client, "feature_level", 0)) >= 481:
+            # Ask modern Zulip servers for a 12-hour idle lifetime as a safety
+            # margin around the dedicated account long-poll worker. Use an integer:
+            # this official client forwards free-form kwargs without JSON-
+            # encoding string values, while the endpoint parses this field as
+            # JSON.
+            register_request["idle_queue_timeout"] = (
+                PROVIDER_QUEUE_IDLE_TIMEOUT_SECONDS
             )
+        try:
+            result = _successful(self.client.register(**register_request))
+            subscriptions = _successful(
+                self.client.get_subscriptions({"include_subscribers": True})
+            ).get("subscriptions")
         except PROVIDER_NETWORK_ERRORS as exc:
             raise ZulipOperationError("provider_unavailable", True) from exc
+        if not isinstance(subscriptions, list) or not all(
+            isinstance(subscription, dict)
+            and isinstance(subscription.get("stream_id"), int)
+            and isinstance(subscription.get("name"), str)
+            and isinstance(subscription.get("subscribers"), list)
+            and all(
+                isinstance(user_id, int)
+                for user_id in typing.cast(
+                    list[object], subscription.get("subscribers")
+                )
+            )
+            for subscription in subscriptions
+        ):
+            raise ZulipOperationError("invalid_record", False)
+        result["subscriptions"] = subscriptions
         if result.get("user_id") is not None:
             self._user_id = int(result["user_id"])
         return (
@@ -432,6 +476,53 @@ class OfficialZulipAdapter:
             int(result["last_event_id"]),
             result,
         )
+
+    def channel_catalog(self, provider_chat_key: str) -> dict[str, object]:
+        stream_id = self._channel_id(provider_chat_key)
+        try:
+            subscriptions = _successful(
+                self.client.get_subscriptions({"include_subscribers": True})
+            ).get("subscriptions")
+            members = _successful(self.client.get_users()).get("members")
+            profile = _successful(self.client.get_profile())
+        except PROVIDER_NETWORK_ERRORS as exc:
+            raise ZulipOperationError("provider_unavailable", True) from exc
+        if (
+            not isinstance(subscriptions, list)
+            or not isinstance(members, list)
+            or not all(
+                isinstance(member, dict)
+                and isinstance(member.get("user_id"), int)
+                for member in members
+            )
+            or not isinstance(profile.get("user_id"), int)
+        ):
+            raise ZulipOperationError("invalid_record", False)
+        subscription = next(
+            (
+                item
+                for item in subscriptions
+                if isinstance(item, dict) and item.get("stream_id") == stream_id
+            ),
+            None,
+        )
+        if (
+            subscription is None
+            or not isinstance(subscription.get("name"), str)
+            or not isinstance(subscription.get("subscribers"), list)
+            or not all(
+                isinstance(user_id, int)
+                for user_id in typing.cast(
+                    list[object], subscription.get("subscribers")
+                )
+            )
+        ):
+            raise ZulipOperationError("invalid_record", False)
+        return {
+            "subscriptions": [subscription],
+            "realm_users": members,
+            "user_id": profile["user_id"],
+        }
 
     def _external_chat_uuid(self, provider_chat_key: str) -> uuid.UUID:
         if self.routing is None:
@@ -546,13 +637,25 @@ class OfficialZulipAdapter:
 
     def events(self, queue_id: str, last_event_id: int) -> list[dict[str, object]]:
         try:
-            result = _successful(
-                self.client.get_events(
+            call_endpoint = getattr(self.client, "call_endpoint", None)
+            if callable(call_endpoint):
+                response = call_endpoint(
+                    url="events",
+                    method="GET",
+                    request={
+                        "queue_id": queue_id,
+                        "last_event_id": last_event_id,
+                    },
+                    longpolling=True,
+                )
+            else:
+                # Small test doubles and compatible client implementations may
+                # expose only the generated endpoint method.
+                response = self.client.get_events(
                     queue_id=queue_id,
                     last_event_id=last_event_id,
-                    dont_block=True,
                 )
-            )
+            result = _successful(response)
         except PROVIDER_NETWORK_ERRORS as exc:
             raise ZulipOperationError("provider_unavailable", True) from exc
         return typing.cast(list[dict[str, object]], result["events"])

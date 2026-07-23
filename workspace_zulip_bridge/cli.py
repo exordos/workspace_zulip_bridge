@@ -44,7 +44,6 @@ def build(
         provider_poll_interval_seconds=(runtime.provider_api.poll_interval_seconds),
         provider_lease_seconds=runtime.provider_api.lease_seconds,
         provider_batch_size=runtime.provider_api.batch_size,
-        provider_poll_workers=runtime.provider_api.poll_workers,
         control_poll_interval_seconds=runtime.control.poll_interval_seconds,
         heartbeat_interval_seconds=runtime.control.heartbeat_interval_seconds,
         control_retry_base_seconds=runtime.control.retry_base_seconds,

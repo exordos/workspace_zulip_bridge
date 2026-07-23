@@ -52,12 +52,6 @@ worker_id = test
         config.load(path)
 
 
-def test_example_config_sets_bounded_provider_poll_workers():
-    path = pathlib.Path(__file__).parents[2] / "etc/bridge.conf.example"
-
-    assert config.load(path).provider_api.poll_workers == 16
-
-
 def test_legacy_database_dsn_remains_readable_during_config_upgrade(
     tmp_path: pathlib.Path,
 ):

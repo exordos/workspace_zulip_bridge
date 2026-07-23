@@ -19,6 +19,7 @@ EXTERNAL_CHAT_UUID = "10000000-0000-4000-8000-000000000007"
 class FakeClient:
     def __init__(self):
         self.base_url = "https://zulip.example.invalid/api/"
+        self.feature_level = 500
         self.sent = []
         self.updated = []
         self.flags = []
@@ -26,11 +27,25 @@ class FakeClient:
         self.fail_send = False
         self.messages = []
         self.event_requests = []
+        self.endpoint_requests = []
         self.stream_updates = []
         self.read_streams = []
         self.read_topics = []
         self.uploads = []
         self.registration_request = None
+        self.subscriptions_request = None
+        self.members = [
+            {
+                "user_id": 1,
+                "full_name": "Owner",
+                "email": "owner@example.invalid",
+            },
+            {
+                "user_id": 2,
+                "full_name": "Other User",
+                "email": "other@example.invalid",
+            },
+        ]
 
     def register(self, **kwargs):
         self.registration_request = kwargs
@@ -41,12 +56,50 @@ class FakeClient:
             "user_id": 1,
         }
 
+    def get_subscriptions(self, request=None):
+        self.subscriptions_request = request
+        return {
+            "result": "success",
+            "subscriptions": [
+                {
+                    "stream_id": 42,
+                    "name": "Engineering",
+                    "subscribers": [1, 2],
+                }
+            ],
+        }
+
     def get_events(self, **kwargs):
         self.event_requests.append(kwargs)
         return {"result": "success", "events": []}
 
+    def call_endpoint(
+        self,
+        *,
+        url,
+        method,
+        request,
+        longpolling=False,
+        timeout=None,
+    ):
+        self.endpoint_requests.append(
+            {
+                "url": url,
+                "method": method,
+                "request": request,
+                "longpolling": longpolling,
+                "timeout": timeout,
+            }
+        )
+        if url != "events":
+            raise AssertionError(f"Unexpected endpoint: {url}")
+        return self.get_events(**request)
+
     def get_profile(self):
         return {"result": "success", "user_id": 1}
+
+    def get_users(self):
+        return {"result": "success", "members": self.members}
 
     def get_messages(self, request):
         self.last_get_messages = request
@@ -181,6 +234,37 @@ def test_outbound_prepare_never_registers_or_replaces_the_live_queue():
     assert error.value.code == "provider_unavailable"
     assert error.value.retryable
     assert client.registration_request is None
+
+
+def test_selected_channel_catalog_reads_authoritative_subscribers_and_users():
+    client = FakeClient()
+    adapter = _adapter(client)
+
+    catalog = adapter.channel_catalog("channel:42")
+
+    assert client.subscriptions_request == {"include_subscribers": True}
+    assert catalog == {
+        "subscriptions": [
+            {
+                "stream_id": 42,
+                "name": "Engineering",
+                "subscribers": [1, 2],
+            }
+        ],
+        "realm_users": client.members,
+        "user_id": 1,
+    }
+
+
+def test_selected_channel_catalog_rejects_unknown_stream():
+    client = FakeClient()
+    adapter = _adapter(client)
+
+    with pytest.raises(zulip_adapter.ZulipOperationError) as error:
+        adapter.channel_catalog("channel:404")
+
+    assert error.value.code == "invalid_record"
+    assert not error.value.retryable
 
 
 @pytest.mark.parametrize("chat_kind", ["channel", "personal_dm", "group_dm"])
@@ -617,19 +701,59 @@ def test_backfill_history_is_raw_and_newest_first():
     adapter = zulip_adapter.OfficialZulipAdapter(client=client)
     messages = adapter.message_history("channel:42")
     assert [message["id"] for message in messages] == [12, 11, 10]
+    assert client.last_get_messages["num_before"] == zulip_adapter.HISTORY_PAGE_SIZE
     assert client.last_get_messages["apply_markdown"] is False
     assert client.last_get_messages["narrow"] == [
         {"operator": "channel", "operand": 42}
     ]
 
 
-def test_provider_event_poll_is_nonblocking():
+def test_provider_event_poll_uses_official_longpoll_boundary():
     client = FakeClient()
     adapter = zulip_adapter.OfficialZulipAdapter(client=client)
 
     assert adapter.events("queue-1", 7) == []
-    assert client.event_requests == [
-        {"queue_id": "queue-1", "last_event_id": 7, "dont_block": True}
+    assert client.event_requests == [{"queue_id": "queue-1", "last_event_id": 7}]
+    assert client.endpoint_requests == [
+        {
+            "url": "events",
+            "method": "GET",
+            "request": {
+                "queue_id": "queue-1",
+                "last_event_id": 7,
+            },
+            "longpolling": True,
+            "timeout": None,
+        }
+    ]
+
+
+def test_official_client_disables_inline_retries(monkeypatch):
+    calls = []
+
+    class Client(FakeClient):
+        def __init__(self, **kwargs):
+            super().__init__()
+            calls.append(kwargs)
+
+    monkeypatch.setattr(zulip_adapter.zulip, "Client", Client)
+    credentials = zulip_adapter.ZulipCredentials(
+        site="https://zulip.example.invalid",
+        email="owner@example.invalid",
+        api_key="secret",
+    )
+
+    zulip_adapter.OfficialZulipAdapter(credentials=credentials)
+
+    assert calls == [
+        {
+            "email": "owner@example.invalid",
+            "api_key": "secret",
+            "site": "https://zulip.example.invalid",
+            "client": "workspace-zulip-bridge/0.1",
+            "cert_bundle": None,
+            "retry_on_errors": False,
+        }
     ]
 
 
@@ -641,6 +765,14 @@ def test_registration_requests_and_retains_catalog_snapshot_fields():
     snapshot = adapter.take_registration_snapshot()
     assert snapshot is not None
     assert snapshot["user_id"] == 1
+    assert snapshot["subscriptions"] == [
+        {
+            "stream_id": 42,
+            "name": "Engineering",
+            "subscribers": [1, 2],
+        }
+    ]
+    assert client.subscriptions_request == {"include_subscribers": True}
     assert client.registration_request["fetch_event_types"] == [
         "message",
         "subscription",
@@ -652,7 +784,19 @@ def test_registration_requests_and_retains_catalog_snapshot_fields():
         "bulk_message_deletion": True,
         "empty_topic_name": True,
     }
+    assert client.registration_request["idle_queue_timeout"] == (
+        zulip_adapter.PROVIDER_QUEUE_IDLE_TIMEOUT_SECONDS
+    )
     assert adapter.take_registration_snapshot() is None
+
+
+def test_legacy_registration_omits_unsupported_idle_queue_timeout():
+    client = FakeClient()
+    client.feature_level = 480
+    adapter = zulip_adapter.OfficialZulipAdapter(client=client)
+
+    assert adapter.ensure_queue() == ("queue-1", 7)
+    assert "idle_queue_timeout" not in client.registration_request
 
 
 def test_provider_file_download_streams_with_a_strict_effective_limit(monkeypatch):

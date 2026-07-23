@@ -25,6 +25,15 @@ class Store:
 
     def workspace_mapping(self, account_uuid, kind, workspace_uuid):
         return {
+            "identity": {
+                "provider_id": "9",
+                "metadata": {
+                    "display_name": "Account Owner",
+                    "email": None,
+                    "avatar_urn": None,
+                    "active": True,
+                },
+            },
             "stream": {"provider_id": "channel:42", "metadata": {}},
             "message": {
                 "provider_id": "101",

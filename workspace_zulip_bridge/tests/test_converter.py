@@ -12,6 +12,7 @@ PROJECT_UUID = str(uuid.uuid4())
 class FakeStore:
     def __init__(self, selection_mode="all", auto_materialize=True):
         self.account = {
+            "generation": 1,
             "owner_user_uuid": OWNER_UUID,
             "settings": {
                 "selection_mode": selection_mode,
@@ -244,7 +245,7 @@ def test_new_chat_waits_for_backend_assignment_before_materialization():
     assert converter.stable_entity_uuid(ACCOUNT_UUID, "identity", "2") in participants
 
 
-def test_channel_message_waits_for_exact_author_and_topic_projection():
+def test_channel_message_waits_for_topic_and_accepts_former_author():
     store = FakeStore(auto_materialize=False)
     stream_uuid = str(uuid.uuid4())
     store.remember_provider_mapping(
@@ -265,15 +266,7 @@ def test_channel_message_waits_for_exact_author_and_topic_projection():
     event = {"id": 10, "type": "message", "message": _stream_message()}
     with pytest.raises(ValueError, match="provider_chat_assignment_pending"):
         converter.event_records(store, ACCOUNT_UUID, "queue", event)
-    author_uuid = str(uuid.uuid4())
     topic_uuid = str(uuid.uuid4())
-    store.remember_provider_mapping(
-        ACCOUNT_UUID,
-        "identity",
-        "2",
-        author_uuid,
-        {"display_name": "Other User", "active": True},
-    )
     store.remember_provider_mapping(
         ACCOUNT_UUID,
         "topic",
@@ -281,18 +274,20 @@ def test_channel_message_waits_for_exact_author_and_topic_projection():
         topic_uuid,
         {"stream_uuid": stream_uuid, "chat_key": "channel:42"},
     )
-    store.mappings[("stream", "channel:42")]["metadata"]["participants"] = [
-        OWNER_UUID,
-        author_uuid,
-    ]
     operations = _operations(
         converter.event_records(store, ACCOUNT_UUID, "queue", event)
     )
+    author_uuid = converter.stable_entity_uuid(ACCOUNT_UUID, "identity", "2")
     message = next(value for value in operations if value["kind"] == "message.create")
+    identity = next(value for value in operations if value["kind"] == "identity.upsert")
     topic = next(value for value in operations if value["kind"] == "topic.upsert")
     assert message["actor_uuid"] == author_uuid
+    assert identity["entity_uuid"] == author_uuid
     assert message["payload"]["topic_uuid"] == topic_uuid
     assert topic["entity_uuid"] == topic_uuid
+    assert store.mappings[("stream", "channel:42")]["metadata"]["participants"] == [
+        OWNER_UUID
+    ]
     assert not any(value["kind"] == "stream.upsert" for value in operations)
 
 
@@ -305,6 +300,9 @@ def test_message_mutations_and_topic_rename_reuse_stable_mappings():
         for operation in _operations(created)
         if operation["kind"] == "message.create"
     )
+    original_content_sha256 = store.provider_mapping(ACCOUNT_UUID, "message", "601")[
+        "metadata"
+    ]["content_sha256"]
     external_author_uuid = created_message["payload"]["author_uuid"]
     topic_uuid = store.provider_mapping(ACCOUNT_UUID, "topic", "42:Topic")[
         "workspace_uuid"
@@ -327,9 +325,13 @@ def test_message_mutations_and_topic_rename_reuse_stable_mappings():
     ]
     assert updated[0]["entity_uuid"] == topic_uuid
     assert updated[1]["actor_uuid"] == external_author_uuid
-    assert store.provider_mapping(ACCOUNT_UUID, "message", "601")["metadata"][
-        "content_sha256"
-    ]
+    assert (
+        store.provider_mapping(ACCOUNT_UUID, "message", "601")["metadata"][
+            "content_sha256"
+        ]
+        == original_content_sha256
+    )
+    assert updated[1]["extensions"]["content_sha256"] != original_content_sha256
     deleted = _operations(
         converter.event_records(
             store,
@@ -364,6 +366,28 @@ def test_message_mutations_and_topic_rename_reuse_stable_mappings():
     assert read[0]["payload"]["reader_uuid"] == OWNER_UUID
     assert read[0]["payload"]["message_uuids"] == [created_message["entity_uuid"]]
     assert "through_message_uuid" not in read[0]["payload"]
+
+
+@pytest.mark.parametrize(("flags", "expected_read"), [(["read"], True), ([], False)])
+def test_message_snapshot_carries_exact_owner_read_state(flags, expected_read):
+    store = FakeStore()
+    event = {"id": 10, "type": "message", "message": _stream_message()}
+    event["message"]["flags"] = flags
+
+    operations = _operations(
+        converter.event_records(store, ACCOUNT_UUID, "queue", event)
+    )
+
+    read = next(operation for operation in operations if operation["kind"] == "read_state.set")
+    created = next(operation for operation in operations if operation["kind"] == "message.create")
+    assert created["payload"]["read"] is expected_read
+    assert read["payload"] == {
+        "stream_uuid": created["payload"]["stream_uuid"],
+        "topic_uuid": created["payload"]["topic_uuid"],
+        "reader_uuid": OWNER_UUID,
+        "message_uuids": [created["entity_uuid"]],
+        "read": expected_read,
+    }
 
 
 def test_channel_message_does_not_overwrite_backend_owned_stream_projection():
@@ -417,13 +441,36 @@ def test_channel_message_does_not_overwrite_backend_owned_stream_projection():
 
 
 def test_message_create_and_update_mentions_use_provider_identity_ids_and_urns():
-    store = FakeStore()
+    store = FakeStore(auto_materialize=False)
     store.remember_provider_mapping(
         ACCOUNT_UUID,
         "identity",
         "1",
         OWNER_UUID,
         {"display_name": "Owner", "active": True},
+    )
+    stream_uuid = str(uuid.uuid4())
+    store.remember_provider_mapping(
+        ACCOUNT_UUID,
+        "stream",
+        "channel:42",
+        stream_uuid,
+        {
+            "chat_type": "channel",
+            "project_uuid": PROJECT_UUID,
+            "participants": [OWNER_UUID],
+            "name": "Engineering",
+            "description": "",
+            "private": False,
+            "default_topic_uuid": None,
+        },
+    )
+    store.remember_provider_mapping(
+        ACCOUNT_UUID,
+        "topic",
+        "42:Topic",
+        str(uuid.uuid4()),
+        {"stream_uuid": stream_uuid, "chat_key": "channel:42"},
     )
     message = _stream_message()
     message["content"] = "hello @**Mentioned User|3** and @**Owner|1**"
@@ -487,9 +534,14 @@ def test_message_create_and_update_mentions_use_provider_identity_ids_and_urns()
     update_identity = next(
         operation for operation in updated if operation["kind"] == "identity.upsert"
     )
+    updated_topic = next(
+        operation for operation in updated if operation["kind"] == "topic.upsert"
+    )
     updated_message = next(
         operation for operation in updated if operation["kind"] == "message.update"
     )
+    assert updated.index(updated_topic) < updated.index(updated_message)
+    assert updated_topic["entity_uuid"] == created_message["payload"]["topic_uuid"]
     assert update_identity["provider"]["entity_id"] == "4"
     assert (
         "[Another User](urn:user:" in updated_message["payload"]["payload"]["content"]
@@ -531,7 +583,7 @@ def test_inbound_zulip_reply_resolves_provider_target_to_workspace_message():
     assert message["extensions"]["unresolved_reply_provider_id"] is None
 
 
-def test_convergent_workspace_alias_suppresses_provider_history_duplicate_create():
+def test_convergent_workspace_alias_replays_idempotent_backfill_upsert():
     store = FakeStore()
     workspace_uuid = str(uuid.uuid4())
     store.mappings[("message", "601")] = {
@@ -545,16 +597,25 @@ def test_convergent_workspace_alias_suppresses_provider_history_duplicate_create
         "convergent_alias": True,
     }
 
+    provider_message = _stream_message(601)
+    provider_message["flags"] = ["read"]
     records = converter.event_records(
         store,
         ACCOUNT_UUID,
         "history",
-        {"id": 601, "type": "message", "message": _stream_message(601)},
+        {"id": 601, "type": "message", "message": provider_message},
         "backfill",
     )
 
-    assert all(
-        operation["kind"] != "message.create" for operation in _operations(records)
+    message = next(
+        operation
+        for operation in _operations(records)
+        if operation["kind"] == "message.update"
+    )
+    assert message["entity_uuid"] == workspace_uuid
+    assert message["payload"]["read"] is True
+    assert not any(
+        operation["kind"] == "read_state.set" for operation in _operations(records)
     )
     assert (
         store.provider_mapping(ACCOUNT_UUID, "message", "601")["workspace_uuid"]

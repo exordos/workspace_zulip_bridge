@@ -1,11 +1,12 @@
-import concurrent.futures
 import dataclasses
 import datetime
 import hashlib
 import pathlib
+import queue
 import random
 import ssl
 import tempfile
+import threading
 import time
 import typing
 import uuid
@@ -89,14 +90,32 @@ class AdapterRegistry:
         resource = self.store.desired_resource("external_account", account_uuid)
         if resource is None or not resource["synchronization_enabled"]:
             raise zulip_adapter.ZulipOperationError("unauthorized_account", False)
-        generation = int(resource["generation"])
-        envelope = typing.cast(dict[str, object], resource["credential_envelope"])
-        account_credentials = self.decryptor.decrypt(
-            account_uuid,
-            str(resource["owner_user_uuid"]),
-            generation,
-            envelope,
-        )
+        try:
+            generation = int(resource["generation"])
+            if generation < 1:
+                raise ValueError("Account generation must be positive")
+            envelope = typing.cast(dict[str, object], resource["credential_envelope"])
+            associated_data = typing.cast(
+                dict[str, object], envelope["associated_data"]
+            )
+            credential_generation = associated_data["account_generation"]
+            if (
+                isinstance(credential_generation, bool)
+                or not isinstance(credential_generation, int)
+                or credential_generation < 1
+                or credential_generation > generation
+            ):
+                raise ValueError("Invalid credential account generation")
+            account_credentials = self.decryptor.decrypt(
+                account_uuid,
+                str(resource["owner_user_uuid"]),
+                credential_generation,
+                envelope,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise zulip_adapter.ZulipOperationError(
+                "unauthorized_account", False
+            ) from exc
         account_credentials = dataclasses.replace(
             account_credentials,
             cert_bundle=self._cert_bundle(),
@@ -174,12 +193,9 @@ class BridgeService:
         provider_poll_interval_seconds: float = 2.0,
         provider_lease_seconds: int = 300,
         provider_batch_size: int = 20,
-        provider_poll_workers: int = 16,
     ):
         if provider_client is None:
             raise ValueError("Provider API client is required")
-        if not 1 <= provider_poll_workers <= 64:
-            raise ValueError("Provider poll worker count must be between 1 and 64")
         self.store = store
         self.control = control_client
         self.scheduler = operation_scheduler
@@ -196,13 +212,19 @@ class BridgeService:
         self.provider_poll_interval_seconds = provider_poll_interval_seconds
         self.provider_lease_seconds = provider_lease_seconds
         self.provider_batch_size = provider_batch_size
-        self.provider_poll_workers = provider_poll_workers
         self.provider_lease_request_uuid: uuid.UUID | None = None
         self.last_control = 0.0
         self.last_heartbeat = 0.0
         self.last_certificate_check = 0.0
         self.last_provider_poll = 0.0
         self.last_history_quantum = time.monotonic()
+        self.provider_poll_threads: dict[str, threading.Thread] = {}
+        self.provider_poll_stops: dict[str, threading.Event] = {}
+        self.provider_poll_results: queue.SimpleQueue[
+            tuple[str, int, zulip_adapter.ZulipOperationError | None]
+        ] = queue.SimpleQueue()
+        self.provider_failed_accounts: set[str] = set()
+        self.provider_successful_accounts: set[str] = set()
         self.provider_retry_attempts: dict[str, int] = {}
         self.provider_retry_after: dict[str, float] = {}
         self.provider_random = random.Random()
@@ -479,15 +501,23 @@ class BridgeService:
         return sent
 
     def _poll_provider_account(
-        self, account_uuid: str
+        self,
+        account_uuid: str,
+        adapter: zulip_adapter.OfficialZulipAdapter | None = None,
     ) -> tuple[int, zulip_adapter.ZulipOperationError | None]:
-        """Poll one account with an adapter owned only by this worker call."""
-        adapter = None
+        """Perform one queue long-poll using an account-thread-owned adapter."""
         try:
-            adapter = self.provider_adapters(account_uuid)
+            if adapter is None:
+                adapter = self.provider_adapters(account_uuid)
             cursor = self.store.provider_event_cursor(account_uuid)
             if cursor is None:
                 queue_id, last_event_id = adapter.ensure_queue()
+                # Persist the queue before catalog, participant, or history work.
+                # A restart can then resume the same queue instead of opening a
+                # gap while the initial synchronization is still in progress.
+                self.store.update_provider_event_cursor(
+                    account_uuid, queue_id, last_event_id
+                )
                 registration = adapter.take_registration_snapshot()
                 if registration is not None:
                     self._queue_registration_reports(
@@ -495,22 +525,11 @@ class BridgeService:
                         registration,
                         getattr(adapter, "server_url", ""),
                     )
-                catchup_ready = self._run_provider_queue_catchup(account_uuid, adapter)
-                self._queue_account_report(account_uuid, "backfill")
-                if not catchup_ready:
-                    return 0, None
-                self.store.update_provider_event_cursor(
-                    account_uuid, queue_id, last_event_id
-                )
             else:
                 queue_id = str(cursor["queue_id"])
                 last_event_id = int(cursor["last_event_id"])
                 adapter.restore_queue(queue_id, last_event_id)
             events = adapter.events(queue_id, last_event_id)
-            self._queue_account_report(
-                account_uuid,
-                "live_ready" if self._initial_sync_ready(account_uuid) else "backfill",
-            )
         except zulip_adapter.ZulipOperationError as exc:
             if exc.code == "bad_event_queue_id":
                 self.store.begin_provider_queue_catchup(account_uuid)
@@ -521,48 +540,93 @@ class BridgeService:
         processed = 0
         for event in events:
             event_id = int(event["id"])
-            self.store.record_provider_event(account_uuid, queue_id, event)
-            local_id = event.get("local_message_id")
-            message = event.get("message")
-            if local_id is not None and isinstance(message, dict):
-                provider_message_id = message.get("id")
-                if provider_message_id is not None:
-                    self.scheduler.reconcile_local_echo(
-                        account_uuid,
-                        queue_id,
-                        str(local_id),
-                        str(provider_message_id),
-                    )
+            if event.get("type") != "heartbeat":
+                self.store.record_provider_event(account_uuid, queue_id, event)
+                local_id = event.get("local_message_id")
+                message = event.get("message")
+                if local_id is not None and isinstance(message, dict):
+                    provider_message_id = message.get("id")
+                    if provider_message_id is not None:
+                        self.scheduler.reconcile_local_echo(
+                            account_uuid,
+                            queue_id,
+                            str(local_id),
+                            str(provider_message_id),
+                        )
+                processed += 1
             self.store.update_provider_event_cursor(account_uuid, queue_id, event_id)
-            processed += 1
+        initial_sync_ready = self._initial_sync_ready(account_uuid)
+        self._queue_account_report(
+            account_uuid,
+            "live_ready" if initial_sync_ready else "backfill",
+        )
+        if initial_sync_ready:
+            self._queue_ready_assignment_reports(account_uuid)
         return processed, None
 
+    def _ensure_provider_poll_state(self) -> None:
+        """Initialize account-thread state for normal and lightweight test instances."""
+        if not hasattr(self, "provider_poll_threads"):
+            self.provider_poll_threads = {}
+        if not hasattr(self, "provider_poll_stops"):
+            self.provider_poll_stops = {}
+        if not hasattr(self, "provider_poll_results"):
+            self.provider_poll_results = queue.SimpleQueue()
+        if not hasattr(self, "provider_failed_accounts"):
+            self.provider_failed_accounts = set()
+        if not hasattr(self, "provider_successful_accounts"):
+            self.provider_successful_accounts = set()
+
+    def _run_provider_account_longpoll(
+        self,
+        account_uuid: str,
+        stop: threading.Event,
+    ) -> None:
+        """Continuously capture one account queue outside the main sync thread."""
+        try:
+            adapter = self.provider_adapters(account_uuid)
+            while not stop.is_set():
+                processed, error = self._poll_provider_account(account_uuid, adapter)
+                self.provider_poll_results.put((account_uuid, processed, error))
+                if error is not None:
+                    return
+        except zulip_adapter.ZulipOperationError as exc:
+            self.provider_poll_results.put((account_uuid, 0, exc))
+        except Exception:
+            self.provider_poll_results.put(
+                (
+                    account_uuid,
+                    0,
+                    zulip_adapter.ZulipOperationError(
+                        "provider_poll_failed",
+                        True,
+                    ),
+                )
+            )
+
     def poll_provider_events(self) -> int:
+        """Supervise one persistent long-poll thread for every active account."""
+        self._ensure_provider_poll_state()
         now = time.monotonic()
-        active_accounts = self.store.active_account_uuids()
-        accounts = [
-            account_uuid
-            for account_uuid in active_accounts
-            if self.provider_retry_after.get(account_uuid, 0.0) <= now
-        ]
-        if not accounts:
-            return 0
-        workers = min(getattr(self, "provider_poll_workers", 16), len(accounts))
+        active_accounts = set(self.store.active_account_uuids())
         processed = 0
-        failed = len(accounts) < len(active_accounts)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {
-                executor.submit(self._poll_provider_account, account_uuid): account_uuid
-                for account_uuid in accounts
-            }
-            for future in concurrent.futures.as_completed(futures):
-                account_uuid = futures[future]
-                account_processed, error = future.result()
-                if error is None:
-                    self._clear_provider_retry(account_uuid)
-                    processed += account_processed
-                    continue
-                failed = True
+        while True:
+            try:
+                account_uuid, account_processed, error = (
+                    self.provider_poll_results.get_nowait()
+                )
+            except queue.Empty:
+                break
+            if account_uuid not in active_accounts:
+                continue
+            if error is None:
+                self._clear_provider_retry(account_uuid)
+                self.provider_failed_accounts.discard(account_uuid)
+                self.provider_successful_accounts.add(account_uuid)
+                processed += account_processed
+            else:
+                self.provider_successful_accounts.discard(account_uuid)
+                self.provider_failed_accounts.add(account_uuid)
                 self._defer_provider_account(account_uuid, now)
                 self.store.mark_health("provider", "degraded", error.code)
                 self._queue_account_report(
@@ -570,7 +634,37 @@ class BridgeService:
                     "degraded",
                     error.code,
                 )
-        if not failed:
+
+        for account_uuid, thread in list(self.provider_poll_threads.items()):
+            if account_uuid not in active_accounts:
+                self.provider_poll_stops[account_uuid].set()
+            if not thread.is_alive():
+                thread.join(timeout=0)
+                del self.provider_poll_threads[account_uuid]
+                del self.provider_poll_stops[account_uuid]
+
+        self.provider_failed_accounts.intersection_update(active_accounts)
+        self.provider_successful_accounts.intersection_update(active_accounts)
+        for account_uuid in sorted(active_accounts):
+            if account_uuid in self.provider_poll_threads:
+                continue
+            if self.provider_retry_after.get(account_uuid, 0.0) > now:
+                continue
+            stop = threading.Event()
+            thread = threading.Thread(
+                target=self._run_provider_account_longpoll,
+                args=(account_uuid, stop),
+                name=f"zulip-live-{account_uuid[:8]}-{account_uuid[-4:]}",
+                daemon=True,
+            )
+            self.provider_poll_stops[account_uuid] = stop
+            self.provider_poll_threads[account_uuid] = thread
+            thread.start()
+
+        if not active_accounts or (
+            not self.provider_failed_accounts
+            and active_accounts <= self.provider_successful_accounts
+        ):
             self.store.mark_health("provider", "healthy")
         return processed
 
@@ -644,6 +738,16 @@ class BridgeService:
             safe_error_code=safe_error_code,
         )
 
+    def _queue_ready_assignment_reports(self, account_uuid: str) -> None:
+        for assignment in self.store.assignments_needing_live_report(account_uuid):
+            self._queue_observed_report(
+                "external_chat_assignment",
+                str(assignment["uuid"]),
+                int(assignment["generation"]),
+                "live_ready",
+                "live",
+            )
+
     def _queue_registration_reports(
         self,
         account_uuid: str,
@@ -695,13 +799,37 @@ class BridgeService:
             stream_id = subscription.get("stream_id")
             name = subscription.get("name")
             if isinstance(stream_id, int) and isinstance(name, str) and name:
-                owner = people.get(provider_user_id) if provider_user_id else None
-                channel_participants = (
-                    [self._catalog_participant(owner, True)]
-                    if isinstance(owner, dict)
-                    else []
+                chat_key = f"channel:{stream_id}"
+                assignment_lookup = getattr(
+                    self.store, "assignment_for_provider_chat", None
                 )
-                catalog[f"channel:{stream_id}"] = (
+                assignment = (
+                    assignment_lookup(account_uuid, chat_key)
+                    if assignment_lookup is not None
+                    else None
+                )
+                subscribers = subscription.get("subscribers")
+                participant_ids: set[int] = set()
+                if assignment is not None and bool(assignment.get("selected", True)):
+                    participant_ids.update(
+                        value
+                        for value in (
+                            typing.cast(list[object], subscribers)
+                            if isinstance(subscribers, list)
+                            else []
+                        )
+                        if isinstance(value, int)
+                    )
+                    if isinstance(provider_user_id, int):
+                        participant_ids.add(provider_user_id)
+                channel_participants = [
+                    self._catalog_participant(
+                        people.get(value, {"user_id": value}),
+                        value == provider_user_id,
+                    )
+                    for value in sorted(participant_ids)
+                ]
+                catalog[chat_key] = (
                     "channel",
                     name,
                     channel_participants,
@@ -759,7 +887,92 @@ class BridgeService:
                 server_url,
                 participants=participants,
                 topics=topics,
+                authoritative_participants=True,
             )
+
+    @staticmethod
+    def _projection_participant_ids(
+        assignment: dict[str, object],
+    ) -> set[int]:
+        projection = assignment.get("workspace_projection")
+        if not isinstance(projection, dict):
+            return set()
+        participants = projection.get("participants")
+        if not isinstance(participants, list):
+            return set()
+        result: set[int] = set()
+        for participant in participants:
+            if not isinstance(participant, dict):
+                continue
+            try:
+                result.add(int(str(participant["provider_user_id"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return result
+
+    def _assignment_participants_ready(
+        self,
+        account_uuid: str,
+        chat_key: str,
+        assignment: dict[str, object],
+    ) -> bool:
+        checker = getattr(self.store, "assignment_participants_ready", None)
+        if checker is None:
+            return True
+        return bool(
+            checker(account_uuid, chat_key, int(assignment["generation"]))
+        )
+
+    def refresh_selected_participants_once(self) -> bool:
+        job = self.store.claim_participant_sync()
+        if job is None:
+            return False
+        account_uuid = str(job["account_uuid"])
+        chat_key = str(job["provider_chat_key"])
+        generation = int(job["assignment_generation"])
+        assignment = self.store.assignment_for_provider_chat(account_uuid, chat_key)
+        if (
+            assignment is None
+            or int(assignment["generation"]) != generation
+            or not bool(assignment.get("selected", True))
+            or self.store.provider_event_cursor(account_uuid) is None
+        ):
+            self.store.release_participant_sync(
+                account_uuid, chat_key, generation
+            )
+            return False
+        try:
+            adapter = self.provider_adapters(account_uuid)
+            registration = adapter.channel_catalog(chat_key)
+            self._queue_registration_reports(
+                account_uuid,
+                registration,
+                getattr(adapter, "server_url", ""),
+            )
+        except zulip_adapter.ZulipOperationError as exc:
+            self.store.release_participant_sync(
+                account_uuid, chat_key, generation
+            )
+            self.store.mark_health("provider", "degraded", exc.code)
+            self._queue_account_report(account_uuid, "degraded", exc.code)
+            return False
+        subscription = typing.cast(
+            list[dict[str, object]], registration["subscriptions"]
+        )[0]
+        provider_user_ids = {
+            int(value)
+            for value in typing.cast(list[object], subscription["subscribers"])
+        }
+        provider_user_ids.add(int(registration["user_id"]))
+        ready = provider_user_ids == self._projection_participant_ids(assignment)
+        self.store.complete_participant_sync(
+            account_uuid,
+            chat_key,
+            generation,
+            sorted(provider_user_ids),
+            ready,
+        )
+        return True
 
     @staticmethod
     def _catalog_participant(
@@ -789,10 +1002,15 @@ class BridgeService:
         operation: str = "upsert",
         participants: list[dict[str, object]] | None = None,
         topics: list[dict[str, object]] | None = None,
+        authoritative_participants: bool = False,
     ) -> None:
         if operation == "upsert" and hasattr(self.store, "merge_catalog_topology"):
             participants, topics = self.store.merge_catalog_topology(
-                account_uuid, chat_key, participants or [], topics or []
+                account_uuid,
+                chat_key,
+                participants or [],
+                topics or [],
+                authoritative_participants=authoritative_participants,
             )
         elif operation == "delete" and hasattr(self.store, "delete_catalog_topology"):
             self.store.delete_catalog_topology(account_uuid, chat_key)
@@ -876,41 +1094,6 @@ class BridgeService:
             topics: list[dict[str, object]] = []
             if isinstance(recipient, str):
                 display_name = recipient
-                owner_uuid = str(account["owner_user_uuid"])
-                owner_mapping = self.store.workspace_mapping(
-                    account_uuid, "identity", owner_uuid
-                )
-                if owner_mapping is None:
-                    return
-                owner_metadata = typing.cast(
-                    dict[str, object], owner_mapping["metadata"]
-                )
-                participants.append(
-                    {
-                        "provider_user_id": str(owner_mapping["provider_id"]),
-                        "display_name": str(
-                            owner_metadata.get("display_name", "Workspace owner")
-                        ),
-                        "email": owner_metadata.get("email"),
-                        "avatar_urn": owner_metadata.get("avatar_urn"),
-                        "is_owner": True,
-                    }
-                )
-                sender_id = message.get("sender_id")
-                if isinstance(sender_id, int) and str(sender_id) != str(
-                    owner_mapping["provider_id"]
-                ):
-                    participants.append(
-                        {
-                            "provider_user_id": str(sender_id),
-                            "display_name": str(
-                                message.get("sender_full_name", sender_id)
-                            ),
-                            "email": message.get("sender_email"),
-                            "avatar_urn": None,
-                            "is_owner": False,
-                        }
-                    )
                 subject = message.get("subject")
                 stream_id = message.get("stream_id")
                 if isinstance(stream_id, int) and isinstance(subject, str) and subject:
@@ -937,23 +1120,6 @@ class BridgeService:
                 ]
             else:
                 return
-            known_participants = {
-                str(participant["provider_user_id"]) for participant in participants
-            }
-            for match in converter.MENTION_RE.finditer(str(message.get("content", ""))):
-                provider_user_id = match.group("user_id") or match.group("user_id_only")
-                if provider_user_id is None or provider_user_id in known_participants:
-                    continue
-                participants.append(
-                    {
-                        "provider_user_id": provider_user_id,
-                        "display_name": match.group("name_with_id") or provider_user_id,
-                        "email": None,
-                        "avatar_urn": None,
-                        "is_owner": False,
-                    }
-                )
-                known_participants.add(provider_user_id)
             if display_name:
                 self._queue_catalog_report(
                     account_uuid,
@@ -1046,6 +1212,8 @@ class BridgeService:
         adapter: zulip_adapter.OfficialZulipAdapter,
     ) -> bool:
         """Reconcile one bounded newest-first page before enabling live events."""
+        if not hasattr(self.store, "pending_provider_catchup"):
+            return True
         job = self.store.pending_provider_catchup(account_uuid)
         if job is None:
             return self.store.provider_catchup_ready(account_uuid)
@@ -1074,7 +1242,10 @@ class BridgeService:
         reached_checkpoint = checkpoint is None or any(
             message_id <= checkpoint for message_id in page_ids
         )
-        complete = reached_checkpoint or len(messages) < 100
+        complete = (
+            reached_checkpoint
+            or len(messages) < zulip_adapter.HISTORY_PAGE_SIZE
+        )
 
         unmapped_messages = []
         for message in converter.newest_first(messages):
@@ -1086,6 +1257,14 @@ class BridgeService:
                 unmapped_messages.append(message)
                 continue
             metadata = typing.cast(dict[str, object], mapping["metadata"])
+            workspace_delivery_committed = (
+                mapping.get("convergent_alias") is True
+                or metadata.get("mapping_origin") == "workspace"
+                or metadata.get("workspace_delivery_state") == "committed"
+            )
+            if not workspace_delivery_committed:
+                unmapped_messages.append(message)
+                continue
             provider_content_sha256 = hashlib.sha256(
                 str(message["content"]).encode("utf-8")
             ).hexdigest()
@@ -1127,12 +1306,15 @@ class BridgeService:
             try:
                 self.enqueue_backfill(account_uuid, chat_key, unmapped_messages)
             except ValueError as exc:
-                if str(exc) != "provider_chat_assignment_pending":
+                if str(exc) not in {
+                    "provider_chat_assignment_pending",
+                    "provider_chat_participants_pending",
+                }:
                     raise
                 # Queue recovery can overlap the Workspace control-plane work
-                # that creates stream/topic mappings for a newly selected chat.
-                # Leave the catch-up checkpoint untouched and retry after those
-                # mappings have arrived.
+                # that creates stream/topic mappings or projects the complete
+                # participant set for a newly selected chat. Leave the catch-up
+                # checkpoint untouched and retry after both gates are ready.
                 return False
 
         if complete and checkpoint is not None:
@@ -1171,6 +1353,34 @@ class BridgeService:
             complete,
         )
         return complete and self.store.provider_catchup_ready(account_uuid)
+
+    def run_provider_catchup_once(self) -> bool:
+        store = getattr(self, "store", None)
+        if (
+            store is None
+            or not hasattr(store, "active_account_uuids")
+            or not hasattr(store, "provider_catchup_ready")
+        ):
+            return False
+        for account_uuid in store.active_account_uuids():
+            if store.provider_catchup_ready(account_uuid):
+                continue
+            try:
+                self._run_provider_queue_catchup(
+                    account_uuid,
+                    self.provider_adapters(account_uuid),
+                )
+            except zulip_adapter.ZulipOperationError as exc:
+                self.store.mark_health("provider", "degraded", exc.code)
+                self._queue_account_report(account_uuid, "degraded", exc.code)
+                return False
+            return True
+        return False
+
+    def _run_history_quantum_once(self) -> bool:
+        if self.run_provider_catchup_once():
+            return True
+        return self.run_backfill_once()
 
     def _file_resolver(
         self,
@@ -1228,33 +1438,20 @@ class BridgeService:
         event: dict[str, object],
         delivery_class: str,
     ) -> list[dict[str, object]]:
-        try:
-            return converter.event_records(
-                self.store,
+        return converter.event_records(
+            self.store,
+            account_uuid,
+            queue_id,
+            event,
+            delivery_class,
+            adapter.server_url,
+            self._file_resolver(
+                adapter,
                 account_uuid,
-                queue_id,
-                event,
-                delivery_class,
-                adapter.server_url,
-                self._file_resolver(
-                    adapter,
-                    account_uuid,
-                    external_chat_uuid,
-                    int(event["id"]),
-                ),
-            )
-        except zulip_adapter.ZulipOperationError as exc:
-            if exc.retryable:
-                raise
-            return converter.event_records(
-                self.store,
-                account_uuid,
-                queue_id,
-                event,
-                delivery_class,
-                adapter.server_url,
-                None,
-            )
+                external_chat_uuid,
+                int(event["id"]),
+            ),
+        )
 
     def process_provider_journal(self) -> int:
         processed = 0
@@ -1282,12 +1479,25 @@ class BridgeService:
             except zulip_adapter.ZulipOperationError as exc:
                 self.store.mark_health("provider", "degraded", exc.code)
                 continue
+            supported = str(event["type"]) in supported_types
             try:
                 self._queue_event_catalog(account_uuid, event, adapter.server_url)
                 external_chat_uuid = uuid.UUID(int=0)
                 if event["type"] == "message":
                     message = typing.cast(dict[str, object], event["message"])
                     _, chat_key = converter.provider_chat_reference(message)
+                    assignment_lookup = getattr(
+                        self.store, "assignment_for_provider_chat", None
+                    )
+                    assignment = (
+                        assignment_lookup(account_uuid, chat_key)
+                        if assignment_lookup is not None
+                        else None
+                    )
+                    if assignment is not None and not self._assignment_participants_ready(
+                        account_uuid, chat_key, assignment
+                    ):
+                        raise ValueError("provider_chat_participants_pending")
                     external_chat_uuid = uuid.UUID(
                         converter.stable_entity_uuid(
                             account_uuid, "external_chat", chat_key
@@ -1326,7 +1536,6 @@ class BridgeService:
                     event,
                     "live",
                 )
-                supported = str(event["type"]) in supported_types
             except zulip_adapter.ZulipOperationError as exc:
                 if exc.retryable:
                     self.store.retry_provider_event(
@@ -1334,30 +1543,22 @@ class BridgeService:
                     )
                     self.store.mark_health("provider", "degraded", exc.code)
                     continue
-                try:
-                    records = converter.event_records(
-                        self.store,
-                        account_uuid,
-                        queue_id,
-                        event,
-                        "live",
-                        adapter.server_url,
-                        None,
-                    )
-                    supported = str(event["type"]) in supported_types
-                except (KeyError, TypeError, ValueError):
-                    self.store.mark_provider_event_invalid(
-                        account_uuid, queue_id, event_id, exc.code
-                    )
-                    processed += 1
-                    continue
+                self.store.mark_provider_event_invalid(
+                    account_uuid, queue_id, event_id, exc.code
+                )
+                self.store.mark_health("provider", "degraded", exc.code)
+                processed += 1
+                continue
             except ValueError as exc:
-                if str(exc) == "provider_chat_assignment_pending":
+                if str(exc) in {
+                    "provider_chat_assignment_pending",
+                    "provider_chat_participants_pending",
+                }:
                     self.store.retry_provider_event(
                         account_uuid,
                         queue_id,
                         event_id,
-                        "provider_chat_assignment_pending",
+                        str(exc),
                     )
                     continue
                 if str(exc) == "provider_chat_not_selected":
@@ -1416,10 +1617,16 @@ class BridgeService:
         )
         if assignment is None:
             raise ValueError("provider_chat_assignment_pending")
+        if not self._assignment_participants_ready(
+            account_uuid, provider_chat_key, assignment
+        ):
+            raise ValueError("provider_chat_participants_pending")
         queue_id = (
             f"backfill:{provider_chat_key}:"
             f"{assignment['uuid']}:{assignment['generation']}"
         )
+        topic_cache = getattr(self, "backfill_topic_cache", set())
+        self.backfill_topic_cache = topic_cache
         ordered_messages = converter.newest_first(messages)
         for message in ordered_messages:
             self._queue_event_catalog(
@@ -1450,7 +1657,40 @@ class BridgeService:
                 "backfill",
             )
             for record in records:
-                enqueued += int(self.store.enqueue_workspace_delivery(record, 2))
+                operation = typing.cast(
+                    dict[str, object],
+                    record.get("operation", {}),
+                )
+                topic_cache_key = None
+                if operation.get("kind") == "topic.upsert":
+                    topic_cache_key = (
+                        account_uuid,
+                        str(assignment["uuid"]),
+                        int(assignment["generation"]),
+                        str(operation["entity_uuid"]),
+                    )
+                    if topic_cache_key in topic_cache:
+                        continue
+                try:
+                    enqueued += int(
+                        self.store.enqueue_workspace_delivery(record, 2)
+                    )
+                except ValueError as exc:
+                    if (
+                        str(exc)
+                        != "Operation UUID reused with a different digest"
+                    ):
+                        raise
+                    # A repeated history page can contain the current revision of
+                    # a message whose deterministic backfill operation was already
+                    # accepted from an earlier snapshot. Keep that first operation
+                    # canonical; live queue recovery carries later edits separately.
+                if topic_cache_key is not None:
+                    # Add only after the topic operation is durable (or already
+                    # present with the same deterministic UUID). A process restart
+                    # merely replays one harmless upsert; it can never skip the
+                    # first durable topic projection of an assignment generation.
+                    topic_cache.add(topic_cache_key)
         return enqueued
 
     def run_backfill_once(self) -> bool:
@@ -1487,7 +1727,8 @@ class BridgeService:
             self.store.defer_backfill_job(
                 account_uuid,
                 provider_chat_key,
-                datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=delay),
+                datetime.datetime.now(datetime.UTC)
+                + datetime.timedelta(seconds=delay),
                 exc.code,
             )
             self.store.mark_health("provider", "degraded", exc.code)
@@ -1528,21 +1769,27 @@ class BridgeService:
             self.store.defer_backfill_job(
                 account_uuid,
                 provider_chat_key,
-                datetime.datetime.now(datetime.UTC)
-                + datetime.timedelta(seconds=delay),
+                datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=delay),
                 exc.code,
             )
             self.store.mark_health("provider", "degraded", exc.code)
             return True
         except ValueError as exc:
-            if str(exc) != "provider_chat_assignment_pending":
+            if str(exc) not in {
+                "provider_chat_assignment_pending",
+                "provider_chat_participants_pending",
+            }:
                 raise
             # Selecting a chat and receiving the resulting Workspace stream/topic
             # mappings are separate control-plane steps. Keep the history job
             # pending until those mappings arrive instead of crashing the worker.
             self.store.release_backfill_job(account_uuid, provider_chat_key)
             return False
-        complete = reached_cutoff or len(messages) < 100 or not messages
+        complete = (
+            reached_cutoff
+            or len(messages) < zulip_adapter.HISTORY_PAGE_SIZE
+            or not messages
+        )
         next_anchor = (
             None
             if not messages
@@ -1628,6 +1875,8 @@ class BridgeService:
         progressed |= self._run_heartbeat(now)
         progressed |= self._run_control_poll(now)
         store = getattr(self, "store", None)
+        if store is not None and hasattr(store, "reconcile_participant_sync"):
+            store.reconcile_participant_sync()
         if store is not None and hasattr(store, "reconcile_backfill_jobs"):
             store.reconcile_backfill_jobs()
         live_progressed = False
@@ -1646,6 +1895,8 @@ class BridgeService:
         if now - last_provider_poll >= provider_poll_interval:
             live_progressed |= self.poll_provider_events() > 0
             self.last_provider_poll = now
+        if store is not None and hasattr(store, "claim_participant_sync"):
+            live_progressed |= self.refresh_selected_participants_once()
         if hasattr(self, "store"):
             live_progressed |= self._flush_observed_reports(now) > 0
         live_progressed |= self.process_provider_journal() > 0
@@ -1678,20 +1929,30 @@ class BridgeService:
         if not live_progressed or history_due:
             if history_due:
                 self.last_history_quantum = now
-            progressed |= self.run_backfill_once()
-            # Live work is handled first. One bounded history delivery then
-            # prevents continuous healthy traffic from starving initial sync.
+            # Live work is handled first. Drain a bounded batch that is already
+            # durable before fetching another provider history page. Provider
+            # I/O may take several seconds, so fetching first would otherwise
+            # leave ready messages untouched while the bridge waits on Zulip.
+            history_delivered = 0
+            history_batch_size = max(
+                1,
+                min(int(getattr(self, "provider_batch_size", 20)), 100),
+            )
             try:
-                progressed |= (
-                    self.flush_provider_events(
-                        minimum_priority=2, maximum_priority=2, limit=1
-                    )
-                    > 0
+                history_delivered = self.flush_provider_events(
+                    minimum_priority=2,
+                    maximum_priority=2,
+                    limit=history_batch_size,
                 )
             except (httpx.TransportError, provider_api.ProviderApiRetryableError):
                 self.store.mark_health(
                     "provider_api", "degraded", "provider_api_unavailable"
                 )
+            progressed |= history_delivered > 0
+            # Do not grow an already full delivery backlog. Once a bounded
+            # batch has drained, discover at most one more provider page.
+            if history_delivered < history_batch_size:
+                progressed |= self._run_history_quantum_once()
         self.health_file.parent.mkdir(parents=True, exist_ok=True)
         self.health_file.write_text(
             datetime.datetime.now(datetime.UTC).isoformat(),

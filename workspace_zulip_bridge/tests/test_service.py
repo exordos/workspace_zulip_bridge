@@ -69,7 +69,10 @@ def test_adapter_registry_does_not_retain_decrypted_credentials(monkeypatch):
                 "synchronization_enabled": True,
                 "generation": 7,
                 "owner_user_uuid": "00000000-0000-0000-0000-000000000002",
-                "credential_envelope": {"ciphertext": "opaque"},
+                "credential_envelope": {
+                    "associated_data": {"account_generation": 7},
+                    "ciphertext": "opaque",
+                },
             }
 
     class Decryptor:
@@ -96,6 +99,110 @@ def test_adapter_registry_does_not_retain_decrypted_credentials(monkeypatch):
     assert not hasattr(registry, "cache")
 
 
+def test_adapter_registry_uses_encrypted_credential_generation(monkeypatch):
+    account_uuid = "00000000-0000-0000-0000-000000000001"
+    owner_uuid = "00000000-0000-0000-0000-000000000002"
+    envelope = {
+        "associated_data": {"account_generation": 7},
+        "ciphertext": "opaque",
+    }
+
+    class Store:
+        def provider_is_enabled(self, provider_kind):
+            return True
+
+        def custom_ca_bundle(self, provider_kind):
+            return None
+
+        def desired_resource(self, resource_type, resource_uuid):
+            return {
+                "synchronization_enabled": True,
+                "generation": 8,
+                "owner_user_uuid": owner_uuid,
+                "credential_envelope": envelope,
+            }
+
+    class Decryptor:
+        def __init__(self):
+            self.calls = []
+
+        def decrypt(self, *args):
+            self.calls.append(args)
+            return zulip_adapter.ZulipCredentials("https://zulip.invalid", "e", "k")
+
+    class Adapter:
+        def __init__(self, credentials, **kwargs):
+            pass
+
+    monkeypatch.setattr(zulip_adapter, "OfficialZulipAdapter", Adapter)
+    decryptor = Decryptor()
+    service.AdapterRegistry(Store(), decryptor)(account_uuid)
+
+    assert decryptor.calls == [(account_uuid, owner_uuid, 7, envelope)]
+
+
+@pytest.mark.parametrize(
+    "credential_generation",
+    [0, 8, True, "7"],
+)
+def test_adapter_registry_rejects_invalid_credential_generation(
+    monkeypatch, credential_generation
+):
+    class Store:
+        def provider_is_enabled(self, provider_kind):
+            return True
+
+        def desired_resource(self, resource_type, resource_uuid):
+            return {
+                "synchronization_enabled": True,
+                "generation": 7,
+                "owner_user_uuid": "00000000-0000-0000-0000-000000000002",
+                "credential_envelope": {
+                    "associated_data": {
+                        "account_generation": credential_generation,
+                    }
+                },
+            }
+
+    class Decryptor:
+        def decrypt(self, *args):
+            raise AssertionError("invalid credential generation must fail closed")
+
+    registry = service.AdapterRegistry(Store(), Decryptor())
+    with pytest.raises(zulip_adapter.ZulipOperationError) as error:
+        registry("00000000-0000-0000-0000-000000000001")
+
+    assert error.value.code == "unauthorized_account"
+    assert not error.value.retryable
+
+
+def test_adapter_registry_isolates_credential_decryption_failure():
+    class Store:
+        def provider_is_enabled(self, provider_kind):
+            return True
+
+        def desired_resource(self, resource_type, resource_uuid):
+            return {
+                "synchronization_enabled": True,
+                "generation": 7,
+                "owner_user_uuid": "00000000-0000-0000-0000-000000000002",
+                "credential_envelope": {
+                    "associated_data": {"account_generation": 7},
+                },
+            }
+
+    class Decryptor:
+        def decrypt(self, *args):
+            raise ValueError("Credential associated data mismatch")
+
+    registry = service.AdapterRegistry(Store(), Decryptor())
+    with pytest.raises(zulip_adapter.ZulipOperationError) as error:
+        registry("00000000-0000-0000-0000-000000000001")
+
+    assert error.value.code == "unauthorized_account"
+    assert not error.value.retryable
+
+
 def test_adapter_registry_combines_system_and_managed_provider_ca(
     tmp_path, monkeypatch
 ):
@@ -118,7 +225,7 @@ def test_adapter_registry_combines_system_and_managed_provider_ca(
                 "synchronization_enabled": True,
                 "generation": 1,
                 "owner_user_uuid": "00000000-0000-0000-0000-000000000002",
-                "credential_envelope": {},
+                "credential_envelope": {"associated_data": {"account_generation": 1}},
             }
 
     class Decryptor:
@@ -218,8 +325,11 @@ def test_control_snapshot_resource_guard_preserves_installed_state(monkeypatch):
     assert store.installed == [([{"uuid": "old"}], "old-anchor")]
 
 
-def test_retryable_provider_error_defers_only_failing_account(monkeypatch):
+def test_retryable_longpoll_error_defers_only_failing_account(monkeypatch):
     accounts = ["account-a", "account-b"]
+    healthy_started = threading.Event()
+    healthy_release = threading.Event()
+    healthy_stop_release = threading.Event()
 
     class Store:
         def __init__(self):
@@ -248,6 +358,7 @@ def test_retryable_provider_error_defers_only_failing_account(monkeypatch):
     class Adapter:
         def __init__(self, account_uuid):
             self.account_uuid = account_uuid
+            self.calls = 0
 
         def restore_queue(self, queue_id, last_event_id):
             return None
@@ -255,7 +366,13 @@ def test_retryable_provider_error_defers_only_failing_account(monkeypatch):
         def events(self, queue_id, last_event_id):
             if self.account_uuid == "account-a":
                 raise zulip_adapter.ZulipOperationError("provider_unavailable", True)
-            return [{"id": 5, "type": "realm_user"}]
+            self.calls += 1
+            if self.calls == 1:
+                healthy_started.set()
+                assert healthy_release.wait(timeout=2)
+                return [{"id": 5, "type": "realm_user"}]
+            assert healthy_stop_release.wait(timeout=2)
+            return [{"id": 6, "type": "heartbeat"}]
 
     class FixedRandom:
         def uniform(self, lower, upper):
@@ -272,22 +389,34 @@ def test_retryable_provider_error_defers_only_failing_account(monkeypatch):
     instance.provider_random = FixedRandom()
     monkeypatch.setattr(time, "monotonic", lambda: 100.0)
 
+    assert instance.poll_provider_events() == 0
+    assert set(instance.provider_poll_threads) == set(accounts)
+    assert {
+        thread.name for thread in instance.provider_poll_threads.values()
+    } == {"zulip-live-account--nt-a", "zulip-live-account--nt-b"}
+    assert healthy_started.wait(timeout=1)
+    healthy_release.set()
+    deadline = time.time() + 1
+    while len(instance.store.recorded) < 1 and time.time() < deadline:
+        time.sleep(0.01)
+    deadline = time.time() + 1
+    while not instance.provider_poll_results.qsize() and time.time() < deadline:
+        time.sleep(0.01)
     assert instance.poll_provider_events() == 1
     assert instance.store.recorded == [("account-b", "queue-account-b", 5)]
     assert instance.provider_retry_attempts == {"account-a": 1}
     assert instance.provider_retry_after["account-a"] > 100.0
 
-    assert instance.poll_provider_events() == 1
-    assert instance.provider_retry_attempts == {"account-a": 1}
-    assert instance.store.recorded == [
-        ("account-b", "queue-account-b", 5),
-        ("account-b", "queue-account-b", 5),
-    ]
-    assert ("provider", "healthy", None) not in instance.store.health
+    instance.provider_poll_stops["account-b"].set()
+    healthy_stop_release.set()
+    instance.provider_poll_threads["account-b"].join(timeout=1)
+    assert not instance.provider_poll_threads["account-b"].is_alive()
 
 
-def test_empty_successful_provider_poll_recovers_health():
+def test_empty_successful_longpoll_recovers_health():
     account_uuid = "00000000-0000-4000-8000-000000000001"
+    first_returned = threading.Event()
+    stop_release = threading.Event()
 
     class Store:
         def __init__(self):
@@ -308,10 +437,18 @@ def test_empty_successful_provider_poll_recovers_health():
             self.health.append((component, status, code))
 
     class Adapter:
+        def __init__(self):
+            self.calls = 0
+
         def restore_queue(self, queue_id, last_event_id):
             assert (queue_id, last_event_id) == ("queue", -1)
 
         def events(self, queue_id, last_event_id):
+            self.calls += 1
+            if self.calls == 1:
+                first_returned.set()
+                return []
+            assert stop_release.wait(timeout=2)
             return []
 
     instance = object.__new__(service.BridgeService)
@@ -327,96 +464,138 @@ def test_empty_successful_provider_poll_recovers_health():
     )()
 
     assert instance.poll_provider_events() == 0
+    assert first_returned.wait(timeout=1)
+    deadline = time.time() + 1
+    while not instance.provider_poll_results.qsize() and time.time() < deadline:
+        time.sleep(0.01)
+    assert instance.poll_provider_events() == 0
     assert instance.provider_retry_attempts == {}
     assert instance.provider_retry_after == {}
     assert instance.store.health == [("provider", "healthy", None)]
+    instance.provider_poll_stops[account_uuid].set()
+    stop_release.set()
+    instance.provider_poll_threads[account_uuid].join(timeout=1)
 
 
-def test_adapter_connection_failure_degrades_only_affected_account(monkeypatch):
-    failed_account = "00000000-0000-4000-8000-000000000001"
-    healthy_account = "00000000-0000-4000-8000-000000000002"
+def test_live_event_is_persisted_before_incomplete_queue_catchup():
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+    calls = []
 
     class Store:
-        def __init__(self):
-            self.recorded = []
-            self.reports = []
-            self.health = []
+        def account_resource(self, requested):
+            assert requested == account_uuid
+            return None
 
-        def active_account_uuids(self):
-            return [failed_account, healthy_account]
+        def provider_event_cursor(self, requested):
+            assert requested == account_uuid
+            return {"queue_id": "queue", "last_event_id": 4}
 
+        def record_provider_event(self, requested, queue_id, event):
+            calls.append(("record", requested, queue_id, event["id"]))
+
+        def update_provider_event_cursor(self, requested, queue_id, event_id):
+            calls.append(("cursor", requested, queue_id, event_id))
+
+    class Adapter:
+        def restore_queue(self, queue_id, last_event_id):
+            calls.append(("restore", queue_id, last_event_id))
+
+        def events(self, queue_id, last_event_id):
+            calls.append(("events", queue_id, last_event_id))
+            return [{"id": 5, "type": "realm_user"}]
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance.provider_adapters = lambda requested: Adapter()
+    instance.scheduler = type(
+        "Scheduler", (), {"reconcile_local_echo": lambda *args: None}
+    )()
+    instance._run_provider_queue_catchup = (
+        lambda requested, adapter: calls.append(("catchup", requested)) or False
+    )
+    instance._queue_account_report = (
+        lambda requested, status: calls.append(("report", requested, status))
+    )
+
+    assert instance._poll_provider_account(account_uuid) == (1, None)
+    assert calls == [
+        ("restore", "queue", 4),
+        ("events", "queue", 4),
+        ("record", account_uuid, "queue", 5),
+        ("cursor", account_uuid, "queue", 5),
+        ("report", account_uuid, "backfill"),
+    ]
+
+
+def test_heartbeat_advances_cursor_without_journaling_an_operation():
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+    calls = []
+
+    class Store:
+        def account_resource(self, requested):
+            return None
+
+        def provider_event_cursor(self, requested):
+            return {"queue_id": "queue", "last_event_id": 4}
+
+        def record_provider_event(self, *args):
+            calls.append(("record", args))
+
+        def update_provider_event_cursor(self, requested, queue_id, event_id):
+            calls.append(("cursor", requested, queue_id, event_id))
+
+    class Adapter:
+        def restore_queue(self, queue_id, last_event_id):
+            return None
+
+        def events(self, queue_id, last_event_id):
+            return [{"id": 5, "type": "heartbeat"}]
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance.provider_adapters = lambda requested: Adapter()
+
+    assert instance._poll_provider_account(account_uuid) == (0, None)
+    assert calls == [("cursor", account_uuid, "queue", 5)]
+
+
+def test_adapter_connection_failure_is_reported_from_account_poll(monkeypatch):
+    failed_account = "00000000-0000-4000-8000-000000000001"
+
+    class Store:
         def provider_event_cursor(self, account_uuid):
             return {"queue_id": f"queue-{account_uuid}", "last_event_id": 4}
 
         def account_resource(self, account_uuid):
-            if account_uuid == failed_account:
-                return {"generation": 7}
             return None
-
-        def record_provider_event(self, account_uuid, queue_id, event):
-            self.recorded.append((account_uuid, queue_id, event["id"]))
-
-        def update_provider_event_cursor(self, account_uuid, queue_id, event_id):
-            return None
-
-        def enqueue_observed_report(self, report):
-            self.reports.append(report)
-
-        def mark_health(self, component, status, code=None):
-            self.health.append((component, status, code))
 
     class UnreachableClient:
         def __init__(self, **kwargs):
             raise zulip_adapter.zulip.UnrecoverableNetworkError("offline")
 
-    class HealthyAdapter:
-        def restore_queue(self, queue_id, last_event_id):
-            return None
-
-        def events(self, queue_id, last_event_id):
-            return [{"id": 5, "type": "realm_user"}]
-
-    def adapter_factory(account_uuid):
-        if account_uuid == failed_account:
-            return zulip_adapter.OfficialZulipAdapter(
-                credentials=zulip_adapter.ZulipCredentials(
-                    "https://unresolvable.example.invalid",
-                    "user@example.invalid",
-                    "opaque-api-key",
-                )
-            )
-        return HealthyAdapter()
-
     instance = object.__new__(service.BridgeService)
     instance.store = Store()
-    instance.provider_adapters = adapter_factory
-    instance.scheduler = type(
-        "Scheduler", (), {"reconcile_local_echo": lambda *args: None}
-    )()
-    instance.provider_retry_attempts = {}
-    instance.provider_retry_after = {}
-    instance.provider_random = type(
-        "Random", (), {"uniform": lambda self, lower, upper: upper}
-    )()
-    monkeypatch.setattr(zulip_adapter.zulip, "Client", UnreachableClient)
-    monkeypatch.setattr(time, "monotonic", lambda: 100.0)
-
-    assert instance.poll_provider_events() == 1
-    assert instance.store.recorded == [
-        (healthy_account, f"queue-{healthy_account}", 5)
-    ]
-    assert instance.provider_retry_attempts == {failed_account: 1}
-    assert instance.provider_retry_after[failed_account] > 100.0
-    assert len(instance.store.reports) == 1
-    assert instance.store.reports[0]["resource_uuid"] == failed_account
-    assert instance.store.reports[0]["status"] == "degraded"
-    assert instance.store.reports[0]["safe_error"]["code"] == (
-        "provider_unavailable"
+    instance.provider_adapters = lambda account_uuid: (
+        zulip_adapter.OfficialZulipAdapter(
+            credentials=zulip_adapter.ZulipCredentials(
+                "https://unresolvable.example.invalid",
+                "user@example.invalid",
+                "opaque-api-key",
+            )
+        )
     )
+    monkeypatch.setattr(zulip_adapter.zulip, "Client", UnreachableClient)
+
+    processed, error = instance._poll_provider_account(failed_account)
+    assert processed == 0
+    assert error is not None
+    assert error.code == "provider_unavailable"
 
 
-def test_150_account_poll_is_bounded_by_worker_pool_not_serial_latency():
-    accounts = [str(uuid.UUID(int=index + 1)) for index in range(150)]
+def test_each_active_account_gets_a_dedicated_longpoll_thread():
+    accounts = [str(uuid.UUID(int=index + 1)) for index in range(3)]
+    started = {account_uuid: threading.Event() for account_uuid in accounts}
+    release = threading.Event()
 
     class Store:
         def active_account_uuids(self):
@@ -431,46 +610,45 @@ def test_150_account_poll_is_bounded_by_worker_pool_not_serial_latency():
         def mark_health(self, *args):
             return None
 
-    active = 0
-    maximum_active = 0
     adapters = []
-    lock = threading.Lock()
 
     class Adapter:
-        def __init__(self):
-            adapters.append(self)
+        def __init__(self, account_uuid):
+            self.account_uuid = account_uuid
+            adapters.append((account_uuid, self))
 
         def restore_queue(self, queue_id, last_event_id):
             return None
 
         def events(self, queue_id, last_event_id):
-            nonlocal active, maximum_active
-            with lock:
-                active += 1
-                maximum_active = max(maximum_active, active)
-            time.sleep(0.04)
-            with lock:
-                active -= 1
-            return []
+            started[self.account_uuid].set()
+            assert release.wait(timeout=2)
+            return [{"id": 1, "type": "heartbeat"}]
 
     instance = object.__new__(service.BridgeService)
     instance.store = Store()
-    instance.provider_adapters = lambda account_uuid: Adapter()
-    instance.provider_poll_workers = 16
+    instance.provider_adapters = Adapter
     instance.provider_retry_attempts = {}
     instance.provider_retry_after = {}
     instance.provider_random = type(
         "Random", (), {"uniform": lambda self, lower, upper: lower}
     )()
 
-    started = time.monotonic()
     assert instance.poll_provider_events() == 0
-    elapsed = time.monotonic() - started
-
-    assert maximum_active == 16
+    assert all(event.wait(timeout=1) for event in started.values())
+    assert set(instance.provider_poll_threads) == set(accounts)
+    assert len({thread.ident for thread in instance.provider_poll_threads.values()}) == 3
+    assert all(
+        thread.name == f"zulip-live-{account_uuid[:8]}-{account_uuid[-4:]}"
+        for account_uuid, thread in instance.provider_poll_threads.items()
+    )
     assert len(adapters) == len(accounts)
-    assert len({id(adapter) for adapter in adapters}) == len(accounts)
-    assert elapsed < 5.0
+    assert len({id(adapter) for _, adapter in adapters}) == len(accounts)
+    for stop in instance.provider_poll_stops.values():
+        stop.set()
+    release.set()
+    for thread in instance.provider_poll_threads.values():
+        thread.join(timeout=1)
 
 
 class DeliveryStore:
@@ -542,6 +720,7 @@ class CatchupStore(DeliveryStore):
             "author_uuid": "00000000-0000-0000-0000-000000000005",
             "chat_key": "channel:42",
             "subject": "Topic",
+            "workspace_delivery_state": "committed",
         }
         self.mappings = {
             "10": {
@@ -636,6 +815,34 @@ def test_provider_journal_enqueues_live_before_marking_event(monkeypatch):
     assert store.processed == [
         ("00000000-0000-0000-0000-000000000001", "queue", 7, True)
     ]
+
+
+def test_unselected_provider_event_is_finalized_without_crashing(monkeypatch):
+    account_uuid = "00000000-0000-0000-0000-000000000001"
+    store = DeliveryStore(
+        [
+            {
+                "account_uuid": account_uuid,
+                "queue_id": "queue",
+                "event_id": 7,
+                "body": {"id": 7, "type": "realm_user", "person": {}},
+            }
+        ]
+    )
+    instance = _delivery_service(store)
+
+    def reject_unselected(*_args, **_kwargs):
+        raise ValueError("provider_chat_not_selected")
+
+    monkeypatch.setattr(
+        instance,
+        "_event_records_with_file_fallback",
+        reject_unselected,
+    )
+
+    assert instance.process_provider_journal() == 1
+    assert store.enqueued == []
+    assert store.processed == [(account_uuid, "queue", 7, True)]
 
 
 def test_provider_journal_waits_for_assignment_bound_delivery(monkeypatch):
@@ -891,7 +1098,13 @@ def test_registration_snapshot_queues_account_live_ready_and_chat_catalog_report
                     "email": "other@example.invalid",
                 },
             ],
-            "subscriptions": [{"stream_id": 42, "name": "Engineering"}],
+            "subscriptions": [
+                {
+                    "stream_id": 42,
+                    "name": "Engineering",
+                    "subscribers": [1, 2],
+                }
+            ],
             "recent_private_conversations": [{"user_ids": [2], "max_message_id": 99}],
         },
         "https://zulip.example.invalid",
@@ -926,6 +1139,7 @@ def test_registration_snapshot_queues_account_live_ready_and_chat_catalog_report
     )
     assert channel["catalog"]["source"]["original_url"].endswith("/#narrow/channel/42")
     assert direct["catalog"]["source"]["original_url"].endswith("/#narrow/dm/1,2-dm")
+    assert channel["catalog"]["participants"] == []
     assert channel["catalog"]["capabilities"]["messenger.stream.rename"]["available"]
     assert "messenger.stream.rename" not in direct["catalog"]["capabilities"]
     assert set(channel["catalog"]["source"]) == {
@@ -966,6 +1180,160 @@ def test_registration_snapshot_queues_account_live_ready_and_chat_catalog_report
         assert report["resource_uuid"] == expected
 
 
+@pytest.mark.parametrize(
+    ("projected_user_ids", "expected_ready"),
+    [(["1"], False), (["1", "2"], True)],
+)
+def test_selected_channel_participants_gate_messages_until_projection_matches(
+    projected_user_ids, expected_ready
+):
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+    owner_uuid = "00000000-0000-4000-8000-000000000002"
+    project_uuid = "00000000-0000-4000-8000-000000000003"
+    assignment = {
+        "uuid": "00000000-0000-4000-8000-000000000004",
+        "generation": 3,
+        "selected": True,
+        "workspace_projection": {
+            "participants": [
+                {"provider_user_id": user_id} for user_id in projected_user_ids
+            ]
+        },
+    }
+
+    class Store:
+        def __init__(self):
+            self.reports = []
+            self.completed = []
+
+        def claim_participant_sync(self):
+            return {
+                "account_uuid": account_uuid,
+                "provider_chat_key": "channel:42",
+                "assignment_generation": 3,
+            }
+
+        def assignment_for_provider_chat(self, requested, chat_key):
+            assert (requested, chat_key) == (account_uuid, "channel:42")
+            return assignment
+
+        def provider_event_cursor(self, requested):
+            return {"queue_id": "queue", "last_event_id": 7}
+
+        def account_resource(self, requested):
+            return {
+                "generation": 2,
+                "owner_user_uuid": owner_uuid,
+                "settings": {
+                    "selection_mode": "manual",
+                    "default_project_id": project_uuid,
+                },
+            }
+
+        def enqueue_observed_report(self, report):
+            self.reports.append(report)
+            return True
+
+        def remember_provider_mapping(self, *args):
+            return None
+
+        def complete_participant_sync(self, *args):
+            self.completed.append(args)
+
+        def release_participant_sync(self, *args):
+            raise AssertionError("valid participant synchronization was released")
+
+        def mark_health(self, *args):
+            return None
+
+    class Adapter:
+        server_url = "https://zulip.example.invalid"
+
+        def channel_catalog(self, chat_key):
+            assert chat_key == "channel:42"
+            return {
+                "user_id": 1,
+                "realm_users": [
+                    {"user_id": 1, "full_name": "Owner"},
+                    {"user_id": 2, "full_name": "Other User"},
+                ],
+                "subscriptions": [
+                    {
+                        "stream_id": 42,
+                        "name": "Engineering",
+                        "subscribers": [1, 2],
+                    }
+                ],
+            }
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance.provider_adapters = lambda requested: Adapter()
+
+    assert instance.refresh_selected_participants_once()
+    assert instance.store.completed == [
+        (account_uuid, "channel:42", 3, [1, 2], expected_ready)
+    ]
+    catalog = instance.store.reports[0]["catalog"]
+    assert {
+        participant["provider_user_id"]
+        for participant in catalog["participants"]
+    } == {"1", "2"}
+
+
+def test_live_message_waits_for_selected_channel_participant_projection():
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+
+    class Store(DeliveryStore):
+        def assignment_participants_ready(self, *args):
+            return False
+
+    store = Store(
+        [
+            {
+                "account_uuid": account_uuid,
+                "queue_id": "queue",
+                "event_id": 7,
+                "body": {
+                    "id": 7,
+                    "type": "message",
+                    "message": {
+                        "id": 70,
+                        "type": "stream",
+                        "stream_id": 42,
+                    },
+                },
+            }
+        ]
+    )
+
+    assert _delivery_service(store).process_provider_journal() == 0
+    assert store.retried == [
+        (
+            account_uuid,
+            "queue",
+            7,
+            "provider_chat_participants_pending",
+        )
+    ]
+    assert store.enqueued == []
+
+
+def test_backfill_waits_for_selected_channel_participant_projection():
+    class Store(DeliveryStore):
+        def assignment_participants_ready(self, *args):
+            return False
+
+    instance = _delivery_service(Store())
+
+    with pytest.raises(ValueError, match="provider_chat_participants_pending"):
+        instance.enqueue_backfill(
+            "00000000-0000-4000-8000-000000000001",
+            "channel:42",
+            [{"id": 7, "timestamp": 7}],
+        )
+
+
 def test_catalog_reports_accumulate_full_replacement_topology():
     class Store:
         def __init__(self):
@@ -973,7 +1341,17 @@ def test_catalog_reports_accumulate_full_replacement_topology():
             self.topics = {}
             self.reports = []
 
-        def merge_catalog_topology(self, _account, _chat, participants, topics):
+        def merge_catalog_topology(
+            self,
+            _account,
+            _chat,
+            participants,
+            topics,
+            *,
+            authoritative_participants=False,
+        ):
+            if authoritative_participants:
+                self.participants = {}
             self.participants.update(
                 (value["provider_user_id"], value) for value in participants
             )
@@ -1033,6 +1411,71 @@ def test_catalog_reports_accumulate_full_replacement_topology():
     }
 
 
+def test_channel_message_catalog_does_not_turn_authors_or_mentions_into_members():
+    class Store:
+        def __init__(self):
+            self.reports = []
+            self.merge_calls = []
+
+        def account_resource(self, _account_uuid):
+            return {
+                "owner_user_uuid": "10000000-0000-4000-8000-000000000001",
+                "generation": 1,
+                "settings": {
+                    "default_project_id": "10000000-0000-4000-8000-000000000002"
+                },
+            }
+
+        def merge_catalog_topology(
+            self,
+            _account,
+            _chat,
+            participants,
+            topics,
+            *,
+            authoritative_participants=False,
+        ):
+            self.merge_calls.append(
+                (participants, topics, authoritative_participants)
+            )
+            return participants, topics
+
+        def enqueue_observed_report(self, report):
+            self.reports.append(report)
+            return True
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance._queue_event_catalog(
+        "10000000-0000-4000-8000-000000000003",
+        {
+            "type": "message",
+            "message": {
+                "type": "stream",
+                "stream_id": 42,
+                "display_recipient": "Engineering",
+                "subject": "General",
+                "sender_id": 2,
+                "sender_full_name": "Former Member",
+                "sender_email": "former@example.test",
+                "content": "Hello @_**Unrelated User|3**",
+            },
+        },
+        "https://zulip.example.invalid",
+    )
+
+    participants, topics, authoritative = instance.store.merge_calls[0]
+    assert participants == []
+    assert topics == [
+        {
+            "provider_topic_id": "42:General",
+            "name": "General",
+            "is_default": False,
+        }
+    ]
+    assert authoritative is False
+
+
 def test_catalog_original_urls_follow_zulip_dm_permalink_shapes():
     site = "https://zulip.example.invalid"
     assert service.BridgeService._catalog_original_url(site, "direct:1,2") == (
@@ -1066,6 +1509,7 @@ def test_first_provider_poll_processes_registration_and_reports_live_ready():
             return True
 
         def pending_provider_catchup(self, requested):
+            assert self.cursor == {"queue_id": "queue", "last_event_id": 10}
             return None
 
         def update_provider_event_cursor(self, requested, queue_id, event_id):
@@ -1099,6 +1543,16 @@ def test_first_provider_poll_processes_registration_and_reports_live_ready():
 
         def initial_backfill_ready(self, requested):
             return self.ready
+
+        def assignments_needing_live_report(self, requested):
+            if not self.ready:
+                return []
+            return [
+                {
+                    "uuid": "00000000-0000-4000-8000-000000000042",
+                    "generation": 5,
+                }
+            ]
 
         def mark_health(self, *args):
             return None
@@ -1135,7 +1589,7 @@ def test_first_provider_poll_processes_registration_and_reports_live_ready():
         "Random", (), {"uniform": lambda self, lower, upper: lower}
     )()
 
-    assert instance.poll_provider_events() == 0
+    assert instance._poll_provider_account(account_uuid) == (0, None)
     assert instance.store.cursor == {"queue_id": "queue", "last_event_id": 10}
     assert {report["resource_type"] for report in instance.store.reports} == {
         "external_account",
@@ -1149,13 +1603,24 @@ def test_first_provider_poll_processes_registration_and_reports_live_ready():
     assert account_report["status"] == "backfill"
 
     instance.store.ready = True
-    assert instance.poll_provider_events() == 0
+    assert instance._poll_provider_account(account_uuid) == (0, None)
     account_report = [
         report
         for report in instance.store.reports
         if report["resource_type"] == "external_account"
     ][-1]
     assert account_report["status"] == "live_ready"
+    assignment_report = next(
+        report
+        for report in instance.store.reports
+        if report["resource_type"] == "external_chat_assignment"
+    )
+    assert assignment_report["resource_uuid"] == (
+        "00000000-0000-4000-8000-000000000042"
+    )
+    assert assignment_report["observed_generation"] == 5
+    assert assignment_report["status"] == "live_ready"
+    assert assignment_report["progress"]["phase"] == "live"
 
 
 def test_live_ready_requires_catalog_assignment_and_initial_backfill_gates():
@@ -1244,6 +1709,8 @@ def test_tick_reconciles_global_backfill_state_once_not_once_per_account(
     instance.last_history_quantum = now
     instance.health_file = tmp_path / "progress"
     instance.scheduler = Scheduler()
+    instance._run_heartbeat = lambda current: False
+    instance._run_control_poll = lambda current: False
     instance.poll_provider_operations = lambda: 0
     instance.poll_provider_events = lambda: (
         sum(instance._initial_sync_ready(account_uuid) for _index in range(150)) * 0
@@ -1462,7 +1929,7 @@ def test_incoming_update_file_reuses_mapped_message_external_chat_uuid(monkeypat
     )
 
 
-def test_permanent_attachment_failure_uses_loss_aware_fallback(monkeypatch):
+def test_permanent_attachment_failure_does_not_enqueue_broken_fallback(monkeypatch):
     account_uuid = "00000000-0000-0000-0000-000000000001"
     store = DeliveryStore(
         [
@@ -1481,17 +1948,18 @@ def test_permanent_attachment_failure_uses_loss_aware_fallback(monkeypatch):
     instance = _delivery_service(store)
     instance.file_client = object()
 
-    def records(*args, **kwargs):
-        if args[6] is not None:
-            raise zulip_adapter.ZulipOperationError("provider_file_too_large", False)
-        return [{"record_uuid": "fallback-record"}]
-
-    monkeypatch.setattr(converter, "event_records", records)
+    monkeypatch.setattr(
+        converter,
+        "event_records",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            zulip_adapter.ZulipOperationError("provider_file_too_large", False)
+        ),
+    )
     assert instance.process_provider_journal() == 1
     assert store.retried == []
-    assert store.invalid == []
-    assert store.enqueued == [({"record_uuid": "fallback-record"}, 0)]
-    assert store.processed == [(account_uuid, "queue", 7, True)]
+    assert store.invalid == [(account_uuid, "queue", 7, "provider_file_too_large")]
+    assert store.enqueued == []
+    assert store.processed == []
 
 
 @pytest.mark.parametrize(
@@ -1578,7 +2046,106 @@ def test_backfill_is_discovered_newest_first_and_queued_at_priority_two(
     }
 
 
-def test_backfill_uses_loss_aware_fallback_for_unavailable_attachment(monkeypatch):
+def test_backfill_keeps_first_accepted_digest_for_repeated_history(monkeypatch):
+    class Store(DeliveryStore):
+        def __init__(self):
+            super().__init__()
+            self.attempted = []
+
+        def enqueue_workspace_delivery(self, record, priority):
+            self.attempted.append((record, priority))
+            if record["operation_uuid"] == "operation-2":
+                raise ValueError("Operation UUID reused with a different digest")
+            return True
+
+    store = Store()
+
+    monkeypatch.setattr(
+        converter,
+        "event_records",
+        lambda *args, **kwargs: [
+            {
+                "record_uuid": f"record-{args[3]['message']['id']}",
+                "operation_uuid": f"operation-{args[3]['message']['id']}",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        converter, "provider_chat_reference", lambda message: ("channel", "channel:42")
+    )
+
+    assert (
+        _delivery_service(store).enqueue_backfill(
+            "00000000-0000-0000-0000-000000000001",
+            "channel:42",
+            [
+                {"id": 1, "timestamp": 10},
+                {"id": 2, "timestamp": 11},
+            ],
+        )
+        == 1
+    )
+    assert [record["operation_uuid"] for record, _ in store.attempted] == [
+        "operation-2",
+        "operation-1",
+    ]
+
+
+def test_backfill_caches_durable_topic_upsert_per_assignment_generation(monkeypatch):
+    store = DeliveryStore()
+    instance = _delivery_service(store)
+
+    def records(*args, **kwargs):
+        message_id = args[3]["message"]["id"]
+        return [
+            {
+                "record_uuid": f"topic-{message_id}",
+                "operation_uuid": f"topic-operation-{message_id}",
+                "operation": {
+                    "kind": "topic.upsert",
+                    "entity_uuid": "00000000-0000-4000-8000-000000000091",
+                },
+            },
+            {
+                "record_uuid": f"message-{message_id}",
+                "operation_uuid": f"message-operation-{message_id}",
+                "operation": {
+                    "kind": "message.update",
+                    "entity_uuid": f"00000000-0000-4000-8000-{message_id:012d}",
+                },
+            },
+        ]
+
+    monkeypatch.setattr(converter, "event_records", records)
+    monkeypatch.setattr(
+        converter, "provider_chat_reference", lambda message: ("channel", "channel:42")
+    )
+
+    assert (
+        instance.enqueue_backfill(
+            "00000000-0000-0000-0000-000000000001",
+            "channel:42",
+            [{"id": 2, "timestamp": 2}, {"id": 1, "timestamp": 1}],
+        )
+        == 3
+    )
+    assert (
+        instance.enqueue_backfill(
+            "00000000-0000-0000-0000-000000000001",
+            "channel:42",
+            [{"id": 0, "timestamp": 0}],
+        )
+        == 1
+    )
+    assert [record["record_uuid"] for record, _priority in store.enqueued] == [
+        "topic-2",
+        "message-2",
+        "message-1",
+        "message-0",
+    ]
+
+
+def test_backfill_does_not_enqueue_broken_attachment_fallback(monkeypatch):
     store = DeliveryStore()
     instance = _delivery_service(store)
 
@@ -1586,7 +2153,7 @@ def test_backfill_uses_loss_aware_fallback_for_unavailable_attachment(monkeypatc
         resolver = args[6]
         if resolver is not None:
             resolver("/user_uploads/report.pdf", "report.pdf")
-        return [{"record_uuid": "fallback-record"}]
+        pytest.fail("attachment failure must abort conversion")
 
     monkeypatch.setattr(converter, "event_records", records)
     monkeypatch.setattr(
@@ -1600,15 +2167,14 @@ def test_backfill_uses_loss_aware_fallback_for_unavailable_attachment(monkeypatc
         )
     )
 
-    assert (
+    with pytest.raises(zulip_adapter.ZulipOperationError) as captured:
         instance.enqueue_backfill(
             "00000000-0000-0000-0000-000000000001",
             "channel:42",
             [{"id": 7, "timestamp": 7}],
         )
-        == 1
-    )
-    assert store.enqueued == [({"record_uuid": "fallback-record"}, 2)]
+    assert captured.value.code == "workspace_file_import_unavailable"
+    assert store.enqueued == []
 
 
 def test_backfill_discovers_all_topics_before_waiting_for_workspace_mappings(
@@ -1695,12 +2261,19 @@ def test_queue_loss_catchup_recovers_create_edit_delete_before_live_ready(
     assert store.advanced == [([10, 12, 13], 9, True, None)]
 
 
-def test_queue_loss_catchup_waits_for_workspace_chat_mappings():
+@pytest.mark.parametrize(
+    "pending_gate",
+    [
+        "provider_chat_assignment_pending",
+        "provider_chat_participants_pending",
+    ],
+)
+def test_queue_loss_catchup_waits_for_workspace_chat_gates(pending_gate):
     store = CatchupStore()
     store.mappings = {}
     instance = _delivery_service(store)
     instance.enqueue_backfill = lambda *args: (_ for _ in ()).throw(
-        ValueError("provider_chat_assignment_pending")
+        ValueError(pending_gate)
     )
 
     assert not instance._run_provider_queue_catchup(
@@ -1768,6 +2341,8 @@ def test_continuous_live_work_still_runs_bounded_history_quantum(tmp_path, monke
     instance.last_history_quantum = now[0] - 1.0
     instance.health_file = tmp_path / "progress"
     instance.scheduler = Scheduler()
+    instance._run_heartbeat = lambda current: False
+    instance._run_control_poll = lambda current: False
     instance.poll_provider_operations = lambda: 0
     instance.poll_provider_events = lambda: 0
     instance.process_provider_journal = lambda: 0
@@ -1783,8 +2358,192 @@ def test_continuous_live_work_still_runs_bounded_history_quantum(tmp_path, monke
     assert calls == [
         "live",
         "delivery:0:0:10",
+        "delivery:2:2:20",
         "backfill",
-        "delivery:2:2:1",
+    ]
+
+
+def test_history_quantum_runs_in_the_main_service_thread(tmp_path, monkeypatch):
+    history_threads = []
+    now = [10.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+
+    class Scheduler:
+        def reconcile_once(self):
+            return False
+
+        def run_once(self):
+            return False
+
+    instance = object.__new__(service.BridgeService)
+    instance.last_heartbeat = now[0]
+    instance.last_control = now[0]
+    instance.last_certificate_check = now[0]
+    instance.last_provider_poll = now[0]
+    instance.last_history_quantum = now[0] - 1.0
+    instance.health_file = tmp_path / "progress"
+    instance.scheduler = Scheduler()
+    instance._run_heartbeat = lambda current: False
+    instance._run_control_poll = lambda current: False
+    instance.poll_provider_operations = lambda: 0
+    instance.poll_provider_events = lambda: 0
+    instance.process_provider_journal = lambda: 0
+    instance.flush_provider_results = lambda: 0
+    instance.flush_provider_events = lambda **kwargs: 0
+
+    def history():
+        history_threads.append(threading.get_ident())
+        return True
+
+    instance._run_history_quantum_once = history
+
+    calling_thread = threading.get_ident()
+    assert instance.tick()
+    assert history_threads == [calling_thread]
+
+
+def test_longpoll_persists_live_event_while_main_thread_runs_history(
+    tmp_path, monkeypatch
+):
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+    now = [10.0]
+    history_started = threading.Event()
+    release_history = threading.Event()
+    event_recorded = threading.Event()
+    release_second_poll = threading.Event()
+    tick_finished = threading.Event()
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+
+    class Store:
+        def __init__(self):
+            self.events = []
+
+        def active_account_uuids(self):
+            return [account_uuid]
+
+        def provider_event_cursor(self, requested):
+            return {"queue_id": "queue", "last_event_id": 4}
+
+        def account_resource(self, requested):
+            return None
+
+        def record_provider_event(self, requested, queue_id, event):
+            self.events.append((requested, queue_id, event["id"]))
+            event_recorded.set()
+
+        def update_provider_event_cursor(self, *args):
+            return None
+
+        def mark_health(self, *args):
+            return None
+
+    class Adapter:
+        def __init__(self):
+            self.calls = 0
+
+        def restore_queue(self, queue_id, last_event_id):
+            return None
+
+        def events(self, queue_id, last_event_id):
+            self.calls += 1
+            if self.calls == 1:
+                assert history_started.wait(timeout=2)
+                return [{"id": 5, "type": "realm_user"}]
+            assert release_second_poll.wait(timeout=2)
+            return [{"id": 6, "type": "heartbeat"}]
+
+    class Scheduler:
+        def reconcile_once(self):
+            return False
+
+        def run_once(self):
+            return False
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance.provider_adapters = lambda requested: Adapter()
+    instance.provider_retry_attempts = {}
+    instance.provider_retry_after = {}
+    instance.provider_random = type(
+        "Random", (), {"uniform": lambda self, lower, upper: lower}
+    )()
+    instance.last_heartbeat = now[0]
+    instance.last_control = now[0]
+    instance.last_certificate_check = now[0]
+    instance.last_provider_poll = 0.0
+    instance.last_history_quantum = now[0] - 1.0
+    instance.health_file = tmp_path / "progress"
+    instance.scheduler = Scheduler()
+    instance._run_heartbeat = lambda current: False
+    instance._run_control_poll = lambda current: False
+    instance.poll_provider_operations = lambda: 0
+    instance.process_provider_journal = lambda: 0
+    instance.flush_provider_results = lambda: 0
+    instance.flush_provider_events = lambda **kwargs: 0
+    instance._flush_observed_reports = lambda current: 0
+
+    def history():
+        history_started.set()
+        assert release_history.wait(timeout=2)
+        return True
+
+    instance._run_history_quantum_once = history
+
+    def run_tick():
+        instance.tick()
+        tick_finished.set()
+
+    service_thread = threading.Thread(target=run_tick)
+    service_thread.start()
+    assert history_started.wait(timeout=1)
+    assert event_recorded.wait(timeout=1)
+    assert not tick_finished.is_set()
+    assert instance.store.events == [(account_uuid, "queue", 5)]
+
+    instance.provider_poll_stops[account_uuid].set()
+    release_history.set()
+    release_second_poll.set()
+    service_thread.join(timeout=1)
+    instance.provider_poll_threads[account_uuid].join(timeout=1)
+    assert tick_finished.is_set()
+
+
+def test_full_history_delivery_batch_defers_more_provider_io(tmp_path, monkeypatch):
+    calls = []
+    now = [10.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+
+    class Scheduler:
+        def reconcile_once(self):
+            return False
+
+        def run_once(self):
+            return False
+
+    instance = object.__new__(service.BridgeService)
+    instance.last_heartbeat = now[0]
+    instance.last_control = now[0]
+    instance.last_certificate_check = now[0]
+    instance.last_provider_poll = now[0]
+    instance.last_history_quantum = now[0] - 1.0
+    instance.health_file = tmp_path / "progress"
+    instance.scheduler = Scheduler()
+    instance.poll_provider_operations = lambda: 0
+    instance.poll_provider_events = lambda: 0
+    instance.process_provider_journal = lambda: 0
+    instance.flush_provider_results = lambda: 0
+    instance.flush_provider_events = (
+        lambda minimum_priority=0, maximum_priority=2, limit=100: (
+            calls.append(f"delivery:{minimum_priority}:{maximum_priority}:{limit}")
+            or (20 if minimum_priority == 2 else 0)
+        )
+    )
+    instance.run_backfill_once = lambda: calls.append("backfill") or True
+
+    assert instance.tick()
+    assert calls == [
+        "delivery:0:0:10",
+        "delivery:2:2:20",
     ]
 
 

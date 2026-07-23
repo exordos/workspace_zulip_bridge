@@ -61,6 +61,86 @@ def _desired_change():
     }
 
 
+def test_catalog_participants_merge_is_monotonic_and_enriches_placeholders():
+    current = [
+        {
+            "provider_user_id": "20",
+            "display_name": "Full Name",
+            "email": "full@example.test",
+            "avatar_urn": "urn:avatar:20",
+            "is_owner": False,
+        },
+        {
+            "provider_user_id": "10",
+            "display_name": "10",
+            "email": None,
+            "avatar_urn": None,
+            "is_owner": False,
+        },
+    ]
+    observed = [
+        {
+            "provider_user_id": "20",
+            "display_name": "Mention Name",
+            "email": None,
+            "avatar_urn": None,
+            "is_owner": False,
+        },
+        {
+            "provider_user_id": "10",
+            "display_name": "Discovered Name",
+            "email": "discovered@example.test",
+            "avatar_urn": "urn:avatar:10",
+            "is_owner": True,
+        },
+    ]
+
+    assert storage._merge_catalog_participants(current, observed) == [
+        {
+            "provider_user_id": "10",
+            "display_name": "Discovered Name",
+            "email": "discovered@example.test",
+            "avatar_urn": "urn:avatar:10",
+            "is_owner": True,
+        },
+        current[0],
+    ]
+
+
+def test_authoritative_catalog_participants_remove_stale_members_and_keep_facts():
+    current = [
+        {
+            "provider_user_id": "10",
+            "display_name": "Full Name",
+            "email": "full@example.test",
+            "avatar_urn": "urn:avatar:10",
+            "is_owner": True,
+        },
+        {
+            "provider_user_id": "20",
+            "display_name": "Stale Member",
+            "email": "stale@example.test",
+            "avatar_urn": None,
+            "is_owner": False,
+        },
+    ]
+    observed = [
+        {
+            "provider_user_id": "10",
+            "display_name": "10",
+            "email": None,
+            "avatar_urn": None,
+            "is_owner": True,
+        }
+    ]
+
+    assert storage._merge_catalog_participants(
+        current,
+        observed,
+        authoritative=True,
+    ) == [current[0]]
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -161,12 +241,23 @@ def test_workspace_delivery_outbox_orders_live_before_backfill():
         )
         == []
     )
-    statement = session.statements[0][0]
+    assert len(session.statements) == 3
+    read_promotion = session.statements[0][0]
+    topic_promotion = session.statements[1][0]
+    statement = session.statements[2][0]
+    assert "SET priority = read_delivery.priority" in read_promotion
+    assert "SET priority = message_delivery.priority" in topic_promotion
     assert "submission_state IN ('pending', 'ambiguous')" in statement
     assert "submission_state = 'awaiting_result'" in statement
     assert "next_submission_at <= now()" in statement
     assert "delivery.priority BETWEEN %s AND %s" in statement
-    assert session.statements[0][1] == (2, 2, 101)
+    assert session.statements[2][1] == (2, 2, 101)
+    assert "topic_delivery.sent_at IS NULL" in statement
+    assert "'message.create', 'message.update', 'read_state.set'" in statement
+    assert "message_create.record->'operation'->>'kind'" in statement
+    assert "jsonb_array_elements_text" in statement
+    assert "workspace_delivery_state" in statement
+    assert "provider_mappings AS message_mapping" in statement
     assert "ORDER BY priority, created_at" in statement
 
 
@@ -273,8 +364,80 @@ def test_initial_backfill_gate_ignores_delivery_outcomes_from_older_generation()
 
     assert store.initial_backfill_ready("00000000-0000-4000-8000-000000000001")
     statement = session.statements[0][0]
-    assert "account.resource_uuid = delivery.account_uuid" in statement
-    assert "delivery.account_generation = account.generation" in statement
+    normalized = " ".join(statement.split())
+    assert "zulip_participant_sync" in normalized
+    assert (
+        "participant_sync.assignment_generation = assignment.generation"
+        in normalized
+    )
+    assert "participant_sync.state = 'ready'" in normalized
+    assert "account.resource_uuid = delivery.account_uuid" in normalized
+    assert "delivery.account_generation = account.generation" in normalized
+
+
+def test_backfill_claim_requires_ready_participants_for_current_assignment():
+    session = Session()
+    store = _store_with_session(session)
+
+    assert store.claim_backfill_job() is None
+
+    statement = session.statements[0][0]
+    assert "JOIN zulip_participant_sync AS participant_sync" in statement
+    assert "participant_sync.assignment_generation =" in statement
+    assert "assignment.generation" in statement
+    assert "participant_sync.state = 'ready'" in statement
+
+
+def test_participant_claim_only_refreshes_channels():
+    session = Session()
+    store = _store_with_session(session)
+
+    assert store.claim_participant_sync() is None
+
+    statement = session.statements[0][0]
+    assert "JOIN desired_resources AS assignment" in statement
+    assert "->>'chat_type' =" in statement
+    assert "'channel'" in statement
+
+
+def test_dead_queue_restarts_participants_and_configured_history():
+    session = Session()
+    store = _store_with_session(session)
+
+    store.begin_provider_queue_catchup(
+        "00000000-0000-4000-8000-000000000001"
+    )
+
+    assert len(session.statements) == 3
+    participant_reset = session.statements[1][0]
+    history_reset = session.statements[2][0]
+    assert "UPDATE zulip_participant_sync" in participant_reset
+    assert "state = 'pending'" in participant_reset
+    assert "provider_user_ids = '[]'::jsonb" in participant_reset
+    assert "UPDATE zulip_backfill_jobs" in history_reset
+    assert "next_anchor = NULL" in history_reset
+    assert "WHEN job.history_depth = 'new' THEN 'complete'" in history_reset
+    assert "ELSE 'pending'" in history_reset
+
+
+def test_live_assignment_report_is_queued_once_per_completed_generation():
+    assignment = {
+        "uuid": "00000000-0000-4000-8000-000000000042",
+        "generation": 5,
+    }
+    session = Session(({"body": assignment},))
+    store = _store_with_session(session)
+
+    assert store.assignments_needing_live_report("account") == [assignment]
+
+    statement, parameters = session.statements[0]
+    assert "job.state = 'complete'" in statement
+    assert "report.body->>'observed_generation'" in statement
+    assert "assignment.generation" in statement
+    assert "report.body->>'status' = 'live_ready'" in statement
+    assert "report.result_status IS NULL" in statement
+    assert "report.result_status IN ('applied', 'duplicate')" in statement
+    assert parameters == ("account",)
 
 
 def test_claim_allows_explicit_retry_after_lane_advanced_without_later_delete():
@@ -515,6 +678,11 @@ def test_projection_tombstone_includes_all_assignment_owned_entities():
     assert "entity_kind = 'identity'" in statement
     assert "entity_kind = 'stream'" in statement
     assert "entity_kind = 'topic'" in statement
+    assert "metadata->>'stream_uuid'" not in statement
+    assert set(parameters[-2]) == {
+        "70000000-0000-4000-8000-000000000007",
+        "71000000-0000-4000-8000-000000000071",
+    }
     assert set(parameters[-1]) == {
         "80000000-0000-4000-8000-000000000008",
         "81000000-0000-4000-8000-000000000081",
@@ -564,3 +732,4 @@ def test_stale_assignment_delivery_is_removed_and_provider_event_replayed():
     assert "delivery.assignment_generation" in statement
     assert "assignment.body->>'project_id'" in statement
     assert "RETURNING operation_uuid" in statement
+    assert "priority, record" in statement

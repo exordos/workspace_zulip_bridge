@@ -87,13 +87,23 @@ The current implementation provides:
 - durable exact lease binding and idempotent retry state in PostgreSQL;
 - official Zulip client calls, event queues, newest-first backfill, and
   ambiguous-send reconciliation;
+- durable queue registration before discovery, names-only initial channel
+  discovery, and an authoritative selected-channel participant gate before
+  live or historical messages are projected;
 - owner-scoped projections and stable identity/chat/topic/message mappings;
 - private file-plane transfers with short-lived URLs;
-- bounded concurrent per-account Zulip polling (16 workers by default) with a
-  fresh adapter/client per worker call;
-- live/retry/backfill scheduling with hard live priority and one bounded
-  history quantum per second, so initial synchronization still advances under
-  continuous live traffic;
+- one dedicated persistent Zulip long-poll thread per active account, with
+  durable event and cursor capture independent from history synchronization;
+- extended idle queue lifetimes on compatible Zulip servers, preserving durable
+  queue cursors across quiet periods without ten-minute recovery churn;
+- live/retry/backfill scheduling with hard live priority, bounded history
+  delivery batches, and history synchronization in the main service thread;
+- exact owner read/unread projection from both Zulip message snapshots and live
+  flag events, ordered after the corresponding Workspace message projection;
+- automatic removal of queue-recovery jobs when their chats are deselected, so
+  stale recovery state cannot keep an account in backfill forever;
+- stable history cutoffs and reconciliation checkpoints across unchanged
+  control-plane polls;
 - durable backfill retry state with exponential full-jitter deferral for
   retryable provider failures; non-retryable failures terminate only the
   affected account/chat backfill job and produce a degraded observed report.

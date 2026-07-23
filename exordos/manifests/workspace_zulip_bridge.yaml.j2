@@ -87,9 +87,8 @@ resources:
           private_key_file = /var/lib/workspace-zulip-bridge/pki/bridge.key
           poll_interval_seconds = 2
           lease_seconds = 300
-          batch_size = 20
+          batch_size = 40
           timeout_seconds = 30
-          poll_workers = 16
 
           [file_api]
           base_url = https://workspace-bridge-control.{$workspace_zulip_bridge.imports.$core_local_domain:name}:21443

@@ -12,6 +12,49 @@ from restalchemy.storage.sql import engines, sessions
 from workspace_zulip_bridge import canonical, control
 
 
+def _merge_catalog_participants(
+    current: list[object],
+    observed: list[dict[str, object]],
+    *,
+    authoritative: bool = False,
+) -> list[dict[str, object]]:
+    """Merge participant facts, optionally replacing the membership set."""
+    participants: dict[str, dict[str, object]] = {}
+    observed_ids = {
+        str(value["provider_user_id"])
+        for value in observed
+        if value.get("provider_user_id") is not None
+    }
+    for value in current:
+        if not isinstance(value, dict) or value.get("provider_user_id") is None:
+            continue
+        provider_user_id = str(value["provider_user_id"])
+        if authoritative and provider_user_id not in observed_ids:
+            continue
+        participants[provider_user_id] = dict(value)
+    for value in observed:
+        if value.get("provider_user_id") is None:
+            continue
+        provider_user_id = str(value["provider_user_id"])
+        prior = participants.get(provider_user_id)
+        if prior is None:
+            participants[provider_user_id] = dict(value)
+            continue
+        merged = dict(prior)
+        merged["is_owner"] = bool(prior.get("is_owner")) or bool(
+            value.get("is_owner")
+        )
+        for name in ("email", "avatar_urn"):
+            if not merged.get(name) and value.get(name):
+                merged[name] = value[name]
+        prior_name = str(prior.get("display_name", "")).strip()
+        observed_name = str(value.get("display_name", "")).strip()
+        if (not prior_name or prior_name == provider_user_id) and observed_name:
+            merged["display_name"] = observed_name
+        participants[provider_user_id] = merged
+    return [participants[key] for key in sorted(participants)]
+
+
 def _validate_required_capabilities(value: object) -> None:
     if not isinstance(value, dict):
         raise ValueError("Desired resource capability requirements are invalid")
@@ -262,8 +305,10 @@ class RestAlchemyStore:
         provider_chat_key: str,
         participants: list[dict[str, object]],
         topics: list[dict[str, object]],
+        *,
+        authoritative_participants: bool = False,
     ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-        """Accumulate the complete replacement catalog view transactionally."""
+        """Merge a catalog view transactionally."""
         with self.session() as session:
             row = session.execute(
                 """
@@ -275,20 +320,17 @@ class RestAlchemyStore:
             ).fetchone()
             old_participants = [] if row is None else row["participants"]
             old_topics = [] if row is None else row["topics"]
-            participant_map = {
-                str(value["provider_user_id"]): value
-                for value in [*old_participants, *participants]
-                if isinstance(value, dict) and value.get("provider_user_id") is not None
-            }
             topic_map = {
                 str(value["provider_topic_id"]): value
                 for value in [*old_topics, *topics]
                 if isinstance(value, dict)
                 and value.get("provider_topic_id") is not None
             }
-            merged_participants = [
-                participant_map[key] for key in sorted(participant_map)
-            ]
+            merged_participants = _merge_catalog_participants(
+                old_participants,
+                participants,
+                authoritative=authoritative_participants,
+            )
             merged_topics = [topic_map[key] for key in sorted(topic_map)]
             session.execute(
                 """
@@ -599,6 +641,12 @@ class RestAlchemyStore:
             for participant in participants
             if isinstance(participant, dict) and participant.get("identity_uuid")
         ]
+        topics = projection.get("topics", [])
+        topic_uuids = [
+            str(topic["topic_uuid"])
+            for topic in topics
+            if isinstance(topic, dict) and topic.get("topic_uuid")
+        ]
         session.execute(
             """
             UPDATE provider_mappings
@@ -606,7 +654,9 @@ class RestAlchemyStore:
             WHERE account_uuid = %s
               AND (
                   (entity_kind = 'stream' AND workspace_uuid = %s)
-                  OR (entity_kind = 'topic' AND metadata->>'stream_uuid' = %s)
+                  OR (
+                      entity_kind = 'topic' AND workspace_uuid = ANY(%s)
+                  )
                   OR (
                       entity_kind = 'identity' AND workspace_uuid = ANY(%s)
                       AND NOT EXISTS (
@@ -630,7 +680,7 @@ class RestAlchemyStore:
             (
                 str(assignment["external_account_uuid"]),
                 str(stream["uuid"]),
-                str(stream["uuid"]),
+                topic_uuids,
                 participant_uuids,
             ),
         )
@@ -724,6 +774,51 @@ class RestAlchemyStore:
                 (account_uuid, provider_chat_key),
             ).fetchone()
             return None if row is None else typing.cast(dict[str, object], row["body"])
+
+    def assignments_needing_live_report(
+        self, account_uuid: str
+    ) -> list[dict[str, object]]:
+        with self.session() as session:
+            rows = session.execute(
+                """
+                SELECT assignment.body
+                FROM desired_resources AS assignment
+                JOIN zulip_backfill_jobs AS job
+                  ON job.account_uuid::text =
+                     assignment.body->>'external_account_uuid'
+                 AND job.provider_chat_key =
+                     assignment.body->'provider_chat'->>'provider_chat_key'
+                 AND job.state = 'complete'
+                WHERE assignment.resource_type = 'external_chat_assignment'
+                  AND NOT assignment.deleted
+                  AND assignment.body->>'external_account_uuid' = %s
+                  AND COALESCE(
+                      (assignment.body->>'selected')::boolean, true
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM observed_report_outbox AS report
+                      WHERE report.body->>'resource_type' =
+                            'external_chat_assignment'
+                        AND report.body->>'resource_uuid' =
+                            assignment.resource_uuid::text
+                        AND (
+                            report.body->>'observed_generation'
+                        )::bigint = assignment.generation
+                        AND report.body->>'status' = 'live_ready'
+                        AND (
+                            report.result_status IS NULL
+                            OR report.result_status IN ('applied', 'duplicate')
+                        )
+                  )
+                ORDER BY assignment.resource_uuid
+                """,
+                (account_uuid,),
+            ).fetchall()
+            return [
+                typing.cast(dict[str, object], row["body"])
+                for row in rows
+            ]
 
     def provider_mapping(
         self, account_uuid: str, entity_kind: str, provider_id: str
@@ -1208,6 +1303,40 @@ class RestAlchemyStore:
                 ).fetchone()
                 if assignment is None:
                     raise ValueError("provider_chat_assignment_pending")
+            if operation.get("kind") == "topic.upsert" and assignment is not None:
+                payload = typing.cast(dict[str, object], operation["payload"])
+                duplicate_topic = session.execute(
+                    """
+                    UPDATE workspace_delivery_outbox AS delivery
+                    SET priority = LEAST(delivery.priority, %s)
+                    WHERE delivery.sent_at IS NULL
+                      AND delivery.account_uuid = %s
+                      AND delivery.assignment_uuid = %s
+                      AND delivery.assignment_generation = %s
+                      AND delivery.assignment_project_uuid = %s
+                      AND delivery.record->'operation'->>'kind' = 'topic.upsert'
+                      AND delivery.record->'operation'->>'entity_uuid' = %s
+                      AND delivery.record->'operation'->'payload'
+                              ->>'stream_uuid' = %s
+                      AND delivery.record->'operation'->'payload'->>'name' = %s
+                      AND delivery.record->'operation'->'provider'
+                              ->>'entity_id' = %s
+                    RETURNING delivery.record_uuid
+                    """,
+                    (
+                        priority,
+                        str(record["account_uuid"]),
+                        str(assignment["resource_uuid"]),
+                        int(assignment["generation"]),
+                        str(assignment["project_uuid"]),
+                        str(operation["entity_uuid"]),
+                        str(payload["stream_uuid"]),
+                        str(payload["name"]),
+                        str(provider["entity_id"]),
+                    ),
+                ).fetchone()
+                if duplicate_topic is not None:
+                    return False
             result = session.execute(
                 """
                 INSERT INTO workspace_delivery_outbox (
@@ -1244,6 +1373,64 @@ class RestAlchemyStore:
         if not 0 <= minimum_priority <= maximum_priority <= 2:
             raise ValueError("Invalid workspace delivery priority range")
         with self.session() as session:
+            session.execute(
+                """
+                UPDATE workspace_delivery_outbox AS message_delivery
+                SET priority = read_delivery.priority
+                FROM workspace_delivery_outbox AS read_delivery
+                WHERE message_delivery.sent_at IS NULL
+                  AND read_delivery.sent_at IS NULL
+                  AND message_delivery.priority > read_delivery.priority
+                  AND message_delivery.account_uuid =
+                      read_delivery.account_uuid
+                  AND message_delivery.assignment_uuid IS NOT DISTINCT FROM
+                      read_delivery.assignment_uuid
+                  AND message_delivery.assignment_generation
+                      IS NOT DISTINCT FROM
+                      read_delivery.assignment_generation
+                  AND message_delivery.assignment_project_uuid
+                      IS NOT DISTINCT FROM
+                      read_delivery.assignment_project_uuid
+                  AND read_delivery.record->'operation'->>'kind' =
+                      'read_state.set'
+                  AND message_delivery.record->'operation'->>'kind'
+                      IN ('message.create', 'message.update')
+                  AND message_delivery.record->'operation'->>'entity_uuid' IN (
+                      SELECT jsonb_array_elements_text(
+                          read_delivery.record->'operation'->'payload'
+                              ->'message_uuids'
+                      )
+                  )
+                """
+            )
+            session.execute(
+                """
+                UPDATE workspace_delivery_outbox AS topic_delivery
+                SET priority = message_delivery.priority
+                FROM workspace_delivery_outbox AS message_delivery
+                WHERE topic_delivery.sent_at IS NULL
+                  AND message_delivery.sent_at IS NULL
+                  AND topic_delivery.priority > message_delivery.priority
+                  AND topic_delivery.account_uuid =
+                      message_delivery.account_uuid
+                  AND topic_delivery.assignment_uuid IS NOT DISTINCT FROM
+                      message_delivery.assignment_uuid
+                  AND topic_delivery.assignment_generation
+                      IS NOT DISTINCT FROM
+                      message_delivery.assignment_generation
+                  AND topic_delivery.assignment_project_uuid
+                      IS NOT DISTINCT FROM
+                      message_delivery.assignment_project_uuid
+                  AND topic_delivery.record->'operation'->>'kind' =
+                      'topic.upsert'
+                  AND message_delivery.record->'operation'->>'kind' IN (
+                      'message.create', 'message.update', 'read_state.set'
+                  )
+                  AND topic_delivery.record->'operation'->>'entity_uuid' =
+                      message_delivery.record->'operation'->'payload'
+                          ->>'topic_uuid'
+                """
+            )
             rows = session.execute(
                 """
                     SELECT delivery.record FROM workspace_delivery_outbox AS delivery
@@ -1274,6 +1461,109 @@ class RestAlchemyStore:
                       AND (
                           delivery.assignment_uuid IS NULL
                           OR assignment.resource_uuid IS NOT NULL
+                      )
+                      AND (
+                          delivery.record->'operation'->>'kind' NOT IN (
+                              'message.create', 'message.update', 'read_state.set'
+                          )
+                          OR NOT EXISTS (
+                              SELECT 1
+                              FROM workspace_delivery_outbox AS topic_delivery
+                              WHERE topic_delivery.sent_at IS NULL
+                                AND topic_delivery.account_uuid =
+                                    delivery.account_uuid
+                                AND topic_delivery.assignment_uuid IS NOT DISTINCT
+                                    FROM delivery.assignment_uuid
+                                AND topic_delivery.assignment_generation
+                                    IS NOT DISTINCT FROM
+                                    delivery.assignment_generation
+                                AND topic_delivery.assignment_project_uuid
+                                    IS NOT DISTINCT FROM
+                                    delivery.assignment_project_uuid
+                                AND topic_delivery.record->'operation'->>'kind' =
+                                    'topic.upsert'
+                                AND topic_delivery.record->'operation'
+                                        ->>'entity_uuid' =
+                                    delivery.record->'operation'->'payload'
+                                        ->>'topic_uuid'
+                          )
+                      )
+                      AND (
+                          delivery.record->'operation'->>'kind' NOT IN (
+                              'message.update', 'message.delete'
+                          )
+                          OR NOT EXISTS (
+                              SELECT 1
+                              FROM workspace_delivery_outbox AS message_create
+                              WHERE message_create.sent_at IS NULL
+                                AND message_create.account_uuid =
+                                    delivery.account_uuid
+                                AND message_create.assignment_uuid
+                                    IS NOT DISTINCT FROM
+                                    delivery.assignment_uuid
+                                AND message_create.assignment_generation
+                                    IS NOT DISTINCT FROM
+                                    delivery.assignment_generation
+                                AND message_create.assignment_project_uuid
+                                    IS NOT DISTINCT FROM
+                                    delivery.assignment_project_uuid
+                                AND message_create.record->'operation'->>'kind' =
+                                    'message.create'
+                                AND message_create.record->'operation'
+                                        ->>'entity_uuid' =
+                                    delivery.record->'operation'->>'entity_uuid'
+                          )
+                      )
+                      AND (
+                          delivery.record->'operation'->>'kind' <> 'read_state.set'
+                          OR NOT EXISTS (
+                              SELECT 1
+                              FROM workspace_delivery_outbox AS message_delivery
+                              WHERE message_delivery.sent_at IS NULL
+                                AND message_delivery.account_uuid =
+                                    delivery.account_uuid
+                                AND message_delivery.assignment_uuid
+                                    IS NOT DISTINCT FROM
+                                    delivery.assignment_uuid
+                                AND message_delivery.assignment_generation
+                                    IS NOT DISTINCT FROM
+                                    delivery.assignment_generation
+                                AND message_delivery.assignment_project_uuid
+                                    IS NOT DISTINCT FROM
+                                    delivery.assignment_project_uuid
+                                AND message_delivery.record->'operation'->>'kind'
+                                    IN ('message.create', 'message.update')
+                                AND message_delivery.record->'operation'
+                                        ->>'entity_uuid' IN (
+                                    SELECT jsonb_array_elements_text(
+                                        delivery.record->'operation'->'payload'
+                                            ->'message_uuids'
+                                    )
+                                )
+                          )
+                      )
+                      AND (
+                          delivery.record->'operation'->>'kind' <> 'read_state.set'
+                          OR NOT EXISTS (
+                              SELECT 1
+                              FROM jsonb_array_elements_text(
+                                  delivery.record->'operation'->'payload'
+                                      ->'message_uuids'
+                              ) AS read_message(message_uuid)
+                              WHERE NOT EXISTS (
+                                  SELECT 1
+                                  FROM provider_mappings AS message_mapping
+                                  WHERE message_mapping.account_uuid =
+                                      delivery.account_uuid
+                                    AND message_mapping.entity_kind = 'message'
+                                    AND message_mapping.workspace_uuid::text =
+                                        read_message.message_uuid
+                                    AND NOT message_mapping.deleted
+                                    AND message_mapping.metadata
+                                            ->>'workspace_delivery_state' =
+                                        'committed'
+                              )
+                          )
                       )
                     ORDER BY priority, created_at LIMIT %s
                     """,
@@ -1315,7 +1605,7 @@ class RestAlchemyStore:
                     )
                 )
                 RETURNING operation_uuid, account_uuid,
-                          provider_queue_id, provider_event_id
+                          provider_queue_id, provider_event_id, priority, record
                 """
             ).fetchall()
             if not stale:
@@ -1330,6 +1620,32 @@ class RestAlchemyStore:
                 (operation_ids,),
             )
             for row in stale:
+                if row["priority"] == 2:
+                    record = typing.cast(dict[str, object], row["record"])
+                    operation = typing.cast(
+                        dict[str, object] | None,
+                        record.get("operation"),
+                    )
+                    if operation is not None:
+                        provider = typing.cast(
+                            dict[str, object],
+                            operation["provider"],
+                        )
+                        session.execute(
+                            """
+                            UPDATE zulip_backfill_jobs
+                            SET state = 'pending', next_anchor = NULL,
+                                lease_until = NULL, available_at = now(),
+                                retry_count = 0, last_error_code = NULL,
+                                updated_at = now()
+                            WHERE account_uuid = %s AND provider_chat_key = %s
+                              AND state != 'cancelled'
+                            """,
+                            (
+                                row["account_uuid"],
+                                str(provider["chat_id"]),
+                            ),
+                        )
                 if row["provider_queue_id"] is None:
                     continue
                 session.execute(
@@ -1513,6 +1829,201 @@ class RestAlchemyStore:
             ).fetchall()
             return [str(row["resource_uuid"]) for row in rows]
 
+    def reconcile_participant_sync(self) -> None:
+        with self.session() as session:
+            session.execute(
+                """
+                INSERT INTO zulip_participant_sync (
+                    account_uuid, provider_chat_key, assignment_generation, state
+                )
+                SELECT
+                    (assignment.body->>'external_account_uuid')::uuid,
+                    assignment.body->'provider_chat'->>'provider_chat_key',
+                    assignment.generation,
+                    CASE
+                        WHEN assignment.body->'provider_chat'->>'chat_type' =
+                             'channel'
+                        THEN 'pending'
+                        ELSE 'ready'
+                    END
+                FROM desired_resources AS assignment
+                WHERE assignment.resource_type = 'external_chat_assignment'
+                  AND NOT assignment.deleted
+                  AND COALESCE(
+                      (assignment.body->>'selected')::boolean, true
+                  )
+                ON CONFLICT (account_uuid, provider_chat_key) DO UPDATE SET
+                    assignment_generation = EXCLUDED.assignment_generation,
+                    state = CASE
+                        WHEN EXCLUDED.state = 'ready'
+                        THEN 'ready'
+                        WHEN zulip_participant_sync.assignment_generation =
+                             EXCLUDED.assignment_generation
+                        THEN zulip_participant_sync.state
+                        ELSE EXCLUDED.state
+                    END,
+                    lease_until = CASE
+                        WHEN EXCLUDED.state = 'ready'
+                        THEN NULL
+                        WHEN zulip_participant_sync.assignment_generation =
+                             EXCLUDED.assignment_generation
+                        THEN zulip_participant_sync.lease_until
+                        ELSE NULL
+                    END,
+                    provider_user_ids = CASE
+                        WHEN EXCLUDED.state = 'ready'
+                        THEN '[]'::jsonb
+                        WHEN zulip_participant_sync.assignment_generation =
+                             EXCLUDED.assignment_generation
+                        THEN zulip_participant_sync.provider_user_ids
+                        ELSE '[]'::jsonb
+                    END,
+                    updated_at = CASE
+                        WHEN zulip_participant_sync.assignment_generation =
+                             EXCLUDED.assignment_generation
+                        THEN zulip_participant_sync.updated_at
+                        ELSE now()
+                    END
+                WHERE zulip_participant_sync.assignment_generation IS DISTINCT FROM
+                          EXCLUDED.assignment_generation
+                   OR (
+                       EXCLUDED.state = 'ready'
+                       AND zulip_participant_sync.state IS DISTINCT FROM 'ready'
+                   )
+                """
+            )
+            session.execute(
+                """
+                DELETE FROM zulip_participant_sync AS participant_sync
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM desired_resources AS assignment
+                    WHERE assignment.resource_type = 'external_chat_assignment'
+                      AND NOT assignment.deleted
+                      AND assignment.body->>'external_account_uuid' =
+                          participant_sync.account_uuid::text
+                      AND assignment.body->'provider_chat'
+                              ->>'provider_chat_key' =
+                          participant_sync.provider_chat_key
+                      AND COALESCE(
+                          (assignment.body->>'selected')::boolean, true
+                      )
+                )
+                """
+            )
+
+    def claim_participant_sync(self) -> dict[str, object] | None:
+        with self.session() as session:
+            return session.execute(
+                """
+                WITH candidate AS (
+                    SELECT participant_sync.account_uuid,
+                           participant_sync.provider_chat_key
+                    FROM zulip_participant_sync AS participant_sync
+                    JOIN desired_resources AS assignment
+                      ON assignment.resource_type =
+                         'external_chat_assignment'
+                     AND NOT assignment.deleted
+                     AND assignment.generation =
+                         participant_sync.assignment_generation
+                     AND assignment.body->>'external_account_uuid' =
+                         participant_sync.account_uuid::text
+                     AND assignment.body->'provider_chat'
+                             ->>'provider_chat_key' =
+                         participant_sync.provider_chat_key
+                     AND assignment.body->'provider_chat'->>'chat_type' =
+                         'channel'
+                    WHERE participant_sync.state = 'pending'
+                       OR (
+                           participant_sync.state = 'running'
+                           AND participant_sync.lease_until < now()
+                       )
+                       OR (
+                           participant_sync.state = 'reported'
+                           AND participant_sync.updated_at <
+                               now() - interval '30 seconds'
+                       )
+                    ORDER BY participant_sync.updated_at,
+                             participant_sync.provider_chat_key
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                UPDATE zulip_participant_sync AS participant_sync
+                SET state = 'running',
+                    lease_until = now() + interval '60 seconds',
+                    updated_at = now()
+                FROM candidate
+                WHERE participant_sync.account_uuid = candidate.account_uuid
+                  AND participant_sync.provider_chat_key =
+                      candidate.provider_chat_key
+                RETURNING participant_sync.account_uuid,
+                          participant_sync.provider_chat_key,
+                          participant_sync.assignment_generation
+                """
+            ).fetchone()
+
+    def complete_participant_sync(
+        self,
+        account_uuid: str,
+        provider_chat_key: str,
+        assignment_generation: int,
+        provider_user_ids: list[int],
+        ready: bool,
+    ) -> None:
+        with self.session() as session:
+            session.execute(
+                """
+                UPDATE zulip_participant_sync
+                SET state = %s, lease_until = NULL,
+                    provider_user_ids = %s::jsonb, updated_at = now()
+                WHERE account_uuid = %s AND provider_chat_key = %s
+                  AND assignment_generation = %s
+                  AND state = 'running'
+                """,
+                (
+                    "ready" if ready else "reported",
+                    json.dumps(sorted(set(provider_user_ids))),
+                    account_uuid,
+                    provider_chat_key,
+                    assignment_generation,
+                ),
+            )
+
+    def release_participant_sync(
+        self,
+        account_uuid: str,
+        provider_chat_key: str,
+        assignment_generation: int,
+    ) -> None:
+        with self.session() as session:
+            session.execute(
+                """
+                UPDATE zulip_participant_sync
+                SET state = 'pending', lease_until = NULL, updated_at = now()
+                WHERE account_uuid = %s AND provider_chat_key = %s
+                  AND assignment_generation = %s
+                  AND state = 'running'
+                """,
+                (account_uuid, provider_chat_key, assignment_generation),
+            )
+
+    def assignment_participants_ready(
+        self,
+        account_uuid: str,
+        provider_chat_key: str,
+        assignment_generation: int,
+    ) -> bool:
+        with self.session() as session:
+            row = session.execute(
+                """
+                SELECT state = 'ready' AS ready
+                FROM zulip_participant_sync
+                WHERE account_uuid = %s AND provider_chat_key = %s
+                  AND assignment_generation = %s
+                """,
+                (account_uuid, provider_chat_key, assignment_generation),
+            ).fetchone()
+            return row is not None and bool(row["ready"])
+
     def reconcile_backfill_jobs(self) -> None:
         with self.session() as session:
             session.execute(
@@ -1544,8 +2055,21 @@ class RestAlchemyStore:
                   AND NOT assignment.deleted
                   AND COALESCE((assignment.body->>'selected')::boolean, true)
                 ON CONFLICT (account_uuid, provider_chat_key) DO UPDATE SET
+                    next_anchor = CASE
+                        WHEN zulip_backfill_jobs.state <> 'cancelled'
+                         AND zulip_backfill_jobs.history_depth =
+                             EXCLUDED.history_depth
+                        THEN zulip_backfill_jobs.next_anchor
+                        ELSE NULL
+                    END,
                     history_depth = EXCLUDED.history_depth,
-                    cutoff_at = EXCLUDED.cutoff_at,
+                    cutoff_at = CASE
+                        WHEN zulip_backfill_jobs.state <> 'cancelled'
+                         AND zulip_backfill_jobs.history_depth =
+                             EXCLUDED.history_depth
+                        THEN zulip_backfill_jobs.cutoff_at
+                        ELSE EXCLUDED.cutoff_at
+                    END,
                     state = CASE
                         WHEN zulip_backfill_jobs.state = 'cancelled'
                         THEN EXCLUDED.state
@@ -1554,19 +2078,41 @@ class RestAlchemyStore:
                         ELSE EXCLUDED.state
                     END,
                     updated_at = now()
+                WHERE zulip_backfill_jobs.state = 'cancelled'
+                   OR zulip_backfill_jobs.history_depth IS DISTINCT FROM
+                          EXCLUDED.history_depth
                 """
             )
             session.execute(
                 """
                 UPDATE zulip_backfill_jobs AS job
                 SET state = 'cancelled', updated_at = now()
-                WHERE NOT EXISTS (
+                WHERE job.state <> 'cancelled'
+                  AND NOT EXISTS (
                     SELECT 1 FROM desired_resources AS assignment
                     WHERE assignment.resource_type = 'external_chat_assignment'
                       AND NOT assignment.deleted
                       AND assignment.body->>'external_account_uuid' =
                           job.account_uuid::text
                       AND assignment.body->'provider_chat'->>'provider_chat_key' =
+                          job.provider_chat_key
+                      AND COALESCE(
+                          (assignment.body->>'selected')::boolean, true
+                      )
+                )
+                """
+            )
+            session.execute(
+                """
+                DELETE FROM zulip_queue_catchup_jobs AS job
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM desired_resources AS assignment
+                    WHERE assignment.resource_type = 'external_chat_assignment'
+                      AND NOT assignment.deleted
+                      AND assignment.body->>'external_account_uuid' =
+                          job.account_uuid::text
+                      AND assignment.body->'provider_chat'
+                              ->>'provider_chat_key' =
                           job.provider_chat_key
                       AND COALESCE(
                           (assignment.body->>'selected')::boolean, true
@@ -1656,6 +2202,27 @@ class RestAlchemyStore:
                               (assignment.body->>'selected')::boolean, true
                           )
                           AND NOT EXISTS (
+                              SELECT 1 FROM zulip_participant_sync
+                                  AS participant_sync
+                              WHERE participant_sync.account_uuid::text = %s
+                                AND participant_sync.provider_chat_key =
+                                    assignment.body->'provider_chat'
+                                        ->>'provider_chat_key'
+                                AND participant_sync.assignment_generation =
+                                    assignment.generation
+                                AND participant_sync.state = 'ready'
+                          )
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM desired_resources AS assignment
+                        WHERE assignment.resource_type =
+                              'external_chat_assignment'
+                          AND NOT assignment.deleted
+                          AND assignment.body->>'external_account_uuid' = %s
+                          AND COALESCE(
+                              (assignment.body->>'selected')::boolean, true
+                          )
+                          AND NOT EXISTS (
                               SELECT 1 FROM zulip_backfill_jobs AS job
                               WHERE job.account_uuid::text = %s
                                 AND job.provider_chat_key =
@@ -1677,7 +2244,13 @@ class RestAlchemyStore:
                           AND operation.terminal_outcome IS DISTINCT FROM 'committed'
                     ) AS ready
                 """,
-                (account_uuid, account_uuid, account_uuid),
+                (
+                    account_uuid,
+                    account_uuid,
+                    account_uuid,
+                    account_uuid,
+                    account_uuid,
+                ),
             ).fetchone()
             return bool(row["ready"])
 
@@ -1686,14 +2259,30 @@ class RestAlchemyStore:
             return session.execute(
                 """
                 WITH candidate AS (
-                    SELECT account_uuid, provider_chat_key
-                    FROM zulip_backfill_jobs
+                    SELECT job.account_uuid, job.provider_chat_key
+                    FROM zulip_backfill_jobs AS job
+                    JOIN desired_resources AS assignment
+                      ON assignment.resource_type =
+                         'external_chat_assignment'
+                     AND NOT assignment.deleted
+                     AND assignment.body->>'external_account_uuid' =
+                         job.account_uuid::text
+                     AND assignment.body->'provider_chat'
+                             ->>'provider_chat_key' =
+                         job.provider_chat_key
+                    JOIN zulip_participant_sync AS participant_sync
+                      ON participant_sync.account_uuid = job.account_uuid
+                     AND participant_sync.provider_chat_key =
+                         job.provider_chat_key
+                     AND participant_sync.assignment_generation =
+                         assignment.generation
+                     AND participant_sync.state = 'ready'
                     WHERE (
-                        state = 'pending' AND available_at <= now()
+                        job.state = 'pending' AND job.available_at <= now()
                     ) OR (
-                        state = 'running' AND lease_until < now()
+                        job.state = 'running' AND job.lease_until < now()
                     )
-                    ORDER BY updated_at
+                    ORDER BY job.updated_at
                     FOR UPDATE SKIP LOCKED LIMIT 1
                 )
                 UPDATE zulip_backfill_jobs AS job
@@ -2270,6 +2859,7 @@ class RestAlchemyStore:
                 ) VALUES (%s, 'message', %s, %s, %s, %s, false)
                 ON CONFLICT (account_uuid, entity_kind, provider_id) DO UPDATE SET
                     provider_revision = EXCLUDED.provider_revision,
+                    metadata = provider_mappings.metadata || EXCLUDED.metadata,
                     deleted = false,
                     updated_at = now()
                 """,
@@ -2320,7 +2910,33 @@ class RestAlchemyStore:
                     ),
                 ),
             )
-        elif kind in {"message.update", "topic.upsert", "stream.upsert"}:
+        elif kind == "message.update":
+            extensions = typing.cast(dict[str, object], operation.get("extensions", {}))
+            session.execute(
+                """
+                UPDATE provider_mappings
+                SET provider_revision = COALESCE(%s, provider_revision),
+                    metadata = metadata || jsonb_strip_nulls(jsonb_build_object(
+                        'content_sha256', %s::text,
+                        'provider_content_sha256', %s::text,
+                        'subject', %s::text
+                    )) || jsonb_build_object(
+                        'workspace_delivery_state', 'committed'
+                    ),
+                    deleted = false, updated_at = now()
+                WHERE account_uuid = %s AND entity_kind = 'message'
+                  AND workspace_uuid = %s
+                """,
+                (
+                    provider_revision,
+                    extensions.get("content_sha256"),
+                    extensions.get("provider_content_sha256"),
+                    extensions.get("subject"),
+                    account_uuid,
+                    workspace_uuid,
+                ),
+            )
+        elif kind in {"topic.upsert", "stream.upsert"}:
             entity_kind = kind.partition(".")[0]
             session.execute(
                 """
@@ -2692,6 +3308,57 @@ class RestAlchemyStore:
                     updated_at = now()
                 """,
                 (account_uuid, account_uuid),
+            )
+            session.execute(
+                """
+                UPDATE zulip_participant_sync AS participant_sync
+                SET state = 'pending', lease_until = NULL,
+                    provider_user_ids = '[]'::jsonb, updated_at = now()
+                FROM desired_resources AS assignment
+                WHERE participant_sync.account_uuid = %s
+                  AND assignment.resource_type = 'external_chat_assignment'
+                  AND NOT assignment.deleted
+                  AND assignment.body->>'external_account_uuid' =
+                      participant_sync.account_uuid::text
+                  AND assignment.body->'provider_chat'
+                          ->>'provider_chat_key' =
+                      participant_sync.provider_chat_key
+                  AND assignment.generation =
+                      participant_sync.assignment_generation
+                  AND COALESCE(
+                      (assignment.body->>'selected')::boolean, true
+                  )
+                """,
+                (account_uuid,),
+            )
+            session.execute(
+                """
+                UPDATE zulip_backfill_jobs AS job
+                SET next_anchor = NULL,
+                    state = CASE
+                        WHEN job.history_depth = 'new' THEN 'complete'
+                        ELSE 'pending'
+                    END,
+                    available_at = now(), retry_count = 0,
+                    last_error_code = NULL, lease_until = NULL,
+                    updated_at = now()
+                WHERE job.account_uuid = %s
+                  AND EXISTS (
+                      SELECT 1 FROM desired_resources AS assignment
+                      WHERE assignment.resource_type =
+                            'external_chat_assignment'
+                        AND NOT assignment.deleted
+                        AND assignment.body->>'external_account_uuid' =
+                            job.account_uuid::text
+                        AND assignment.body->'provider_chat'
+                                ->>'provider_chat_key' =
+                            job.provider_chat_key
+                        AND COALESCE(
+                            (assignment.body->>'selected')::boolean, true
+                        )
+                  )
+                """,
+                (account_uuid,),
             )
 
     def pending_provider_catchup(self, account_uuid: str) -> dict[str, object] | None:

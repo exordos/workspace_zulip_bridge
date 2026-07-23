@@ -268,14 +268,18 @@ def _identity_operations(
         if is_owner:
             identity_uuid = owner_uuid
         elif existing is None:
-            raise ValueError("provider_chat_assignment_pending")
+            identity_uuid = stable_entity_uuid(
+                account_uuid,
+                "identity",
+                str(provider_user_id),
+            )
         else:
             identity_uuid = str(existing["workspace_uuid"])
         identities[provider_user_id] = identity_uuid
         display_name = str(user.get("full_name", message.get("sender_full_name", "")))
         mentions[display_name] = identity_uuid
         mentions[f"id:{provider_user_id}"] = identity_uuid
-        if identity_uuid == owner_uuid:
+        if identity_uuid == owner_uuid or existing is not None:
             continue
         operations.append(
             {
@@ -317,9 +321,11 @@ def _update_mention_operations(
         seen.add(provider_user_id)
         display_name = match.group("name_with_id") or provider_user_id
         mapping = store.provider_mapping(account_uuid, "identity", provider_user_id)
-        if mapping is None:
-            raise ValueError("provider_chat_assignment_pending")
-        identity_uuid = str(mapping["workspace_uuid"])
+        identity_uuid = (
+            stable_entity_uuid(account_uuid, "identity", provider_user_id)
+            if mapping is None
+            else str(mapping["workspace_uuid"])
+        )
         mention_uuids[f"id:{provider_user_id}"] = identity_uuid
         mention_uuids[display_name] = identity_uuid
         metadata = {
@@ -458,11 +464,14 @@ def message_event_records(
         else []
     )
     participants = sorted(existing_participants)
-    expected_participants = {
-        owner_uuid,
-        author_uuid,
-        *(identity_uuids[int(user["id"])] for user in recipients),
-    }
+    expected_participants = {owner_uuid}
+    if chat_type != "channel":
+        expected_participants.update(
+            {
+                author_uuid,
+                *(identity_uuids[int(user["id"])] for user in recipients),
+            }
+        )
     if not expected_participants.issubset(participants):
         raise ValueError("provider_chat_assignment_pending")
     if chat_type == "direct" and len(participants) != 2:
@@ -508,19 +517,30 @@ def message_event_records(
         if chat_type == "channel"
         else f"{chat_key}:default"
     )
+    flags = message.get("flags")
+    message_payload = {
+        "stream_uuid": stream_uuid,
+        "topic_uuid": topic_uuid,
+        "author_uuid": author_uuid,
+        "payload": {"kind": "markdown", "content": markdown},
+        "reply_to_message_uuid": reply_to_message_uuid,
+    }
+    if isinstance(flags, list):
+        # History catch-up can race ahead of an earlier live read-state event.
+        # Carry the snapshot value on the message projection as the convergent
+        # source of truth instead of relying only on a separate flag operation.
+        message_payload["read"] = "read" in flags
     message_operation = {
-        "kind": "message.create",
+        "kind": (
+            "message.update"
+            if delivery_class == "backfill" and workspace_delivery_committed
+            else "message.create"
+        ),
         "entity_uuid": message_uuid,
         "actor_uuid": author_uuid,
         "occurred_at": occurred_at,
         "provider": _provider(chat_key, provider_message_id),
-        "payload": {
-            "stream_uuid": stream_uuid,
-            "topic_uuid": topic_uuid,
-            "author_uuid": author_uuid,
-            "payload": {"kind": "markdown", "content": markdown},
-            "reply_to_message_uuid": reply_to_message_uuid,
-        },
+        "payload": message_payload,
         "extensions": {
             "provider_badge": "zulip",
             "provider_original_url": message_url,
@@ -550,8 +570,26 @@ def message_event_records(
             "extensions": {"provider_badge": "zulip"},
         },
     ]
-    if not workspace_delivery_committed:
+    if not workspace_delivery_committed or delivery_class == "backfill":
         operations.append(message_operation)
+    if isinstance(flags, list) and delivery_class != "backfill":
+        operations.append(
+            {
+                "kind": "read_state.set",
+                "entity_uuid": stream_uuid,
+                "actor_uuid": owner_uuid,
+                "occurred_at": occurred_at,
+                "provider": _provider(chat_key, None),
+                "payload": {
+                    "stream_uuid": stream_uuid,
+                    "topic_uuid": topic_uuid,
+                    "reader_uuid": owner_uuid,
+                    "message_uuids": [message_uuid],
+                    "read": "read" in flags,
+                },
+                "extensions": {"provider_badge": "zulip"},
+            }
+        )
     store.remember_provider_mapping(
         account_uuid,
         "stream",
@@ -615,6 +653,11 @@ def message_event_records(
             identity_uuid,
             payload,
         )
+    record_source = f"provider-message:{provider_message_id}"
+    if delivery_class == "backfill":
+        record_source = (
+            f"{record_source}:reconcile-generation:{int(account['generation'])}"
+        )
     records = []
     for index, operation in enumerate(operations):
         operation_lane = (
@@ -627,7 +670,7 @@ def message_event_records(
                 store,
                 account_uuid,
                 project_uuid,
-                f"provider-message:{provider_message_id}",
+                record_source,
                 int(event["id"]),
                 index,
                 operation,
@@ -842,6 +885,50 @@ def _mapped_event_records(
             markdown, lossy = convert_markdown(
                 str(event["content"]), mention_uuids, message_url, file_resolver
             )
+            topic_name = str(event.get("subject", metadata.get("subject", "")))
+            if not topic_name:
+                topic_name = "default"
+            topic_provider_id = (
+                f"{chat_key.removeprefix('channel:')}:{topic_name}"
+                if chat_key.startswith("channel:")
+                else f"{chat_key}:default"
+            )
+            if not any(
+                record["operation"]["kind"] == "topic.upsert"
+                and record["operation"]["entity_uuid"] == topic_uuid
+                for record in records
+            ):
+                topic_operation = {
+                    "kind": "topic.upsert",
+                    "entity_uuid": topic_uuid,
+                    "actor_uuid": owner_uuid,
+                    "occurred_at": occurred_at,
+                    "provider": _provider(
+                        chat_key,
+                        topic_provider_id,
+                        str(event.get("edit_timestamp")),
+                    ),
+                    "payload": {
+                        "stream_uuid": stream_uuid,
+                        "name": topic_name,
+                    },
+                    "extensions": {"provider_badge": "zulip"},
+                }
+                records.append(
+                    _record(
+                        store,
+                        account_uuid,
+                        project_uuid,
+                        record_source,
+                        int(event["id"]),
+                        next_subindex,
+                        topic_operation,
+                        f"chat:{account_uuid}:{stream_uuid}",
+                        event_time,
+                        delivery_class,
+                    )
+                )
+                next_subindex += 1
             operation = {
                 "kind": "message.update",
                 "entity_uuid": str(mapping["workspace_uuid"]),
@@ -860,23 +947,13 @@ def _mapped_event_records(
                     "provider_badge": "zulip",
                     "provider_original_url": message_url,
                     "lossy_conversion": lossy,
-                },
-            }
-            store.remember_provider_mapping(
-                account_uuid,
-                "message",
-                provider_message_id,
-                str(mapping["workspace_uuid"]),
-                {
-                    **metadata,
                     "content_sha256": hashlib.sha256(
                         markdown.encode("utf-8")
                     ).hexdigest(),
                     "provider_content_sha256": provider_content_sha256,
-                    "subject": str(event.get("subject", metadata.get("subject", ""))),
+                    "subject": (topic_name if chat_key.startswith("channel:") else ""),
                 },
-                str(event.get("edit_timestamp")),
-            )
+            }
         else:
             continue
         records.append(
