@@ -49,6 +49,27 @@ event UUIDs, and `applied` status before committing its local outbox. Transport
 errors and invalid or non-applied responses release every claimed submission so
 the idempotent event UUIDs can be retried.
 
+### Staged synchronization
+
+The first provider queue is registered and its cursor is persisted before any
+catalog or history work. Initial channel catalog reports contain channel names
+only. Once Workspace selects a channel, the bridge fetches the authoritative
+Zulip subscriber list and reports it before admitting live messages or
+starting the configured history backfill. The participant gate opens only when
+the current Workspace assignment projection contains the same provider user
+IDs.
+
+Zulip topics are discovered from messages. The durable provider mapping table
+is the local processed-topic cache: a missing topic queues an idempotent catalog
+report, message delivery waits for the resulting Workspace topic mapping, and
+then an idempotent `topic.upsert` precedes `message.create`.
+
+If Zulip rejects a persisted queue, the bridge records a catch-up boundary,
+invalidates only that queue cursor, and opens a replacement queue. Selected
+channel participants are revalidated and configured history jobs restart from
+their beginning. Stable provider mappings and operation UUIDs make the repeated
+entity creation and message delivery idempotent.
+
 ## Runtime boundary
 
 The element imports only the backend, enrollment secret, and persistent bridge

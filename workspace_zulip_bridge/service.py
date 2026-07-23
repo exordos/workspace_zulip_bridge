@@ -506,6 +506,12 @@ class BridgeService:
             cursor = self.store.provider_event_cursor(account_uuid)
             if cursor is None:
                 queue_id, last_event_id = adapter.ensure_queue()
+                # Persist the queue before catalog, participant, or history work.
+                # A restart can then resume the same queue instead of opening a
+                # gap while the initial synchronization is still in progress.
+                self.store.update_provider_event_cursor(
+                    account_uuid, queue_id, last_event_id
+                )
                 registration = adapter.take_registration_snapshot()
                 if registration is not None:
                     self._queue_registration_reports(
@@ -513,17 +519,14 @@ class BridgeService:
                         registration,
                         getattr(adapter, "server_url", ""),
                     )
-                catchup_ready = self._run_provider_queue_catchup(account_uuid, adapter)
-                self._queue_account_report(account_uuid, "backfill")
-                if not catchup_ready:
-                    return 0, None
-                self.store.update_provider_event_cursor(
-                    account_uuid, queue_id, last_event_id
-                )
             else:
                 queue_id = str(cursor["queue_id"])
                 last_event_id = int(cursor["last_event_id"])
                 adapter.restore_queue(queue_id, last_event_id)
+            catchup_ready = self._run_provider_queue_catchup(account_uuid, adapter)
+            if not catchup_ready:
+                self._queue_account_report(account_uuid, "backfill")
+                return 0, None
             events = adapter.events(queue_id, last_event_id)
             initial_sync_ready = self._initial_sync_ready(account_uuid)
             self._queue_account_report(
@@ -726,18 +729,29 @@ class BridgeService:
             stream_id = subscription.get("stream_id")
             name = subscription.get("name")
             if isinstance(stream_id, int) and isinstance(name, str) and name:
+                chat_key = f"channel:{stream_id}"
+                assignment_lookup = getattr(
+                    self.store, "assignment_for_provider_chat", None
+                )
+                assignment = (
+                    assignment_lookup(account_uuid, chat_key)
+                    if assignment_lookup is not None
+                    else None
+                )
                 subscribers = subscription.get("subscribers")
-                participant_ids = {
-                    value
-                    for value in (
-                        typing.cast(list[object], subscribers)
-                        if isinstance(subscribers, list)
-                        else []
+                participant_ids: set[int] = set()
+                if assignment is not None and bool(assignment.get("selected", True)):
+                    participant_ids.update(
+                        value
+                        for value in (
+                            typing.cast(list[object], subscribers)
+                            if isinstance(subscribers, list)
+                            else []
+                        )
+                        if isinstance(value, int)
                     )
-                    if isinstance(value, int)
-                }
-                if isinstance(provider_user_id, int):
-                    participant_ids.add(provider_user_id)
+                    if isinstance(provider_user_id, int):
+                        participant_ids.add(provider_user_id)
                 channel_participants = [
                     self._catalog_participant(
                         people.get(value, {"user_id": value}),
@@ -745,7 +759,7 @@ class BridgeService:
                     )
                     for value in sorted(participant_ids)
                 ]
-                catalog[f"channel:{stream_id}"] = (
+                catalog[chat_key] = (
                     "channel",
                     name,
                     channel_participants,
@@ -803,7 +817,92 @@ class BridgeService:
                 server_url,
                 participants=participants,
                 topics=topics,
+                authoritative_participants=True,
             )
+
+    @staticmethod
+    def _projection_participant_ids(
+        assignment: dict[str, object],
+    ) -> set[int]:
+        projection = assignment.get("workspace_projection")
+        if not isinstance(projection, dict):
+            return set()
+        participants = projection.get("participants")
+        if not isinstance(participants, list):
+            return set()
+        result: set[int] = set()
+        for participant in participants:
+            if not isinstance(participant, dict):
+                continue
+            try:
+                result.add(int(str(participant["provider_user_id"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return result
+
+    def _assignment_participants_ready(
+        self,
+        account_uuid: str,
+        chat_key: str,
+        assignment: dict[str, object],
+    ) -> bool:
+        checker = getattr(self.store, "assignment_participants_ready", None)
+        if checker is None:
+            return True
+        return bool(
+            checker(account_uuid, chat_key, int(assignment["generation"]))
+        )
+
+    def refresh_selected_participants_once(self) -> bool:
+        job = self.store.claim_participant_sync()
+        if job is None:
+            return False
+        account_uuid = str(job["account_uuid"])
+        chat_key = str(job["provider_chat_key"])
+        generation = int(job["assignment_generation"])
+        assignment = self.store.assignment_for_provider_chat(account_uuid, chat_key)
+        if (
+            assignment is None
+            or int(assignment["generation"]) != generation
+            or not bool(assignment.get("selected", True))
+            or self.store.provider_event_cursor(account_uuid) is None
+        ):
+            self.store.release_participant_sync(
+                account_uuid, chat_key, generation
+            )
+            return False
+        try:
+            adapter = self.provider_adapters(account_uuid)
+            registration = adapter.channel_catalog(chat_key)
+            self._queue_registration_reports(
+                account_uuid,
+                registration,
+                getattr(adapter, "server_url", ""),
+            )
+        except zulip_adapter.ZulipOperationError as exc:
+            self.store.release_participant_sync(
+                account_uuid, chat_key, generation
+            )
+            self.store.mark_health("provider", "degraded", exc.code)
+            self._queue_account_report(account_uuid, "degraded", exc.code)
+            return False
+        subscription = typing.cast(
+            list[dict[str, object]], registration["subscriptions"]
+        )[0]
+        provider_user_ids = {
+            int(value)
+            for value in typing.cast(list[object], subscription["subscribers"])
+        }
+        provider_user_ids.add(int(registration["user_id"]))
+        ready = provider_user_ids == self._projection_participant_ids(assignment)
+        self.store.complete_participant_sync(
+            account_uuid,
+            chat_key,
+            generation,
+            sorted(provider_user_ids),
+            ready,
+        )
+        return True
 
     @staticmethod
     def _catalog_participant(
@@ -833,10 +932,15 @@ class BridgeService:
         operation: str = "upsert",
         participants: list[dict[str, object]] | None = None,
         topics: list[dict[str, object]] | None = None,
+        authoritative_participants: bool = False,
     ) -> None:
         if operation == "upsert" and hasattr(self.store, "merge_catalog_topology"):
             participants, topics = self.store.merge_catalog_topology(
-                account_uuid, chat_key, participants or [], topics or []
+                account_uuid,
+                chat_key,
+                participants or [],
+                topics or [],
+                authoritative_participants=authoritative_participants,
             )
         elif operation == "delete" and hasattr(self.store, "delete_catalog_topology"):
             self.store.delete_catalog_topology(account_uuid, chat_key)
@@ -920,41 +1024,6 @@ class BridgeService:
             topics: list[dict[str, object]] = []
             if isinstance(recipient, str):
                 display_name = recipient
-                owner_uuid = str(account["owner_user_uuid"])
-                owner_mapping = self.store.workspace_mapping(
-                    account_uuid, "identity", owner_uuid
-                )
-                if owner_mapping is None:
-                    return
-                owner_metadata = typing.cast(
-                    dict[str, object], owner_mapping["metadata"]
-                )
-                participants.append(
-                    {
-                        "provider_user_id": str(owner_mapping["provider_id"]),
-                        "display_name": str(
-                            owner_metadata.get("display_name", "Workspace owner")
-                        ),
-                        "email": owner_metadata.get("email"),
-                        "avatar_urn": owner_metadata.get("avatar_urn"),
-                        "is_owner": True,
-                    }
-                )
-                sender_id = message.get("sender_id")
-                if isinstance(sender_id, int) and str(sender_id) != str(
-                    owner_mapping["provider_id"]
-                ):
-                    participants.append(
-                        {
-                            "provider_user_id": str(sender_id),
-                            "display_name": str(
-                                message.get("sender_full_name", sender_id)
-                            ),
-                            "email": message.get("sender_email"),
-                            "avatar_urn": None,
-                            "is_owner": False,
-                        }
-                    )
                 subject = message.get("subject")
                 stream_id = message.get("stream_id")
                 if isinstance(stream_id, int) and isinstance(subject, str) and subject:
@@ -981,23 +1050,6 @@ class BridgeService:
                 ]
             else:
                 return
-            known_participants = {
-                str(participant["provider_user_id"]) for participant in participants
-            }
-            for match in converter.MENTION_RE.finditer(str(message.get("content", ""))):
-                provider_user_id = match.group("user_id") or match.group("user_id_only")
-                if provider_user_id is None or provider_user_id in known_participants:
-                    continue
-                participants.append(
-                    {
-                        "provider_user_id": provider_user_id,
-                        "display_name": match.group("name_with_id") or provider_user_id,
-                        "email": None,
-                        "avatar_urn": None,
-                        "is_owner": False,
-                    }
-                )
-                known_participants.add(provider_user_id)
             if display_name:
                 self._queue_catalog_report(
                     account_uuid,
@@ -1090,6 +1142,8 @@ class BridgeService:
         adapter: zulip_adapter.OfficialZulipAdapter,
     ) -> bool:
         """Reconcile one bounded newest-first page before enabling live events."""
+        if not hasattr(self.store, "pending_provider_catchup"):
+            return True
         job = self.store.pending_provider_catchup(account_uuid)
         if job is None:
             return self.store.provider_catchup_ready(account_uuid)
@@ -1333,6 +1387,18 @@ class BridgeService:
                 if event["type"] == "message":
                     message = typing.cast(dict[str, object], event["message"])
                     _, chat_key = converter.provider_chat_reference(message)
+                    assignment_lookup = getattr(
+                        self.store, "assignment_for_provider_chat", None
+                    )
+                    assignment = (
+                        assignment_lookup(account_uuid, chat_key)
+                        if assignment_lookup is not None
+                        else None
+                    )
+                    if assignment is not None and not self._assignment_participants_ready(
+                        account_uuid, chat_key, assignment
+                    ):
+                        raise ValueError("provider_chat_participants_pending")
                     external_chat_uuid = uuid.UUID(
                         converter.stable_entity_uuid(
                             account_uuid, "external_chat", chat_key
@@ -1395,12 +1461,15 @@ class BridgeService:
                     processed += 1
                     continue
             except ValueError as exc:
-                if str(exc) == "provider_chat_assignment_pending":
+                if str(exc) in {
+                    "provider_chat_assignment_pending",
+                    "provider_chat_participants_pending",
+                }:
                     self.store.retry_provider_event(
                         account_uuid,
                         queue_id,
                         event_id,
-                        "provider_chat_assignment_pending",
+                        str(exc),
                     )
                     continue
                 if str(exc) == "provider_chat_not_selected":
@@ -1459,6 +1528,10 @@ class BridgeService:
         )
         if assignment is None:
             raise ValueError("provider_chat_assignment_pending")
+        if not self._assignment_participants_ready(
+            account_uuid, provider_chat_key, assignment
+        ):
+            raise ValueError("provider_chat_participants_pending")
         queue_id = (
             f"backfill:{provider_chat_key}:"
             f"{assignment['uuid']}:{assignment['generation']}"
@@ -1530,7 +1603,8 @@ class BridgeService:
             self.store.defer_backfill_job(
                 account_uuid,
                 provider_chat_key,
-                datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=delay),
+                datetime.datetime.now(datetime.UTC)
+                + datetime.timedelta(seconds=delay),
                 exc.code,
             )
             self.store.mark_health("provider", "degraded", exc.code)
@@ -1571,14 +1645,16 @@ class BridgeService:
             self.store.defer_backfill_job(
                 account_uuid,
                 provider_chat_key,
-                datetime.datetime.now(datetime.UTC)
-                + datetime.timedelta(seconds=delay),
+                datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=delay),
                 exc.code,
             )
             self.store.mark_health("provider", "degraded", exc.code)
             return True
         except ValueError as exc:
-            if str(exc) != "provider_chat_assignment_pending":
+            if str(exc) not in {
+                "provider_chat_assignment_pending",
+                "provider_chat_participants_pending",
+            }:
                 raise
             # Selecting a chat and receiving the resulting Workspace stream/topic
             # mappings are separate control-plane steps. Keep the history job
@@ -1671,6 +1747,8 @@ class BridgeService:
         progressed |= self._run_heartbeat(now)
         progressed |= self._run_control_poll(now)
         store = getattr(self, "store", None)
+        if store is not None and hasattr(store, "reconcile_participant_sync"):
+            store.reconcile_participant_sync()
         if store is not None and hasattr(store, "reconcile_backfill_jobs"):
             store.reconcile_backfill_jobs()
         live_progressed = False
@@ -1689,6 +1767,8 @@ class BridgeService:
         if now - last_provider_poll >= provider_poll_interval:
             live_progressed |= self.poll_provider_events() > 0
             self.last_provider_poll = now
+        if store is not None and hasattr(store, "claim_participant_sync"):
+            live_progressed |= self.refresh_selected_participants_once()
         if hasattr(self, "store"):
             live_progressed |= self._flush_observed_reports(now) > 0
         live_progressed |= self.process_provider_journal() > 0

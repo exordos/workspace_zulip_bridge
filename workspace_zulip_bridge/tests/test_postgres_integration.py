@@ -60,7 +60,8 @@ def postgres_store(migrated_postgres_dsn):
             """
             TRUNCATE desired_resources, provider_mappings,
                      provider_mapping_aliases, zulip_backfill_jobs,
-                     zulip_queue_catchup_jobs, workspace_delivery_outbox,
+                     zulip_queue_catchup_jobs, zulip_participant_sync,
+                     workspace_delivery_outbox,
                      operation_idempotency, producer_lane_counters,
                      producer_operations, causal_lane_state, bridge_operations,
                      scheduler_accounts, observed_report_outbox CASCADE
@@ -112,6 +113,16 @@ def _insert_account_and_assignment(
                 json.dumps(assignment),
             ),
         )
+    store.reconcile_participant_sync()
+    participant_job = store.claim_participant_sync()
+    assert participant_job is not None
+    store.complete_participant_sync(
+        account_uuid,
+        "channel:42",
+        1,
+        [],
+        True,
+    )
     return account_uuid, project_uuid
 
 

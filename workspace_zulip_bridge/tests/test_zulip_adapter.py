@@ -32,6 +32,18 @@ class FakeClient:
         self.uploads = []
         self.registration_request = None
         self.subscriptions_request = None
+        self.members = [
+            {
+                "user_id": 1,
+                "full_name": "Owner",
+                "email": "owner@example.invalid",
+            },
+            {
+                "user_id": 2,
+                "full_name": "Other User",
+                "email": "other@example.invalid",
+            },
+        ]
 
     def register(self, **kwargs):
         self.registration_request = kwargs
@@ -61,6 +73,9 @@ class FakeClient:
 
     def get_profile(self):
         return {"result": "success", "user_id": 1}
+
+    def get_users(self):
+        return {"result": "success", "members": self.members}
 
     def get_messages(self, request):
         self.last_get_messages = request
@@ -195,6 +210,37 @@ def test_outbound_prepare_never_registers_or_replaces_the_live_queue():
     assert error.value.code == "provider_unavailable"
     assert error.value.retryable
     assert client.registration_request is None
+
+
+def test_selected_channel_catalog_reads_authoritative_subscribers_and_users():
+    client = FakeClient()
+    adapter = _adapter(client)
+
+    catalog = adapter.channel_catalog("channel:42")
+
+    assert client.subscriptions_request == {"include_subscribers": True}
+    assert catalog == {
+        "subscriptions": [
+            {
+                "stream_id": 42,
+                "name": "Engineering",
+                "subscribers": [1, 2],
+            }
+        ],
+        "realm_users": client.members,
+        "user_id": 1,
+    }
+
+
+def test_selected_channel_catalog_rejects_unknown_stream():
+    client = FakeClient()
+    adapter = _adapter(client)
+
+    with pytest.raises(zulip_adapter.ZulipOperationError) as error:
+        adapter.channel_catalog("channel:404")
+
+    assert error.value.code == "invalid_record"
+    assert not error.value.retryable
 
 
 @pytest.mark.parametrize("chat_kind", ["channel", "personal_dm", "group_dm"])

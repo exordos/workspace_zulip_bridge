@@ -60,11 +60,12 @@ def test_migrations_have_one_versioned_dependency_chain():
         "0001-add-Zulip-provider-scheduler-state-143113.py",
         "0002-remove-legacy-message-projection-deliveries-e1636f.py",
         "0003-requeue-message-missing-topic-projection-ed8a5e.py",
+        "0004-gate-selected-chat-messages-on-participants-23f11f.py",
     ]
     assert engine.get_latest_migration() == (
-        "0003-requeue-message-missing-topic-projection-ed8a5e.py"
+        "0004-gate-selected-chat-messages-on-participants-23f11f.py"
     )
-    assert len({step["uuid"] for step in all_migrations.values()}) == 4
+    assert len({step["uuid"] for step in all_migrations.values()}) == 5
     assert all_migrations[
         "0001-add-Zulip-provider-scheduler-state-143113.py"
     ]["depends"] == ["0000-initialize-bridge-operational-state-18f707.py"]
@@ -75,6 +76,11 @@ def test_migrations_have_one_versioned_dependency_chain():
         "0003-requeue-message-missing-topic-projection-ed8a5e.py"
     ]["depends"] == [
         "0002-remove-legacy-message-projection-deliveries-e1636f.py"
+    ]
+    assert all_migrations[
+        "0004-gate-selected-chat-messages-on-participants-23f11f.py"
+    ]["depends"] == [
+        "0003-requeue-message-missing-topic-projection-ed8a5e.py"
     ]
 
 
@@ -96,7 +102,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
             applied = session.execute(
                 "SELECT count(*) AS count FROM ra_migrations WHERE applied"
             ).fetchone()
-            assert applied["count"] == 4
+            assert applied["count"] == 5
             session.execute("UPDATE bridge_metadata SET control_cursor = 'preserved'")
             session.execute("DROP TABLE ra_migrations")
 
@@ -110,7 +116,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
             cursor = session.execute(
                 "SELECT control_cursor FROM bridge_metadata WHERE singleton"
             ).fetchone()
-            assert applied["count"] == 4
+            assert applied["count"] == 5
             assert cursor["control_cursor"] == "preserved"
     finally:
         with admin_store.session() as session:

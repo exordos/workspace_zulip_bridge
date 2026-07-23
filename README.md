@@ -87,6 +87,9 @@ The current implementation provides:
 - durable exact lease binding and idempotent retry state in PostgreSQL;
 - official Zulip client calls, event queues, newest-first backfill, and
   ambiguous-send reconciliation;
+- durable queue registration before discovery, names-only initial channel
+  discovery, and an authoritative selected-channel participant gate before
+  live or historical messages are projected;
 - owner-scoped projections and stable identity/chat/topic/message mappings;
 - private file-plane transfers with short-lived URLs;
 - bounded concurrent per-account Zulip polling (16 workers by default) with a

@@ -1067,7 +1067,7 @@ def test_registration_snapshot_queues_account_live_ready_and_chat_catalog_report
     )
     assert channel["catalog"]["source"]["original_url"].endswith("/#narrow/channel/42")
     assert direct["catalog"]["source"]["original_url"].endswith("/#narrow/dm/1,2-dm")
-    assert channel["catalog"]["participants"] == direct["catalog"]["participants"]
+    assert channel["catalog"]["participants"] == []
     assert channel["catalog"]["capabilities"]["messenger.stream.rename"]["available"]
     assert "messenger.stream.rename" not in direct["catalog"]["capabilities"]
     assert set(channel["catalog"]["source"]) == {
@@ -1108,6 +1108,160 @@ def test_registration_snapshot_queues_account_live_ready_and_chat_catalog_report
         assert report["resource_uuid"] == expected
 
 
+@pytest.mark.parametrize(
+    ("projected_user_ids", "expected_ready"),
+    [(["1"], False), (["1", "2"], True)],
+)
+def test_selected_channel_participants_gate_messages_until_projection_matches(
+    projected_user_ids, expected_ready
+):
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+    owner_uuid = "00000000-0000-4000-8000-000000000002"
+    project_uuid = "00000000-0000-4000-8000-000000000003"
+    assignment = {
+        "uuid": "00000000-0000-4000-8000-000000000004",
+        "generation": 3,
+        "selected": True,
+        "workspace_projection": {
+            "participants": [
+                {"provider_user_id": user_id} for user_id in projected_user_ids
+            ]
+        },
+    }
+
+    class Store:
+        def __init__(self):
+            self.reports = []
+            self.completed = []
+
+        def claim_participant_sync(self):
+            return {
+                "account_uuid": account_uuid,
+                "provider_chat_key": "channel:42",
+                "assignment_generation": 3,
+            }
+
+        def assignment_for_provider_chat(self, requested, chat_key):
+            assert (requested, chat_key) == (account_uuid, "channel:42")
+            return assignment
+
+        def provider_event_cursor(self, requested):
+            return {"queue_id": "queue", "last_event_id": 7}
+
+        def account_resource(self, requested):
+            return {
+                "generation": 2,
+                "owner_user_uuid": owner_uuid,
+                "settings": {
+                    "selection_mode": "manual",
+                    "default_project_id": project_uuid,
+                },
+            }
+
+        def enqueue_observed_report(self, report):
+            self.reports.append(report)
+            return True
+
+        def remember_provider_mapping(self, *args):
+            return None
+
+        def complete_participant_sync(self, *args):
+            self.completed.append(args)
+
+        def release_participant_sync(self, *args):
+            raise AssertionError("valid participant synchronization was released")
+
+        def mark_health(self, *args):
+            return None
+
+    class Adapter:
+        server_url = "https://zulip.example.invalid"
+
+        def channel_catalog(self, chat_key):
+            assert chat_key == "channel:42"
+            return {
+                "user_id": 1,
+                "realm_users": [
+                    {"user_id": 1, "full_name": "Owner"},
+                    {"user_id": 2, "full_name": "Other User"},
+                ],
+                "subscriptions": [
+                    {
+                        "stream_id": 42,
+                        "name": "Engineering",
+                        "subscribers": [1, 2],
+                    }
+                ],
+            }
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance.provider_adapters = lambda requested: Adapter()
+
+    assert instance.refresh_selected_participants_once()
+    assert instance.store.completed == [
+        (account_uuid, "channel:42", 3, [1, 2], expected_ready)
+    ]
+    catalog = instance.store.reports[0]["catalog"]
+    assert {
+        participant["provider_user_id"]
+        for participant in catalog["participants"]
+    } == {"1", "2"}
+
+
+def test_live_message_waits_for_selected_channel_participant_projection():
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+
+    class Store(DeliveryStore):
+        def assignment_participants_ready(self, *args):
+            return False
+
+    store = Store(
+        [
+            {
+                "account_uuid": account_uuid,
+                "queue_id": "queue",
+                "event_id": 7,
+                "body": {
+                    "id": 7,
+                    "type": "message",
+                    "message": {
+                        "id": 70,
+                        "type": "stream",
+                        "stream_id": 42,
+                    },
+                },
+            }
+        ]
+    )
+
+    assert _delivery_service(store).process_provider_journal() == 0
+    assert store.retried == [
+        (
+            account_uuid,
+            "queue",
+            7,
+            "provider_chat_participants_pending",
+        )
+    ]
+    assert store.enqueued == []
+
+
+def test_backfill_waits_for_selected_channel_participant_projection():
+    class Store(DeliveryStore):
+        def assignment_participants_ready(self, *args):
+            return False
+
+    instance = _delivery_service(Store())
+
+    with pytest.raises(ValueError, match="provider_chat_participants_pending"):
+        instance.enqueue_backfill(
+            "00000000-0000-4000-8000-000000000001",
+            "channel:42",
+            [{"id": 7, "timestamp": 7}],
+        )
+
+
 def test_catalog_reports_accumulate_full_replacement_topology():
     class Store:
         def __init__(self):
@@ -1115,7 +1269,17 @@ def test_catalog_reports_accumulate_full_replacement_topology():
             self.topics = {}
             self.reports = []
 
-        def merge_catalog_topology(self, _account, _chat, participants, topics):
+        def merge_catalog_topology(
+            self,
+            _account,
+            _chat,
+            participants,
+            topics,
+            *,
+            authoritative_participants=False,
+        ):
+            if authoritative_participants:
+                self.participants = {}
             self.participants.update(
                 (value["provider_user_id"], value) for value in participants
             )
@@ -1175,6 +1339,71 @@ def test_catalog_reports_accumulate_full_replacement_topology():
     }
 
 
+def test_channel_message_catalog_does_not_turn_authors_or_mentions_into_members():
+    class Store:
+        def __init__(self):
+            self.reports = []
+            self.merge_calls = []
+
+        def account_resource(self, _account_uuid):
+            return {
+                "owner_user_uuid": "10000000-0000-4000-8000-000000000001",
+                "generation": 1,
+                "settings": {
+                    "default_project_id": "10000000-0000-4000-8000-000000000002"
+                },
+            }
+
+        def merge_catalog_topology(
+            self,
+            _account,
+            _chat,
+            participants,
+            topics,
+            *,
+            authoritative_participants=False,
+        ):
+            self.merge_calls.append(
+                (participants, topics, authoritative_participants)
+            )
+            return participants, topics
+
+        def enqueue_observed_report(self, report):
+            self.reports.append(report)
+            return True
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance._queue_event_catalog(
+        "10000000-0000-4000-8000-000000000003",
+        {
+            "type": "message",
+            "message": {
+                "type": "stream",
+                "stream_id": 42,
+                "display_recipient": "Engineering",
+                "subject": "General",
+                "sender_id": 2,
+                "sender_full_name": "Former Member",
+                "sender_email": "former@example.test",
+                "content": "Hello @_**Unrelated User|3**",
+            },
+        },
+        "https://zulip.example.invalid",
+    )
+
+    participants, topics, authoritative = instance.store.merge_calls[0]
+    assert participants == []
+    assert topics == [
+        {
+            "provider_topic_id": "42:General",
+            "name": "General",
+            "is_default": False,
+        }
+    ]
+    assert authoritative is False
+
+
 def test_catalog_original_urls_follow_zulip_dm_permalink_shapes():
     site = "https://zulip.example.invalid"
     assert service.BridgeService._catalog_original_url(site, "direct:1,2") == (
@@ -1208,6 +1437,7 @@ def test_first_provider_poll_processes_registration_and_reports_live_ready():
             return True
 
         def pending_provider_catchup(self, requested):
+            assert self.cursor == {"queue_id": "queue", "last_event_id": 10}
             return None
 
         def update_provider_event_cursor(self, requested, queue_id, event_id):

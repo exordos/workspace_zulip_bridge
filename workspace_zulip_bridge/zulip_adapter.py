@@ -36,6 +36,8 @@ class ZulipClient(typing.Protocol):
         self, request: dict[str, object] | None = None
     ) -> dict[str, object]: ...
 
+    def get_users(self) -> dict[str, object]: ...
+
     def get_events(self, **kwargs: object) -> dict[str, object]: ...
 
     def get_messages(self, request: dict[str, object]) -> dict[str, object]: ...
@@ -454,6 +456,53 @@ class OfficialZulipAdapter:
             int(result["last_event_id"]),
             result,
         )
+
+    def channel_catalog(self, provider_chat_key: str) -> dict[str, object]:
+        stream_id = self._channel_id(provider_chat_key)
+        try:
+            subscriptions = _successful(
+                self.client.get_subscriptions({"include_subscribers": True})
+            ).get("subscriptions")
+            members = _successful(self.client.get_users()).get("members")
+            profile = _successful(self.client.get_profile())
+        except PROVIDER_NETWORK_ERRORS as exc:
+            raise ZulipOperationError("provider_unavailable", True) from exc
+        if (
+            not isinstance(subscriptions, list)
+            or not isinstance(members, list)
+            or not all(
+                isinstance(member, dict)
+                and isinstance(member.get("user_id"), int)
+                for member in members
+            )
+            or not isinstance(profile.get("user_id"), int)
+        ):
+            raise ZulipOperationError("invalid_record", False)
+        subscription = next(
+            (
+                item
+                for item in subscriptions
+                if isinstance(item, dict) and item.get("stream_id") == stream_id
+            ),
+            None,
+        )
+        if (
+            subscription is None
+            or not isinstance(subscription.get("name"), str)
+            or not isinstance(subscription.get("subscribers"), list)
+            or not all(
+                isinstance(user_id, int)
+                for user_id in typing.cast(
+                    list[object], subscription.get("subscribers")
+                )
+            )
+        ):
+            raise ZulipOperationError("invalid_record", False)
+        return {
+            "subscriptions": [subscription],
+            "realm_users": members,
+            "user_id": profile["user_id"],
+        }
 
     def _external_chat_uuid(self, provider_chat_key: str) -> uuid.UUID:
         if self.routing is None:
