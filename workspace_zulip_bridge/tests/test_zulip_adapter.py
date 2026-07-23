@@ -708,14 +708,12 @@ def test_backfill_history_is_raw_and_newest_first():
     ]
 
 
-def test_provider_event_poll_is_nonblocking():
+def test_provider_event_poll_uses_official_longpoll_boundary():
     client = FakeClient()
     adapter = zulip_adapter.OfficialZulipAdapter(client=client)
 
     assert adapter.events("queue-1", 7) == []
-    assert client.event_requests == [
-        {"queue_id": "queue-1", "last_event_id": 7, "dont_block": True}
-    ]
+    assert client.event_requests == [{"queue_id": "queue-1", "last_event_id": 7}]
     assert client.endpoint_requests == [
         {
             "url": "events",
@@ -723,10 +721,9 @@ def test_provider_event_poll_is_nonblocking():
             "request": {
                 "queue_id": "queue-1",
                 "last_event_id": 7,
-                "dont_block": True,
             },
-            "longpolling": False,
-            "timeout": zulip_adapter.PROVIDER_REQUEST_TIMEOUT_SECONDS,
+            "longpolling": True,
+            "timeout": None,
         }
     ]
 

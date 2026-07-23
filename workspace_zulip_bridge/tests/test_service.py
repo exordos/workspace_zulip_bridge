@@ -1,4 +1,3 @@
-import concurrent.futures
 import pathlib
 import threading
 import time
@@ -326,8 +325,11 @@ def test_control_snapshot_resource_guard_preserves_installed_state(monkeypatch):
     assert store.installed == [([{"uuid": "old"}], "old-anchor")]
 
 
-def test_retryable_provider_error_defers_only_failing_account(monkeypatch):
+def test_retryable_longpoll_error_defers_only_failing_account(monkeypatch):
     accounts = ["account-a", "account-b"]
+    healthy_started = threading.Event()
+    healthy_release = threading.Event()
+    healthy_stop_release = threading.Event()
 
     class Store:
         def __init__(self):
@@ -356,6 +358,7 @@ def test_retryable_provider_error_defers_only_failing_account(monkeypatch):
     class Adapter:
         def __init__(self, account_uuid):
             self.account_uuid = account_uuid
+            self.calls = 0
 
         def restore_queue(self, queue_id, last_event_id):
             return None
@@ -363,7 +366,13 @@ def test_retryable_provider_error_defers_only_failing_account(monkeypatch):
         def events(self, queue_id, last_event_id):
             if self.account_uuid == "account-a":
                 raise zulip_adapter.ZulipOperationError("provider_unavailable", True)
-            return [{"id": 5, "type": "realm_user"}]
+            self.calls += 1
+            if self.calls == 1:
+                healthy_started.set()
+                assert healthy_release.wait(timeout=2)
+                return [{"id": 5, "type": "realm_user"}]
+            assert healthy_stop_release.wait(timeout=2)
+            return [{"id": 6, "type": "heartbeat"}]
 
     class FixedRandom:
         def uniform(self, lower, upper):
@@ -380,22 +389,34 @@ def test_retryable_provider_error_defers_only_failing_account(monkeypatch):
     instance.provider_random = FixedRandom()
     monkeypatch.setattr(time, "monotonic", lambda: 100.0)
 
+    assert instance.poll_provider_events() == 0
+    assert set(instance.provider_poll_threads) == set(accounts)
+    assert {
+        thread.name for thread in instance.provider_poll_threads.values()
+    } == {"zulip-live-account--nt-a", "zulip-live-account--nt-b"}
+    assert healthy_started.wait(timeout=1)
+    healthy_release.set()
+    deadline = time.time() + 1
+    while len(instance.store.recorded) < 1 and time.time() < deadline:
+        time.sleep(0.01)
+    deadline = time.time() + 1
+    while not instance.provider_poll_results.qsize() and time.time() < deadline:
+        time.sleep(0.01)
     assert instance.poll_provider_events() == 1
     assert instance.store.recorded == [("account-b", "queue-account-b", 5)]
     assert instance.provider_retry_attempts == {"account-a": 1}
     assert instance.provider_retry_after["account-a"] > 100.0
 
-    assert instance.poll_provider_events() == 1
-    assert instance.provider_retry_attempts == {"account-a": 1}
-    assert instance.store.recorded == [
-        ("account-b", "queue-account-b", 5),
-        ("account-b", "queue-account-b", 5),
-    ]
-    assert ("provider", "healthy", None) not in instance.store.health
+    instance.provider_poll_stops["account-b"].set()
+    healthy_stop_release.set()
+    instance.provider_poll_threads["account-b"].join(timeout=1)
+    assert not instance.provider_poll_threads["account-b"].is_alive()
 
 
-def test_empty_successful_provider_poll_recovers_health():
+def test_empty_successful_longpoll_recovers_health():
     account_uuid = "00000000-0000-4000-8000-000000000001"
+    first_returned = threading.Event()
+    stop_release = threading.Event()
 
     class Store:
         def __init__(self):
@@ -416,10 +437,18 @@ def test_empty_successful_provider_poll_recovers_health():
             self.health.append((component, status, code))
 
     class Adapter:
+        def __init__(self):
+            self.calls = 0
+
         def restore_queue(self, queue_id, last_event_id):
             assert (queue_id, last_event_id) == ("queue", -1)
 
         def events(self, queue_id, last_event_id):
+            self.calls += 1
+            if self.calls == 1:
+                first_returned.set()
+                return []
+            assert stop_release.wait(timeout=2)
             return []
 
     instance = object.__new__(service.BridgeService)
@@ -435,9 +464,17 @@ def test_empty_successful_provider_poll_recovers_health():
     )()
 
     assert instance.poll_provider_events() == 0
+    assert first_returned.wait(timeout=1)
+    deadline = time.time() + 1
+    while not instance.provider_poll_results.qsize() and time.time() < deadline:
+        time.sleep(0.01)
+    assert instance.poll_provider_events() == 0
     assert instance.provider_retry_attempts == {}
     assert instance.provider_retry_after == {}
     assert instance.store.health == [("provider", "healthy", None)]
+    instance.provider_poll_stops[account_uuid].set()
+    stop_release.set()
+    instance.provider_poll_threads[account_uuid].join(timeout=1)
 
 
 def test_live_event_is_persisted_before_incomplete_queue_catchup():
@@ -490,91 +527,75 @@ def test_live_event_is_persisted_before_incomplete_queue_catchup():
     ]
 
 
-def test_adapter_connection_failure_degrades_only_affected_account(monkeypatch):
-    failed_account = "00000000-0000-4000-8000-000000000001"
-    healthy_account = "00000000-0000-4000-8000-000000000002"
+def test_heartbeat_advances_cursor_without_journaling_an_operation():
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+    calls = []
 
     class Store:
-        def __init__(self):
-            self.recorded = []
-            self.reports = []
-            self.health = []
+        def account_resource(self, requested):
+            return None
 
-        def active_account_uuids(self):
-            return [failed_account, healthy_account]
+        def provider_event_cursor(self, requested):
+            return {"queue_id": "queue", "last_event_id": 4}
 
+        def record_provider_event(self, *args):
+            calls.append(("record", args))
+
+        def update_provider_event_cursor(self, requested, queue_id, event_id):
+            calls.append(("cursor", requested, queue_id, event_id))
+
+    class Adapter:
+        def restore_queue(self, queue_id, last_event_id):
+            return None
+
+        def events(self, queue_id, last_event_id):
+            return [{"id": 5, "type": "heartbeat"}]
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance.provider_adapters = lambda requested: Adapter()
+
+    assert instance._poll_provider_account(account_uuid) == (0, None)
+    assert calls == [("cursor", account_uuid, "queue", 5)]
+
+
+def test_adapter_connection_failure_is_reported_from_account_poll(monkeypatch):
+    failed_account = "00000000-0000-4000-8000-000000000001"
+
+    class Store:
         def provider_event_cursor(self, account_uuid):
             return {"queue_id": f"queue-{account_uuid}", "last_event_id": 4}
 
         def account_resource(self, account_uuid):
-            if account_uuid == failed_account:
-                return {"generation": 7}
             return None
-
-        def record_provider_event(self, account_uuid, queue_id, event):
-            self.recorded.append((account_uuid, queue_id, event["id"]))
-
-        def update_provider_event_cursor(self, account_uuid, queue_id, event_id):
-            return None
-
-        def enqueue_observed_report(self, report):
-            self.reports.append(report)
-
-        def mark_health(self, component, status, code=None):
-            self.health.append((component, status, code))
 
     class UnreachableClient:
         def __init__(self, **kwargs):
             raise zulip_adapter.zulip.UnrecoverableNetworkError("offline")
 
-    class HealthyAdapter:
-        def restore_queue(self, queue_id, last_event_id):
-            return None
-
-        def events(self, queue_id, last_event_id):
-            return [{"id": 5, "type": "realm_user"}]
-
-    def adapter_factory(account_uuid):
-        if account_uuid == failed_account:
-            return zulip_adapter.OfficialZulipAdapter(
-                credentials=zulip_adapter.ZulipCredentials(
-                    "https://unresolvable.example.invalid",
-                    "user@example.invalid",
-                    "opaque-api-key",
-                )
-            )
-        return HealthyAdapter()
-
     instance = object.__new__(service.BridgeService)
     instance.store = Store()
-    instance.provider_adapters = adapter_factory
-    instance.scheduler = type(
-        "Scheduler", (), {"reconcile_local_echo": lambda *args: None}
-    )()
-    instance.provider_retry_attempts = {}
-    instance.provider_retry_after = {}
-    instance.provider_random = type(
-        "Random", (), {"uniform": lambda self, lower, upper: upper}
-    )()
-    monkeypatch.setattr(zulip_adapter.zulip, "Client", UnreachableClient)
-    monkeypatch.setattr(time, "monotonic", lambda: 100.0)
-
-    assert instance.poll_provider_events() == 1
-    assert instance.store.recorded == [
-        (healthy_account, f"queue-{healthy_account}", 5)
-    ]
-    assert instance.provider_retry_attempts == {failed_account: 1}
-    assert instance.provider_retry_after[failed_account] > 100.0
-    assert len(instance.store.reports) == 1
-    assert instance.store.reports[0]["resource_uuid"] == failed_account
-    assert instance.store.reports[0]["status"] == "degraded"
-    assert instance.store.reports[0]["safe_error"]["code"] == (
-        "provider_unavailable"
+    instance.provider_adapters = lambda account_uuid: (
+        zulip_adapter.OfficialZulipAdapter(
+            credentials=zulip_adapter.ZulipCredentials(
+                "https://unresolvable.example.invalid",
+                "user@example.invalid",
+                "opaque-api-key",
+            )
+        )
     )
+    monkeypatch.setattr(zulip_adapter.zulip, "Client", UnreachableClient)
+
+    processed, error = instance._poll_provider_account(failed_account)
+    assert processed == 0
+    assert error is not None
+    assert error.code == "provider_unavailable"
 
 
-def test_150_account_poll_is_bounded_by_worker_pool_not_serial_latency():
-    accounts = [str(uuid.UUID(int=index + 1)) for index in range(150)]
+def test_each_active_account_gets_a_dedicated_longpoll_thread():
+    accounts = [str(uuid.UUID(int=index + 1)) for index in range(3)]
+    started = {account_uuid: threading.Event() for account_uuid in accounts}
+    release = threading.Event()
 
     class Store:
         def active_account_uuids(self):
@@ -589,46 +610,45 @@ def test_150_account_poll_is_bounded_by_worker_pool_not_serial_latency():
         def mark_health(self, *args):
             return None
 
-    active = 0
-    maximum_active = 0
     adapters = []
-    lock = threading.Lock()
 
     class Adapter:
-        def __init__(self):
-            adapters.append(self)
+        def __init__(self, account_uuid):
+            self.account_uuid = account_uuid
+            adapters.append((account_uuid, self))
 
         def restore_queue(self, queue_id, last_event_id):
             return None
 
         def events(self, queue_id, last_event_id):
-            nonlocal active, maximum_active
-            with lock:
-                active += 1
-                maximum_active = max(maximum_active, active)
-            time.sleep(0.04)
-            with lock:
-                active -= 1
-            return []
+            started[self.account_uuid].set()
+            assert release.wait(timeout=2)
+            return [{"id": 1, "type": "heartbeat"}]
 
     instance = object.__new__(service.BridgeService)
     instance.store = Store()
-    instance.provider_adapters = lambda account_uuid: Adapter()
-    instance.provider_poll_workers = 16
+    instance.provider_adapters = Adapter
     instance.provider_retry_attempts = {}
     instance.provider_retry_after = {}
     instance.provider_random = type(
         "Random", (), {"uniform": lambda self, lower, upper: lower}
     )()
 
-    started = time.monotonic()
     assert instance.poll_provider_events() == 0
-    elapsed = time.monotonic() - started
-
-    assert maximum_active == 16
+    assert all(event.wait(timeout=1) for event in started.values())
+    assert set(instance.provider_poll_threads) == set(accounts)
+    assert len({thread.ident for thread in instance.provider_poll_threads.values()}) == 3
+    assert all(
+        thread.name == f"zulip-live-{account_uuid[:8]}-{account_uuid[-4:]}"
+        for account_uuid, thread in instance.provider_poll_threads.items()
+    )
     assert len(adapters) == len(accounts)
-    assert len({id(adapter) for adapter in adapters}) == len(accounts)
-    assert elapsed < 5.0
+    assert len({id(adapter) for _, adapter in adapters}) == len(accounts)
+    for stop in instance.provider_poll_stops.values():
+        stop.set()
+    release.set()
+    for thread in instance.provider_poll_threads.values():
+        thread.join(timeout=1)
 
 
 class DeliveryStore:
@@ -1569,7 +1589,7 @@ def test_first_provider_poll_processes_registration_and_reports_live_ready():
         "Random", (), {"uniform": lambda self, lower, upper: lower}
     )()
 
-    assert instance.poll_provider_events() == 0
+    assert instance._poll_provider_account(account_uuid) == (0, None)
     assert instance.store.cursor == {"queue_id": "queue", "last_event_id": 10}
     assert {report["resource_type"] for report in instance.store.reports} == {
         "external_account",
@@ -1583,7 +1603,7 @@ def test_first_provider_poll_processes_registration_and_reports_live_ready():
     assert account_report["status"] == "backfill"
 
     instance.store.ready = True
-    assert instance.poll_provider_events() == 0
+    assert instance._poll_provider_account(account_uuid) == (0, None)
     account_report = [
         report
         for report in instance.store.reports
@@ -1689,6 +1709,8 @@ def test_tick_reconciles_global_backfill_state_once_not_once_per_account(
     instance.last_history_quantum = now
     instance.health_file = tmp_path / "progress"
     instance.scheduler = Scheduler()
+    instance._run_heartbeat = lambda current: False
+    instance._run_control_poll = lambda current: False
     instance.poll_provider_operations = lambda: 0
     instance.poll_provider_events = lambda: (
         sum(instance._initial_sync_ready(account_uuid) for _index in range(150)) * 0
@@ -2265,6 +2287,8 @@ def test_continuous_live_work_still_runs_bounded_history_quantum(tmp_path, monke
     instance.last_history_quantum = now[0] - 1.0
     instance.health_file = tmp_path / "progress"
     instance.scheduler = Scheduler()
+    instance._run_heartbeat = lambda current: False
+    instance._run_control_poll = lambda current: False
     instance.poll_provider_operations = lambda: 0
     instance.poll_provider_events = lambda: 0
     instance.process_provider_journal = lambda: 0
@@ -2285,10 +2309,8 @@ def test_continuous_live_work_still_runs_bounded_history_quantum(tmp_path, monke
     ]
 
 
-def test_running_history_quantum_does_not_block_next_live_tick(tmp_path, monkeypatch):
-    started = threading.Event()
-    release = threading.Event()
-    live_calls = []
+def test_history_quantum_runs_in_the_main_service_thread(tmp_path, monkeypatch):
+    history_threads = []
     now = [10.0]
     monkeypatch.setattr(time, "monotonic", lambda: now[0])
 
@@ -2297,8 +2319,7 @@ def test_running_history_quantum_does_not_block_next_live_tick(tmp_path, monkeyp
             return False
 
         def run_once(self):
-            live_calls.append(now[0])
-            return True
+            return False
 
     instance = object.__new__(service.BridgeService)
     instance.last_heartbeat = now[0]
@@ -2308,29 +2329,129 @@ def test_running_history_quantum_does_not_block_next_live_tick(tmp_path, monkeyp
     instance.last_history_quantum = now[0] - 1.0
     instance.health_file = tmp_path / "progress"
     instance.scheduler = Scheduler()
+    instance._run_heartbeat = lambda current: False
+    instance._run_control_poll = lambda current: False
     instance.poll_provider_operations = lambda: 0
     instance.poll_provider_events = lambda: 0
     instance.process_provider_journal = lambda: 0
     instance.flush_provider_results = lambda: 0
     instance.flush_provider_events = lambda **kwargs: 0
-    instance.history_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    instance.history_future = None
 
-    def slow_history():
-        started.set()
-        assert release.wait(timeout=2)
+    def history():
+        history_threads.append(threading.get_ident())
         return True
 
-    instance._run_history_quantum_once = slow_history
-    try:
-        assert instance.tick()
-        assert started.wait(timeout=1)
-        now[0] += 1.0
-        assert instance.tick()
-        assert live_calls == [10.0, 11.0]
-    finally:
-        release.set()
-        instance.history_executor.shutdown(wait=True)
+    instance._run_history_quantum_once = history
+
+    calling_thread = threading.get_ident()
+    assert instance.tick()
+    assert history_threads == [calling_thread]
+
+
+def test_longpoll_persists_live_event_while_main_thread_runs_history(
+    tmp_path, monkeypatch
+):
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+    now = [10.0]
+    history_started = threading.Event()
+    release_history = threading.Event()
+    event_recorded = threading.Event()
+    release_second_poll = threading.Event()
+    tick_finished = threading.Event()
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+
+    class Store:
+        def __init__(self):
+            self.events = []
+
+        def active_account_uuids(self):
+            return [account_uuid]
+
+        def provider_event_cursor(self, requested):
+            return {"queue_id": "queue", "last_event_id": 4}
+
+        def account_resource(self, requested):
+            return None
+
+        def record_provider_event(self, requested, queue_id, event):
+            self.events.append((requested, queue_id, event["id"]))
+            event_recorded.set()
+
+        def update_provider_event_cursor(self, *args):
+            return None
+
+        def mark_health(self, *args):
+            return None
+
+    class Adapter:
+        def __init__(self):
+            self.calls = 0
+
+        def restore_queue(self, queue_id, last_event_id):
+            return None
+
+        def events(self, queue_id, last_event_id):
+            self.calls += 1
+            if self.calls == 1:
+                assert history_started.wait(timeout=2)
+                return [{"id": 5, "type": "realm_user"}]
+            assert release_second_poll.wait(timeout=2)
+            return [{"id": 6, "type": "heartbeat"}]
+
+    class Scheduler:
+        def reconcile_once(self):
+            return False
+
+        def run_once(self):
+            return False
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance.provider_adapters = lambda requested: Adapter()
+    instance.provider_retry_attempts = {}
+    instance.provider_retry_after = {}
+    instance.provider_random = type(
+        "Random", (), {"uniform": lambda self, lower, upper: lower}
+    )()
+    instance.last_heartbeat = now[0]
+    instance.last_control = now[0]
+    instance.last_certificate_check = now[0]
+    instance.last_provider_poll = 0.0
+    instance.last_history_quantum = now[0] - 1.0
+    instance.health_file = tmp_path / "progress"
+    instance.scheduler = Scheduler()
+    instance._run_heartbeat = lambda current: False
+    instance._run_control_poll = lambda current: False
+    instance.poll_provider_operations = lambda: 0
+    instance.process_provider_journal = lambda: 0
+    instance.flush_provider_results = lambda: 0
+    instance.flush_provider_events = lambda **kwargs: 0
+    instance._flush_observed_reports = lambda current: 0
+
+    def history():
+        history_started.set()
+        assert release_history.wait(timeout=2)
+        return True
+
+    instance._run_history_quantum_once = history
+
+    def run_tick():
+        instance.tick()
+        tick_finished.set()
+
+    service_thread = threading.Thread(target=run_tick)
+    service_thread.start()
+    assert history_started.wait(timeout=1)
+    assert event_recorded.wait(timeout=1)
+    assert not tick_finished.is_set()
+    assert instance.store.events == [(account_uuid, "queue", 5)]
+
+    instance.provider_poll_stops[account_uuid].set()
+    release_history.set()
+    release_second_poll.set()
+    service_thread.join(timeout=1)
+    instance.provider_poll_threads[account_uuid].join(timeout=1)
+    assert tick_finished.is_set()
 
 
 def test_full_history_delivery_batch_defers_more_provider_io(tmp_path, monkeypatch):

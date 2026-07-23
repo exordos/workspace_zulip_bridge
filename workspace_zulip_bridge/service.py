@@ -1,11 +1,12 @@
-import concurrent.futures
 import dataclasses
 import datetime
 import hashlib
 import pathlib
+import queue
 import random
 import ssl
 import tempfile
+import threading
 import time
 import typing
 import uuid
@@ -192,12 +193,9 @@ class BridgeService:
         provider_poll_interval_seconds: float = 2.0,
         provider_lease_seconds: int = 300,
         provider_batch_size: int = 20,
-        provider_poll_workers: int = 16,
     ):
         if provider_client is None:
             raise ValueError("Provider API client is required")
-        if not 1 <= provider_poll_workers <= 64:
-            raise ValueError("Provider poll worker count must be between 1 and 64")
         self.store = store
         self.control = control_client
         self.scheduler = operation_scheduler
@@ -214,18 +212,19 @@ class BridgeService:
         self.provider_poll_interval_seconds = provider_poll_interval_seconds
         self.provider_lease_seconds = provider_lease_seconds
         self.provider_batch_size = provider_batch_size
-        self.provider_poll_workers = provider_poll_workers
         self.provider_lease_request_uuid: uuid.UUID | None = None
         self.last_control = 0.0
         self.last_heartbeat = 0.0
         self.last_certificate_check = 0.0
         self.last_provider_poll = 0.0
         self.last_history_quantum = time.monotonic()
-        self.history_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="zulip-history",
-        )
-        self.history_future: concurrent.futures.Future[bool] | None = None
+        self.provider_poll_threads: dict[str, threading.Thread] = {}
+        self.provider_poll_stops: dict[str, threading.Event] = {}
+        self.provider_poll_results: queue.SimpleQueue[
+            tuple[str, int, zulip_adapter.ZulipOperationError | None]
+        ] = queue.SimpleQueue()
+        self.provider_failed_accounts: set[str] = set()
+        self.provider_successful_accounts: set[str] = set()
         self.provider_retry_attempts: dict[str, int] = {}
         self.provider_retry_after: dict[str, float] = {}
         self.provider_random = random.Random()
@@ -502,12 +501,14 @@ class BridgeService:
         return sent
 
     def _poll_provider_account(
-        self, account_uuid: str
+        self,
+        account_uuid: str,
+        adapter: zulip_adapter.OfficialZulipAdapter | None = None,
     ) -> tuple[int, zulip_adapter.ZulipOperationError | None]:
-        """Poll one account with an adapter owned only by this worker call."""
-        adapter = None
+        """Perform one queue long-poll using an account-thread-owned adapter."""
         try:
-            adapter = self.provider_adapters(account_uuid)
+            if adapter is None:
+                adapter = self.provider_adapters(account_uuid)
             cursor = self.store.provider_event_cursor(account_uuid)
             if cursor is None:
                 queue_id, last_event_id = adapter.ensure_queue()
@@ -539,20 +540,21 @@ class BridgeService:
         processed = 0
         for event in events:
             event_id = int(event["id"])
-            self.store.record_provider_event(account_uuid, queue_id, event)
-            local_id = event.get("local_message_id")
-            message = event.get("message")
-            if local_id is not None and isinstance(message, dict):
-                provider_message_id = message.get("id")
-                if provider_message_id is not None:
-                    self.scheduler.reconcile_local_echo(
-                        account_uuid,
-                        queue_id,
-                        str(local_id),
-                        str(provider_message_id),
-                    )
+            if event.get("type") != "heartbeat":
+                self.store.record_provider_event(account_uuid, queue_id, event)
+                local_id = event.get("local_message_id")
+                message = event.get("message")
+                if local_id is not None and isinstance(message, dict):
+                    provider_message_id = message.get("id")
+                    if provider_message_id is not None:
+                        self.scheduler.reconcile_local_echo(
+                            account_uuid,
+                            queue_id,
+                            str(local_id),
+                            str(provider_message_id),
+                        )
+                processed += 1
             self.store.update_provider_event_cursor(account_uuid, queue_id, event_id)
-            processed += 1
         initial_sync_ready = self._initial_sync_ready(account_uuid)
         self._queue_account_report(
             account_uuid,
@@ -562,32 +564,69 @@ class BridgeService:
             self._queue_ready_assignment_reports(account_uuid)
         return processed, None
 
+    def _ensure_provider_poll_state(self) -> None:
+        """Initialize account-thread state for normal and lightweight test instances."""
+        if not hasattr(self, "provider_poll_threads"):
+            self.provider_poll_threads = {}
+        if not hasattr(self, "provider_poll_stops"):
+            self.provider_poll_stops = {}
+        if not hasattr(self, "provider_poll_results"):
+            self.provider_poll_results = queue.SimpleQueue()
+        if not hasattr(self, "provider_failed_accounts"):
+            self.provider_failed_accounts = set()
+        if not hasattr(self, "provider_successful_accounts"):
+            self.provider_successful_accounts = set()
+
+    def _run_provider_account_longpoll(
+        self,
+        account_uuid: str,
+        stop: threading.Event,
+    ) -> None:
+        """Continuously capture one account queue outside the main sync thread."""
+        try:
+            adapter = self.provider_adapters(account_uuid)
+            while not stop.is_set():
+                processed, error = self._poll_provider_account(account_uuid, adapter)
+                self.provider_poll_results.put((account_uuid, processed, error))
+                if error is not None:
+                    return
+        except zulip_adapter.ZulipOperationError as exc:
+            self.provider_poll_results.put((account_uuid, 0, exc))
+        except Exception:
+            self.provider_poll_results.put(
+                (
+                    account_uuid,
+                    0,
+                    zulip_adapter.ZulipOperationError(
+                        "provider_poll_failed",
+                        True,
+                    ),
+                )
+            )
+
     def poll_provider_events(self) -> int:
+        """Supervise one persistent long-poll thread for every active account."""
+        self._ensure_provider_poll_state()
         now = time.monotonic()
-        active_accounts = self.store.active_account_uuids()
-        accounts = [
-            account_uuid
-            for account_uuid in active_accounts
-            if self.provider_retry_after.get(account_uuid, 0.0) <= now
-        ]
-        if not accounts:
-            return 0
-        workers = min(getattr(self, "provider_poll_workers", 16), len(accounts))
+        active_accounts = set(self.store.active_account_uuids())
         processed = 0
-        failed = len(accounts) < len(active_accounts)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {
-                executor.submit(self._poll_provider_account, account_uuid): account_uuid
-                for account_uuid in accounts
-            }
-            for future in concurrent.futures.as_completed(futures):
-                account_uuid = futures[future]
-                account_processed, error = future.result()
-                if error is None:
-                    self._clear_provider_retry(account_uuid)
-                    processed += account_processed
-                    continue
-                failed = True
+        while True:
+            try:
+                account_uuid, account_processed, error = (
+                    self.provider_poll_results.get_nowait()
+                )
+            except queue.Empty:
+                break
+            if account_uuid not in active_accounts:
+                continue
+            if error is None:
+                self._clear_provider_retry(account_uuid)
+                self.provider_failed_accounts.discard(account_uuid)
+                self.provider_successful_accounts.add(account_uuid)
+                processed += account_processed
+            else:
+                self.provider_successful_accounts.discard(account_uuid)
+                self.provider_failed_accounts.add(account_uuid)
                 self._defer_provider_account(account_uuid, now)
                 self.store.mark_health("provider", "degraded", error.code)
                 self._queue_account_report(
@@ -595,7 +634,37 @@ class BridgeService:
                     "degraded",
                     error.code,
                 )
-        if not failed:
+
+        for account_uuid, thread in list(self.provider_poll_threads.items()):
+            if account_uuid not in active_accounts:
+                self.provider_poll_stops[account_uuid].set()
+            if not thread.is_alive():
+                thread.join(timeout=0)
+                del self.provider_poll_threads[account_uuid]
+                del self.provider_poll_stops[account_uuid]
+
+        self.provider_failed_accounts.intersection_update(active_accounts)
+        self.provider_successful_accounts.intersection_update(active_accounts)
+        for account_uuid in sorted(active_accounts):
+            if account_uuid in self.provider_poll_threads:
+                continue
+            if self.provider_retry_after.get(account_uuid, 0.0) > now:
+                continue
+            stop = threading.Event()
+            thread = threading.Thread(
+                target=self._run_provider_account_longpoll,
+                args=(account_uuid, stop),
+                name=f"zulip-live-{account_uuid[:8]}-{account_uuid[-4:]}",
+                daemon=True,
+            )
+            self.provider_poll_stops[account_uuid] = stop
+            self.provider_poll_threads[account_uuid] = thread
+            thread.start()
+
+        if not active_accounts or (
+            not self.provider_failed_accounts
+            and active_accounts <= self.provider_successful_accounts
+        ):
             self.store.mark_health("provider", "healthy")
         return processed
 
@@ -1313,25 +1382,6 @@ class BridgeService:
             return True
         return self.run_backfill_once()
 
-    def _collect_history_future(self) -> bool:
-        future = getattr(self, "history_future", None)
-        if future is None or not future.done():
-            return False
-        self.history_future = None
-        try:
-            return future.result()
-        except Exception as exc:
-            self.store.mark_health(
-                "provider",
-                "degraded",
-                (
-                    exc.code
-                    if isinstance(exc, zulip_adapter.ZulipOperationError)
-                    else "provider_history_failed"
-                ),
-            )
-            return False
-
     def _file_resolver(
         self,
         adapter: zulip_adapter.OfficialZulipAdapter,
@@ -1820,7 +1870,7 @@ class BridgeService:
 
     def tick(self) -> bool:
         now = time.monotonic()
-        progressed = self._collect_history_future()
+        progressed = False
         if now - self.last_certificate_check >= 3600.0:
             progressed |= self._renew_certificate(False)
             self.last_certificate_check = now
@@ -1898,13 +1948,7 @@ class BridgeService:
             # Do not grow an already full delivery backlog. Once a bounded
             # batch has drained, discover at most one more provider page.
             if history_delivered < 10:
-                history_executor = getattr(self, "history_executor", None)
-                if history_executor is None:
-                    progressed |= self._run_history_quantum_once()
-                elif getattr(self, "history_future", None) is None:
-                    self.history_future = history_executor.submit(
-                        self._run_history_quantum_once
-                    )
+                progressed |= self._run_history_quantum_once()
         self.health_file.parent.mkdir(parents=True, exist_ok=True)
         self.health_file.write_text(
             datetime.datetime.now(datetime.UTC).isoformat(),

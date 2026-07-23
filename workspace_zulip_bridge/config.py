@@ -55,7 +55,6 @@ class ProviderApiConfig:
     lease_seconds: int = 300
     batch_size: int = 20
     timeout_seconds: float = 30.0
-    poll_workers: int = 16
 
 
 @dataclasses.dataclass(frozen=True)
@@ -118,7 +117,6 @@ def load(path: str | pathlib.Path) -> RuntimeConfig:
             lease_seconds=provider_api.getint("lease_seconds", 300),
             batch_size=provider_api.getint("batch_size", 20),
             timeout_seconds=provider_api.getfloat("timeout_seconds", 30.0),
-            poll_workers=provider_api.getint("poll_workers", 16),
         ),
         file_api=FileApiConfig(
             base_url=file_api["base_url"].rstrip("/"),

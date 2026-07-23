@@ -14,9 +14,10 @@ import zulip
 from workspace_zulip_bridge import file_api
 
 MAX_PROVIDER_FILE_BYTES = 52_428_800
-PROVIDER_REQUEST_TIMEOUT_SECONDS = 5.0
 PROVIDER_QUEUE_IDLE_TIMEOUT_SECONDS = 43_200
-HISTORY_PAGE_SIZE = 20
+# History runs in the main service thread. Keep each provider quantum small so
+# already captured live events return to delivery promptly between pages.
+HISTORY_PAGE_SIZE = 5
 TRANSFER_NAMESPACE = uuid.UUID("8aa58582-d782-4e98-bfc3-7b5ee96e3bd6")
 WORKSPACE_FILE_RE = re.compile(
     r"(?P<image>!?)\[(?P<name>[^\]]+)\]\("
@@ -163,9 +164,9 @@ class OfficialZulipAdapter:
                     client="workspace-zulip-bridge/0.1",
                     cert_bundle=credentials.cert_bundle,
                     # The bridge owns durable retry/backoff state. The official
-                    # client otherwise retries a failed request inline for
-                    # minutes, and its long-poll endpoint retries timeouts
-                    # forever, starving already queued Workspace deliveries.
+                    # client otherwise retries failed non-long-poll requests
+                    # inline for minutes instead of returning control to the
+                    # dedicated account worker.
                     retry_on_errors=False,
                 )
             except PROVIDER_NETWORK_ERRORS as exc:
@@ -435,9 +436,8 @@ class OfficialZulipAdapter:
             },
         }
         if int(getattr(self.client, "feature_level", 0)) >= 481:
-            # Non-long-polling bridge reads do not hold an HTTP request open.
-            # Ask modern Zulip servers for a 12-hour idle lifetime so a healthy
-            # quiet account is not recycled every ten minutes. Use an integer:
+            # Ask modern Zulip servers for a 12-hour idle lifetime as a safety
+            # margin around the dedicated account long-poll worker. Use an integer:
             # this official client forwards free-form kwargs without JSON-
             # encoding string values, while the endpoint parses this field as
             # JSON.
@@ -636,20 +636,14 @@ class OfficialZulipAdapter:
         try:
             call_endpoint = getattr(self.client, "call_endpoint", None)
             if callable(call_endpoint):
-                # get_events() always enables the official client's long-poll
-                # mode, even when dont_block is true. Use the same official
-                # endpoint boundary without long-polling so a broken provider
-                # cannot monopolize the bridge's delivery loop indefinitely.
                 response = call_endpoint(
                     url="events",
                     method="GET",
                     request={
                         "queue_id": queue_id,
                         "last_event_id": last_event_id,
-                        "dont_block": True,
                     },
-                    longpolling=False,
-                    timeout=PROVIDER_REQUEST_TIMEOUT_SECONDS,
+                    longpolling=True,
                 )
             else:
                 # Small test doubles and compatible client implementations may
@@ -657,11 +651,8 @@ class OfficialZulipAdapter:
                 response = self.client.get_events(
                     queue_id=queue_id,
                     last_event_id=last_event_id,
-                    dont_block=True,
                 )
-            result = _successful(
-                response
-            )
+            result = _successful(response)
         except PROVIDER_NETWORK_ERRORS as exc:
             raise ZulipOperationError("provider_unavailable", True) from exc
         return typing.cast(list[dict[str, object]], result["events"])

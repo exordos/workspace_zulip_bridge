@@ -78,18 +78,21 @@ mail credentials, IMAP/SMTP configuration, mail CA bootstrap, or Maildir state.
 
 ## Scheduling and retry behavior
 
-Zulip event queues are polled concurrently across accounts. The configured
-`provider_api.poll_workers` value bounds concurrency (16 by default, accepted
-range 1 through 64). Every polling task constructs and owns its adapter/client;
-client instances are never shared between worker threads.
+Every active Zulip account owns one persistent long-poll thread and one
+adapter/client instance. The worker durably records provider events and advances
+the queue cursor before the main service thread performs history work, so a slow
+history page cannot leave a gap in live event capture. Account workers are
+isolated from one another and use bridge-owned durable retry/backoff after a
+provider error.
 
-Control-derived backfill jobs are reconciled once per service tick. Live
-operations and priority-0 Provider events are always processed first. At least
-once per second, one exact priority-2 history item receives a bounded delivery
-quantum even while live traffic remains continuous. Retryable history-fetch
-failures return the job to `pending` with a durable `available_at`, incremented
-retry count, safe error code, and exponential full jitter capped at 300
-seconds. A worker restart therefore does not erase retry deferral.
+Control-derived backfill jobs are reconciled in the main service thread once per
+service tick. Live operations and priority-0 Provider events are always
+processed first. At least once per second, one exact priority-2 history item
+receives a bounded delivery quantum even while live traffic remains continuous.
+Retryable history-fetch failures return the job to `pending` with a durable
+`available_at`, incremented retry count, safe error code, and exponential full
+jitter capped at 300 seconds. A worker restart therefore does not erase retry
+deferral.
 Non-retryable history errors mark only the affected account/chat job as
 `failed`, retain its safe error code, and emit scoped degraded health plus an
 account observed report. Other accounts continue polling and synchronizing.
@@ -97,5 +100,5 @@ account observed report. Other accounts continue polling and synchronizing.
 `RestAlchemyStore` obtains each transaction from the RestAlchemy PostgreSQL
 engine and scopes it with `session_manager()`. The engine pool may reuse
 connections, but a session never crosses a store-operation or worker-thread
-boundary. Concurrent account poll tasks also construct separate adapter/client
+boundary. Concurrent account long-poll workers also own separate adapter/client
 instances, so Zulip client state does not cross worker-thread boundaries.

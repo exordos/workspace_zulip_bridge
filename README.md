@@ -92,15 +92,12 @@ The current implementation provides:
   live or historical messages are projected;
 - owner-scoped projections and stable identity/chat/topic/message mappings;
 - private file-plane transfers with short-lived URLs;
-- bounded concurrent per-account Zulip polling (16 workers by default) with a
-  fresh adapter/client per worker call;
-- non-long-polling queue reads with bridge-owned retry/backoff, so an official
-  client request cannot retry forever inside the live delivery loop;
+- one dedicated persistent Zulip long-poll thread per active account, with
+  durable event and cursor capture independent from history synchronization;
 - extended idle queue lifetimes on compatible Zulip servers, preserving durable
   queue cursors across quiet periods without ten-minute recovery churn;
 - live/retry/backfill scheduling with hard live priority, bounded history
-  delivery batches, and a dedicated single-worker history lane, so slow Zulip
-  history or recovery I/O cannot block new queue events;
+  delivery batches, and history synchronization in the main service thread;
 - exact owner read/unread projection from both Zulip message snapshots and live
   flag events, ordered after the corresponding Workspace message projection;
 - automatic removal of queue-recovery jobs when their chats are deselected, so
