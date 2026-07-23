@@ -305,6 +305,9 @@ def test_message_mutations_and_topic_rename_reuse_stable_mappings():
         for operation in _operations(created)
         if operation["kind"] == "message.create"
     )
+    original_content_sha256 = store.provider_mapping(ACCOUNT_UUID, "message", "601")[
+        "metadata"
+    ]["content_sha256"]
     external_author_uuid = created_message["payload"]["author_uuid"]
     topic_uuid = store.provider_mapping(ACCOUNT_UUID, "topic", "42:Topic")[
         "workspace_uuid"
@@ -327,9 +330,13 @@ def test_message_mutations_and_topic_rename_reuse_stable_mappings():
     ]
     assert updated[0]["entity_uuid"] == topic_uuid
     assert updated[1]["actor_uuid"] == external_author_uuid
-    assert store.provider_mapping(ACCOUNT_UUID, "message", "601")["metadata"][
-        "content_sha256"
-    ]
+    assert (
+        store.provider_mapping(ACCOUNT_UUID, "message", "601")["metadata"][
+            "content_sha256"
+        ]
+        == original_content_sha256
+    )
+    assert updated[1]["extensions"]["content_sha256"] != original_content_sha256
     deleted = _operations(
         converter.event_records(
             store,
@@ -487,9 +494,14 @@ def test_message_create_and_update_mentions_use_provider_identity_ids_and_urns()
     update_identity = next(
         operation for operation in updated if operation["kind"] == "identity.upsert"
     )
+    updated_topic = next(
+        operation for operation in updated if operation["kind"] == "topic.upsert"
+    )
     updated_message = next(
         operation for operation in updated if operation["kind"] == "message.update"
     )
+    assert updated.index(updated_topic) < updated.index(updated_message)
+    assert updated_topic["entity_uuid"] == created_message["payload"]["topic_uuid"]
     assert update_identity["provider"]["entity_id"] == "4"
     assert (
         "[Another User](urn:user:" in updated_message["payload"]["payload"]["content"]

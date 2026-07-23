@@ -335,7 +335,10 @@ def _provider_record(
     return record
 
 
-def _committed_result(record: dict[str, object]) -> dict[str, object]:
+def _committed_result(
+    record: dict[str, object],
+    provider_entity_id: str | None = None,
+) -> dict[str, object]:
     return {
         "record_uuid": str(uuid.uuid4()),
         "operation_uuid": record["operation_uuid"],
@@ -355,11 +358,200 @@ def _committed_result(record: dict[str, object]) -> dict[str, object]:
         },
         "result": {
             "outcome": "committed",
-            "provider_entity_id": None,
+            "provider_entity_id": provider_entity_id,
             "provider_revision": None,
             "manual_retry_allowed": False,
         },
     }
+
+
+def test_message_delivery_waits_for_one_durable_topic_projection(postgres_store):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    _materialize_channel_projection(postgres_store, account_uuid, project_uuid)
+    records = []
+    for message_id in (101, 102):
+        records.extend(
+            converter.event_records(
+                postgres_store,
+                account_uuid,
+                "backfill:channel:42",
+                {
+                    "id": message_id,
+                    "type": "message",
+                    "message": _provider_history_message(message_id),
+                },
+                "backfill",
+            )
+        )
+    topic_records = [
+        record
+        for record in records
+        if record["operation"]["kind"] == "topic.upsert"
+    ]
+    message_records = [
+        record
+        for record in records
+        if record["operation"]["kind"] == "message.create"
+    ]
+    update_records = converter.event_records(
+        postgres_store,
+        account_uuid,
+        "live:channel:42",
+        {
+            "id": 103,
+            "type": "update_message",
+            "message_id": 101,
+            "message_ids": [101],
+            "stream_id": 42,
+            "subject": "Topic",
+            "content": "edited",
+            "edit_timestamp": 1_700_000_001,
+        },
+        "live",
+    )
+    update_topic = next(
+        record
+        for record in update_records
+        if record["operation"]["kind"] == "topic.upsert"
+    )
+    update_message = next(
+        record
+        for record in update_records
+        if record["operation"]["kind"] == "message.update"
+    )
+
+    assert postgres_store.enqueue_workspace_delivery(topic_records[0], 2)
+    assert not postgres_store.enqueue_workspace_delivery(topic_records[1], 2)
+    assert not postgres_store.enqueue_workspace_delivery(update_topic, 0)
+    for record in message_records:
+        assert postgres_store.enqueue_workspace_delivery(record, 0)
+    assert postgres_store.enqueue_workspace_delivery(update_message, 0)
+
+    assert postgres_store.pending_workspace_deliveries(
+        minimum_priority=0, maximum_priority=0
+    ) == [topic_records[0]]
+    assert (
+        postgres_store.pending_workspace_deliveries(
+            minimum_priority=2, maximum_priority=2
+        )
+        == []
+    )
+
+    postgres_store.accept_result(_committed_result(topic_records[0]))
+
+    assert postgres_store.pending_workspace_deliveries(
+        minimum_priority=0, maximum_priority=0
+    ) == message_records
+
+    postgres_store.accept_result(
+        _committed_result(message_records[0], provider_entity_id="101")
+    )
+
+    assert postgres_store.pending_workspace_deliveries(
+        minimum_priority=0, maximum_priority=0
+    ) == [message_records[1], update_message]
+
+
+def test_read_state_waits_until_every_message_projection_is_committed(
+    postgres_store,
+):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    message_uuid = str(uuid.uuid4())
+    stream_uuid = str(uuid.uuid4())
+    topic_uuid = str(uuid.uuid4())
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "message",
+        "9258",
+        message_uuid,
+        {
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "workspace_delivery_state": "pending",
+        },
+    )
+    record = _provider_record(account_uuid, project_uuid)
+    record["operation"]["kind"] = "read_state.set"
+    record["operation"]["entity_uuid"] = stream_uuid
+    record["operation"]["payload"] = {
+        "stream_uuid": stream_uuid,
+        "topic_uuid": topic_uuid,
+        "reader_uuid": str(uuid.uuid4()),
+        "message_uuids": [message_uuid],
+        "read": True,
+    }
+    record["operation_sha256"] = canonical.operation_digest(record)
+    message_record = _provider_record(account_uuid, project_uuid)
+    message_record["operation"]["entity_uuid"] = message_uuid
+    message_record["operation"]["provider"]["entity_id"] = "9258"
+    message_record["operation"]["payload"] = {
+        "stream_uuid": stream_uuid,
+        "topic_uuid": topic_uuid,
+        "author_uuid": str(uuid.uuid4()),
+        "payload": {"kind": "markdown", "content": "history"},
+        "reply_to_message_uuid": None,
+    }
+    message_record["operation_sha256"] = canonical.operation_digest(message_record)
+
+    assert postgres_store.enqueue_workspace_delivery(message_record, 2)
+    assert postgres_store.enqueue_workspace_delivery(record, 0)
+    assert postgres_store.pending_workspace_deliveries() == [message_record]
+
+    postgres_store.accept_result(
+        _committed_result(message_record, provider_entity_id="9258")
+    )
+
+    assert postgres_store.pending_workspace_deliveries() == [record]
+
+
+def test_reconcile_repairs_legacy_pending_direct_participant_gate(postgres_store):
+    account_uuid, _project_uuid = _insert_account_and_assignment(postgres_store)
+    direct_chat = {
+        "provider_chat_key": "direct:9,10",
+        "chat_type": "direct",
+    }
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE desired_resources
+            SET body = jsonb_set(
+                body, '{provider_chat}', %s::jsonb
+            )
+            WHERE resource_type = 'external_chat_assignment'
+              AND body->>'external_account_uuid' = %s
+            """,
+            (json.dumps(direct_chat), account_uuid),
+        )
+        session.execute(
+            """
+            DELETE FROM zulip_participant_sync
+            WHERE account_uuid = %s
+            """,
+            (account_uuid,),
+        )
+        session.execute(
+            """
+            INSERT INTO zulip_participant_sync (
+                account_uuid, provider_chat_key,
+                assignment_generation, state
+            ) VALUES (%s, 'direct:9,10', 1, 'pending')
+            """,
+            (account_uuid,),
+        )
+
+    postgres_store.reconcile_participant_sync()
+
+    with postgres_store.session() as session:
+        participant = session.execute(
+            """
+            SELECT state, provider_user_ids
+            FROM zulip_participant_sync
+            WHERE account_uuid = %s AND provider_chat_key = 'direct:9,10'
+            """,
+            (account_uuid,),
+        ).fetchone()
+    assert participant == {"state": "ready", "provider_user_ids": []}
+    assert postgres_store.claim_participant_sync() is None
 
 
 @pytest.mark.parametrize(

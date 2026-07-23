@@ -842,6 +842,50 @@ def _mapped_event_records(
             markdown, lossy = convert_markdown(
                 str(event["content"]), mention_uuids, message_url, file_resolver
             )
+            topic_name = str(event.get("subject", metadata.get("subject", "")))
+            if not topic_name:
+                topic_name = "default"
+            topic_provider_id = (
+                f"{chat_key.removeprefix('channel:')}:{topic_name}"
+                if chat_key.startswith("channel:")
+                else f"{chat_key}:default"
+            )
+            if not any(
+                record["operation"]["kind"] == "topic.upsert"
+                and record["operation"]["entity_uuid"] == topic_uuid
+                for record in records
+            ):
+                topic_operation = {
+                    "kind": "topic.upsert",
+                    "entity_uuid": topic_uuid,
+                    "actor_uuid": owner_uuid,
+                    "occurred_at": occurred_at,
+                    "provider": _provider(
+                        chat_key,
+                        topic_provider_id,
+                        str(event.get("edit_timestamp")),
+                    ),
+                    "payload": {
+                        "stream_uuid": stream_uuid,
+                        "name": topic_name,
+                    },
+                    "extensions": {"provider_badge": "zulip"},
+                }
+                records.append(
+                    _record(
+                        store,
+                        account_uuid,
+                        project_uuid,
+                        record_source,
+                        int(event["id"]),
+                        next_subindex,
+                        topic_operation,
+                        f"chat:{account_uuid}:{stream_uuid}",
+                        event_time,
+                        delivery_class,
+                    )
+                )
+                next_subindex += 1
             operation = {
                 "kind": "message.update",
                 "entity_uuid": str(mapping["workspace_uuid"]),
@@ -860,23 +904,13 @@ def _mapped_event_records(
                     "provider_badge": "zulip",
                     "provider_original_url": message_url,
                     "lossy_conversion": lossy,
-                },
-            }
-            store.remember_provider_mapping(
-                account_uuid,
-                "message",
-                provider_message_id,
-                str(mapping["workspace_uuid"]),
-                {
-                    **metadata,
                     "content_sha256": hashlib.sha256(
                         markdown.encode("utf-8")
                     ).hexdigest(),
                     "provider_content_sha256": provider_content_sha256,
-                    "subject": str(event.get("subject", metadata.get("subject", ""))),
+                    "subject": (topic_name if chat_key.startswith("channel:") else ""),
                 },
-                str(event.get("edit_timestamp")),
-            )
+            }
         else:
             continue
         records.append(

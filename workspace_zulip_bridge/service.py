@@ -1184,6 +1184,14 @@ class BridgeService:
                 unmapped_messages.append(message)
                 continue
             metadata = typing.cast(dict[str, object], mapping["metadata"])
+            workspace_delivery_committed = (
+                mapping.get("convergent_alias") is True
+                or metadata.get("mapping_origin") == "workspace"
+                or metadata.get("workspace_delivery_state") == "committed"
+            )
+            if not workspace_delivery_committed:
+                unmapped_messages.append(message)
+                continue
             provider_content_sha256 = hashlib.sha256(
                 str(message["content"]).encode("utf-8")
             ).hexdigest()

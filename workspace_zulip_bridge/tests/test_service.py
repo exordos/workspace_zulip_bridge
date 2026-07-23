@@ -649,6 +649,7 @@ class CatchupStore(DeliveryStore):
             "author_uuid": "00000000-0000-0000-0000-000000000005",
             "chat_key": "channel:42",
             "subject": "Topic",
+            "workspace_delivery_state": "committed",
         }
         self.mappings = {
             "10": {

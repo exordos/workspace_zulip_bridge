@@ -641,6 +641,12 @@ class RestAlchemyStore:
             for participant in participants
             if isinstance(participant, dict) and participant.get("identity_uuid")
         ]
+        topics = projection.get("topics", [])
+        topic_uuids = [
+            str(topic["topic_uuid"])
+            for topic in topics
+            if isinstance(topic, dict) and topic.get("topic_uuid")
+        ]
         session.execute(
             """
             UPDATE provider_mappings
@@ -648,7 +654,9 @@ class RestAlchemyStore:
             WHERE account_uuid = %s
               AND (
                   (entity_kind = 'stream' AND workspace_uuid = %s)
-                  OR (entity_kind = 'topic' AND metadata->>'stream_uuid' = %s)
+                  OR (
+                      entity_kind = 'topic' AND workspace_uuid = ANY(%s)
+                  )
                   OR (
                       entity_kind = 'identity' AND workspace_uuid = ANY(%s)
                       AND NOT EXISTS (
@@ -672,7 +680,7 @@ class RestAlchemyStore:
             (
                 str(assignment["external_account_uuid"]),
                 str(stream["uuid"]),
-                str(stream["uuid"]),
+                topic_uuids,
                 participant_uuids,
             ),
         )
@@ -1295,6 +1303,40 @@ class RestAlchemyStore:
                 ).fetchone()
                 if assignment is None:
                     raise ValueError("provider_chat_assignment_pending")
+            if operation.get("kind") == "topic.upsert" and assignment is not None:
+                payload = typing.cast(dict[str, object], operation["payload"])
+                duplicate_topic = session.execute(
+                    """
+                    UPDATE workspace_delivery_outbox AS delivery
+                    SET priority = LEAST(delivery.priority, %s)
+                    WHERE delivery.sent_at IS NULL
+                      AND delivery.account_uuid = %s
+                      AND delivery.assignment_uuid = %s
+                      AND delivery.assignment_generation = %s
+                      AND delivery.assignment_project_uuid = %s
+                      AND delivery.record->'operation'->>'kind' = 'topic.upsert'
+                      AND delivery.record->'operation'->>'entity_uuid' = %s
+                      AND delivery.record->'operation'->'payload'
+                              ->>'stream_uuid' = %s
+                      AND delivery.record->'operation'->'payload'->>'name' = %s
+                      AND delivery.record->'operation'->'provider'
+                              ->>'entity_id' = %s
+                    RETURNING delivery.record_uuid
+                    """,
+                    (
+                        priority,
+                        str(record["account_uuid"]),
+                        str(assignment["resource_uuid"]),
+                        int(assignment["generation"]),
+                        str(assignment["project_uuid"]),
+                        str(operation["entity_uuid"]),
+                        str(payload["stream_uuid"]),
+                        str(payload["name"]),
+                        str(provider["entity_id"]),
+                    ),
+                ).fetchone()
+                if duplicate_topic is not None:
+                    return False
             result = session.execute(
                 """
                 INSERT INTO workspace_delivery_outbox (
@@ -1331,6 +1373,64 @@ class RestAlchemyStore:
         if not 0 <= minimum_priority <= maximum_priority <= 2:
             raise ValueError("Invalid workspace delivery priority range")
         with self.session() as session:
+            session.execute(
+                """
+                UPDATE workspace_delivery_outbox AS message_delivery
+                SET priority = read_delivery.priority
+                FROM workspace_delivery_outbox AS read_delivery
+                WHERE message_delivery.sent_at IS NULL
+                  AND read_delivery.sent_at IS NULL
+                  AND message_delivery.priority > read_delivery.priority
+                  AND message_delivery.account_uuid =
+                      read_delivery.account_uuid
+                  AND message_delivery.assignment_uuid IS NOT DISTINCT FROM
+                      read_delivery.assignment_uuid
+                  AND message_delivery.assignment_generation
+                      IS NOT DISTINCT FROM
+                      read_delivery.assignment_generation
+                  AND message_delivery.assignment_project_uuid
+                      IS NOT DISTINCT FROM
+                      read_delivery.assignment_project_uuid
+                  AND read_delivery.record->'operation'->>'kind' =
+                      'read_state.set'
+                  AND message_delivery.record->'operation'->>'kind'
+                      IN ('message.create', 'message.update')
+                  AND message_delivery.record->'operation'->>'entity_uuid' IN (
+                      SELECT jsonb_array_elements_text(
+                          read_delivery.record->'operation'->'payload'
+                              ->'message_uuids'
+                      )
+                  )
+                """
+            )
+            session.execute(
+                """
+                UPDATE workspace_delivery_outbox AS topic_delivery
+                SET priority = message_delivery.priority
+                FROM workspace_delivery_outbox AS message_delivery
+                WHERE topic_delivery.sent_at IS NULL
+                  AND message_delivery.sent_at IS NULL
+                  AND topic_delivery.priority > message_delivery.priority
+                  AND topic_delivery.account_uuid =
+                      message_delivery.account_uuid
+                  AND topic_delivery.assignment_uuid IS NOT DISTINCT FROM
+                      message_delivery.assignment_uuid
+                  AND topic_delivery.assignment_generation
+                      IS NOT DISTINCT FROM
+                      message_delivery.assignment_generation
+                  AND topic_delivery.assignment_project_uuid
+                      IS NOT DISTINCT FROM
+                      message_delivery.assignment_project_uuid
+                  AND topic_delivery.record->'operation'->>'kind' =
+                      'topic.upsert'
+                  AND message_delivery.record->'operation'->>'kind' IN (
+                      'message.create', 'message.update', 'read_state.set'
+                  )
+                  AND topic_delivery.record->'operation'->>'entity_uuid' =
+                      message_delivery.record->'operation'->'payload'
+                          ->>'topic_uuid'
+                """
+            )
             rows = session.execute(
                 """
                     SELECT delivery.record FROM workspace_delivery_outbox AS delivery
@@ -1361,6 +1461,109 @@ class RestAlchemyStore:
                       AND (
                           delivery.assignment_uuid IS NULL
                           OR assignment.resource_uuid IS NOT NULL
+                      )
+                      AND (
+                          delivery.record->'operation'->>'kind' NOT IN (
+                              'message.create', 'message.update', 'read_state.set'
+                          )
+                          OR NOT EXISTS (
+                              SELECT 1
+                              FROM workspace_delivery_outbox AS topic_delivery
+                              WHERE topic_delivery.sent_at IS NULL
+                                AND topic_delivery.account_uuid =
+                                    delivery.account_uuid
+                                AND topic_delivery.assignment_uuid IS NOT DISTINCT
+                                    FROM delivery.assignment_uuid
+                                AND topic_delivery.assignment_generation
+                                    IS NOT DISTINCT FROM
+                                    delivery.assignment_generation
+                                AND topic_delivery.assignment_project_uuid
+                                    IS NOT DISTINCT FROM
+                                    delivery.assignment_project_uuid
+                                AND topic_delivery.record->'operation'->>'kind' =
+                                    'topic.upsert'
+                                AND topic_delivery.record->'operation'
+                                        ->>'entity_uuid' =
+                                    delivery.record->'operation'->'payload'
+                                        ->>'topic_uuid'
+                          )
+                      )
+                      AND (
+                          delivery.record->'operation'->>'kind' NOT IN (
+                              'message.update', 'message.delete'
+                          )
+                          OR NOT EXISTS (
+                              SELECT 1
+                              FROM workspace_delivery_outbox AS message_create
+                              WHERE message_create.sent_at IS NULL
+                                AND message_create.account_uuid =
+                                    delivery.account_uuid
+                                AND message_create.assignment_uuid
+                                    IS NOT DISTINCT FROM
+                                    delivery.assignment_uuid
+                                AND message_create.assignment_generation
+                                    IS NOT DISTINCT FROM
+                                    delivery.assignment_generation
+                                AND message_create.assignment_project_uuid
+                                    IS NOT DISTINCT FROM
+                                    delivery.assignment_project_uuid
+                                AND message_create.record->'operation'->>'kind' =
+                                    'message.create'
+                                AND message_create.record->'operation'
+                                        ->>'entity_uuid' =
+                                    delivery.record->'operation'->>'entity_uuid'
+                          )
+                      )
+                      AND (
+                          delivery.record->'operation'->>'kind' <> 'read_state.set'
+                          OR NOT EXISTS (
+                              SELECT 1
+                              FROM workspace_delivery_outbox AS message_delivery
+                              WHERE message_delivery.sent_at IS NULL
+                                AND message_delivery.account_uuid =
+                                    delivery.account_uuid
+                                AND message_delivery.assignment_uuid
+                                    IS NOT DISTINCT FROM
+                                    delivery.assignment_uuid
+                                AND message_delivery.assignment_generation
+                                    IS NOT DISTINCT FROM
+                                    delivery.assignment_generation
+                                AND message_delivery.assignment_project_uuid
+                                    IS NOT DISTINCT FROM
+                                    delivery.assignment_project_uuid
+                                AND message_delivery.record->'operation'->>'kind'
+                                    IN ('message.create', 'message.update')
+                                AND message_delivery.record->'operation'
+                                        ->>'entity_uuid' IN (
+                                    SELECT jsonb_array_elements_text(
+                                        delivery.record->'operation'->'payload'
+                                            ->'message_uuids'
+                                    )
+                                )
+                          )
+                      )
+                      AND (
+                          delivery.record->'operation'->>'kind' <> 'read_state.set'
+                          OR NOT EXISTS (
+                              SELECT 1
+                              FROM jsonb_array_elements_text(
+                                  delivery.record->'operation'->'payload'
+                                      ->'message_uuids'
+                              ) AS read_message(message_uuid)
+                              WHERE NOT EXISTS (
+                                  SELECT 1
+                                  FROM provider_mappings AS message_mapping
+                                  WHERE message_mapping.account_uuid =
+                                      delivery.account_uuid
+                                    AND message_mapping.entity_kind = 'message'
+                                    AND message_mapping.workspace_uuid::text =
+                                        read_message.message_uuid
+                                    AND NOT message_mapping.deleted
+                                    AND message_mapping.metadata
+                                            ->>'workspace_delivery_state' =
+                                        'committed'
+                              )
+                          )
                       )
                     ORDER BY priority, created_at LIMIT %s
                     """,
@@ -1652,18 +1855,24 @@ class RestAlchemyStore:
                 ON CONFLICT (account_uuid, provider_chat_key) DO UPDATE SET
                     assignment_generation = EXCLUDED.assignment_generation,
                     state = CASE
+                        WHEN EXCLUDED.state = 'ready'
+                        THEN 'ready'
                         WHEN zulip_participant_sync.assignment_generation =
                              EXCLUDED.assignment_generation
                         THEN zulip_participant_sync.state
                         ELSE EXCLUDED.state
                     END,
                     lease_until = CASE
+                        WHEN EXCLUDED.state = 'ready'
+                        THEN NULL
                         WHEN zulip_participant_sync.assignment_generation =
                              EXCLUDED.assignment_generation
                         THEN zulip_participant_sync.lease_until
                         ELSE NULL
                     END,
                     provider_user_ids = CASE
+                        WHEN EXCLUDED.state = 'ready'
+                        THEN '[]'::jsonb
                         WHEN zulip_participant_sync.assignment_generation =
                              EXCLUDED.assignment_generation
                         THEN zulip_participant_sync.provider_user_ids
@@ -1701,15 +1910,34 @@ class RestAlchemyStore:
             return session.execute(
                 """
                 WITH candidate AS (
-                    SELECT account_uuid, provider_chat_key
-                    FROM zulip_participant_sync
-                    WHERE state = 'pending'
-                       OR (state = 'running' AND lease_until < now())
+                    SELECT participant_sync.account_uuid,
+                           participant_sync.provider_chat_key
+                    FROM zulip_participant_sync AS participant_sync
+                    JOIN desired_resources AS assignment
+                      ON assignment.resource_type =
+                         'external_chat_assignment'
+                     AND NOT assignment.deleted
+                     AND assignment.generation =
+                         participant_sync.assignment_generation
+                     AND assignment.body->>'external_account_uuid' =
+                         participant_sync.account_uuid::text
+                     AND assignment.body->'provider_chat'
+                             ->>'provider_chat_key' =
+                         participant_sync.provider_chat_key
+                     AND assignment.body->'provider_chat'->>'chat_type' =
+                         'channel'
+                    WHERE participant_sync.state = 'pending'
                        OR (
-                           state = 'reported'
-                           AND updated_at < now() - interval '30 seconds'
+                           participant_sync.state = 'running'
+                           AND participant_sync.lease_until < now()
                        )
-                    ORDER BY updated_at, provider_chat_key
+                       OR (
+                           participant_sync.state = 'reported'
+                           AND participant_sync.updated_at <
+                               now() - interval '30 seconds'
+                       )
+                    ORDER BY participant_sync.updated_at,
+                             participant_sync.provider_chat_key
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
                 )
@@ -2596,6 +2824,7 @@ class RestAlchemyStore:
                 ) VALUES (%s, 'message', %s, %s, %s, %s, false)
                 ON CONFLICT (account_uuid, entity_kind, provider_id) DO UPDATE SET
                     provider_revision = EXCLUDED.provider_revision,
+                    metadata = provider_mappings.metadata || EXCLUDED.metadata,
                     deleted = false,
                     updated_at = now()
                 """,
@@ -2646,7 +2875,33 @@ class RestAlchemyStore:
                     ),
                 ),
             )
-        elif kind in {"message.update", "topic.upsert", "stream.upsert"}:
+        elif kind == "message.update":
+            extensions = typing.cast(dict[str, object], operation.get("extensions", {}))
+            session.execute(
+                """
+                UPDATE provider_mappings
+                SET provider_revision = COALESCE(%s, provider_revision),
+                    metadata = metadata || jsonb_strip_nulls(jsonb_build_object(
+                        'content_sha256', %s::text,
+                        'provider_content_sha256', %s::text,
+                        'subject', %s::text
+                    )) || jsonb_build_object(
+                        'workspace_delivery_state', 'committed'
+                    ),
+                    deleted = false, updated_at = now()
+                WHERE account_uuid = %s AND entity_kind = 'message'
+                  AND workspace_uuid = %s
+                """,
+                (
+                    provider_revision,
+                    extensions.get("content_sha256"),
+                    extensions.get("provider_content_sha256"),
+                    extensions.get("subject"),
+                    account_uuid,
+                    workspace_uuid,
+                ),
+            )
+        elif kind in {"topic.upsert", "stream.upsert"}:
             entity_kind = kind.partition(".")[0]
             session.execute(
                 """
