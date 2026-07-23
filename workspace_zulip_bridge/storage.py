@@ -1884,6 +1884,12 @@ class RestAlchemyStore:
                         THEN zulip_participant_sync.updated_at
                         ELSE now()
                     END
+                WHERE zulip_participant_sync.assignment_generation IS DISTINCT FROM
+                          EXCLUDED.assignment_generation
+                   OR (
+                       EXCLUDED.state = 'ready'
+                       AND zulip_participant_sync.state IS DISTINCT FROM 'ready'
+                   )
                 """
             )
             session.execute(
@@ -2050,13 +2056,20 @@ class RestAlchemyStore:
                   AND COALESCE((assignment.body->>'selected')::boolean, true)
                 ON CONFLICT (account_uuid, provider_chat_key) DO UPDATE SET
                     next_anchor = CASE
-                        WHEN zulip_backfill_jobs.history_depth =
+                        WHEN zulip_backfill_jobs.state <> 'cancelled'
+                         AND zulip_backfill_jobs.history_depth =
                              EXCLUDED.history_depth
                         THEN zulip_backfill_jobs.next_anchor
                         ELSE NULL
                     END,
                     history_depth = EXCLUDED.history_depth,
-                    cutoff_at = EXCLUDED.cutoff_at,
+                    cutoff_at = CASE
+                        WHEN zulip_backfill_jobs.state <> 'cancelled'
+                         AND zulip_backfill_jobs.history_depth =
+                             EXCLUDED.history_depth
+                        THEN zulip_backfill_jobs.cutoff_at
+                        ELSE EXCLUDED.cutoff_at
+                    END,
                     state = CASE
                         WHEN zulip_backfill_jobs.state = 'cancelled'
                         THEN EXCLUDED.state
@@ -2065,19 +2078,41 @@ class RestAlchemyStore:
                         ELSE EXCLUDED.state
                     END,
                     updated_at = now()
+                WHERE zulip_backfill_jobs.state = 'cancelled'
+                   OR zulip_backfill_jobs.history_depth IS DISTINCT FROM
+                          EXCLUDED.history_depth
                 """
             )
             session.execute(
                 """
                 UPDATE zulip_backfill_jobs AS job
                 SET state = 'cancelled', updated_at = now()
-                WHERE NOT EXISTS (
+                WHERE job.state <> 'cancelled'
+                  AND NOT EXISTS (
                     SELECT 1 FROM desired_resources AS assignment
                     WHERE assignment.resource_type = 'external_chat_assignment'
                       AND NOT assignment.deleted
                       AND assignment.body->>'external_account_uuid' =
                           job.account_uuid::text
                       AND assignment.body->'provider_chat'->>'provider_chat_key' =
+                          job.provider_chat_key
+                      AND COALESCE(
+                          (assignment.body->>'selected')::boolean, true
+                      )
+                )
+                """
+            )
+            session.execute(
+                """
+                DELETE FROM zulip_queue_catchup_jobs AS job
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM desired_resources AS assignment
+                    WHERE assignment.resource_type = 'external_chat_assignment'
+                      AND NOT assignment.deleted
+                      AND assignment.body->>'external_account_uuid' =
+                          job.account_uuid::text
+                      AND assignment.body->'provider_chat'
+                              ->>'provider_chat_key' =
                           job.provider_chat_key
                       AND COALESCE(
                           (assignment.body->>'selected')::boolean, true

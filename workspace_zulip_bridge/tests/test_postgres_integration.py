@@ -633,6 +633,60 @@ def test_reconcile_backfill_jobs_casts_json_account_uuid(postgres_store):
     assert row["history_depth"] == "30_days"
 
 
+def test_reconcile_jobs_does_not_rewrite_unchanged_sync_checkpoints(postgres_store):
+    account_uuid, _ = _insert_account_and_assignment(postgres_store)
+    postgres_store.reconcile_participant_sync()
+    postgres_store.reconcile_backfill_jobs()
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_backfill_jobs
+            SET next_anchor = 42,
+                cutoff_at = TIMESTAMPTZ '2026-01-01 00:00:00+00',
+                updated_at = TIMESTAMPTZ '2026-01-02 00:00:00+00'
+            WHERE account_uuid = %s AND provider_chat_key = 'channel:42'
+            """,
+            (account_uuid,),
+        )
+        session.execute(
+            """
+            UPDATE zulip_participant_sync
+            SET updated_at = TIMESTAMPTZ '2026-01-03 00:00:00+00'
+            WHERE account_uuid = %s AND provider_chat_key = 'channel:42'
+            """,
+            (account_uuid,),
+        )
+
+    postgres_store.reconcile_participant_sync()
+    postgres_store.reconcile_backfill_jobs()
+
+    with postgres_store.session() as session:
+        backfill = session.execute(
+            """
+            SELECT next_anchor, cutoff_at, updated_at
+            FROM zulip_backfill_jobs
+            WHERE account_uuid = %s AND provider_chat_key = 'channel:42'
+            """,
+            (account_uuid,),
+        ).fetchone()
+        participant = session.execute(
+            """
+            SELECT updated_at
+            FROM zulip_participant_sync
+            WHERE account_uuid = %s AND provider_chat_key = 'channel:42'
+            """,
+            (account_uuid,),
+        ).fetchone()
+    assert backfill == {
+        "next_anchor": 42,
+        "cutoff_at": datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC),
+        "updated_at": datetime.datetime(2026, 1, 2, tzinfo=datetime.UTC),
+    }
+    assert participant["updated_at"] == datetime.datetime(
+        2026, 1, 3, tzinfo=datetime.UTC
+    )
+
+
 def test_queue_loss_recovery_keeps_selected_account_uuid_typed(postgres_store):
     account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
     with postgres_store.session() as session:
@@ -667,6 +721,32 @@ def test_queue_loss_recovery_keeps_selected_account_uuid_typed(postgres_store):
     assert str(row["account_uuid"]) == account_uuid
     assert row["provider_chat_key"] == "channel:42"
     assert row["checkpoint_provider_message_id"] == 99
+
+
+def test_reconcile_backfill_jobs_removes_deselected_queue_catchup(postgres_store):
+    account_uuid, _ = _insert_account_and_assignment(postgres_store)
+    postgres_store.begin_provider_queue_catchup(account_uuid)
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            INSERT INTO zulip_queue_catchup_jobs (
+                account_uuid, provider_chat_key, state
+            ) VALUES (%s, 'channel:99', 'pending')
+            """,
+            (account_uuid,),
+        )
+
+    postgres_store.reconcile_backfill_jobs()
+
+    with postgres_store.session() as session:
+        jobs = session.execute(
+            """
+            SELECT provider_chat_key, state
+            FROM zulip_queue_catchup_jobs
+            ORDER BY provider_chat_key
+            """
+        ).fetchall()
+    assert jobs == [{"provider_chat_key": "channel:42", "state": "pending"}]
 
 
 def test_queue_loss_catchup_completes_without_a_safe_error(postgres_store):

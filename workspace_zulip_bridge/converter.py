@@ -552,6 +552,25 @@ def message_event_records(
     ]
     if not workspace_delivery_committed:
         operations.append(message_operation)
+    flags = message.get("flags")
+    if isinstance(flags, list):
+        operations.append(
+            {
+                "kind": "read_state.set",
+                "entity_uuid": stream_uuid,
+                "actor_uuid": owner_uuid,
+                "occurred_at": occurred_at,
+                "provider": _provider(chat_key, None),
+                "payload": {
+                    "stream_uuid": stream_uuid,
+                    "topic_uuid": topic_uuid,
+                    "reader_uuid": owner_uuid,
+                    "message_uuids": [message_uuid],
+                    "read": "read" in flags,
+                },
+                "extensions": {"provider_badge": "zulip"},
+            }
+        )
     store.remember_provider_mapping(
         account_uuid,
         "stream",

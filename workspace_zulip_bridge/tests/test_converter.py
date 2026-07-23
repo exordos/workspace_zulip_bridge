@@ -373,6 +373,27 @@ def test_message_mutations_and_topic_rename_reuse_stable_mappings():
     assert "through_message_uuid" not in read[0]["payload"]
 
 
+@pytest.mark.parametrize(("flags", "expected_read"), [(["read"], True), ([], False)])
+def test_message_snapshot_carries_exact_owner_read_state(flags, expected_read):
+    store = FakeStore()
+    event = {"id": 10, "type": "message", "message": _stream_message()}
+    event["message"]["flags"] = flags
+
+    operations = _operations(
+        converter.event_records(store, ACCOUNT_UUID, "queue", event)
+    )
+
+    read = next(operation for operation in operations if operation["kind"] == "read_state.set")
+    created = next(operation for operation in operations if operation["kind"] == "message.create")
+    assert read["payload"] == {
+        "stream_uuid": created["payload"]["stream_uuid"],
+        "topic_uuid": created["payload"]["topic_uuid"],
+        "reader_uuid": OWNER_UUID,
+        "message_uuids": [created["entity_uuid"]],
+        "read": expected_read,
+    }
+
+
 def test_channel_message_does_not_overwrite_backend_owned_stream_projection():
     store = FakeStore()
     stream_uuid = str(uuid.uuid4())

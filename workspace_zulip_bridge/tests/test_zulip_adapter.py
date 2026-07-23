@@ -19,6 +19,7 @@ EXTERNAL_CHAT_UUID = "10000000-0000-4000-8000-000000000007"
 class FakeClient:
     def __init__(self):
         self.base_url = "https://zulip.example.invalid/api/"
+        self.feature_level = 500
         self.sent = []
         self.updated = []
         self.flags = []
@@ -26,6 +27,7 @@ class FakeClient:
         self.fail_send = False
         self.messages = []
         self.event_requests = []
+        self.endpoint_requests = []
         self.stream_updates = []
         self.read_streams = []
         self.read_topics = []
@@ -70,6 +72,28 @@ class FakeClient:
     def get_events(self, **kwargs):
         self.event_requests.append(kwargs)
         return {"result": "success", "events": []}
+
+    def call_endpoint(
+        self,
+        *,
+        url,
+        method,
+        request,
+        longpolling=False,
+        timeout=None,
+    ):
+        self.endpoint_requests.append(
+            {
+                "url": url,
+                "method": method,
+                "request": request,
+                "longpolling": longpolling,
+                "timeout": timeout,
+            }
+        )
+        if url != "events":
+            raise AssertionError(f"Unexpected endpoint: {url}")
+        return self.get_events(**request)
 
     def get_profile(self):
         return {"result": "success", "user_id": 1}
@@ -677,6 +701,7 @@ def test_backfill_history_is_raw_and_newest_first():
     adapter = zulip_adapter.OfficialZulipAdapter(client=client)
     messages = adapter.message_history("channel:42")
     assert [message["id"] for message in messages] == [12, 11, 10]
+    assert client.last_get_messages["num_before"] == zulip_adapter.HISTORY_PAGE_SIZE
     assert client.last_get_messages["apply_markdown"] is False
     assert client.last_get_messages["narrow"] == [
         {"operator": "channel", "operand": 42}
@@ -690,6 +715,48 @@ def test_provider_event_poll_is_nonblocking():
     assert adapter.events("queue-1", 7) == []
     assert client.event_requests == [
         {"queue_id": "queue-1", "last_event_id": 7, "dont_block": True}
+    ]
+    assert client.endpoint_requests == [
+        {
+            "url": "events",
+            "method": "GET",
+            "request": {
+                "queue_id": "queue-1",
+                "last_event_id": 7,
+                "dont_block": True,
+            },
+            "longpolling": False,
+            "timeout": zulip_adapter.PROVIDER_REQUEST_TIMEOUT_SECONDS,
+        }
+    ]
+
+
+def test_official_client_disables_inline_retries(monkeypatch):
+    calls = []
+
+    class Client(FakeClient):
+        def __init__(self, **kwargs):
+            super().__init__()
+            calls.append(kwargs)
+
+    monkeypatch.setattr(zulip_adapter.zulip, "Client", Client)
+    credentials = zulip_adapter.ZulipCredentials(
+        site="https://zulip.example.invalid",
+        email="owner@example.invalid",
+        api_key="secret",
+    )
+
+    zulip_adapter.OfficialZulipAdapter(credentials=credentials)
+
+    assert calls == [
+        {
+            "email": "owner@example.invalid",
+            "api_key": "secret",
+            "site": "https://zulip.example.invalid",
+            "client": "workspace-zulip-bridge/0.1",
+            "cert_bundle": None,
+            "retry_on_errors": False,
+        }
     ]
 
 
@@ -720,7 +787,19 @@ def test_registration_requests_and_retains_catalog_snapshot_fields():
         "bulk_message_deletion": True,
         "empty_topic_name": True,
     }
+    assert client.registration_request["idle_queue_timeout"] == (
+        zulip_adapter.PROVIDER_QUEUE_IDLE_TIMEOUT_SECONDS
+    )
     assert adapter.take_registration_snapshot() is None
+
+
+def test_legacy_registration_omits_unsupported_idle_queue_timeout():
+    client = FakeClient()
+    client.feature_level = 480
+    adapter = zulip_adapter.OfficialZulipAdapter(client=client)
+
+    assert adapter.ensure_queue() == ("queue-1", 7)
+    assert "idle_queue_timeout" not in client.registration_request
 
 
 def test_provider_file_download_streams_with_a_strict_effective_limit(monkeypatch):

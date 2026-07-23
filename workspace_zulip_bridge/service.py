@@ -221,6 +221,11 @@ class BridgeService:
         self.last_certificate_check = 0.0
         self.last_provider_poll = 0.0
         self.last_history_quantum = time.monotonic()
+        self.history_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="zulip-history",
+        )
+        self.history_future: concurrent.futures.Future[bool] | None = None
         self.provider_retry_attempts: dict[str, int] = {}
         self.provider_retry_after: dict[str, float] = {}
         self.provider_random = random.Random()
@@ -523,18 +528,7 @@ class BridgeService:
                 queue_id = str(cursor["queue_id"])
                 last_event_id = int(cursor["last_event_id"])
                 adapter.restore_queue(queue_id, last_event_id)
-            catchup_ready = self._run_provider_queue_catchup(account_uuid, adapter)
-            if not catchup_ready:
-                self._queue_account_report(account_uuid, "backfill")
-                return 0, None
             events = adapter.events(queue_id, last_event_id)
-            initial_sync_ready = self._initial_sync_ready(account_uuid)
-            self._queue_account_report(
-                account_uuid,
-                "live_ready" if initial_sync_ready else "backfill",
-            )
-            if initial_sync_ready:
-                self._queue_ready_assignment_reports(account_uuid)
         except zulip_adapter.ZulipOperationError as exc:
             if exc.code == "bad_event_queue_id":
                 self.store.begin_provider_queue_catchup(account_uuid)
@@ -559,6 +553,13 @@ class BridgeService:
                     )
             self.store.update_provider_event_cursor(account_uuid, queue_id, event_id)
             processed += 1
+        initial_sync_ready = self._initial_sync_ready(account_uuid)
+        self._queue_account_report(
+            account_uuid,
+            "live_ready" if initial_sync_ready else "backfill",
+        )
+        if initial_sync_ready:
+            self._queue_ready_assignment_reports(account_uuid)
         return processed, None
 
     def poll_provider_events(self) -> int:
@@ -1172,7 +1173,10 @@ class BridgeService:
         reached_checkpoint = checkpoint is None or any(
             message_id <= checkpoint for message_id in page_ids
         )
-        complete = reached_checkpoint or len(messages) < 100
+        complete = (
+            reached_checkpoint
+            or len(messages) < zulip_adapter.HISTORY_PAGE_SIZE
+        )
 
         unmapped_messages = []
         for message in converter.newest_first(messages):
@@ -1280,6 +1284,53 @@ class BridgeService:
             complete,
         )
         return complete and self.store.provider_catchup_ready(account_uuid)
+
+    def run_provider_catchup_once(self) -> bool:
+        store = getattr(self, "store", None)
+        if (
+            store is None
+            or not hasattr(store, "active_account_uuids")
+            or not hasattr(store, "provider_catchup_ready")
+        ):
+            return False
+        for account_uuid in store.active_account_uuids():
+            if store.provider_catchup_ready(account_uuid):
+                continue
+            try:
+                self._run_provider_queue_catchup(
+                    account_uuid,
+                    self.provider_adapters(account_uuid),
+                )
+            except zulip_adapter.ZulipOperationError as exc:
+                self.store.mark_health("provider", "degraded", exc.code)
+                self._queue_account_report(account_uuid, "degraded", exc.code)
+                return False
+            return True
+        return False
+
+    def _run_history_quantum_once(self) -> bool:
+        if self.run_provider_catchup_once():
+            return True
+        return self.run_backfill_once()
+
+    def _collect_history_future(self) -> bool:
+        future = getattr(self, "history_future", None)
+        if future is None or not future.done():
+            return False
+        self.history_future = None
+        try:
+            return future.result()
+        except Exception as exc:
+            self.store.mark_health(
+                "provider",
+                "degraded",
+                (
+                    exc.code
+                    if isinstance(exc, zulip_adapter.ZulipOperationError)
+                    else "provider_history_failed"
+                ),
+            )
+            return False
 
     def _file_resolver(
         self,
@@ -1686,7 +1737,11 @@ class BridgeService:
             # pending until those mappings arrive instead of crashing the worker.
             self.store.release_backfill_job(account_uuid, provider_chat_key)
             return False
-        complete = reached_cutoff or len(messages) < 100 or not messages
+        complete = (
+            reached_cutoff
+            or len(messages) < zulip_adapter.HISTORY_PAGE_SIZE
+            or not messages
+        )
         next_anchor = (
             None
             if not messages
@@ -1765,7 +1820,7 @@ class BridgeService:
 
     def tick(self) -> bool:
         now = time.monotonic()
-        progressed = False
+        progressed = self._collect_history_future()
         if now - self.last_certificate_check >= 3600.0:
             progressed |= self._renew_certificate(False)
             self.last_certificate_check = now
@@ -1826,20 +1881,30 @@ class BridgeService:
         if not live_progressed or history_due:
             if history_due:
                 self.last_history_quantum = now
-            progressed |= self.run_backfill_once()
-            # Live work is handled first. One bounded history delivery then
-            # prevents continuous healthy traffic from starving initial sync.
+            # Live work is handled first. Drain a bounded batch that is already
+            # durable before fetching another provider history page. Provider
+            # I/O may take several seconds, so fetching first would otherwise
+            # leave ready messages untouched while the bridge waits on Zulip.
+            history_delivered = 0
             try:
-                progressed |= (
-                    self.flush_provider_events(
-                        minimum_priority=2, maximum_priority=2, limit=1
-                    )
-                    > 0
+                history_delivered = self.flush_provider_events(
+                    minimum_priority=2, maximum_priority=2, limit=10
                 )
             except (httpx.TransportError, provider_api.ProviderApiRetryableError):
                 self.store.mark_health(
                     "provider_api", "degraded", "provider_api_unavailable"
                 )
+            progressed |= history_delivered > 0
+            # Do not grow an already full delivery backlog. Once a bounded
+            # batch has drained, discover at most one more provider page.
+            if history_delivered < 10:
+                history_executor = getattr(self, "history_executor", None)
+                if history_executor is None:
+                    progressed |= self._run_history_quantum_once()
+                elif getattr(self, "history_future", None) is None:
+                    self.history_future = history_executor.submit(
+                        self._run_history_quantum_once
+                    )
         self.health_file.parent.mkdir(parents=True, exist_ok=True)
         self.health_file.write_text(
             datetime.datetime.now(datetime.UTC).isoformat(),

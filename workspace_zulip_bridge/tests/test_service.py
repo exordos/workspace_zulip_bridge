@@ -1,3 +1,4 @@
+import concurrent.futures
 import pathlib
 import threading
 import time
@@ -437,6 +438,56 @@ def test_empty_successful_provider_poll_recovers_health():
     assert instance.provider_retry_attempts == {}
     assert instance.provider_retry_after == {}
     assert instance.store.health == [("provider", "healthy", None)]
+
+
+def test_live_event_is_persisted_before_incomplete_queue_catchup():
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+    calls = []
+
+    class Store:
+        def account_resource(self, requested):
+            assert requested == account_uuid
+            return None
+
+        def provider_event_cursor(self, requested):
+            assert requested == account_uuid
+            return {"queue_id": "queue", "last_event_id": 4}
+
+        def record_provider_event(self, requested, queue_id, event):
+            calls.append(("record", requested, queue_id, event["id"]))
+
+        def update_provider_event_cursor(self, requested, queue_id, event_id):
+            calls.append(("cursor", requested, queue_id, event_id))
+
+    class Adapter:
+        def restore_queue(self, queue_id, last_event_id):
+            calls.append(("restore", queue_id, last_event_id))
+
+        def events(self, queue_id, last_event_id):
+            calls.append(("events", queue_id, last_event_id))
+            return [{"id": 5, "type": "realm_user"}]
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance.provider_adapters = lambda requested: Adapter()
+    instance.scheduler = type(
+        "Scheduler", (), {"reconcile_local_echo": lambda *args: None}
+    )()
+    instance._run_provider_queue_catchup = (
+        lambda requested, adapter: calls.append(("catchup", requested)) or False
+    )
+    instance._queue_account_report = (
+        lambda requested, status: calls.append(("report", requested, status))
+    )
+
+    assert instance._poll_provider_account(account_uuid) == (1, None)
+    assert calls == [
+        ("restore", "queue", 4),
+        ("events", "queue", 4),
+        ("record", account_uuid, "queue", 5),
+        ("cursor", account_uuid, "queue", 5),
+        ("report", account_uuid, "backfill"),
+    ]
 
 
 def test_adapter_connection_failure_degrades_only_affected_account(monkeypatch):
@@ -2229,8 +2280,95 @@ def test_continuous_live_work_still_runs_bounded_history_quantum(tmp_path, monke
     assert calls == [
         "live",
         "delivery:0:0:10",
+        "delivery:2:2:10",
         "backfill",
-        "delivery:2:2:1",
+    ]
+
+
+def test_running_history_quantum_does_not_block_next_live_tick(tmp_path, monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+    live_calls = []
+    now = [10.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+
+    class Scheduler:
+        def reconcile_once(self):
+            return False
+
+        def run_once(self):
+            live_calls.append(now[0])
+            return True
+
+    instance = object.__new__(service.BridgeService)
+    instance.last_heartbeat = now[0]
+    instance.last_control = now[0]
+    instance.last_certificate_check = now[0]
+    instance.last_provider_poll = now[0]
+    instance.last_history_quantum = now[0] - 1.0
+    instance.health_file = tmp_path / "progress"
+    instance.scheduler = Scheduler()
+    instance.poll_provider_operations = lambda: 0
+    instance.poll_provider_events = lambda: 0
+    instance.process_provider_journal = lambda: 0
+    instance.flush_provider_results = lambda: 0
+    instance.flush_provider_events = lambda **kwargs: 0
+    instance.history_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    instance.history_future = None
+
+    def slow_history():
+        started.set()
+        assert release.wait(timeout=2)
+        return True
+
+    instance._run_history_quantum_once = slow_history
+    try:
+        assert instance.tick()
+        assert started.wait(timeout=1)
+        now[0] += 1.0
+        assert instance.tick()
+        assert live_calls == [10.0, 11.0]
+    finally:
+        release.set()
+        instance.history_executor.shutdown(wait=True)
+
+
+def test_full_history_delivery_batch_defers_more_provider_io(tmp_path, monkeypatch):
+    calls = []
+    now = [10.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+
+    class Scheduler:
+        def reconcile_once(self):
+            return False
+
+        def run_once(self):
+            return False
+
+    instance = object.__new__(service.BridgeService)
+    instance.last_heartbeat = now[0]
+    instance.last_control = now[0]
+    instance.last_certificate_check = now[0]
+    instance.last_provider_poll = now[0]
+    instance.last_history_quantum = now[0] - 1.0
+    instance.health_file = tmp_path / "progress"
+    instance.scheduler = Scheduler()
+    instance.poll_provider_operations = lambda: 0
+    instance.poll_provider_events = lambda: 0
+    instance.process_provider_journal = lambda: 0
+    instance.flush_provider_results = lambda: 0
+    instance.flush_provider_events = (
+        lambda minimum_priority=0, maximum_priority=2, limit=100: (
+            calls.append(f"delivery:{minimum_priority}:{maximum_priority}:{limit}")
+            or (10 if minimum_priority == 2 else 0)
+        )
+    )
+    instance.run_backfill_once = lambda: calls.append("backfill") or True
+
+    assert instance.tick()
+    assert calls == [
+        "delivery:0:0:10",
+        "delivery:2:2:10",
     ]
 
 
