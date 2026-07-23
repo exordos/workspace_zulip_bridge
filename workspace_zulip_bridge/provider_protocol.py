@@ -14,6 +14,7 @@ _OUTBOUND_KIND = {
 }
 
 _INBOUND_KIND = {
+    "identity.upsert": "identity.upsert",
     "stream.upsert": "stream.upsert",
     "stream.delete": "stream.delete",
     "topic.upsert": "topic.upsert",
@@ -25,8 +26,6 @@ _INBOUND_KIND = {
     "reaction.delete": "reaction.delete",
     "read_state.set": "read_state.set",
 }
-
-_NON_EVENT_KINDS = frozenset({"identity.upsert"})
 
 
 def _provider_mapping(store, account_uuid: str, kind: str, workspace_uuid: object):
@@ -52,6 +51,45 @@ def _chat_key(store, account_uuid: str, kind: str, payload: dict[str, object]):
     return str(
         _provider_mapping(store, account_uuid, "stream", stream_uuid)["provider_id"]
     )
+
+
+def _message_created_at(
+    store,
+    account_uuid: str,
+    provider: dict[str, object],
+    operation: dict[str, object],
+    record: dict[str, object],
+) -> str:
+    provider_id = provider.get("entity_id")
+    lookup = getattr(store, "provider_mapping", None)
+    if provider_id is not None and callable(lookup):
+        mapping = lookup(account_uuid, "message", str(provider_id))
+        if mapping is not None:
+            metadata = typing.cast(dict[str, object], mapping.get("metadata", {}))
+            provider_timestamp = metadata.get("provider_timestamp")
+            if isinstance(provider_timestamp, (int, float, str)) and not isinstance(
+                provider_timestamp, bool
+            ):
+                try:
+                    return (
+                        datetime.datetime.fromtimestamp(
+                            float(provider_timestamp), datetime.UTC
+                        )
+                        .isoformat()
+                        .replace("+00:00", "Z")
+                    )
+                except (OverflowError, TypeError, ValueError):
+                    pass
+    value = operation.get("occurred_at") or record["created_at"]
+    if isinstance(value, datetime.datetime):
+        parsed = value
+    elif isinstance(value, str):
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    else:
+        raise ValueError("Provider message creation time is invalid")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.UTC)
+    return parsed.astimezone(datetime.UTC).isoformat().replace("+00:00", "Z")
 
 
 def leased_operation_record(store, leased: dict[str, object]) -> dict[str, object]:
@@ -167,8 +205,6 @@ def event_payload(store, record: dict[str, object]) -> dict[str, object] | None:
     operation_kind = str(operation["kind"])
     kind = _INBOUND_KIND.get(operation_kind)
     if kind is None:
-        if operation_kind in _NON_EVENT_KINDS:
-            return None
         raise ValueError(f"Unsupported Provider event operation kind: {operation_kind}")
     account_uuid = str(record["account_uuid"])
     project_uuid = str(record["project_uuid"])
@@ -195,6 +231,34 @@ def event_payload(store, record: dict[str, object]) -> dict[str, object] | None:
         resource.update(payload)
         if "author_uuid" in resource:
             resource["user_uuid"] = resource.pop("author_uuid")
+        if kind == "message.upsert":
+            resource["created_at"] = _message_created_at(
+                store,
+                account_uuid,
+                provider,
+                operation,
+                record,
+            )
+        if kind == "message.upsert" and "user_uuid" in resource:
+            author = store.workspace_mapping(
+                account_uuid,
+                "identity",
+                str(resource["user_uuid"]),
+            )
+            if author is not None:
+                author_metadata = typing.cast(
+                    dict[str, object],
+                    author.get("metadata", {}),
+                )
+                resource["author_identity"] = {
+                    "provider_external_id": str(author["provider_id"]),
+                    "display_name": str(
+                        author_metadata.get("display_name", author["provider_id"])
+                    ),
+                    "email": author_metadata.get("email"),
+                    "avatar_urn": author_metadata.get("avatar_urn"),
+                    "active": bool(author_metadata.get("active", True)),
+                }
     else:
         for relation in ("stream_uuid", "topic_uuid", "message_uuid"):
             if relation in payload:

@@ -17,7 +17,10 @@ MAX_PROVIDER_FILE_BYTES = 52_428_800
 PROVIDER_QUEUE_IDLE_TIMEOUT_SECONDS = 43_200
 # History runs in the main service thread. Keep each provider quantum small so
 # already captured live events return to delivery promptly between pages.
-HISTORY_PAGE_SIZE = 5
+# Zulip's message endpoint is paginated server-side. A production backfill
+# should amortize one request across a useful batch while the delivery outbox
+# still drains it in bounded Provider API quanta.
+HISTORY_PAGE_SIZE = 100
 TRANSFER_NAMESPACE = uuid.UUID("8aa58582-d782-4e98-bfc3-7b5ee96e3bd6")
 WORKSPACE_FILE_RE = re.compile(
     r"(?P<image>!?)\[(?P<name>[^\]]+)\]\("

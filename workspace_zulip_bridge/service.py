@@ -1438,33 +1438,20 @@ class BridgeService:
         event: dict[str, object],
         delivery_class: str,
     ) -> list[dict[str, object]]:
-        try:
-            return converter.event_records(
-                self.store,
+        return converter.event_records(
+            self.store,
+            account_uuid,
+            queue_id,
+            event,
+            delivery_class,
+            adapter.server_url,
+            self._file_resolver(
+                adapter,
                 account_uuid,
-                queue_id,
-                event,
-                delivery_class,
-                adapter.server_url,
-                self._file_resolver(
-                    adapter,
-                    account_uuid,
-                    external_chat_uuid,
-                    int(event["id"]),
-                ),
-            )
-        except zulip_adapter.ZulipOperationError as exc:
-            if exc.retryable:
-                raise
-            return converter.event_records(
-                self.store,
-                account_uuid,
-                queue_id,
-                event,
-                delivery_class,
-                adapter.server_url,
-                None,
-            )
+                external_chat_uuid,
+                int(event["id"]),
+            ),
+        )
 
     def process_provider_journal(self) -> int:
         processed = 0
@@ -1556,22 +1543,12 @@ class BridgeService:
                     )
                     self.store.mark_health("provider", "degraded", exc.code)
                     continue
-                try:
-                    records = converter.event_records(
-                        self.store,
-                        account_uuid,
-                        queue_id,
-                        event,
-                        "live",
-                        adapter.server_url,
-                        None,
-                    )
-                except (KeyError, TypeError, ValueError):
-                    self.store.mark_provider_event_invalid(
-                        account_uuid, queue_id, event_id, exc.code
-                    )
-                    processed += 1
-                    continue
+                self.store.mark_provider_event_invalid(
+                    account_uuid, queue_id, event_id, exc.code
+                )
+                self.store.mark_health("provider", "degraded", exc.code)
+                processed += 1
+                continue
             except ValueError as exc:
                 if str(exc) in {
                     "provider_chat_assignment_pending",
@@ -1648,6 +1625,8 @@ class BridgeService:
             f"backfill:{provider_chat_key}:"
             f"{assignment['uuid']}:{assignment['generation']}"
         )
+        topic_cache = getattr(self, "backfill_topic_cache", set())
+        self.backfill_topic_cache = topic_cache
         ordered_messages = converter.newest_first(messages)
         for message in ordered_messages:
             self._queue_event_catalog(
@@ -1678,6 +1657,20 @@ class BridgeService:
                 "backfill",
             )
             for record in records:
+                operation = typing.cast(
+                    dict[str, object],
+                    record.get("operation", {}),
+                )
+                topic_cache_key = None
+                if operation.get("kind") == "topic.upsert":
+                    topic_cache_key = (
+                        account_uuid,
+                        str(assignment["uuid"]),
+                        int(assignment["generation"]),
+                        str(operation["entity_uuid"]),
+                    )
+                    if topic_cache_key in topic_cache:
+                        continue
                 try:
                     enqueued += int(
                         self.store.enqueue_workspace_delivery(record, 2)
@@ -1692,7 +1685,12 @@ class BridgeService:
                     # a message whose deterministic backfill operation was already
                     # accepted from an earlier snapshot. Keep that first operation
                     # canonical; live queue recovery carries later edits separately.
-                    continue
+                if topic_cache_key is not None:
+                    # Add only after the topic operation is durable (or already
+                    # present with the same deterministic UUID). A process restart
+                    # merely replays one harmless upsert; it can never skip the
+                    # first durable topic projection of an assignment generation.
+                    topic_cache.add(topic_cache_key)
         return enqueued
 
     def run_backfill_once(self) -> bool:
@@ -1936,9 +1934,15 @@ class BridgeService:
             # I/O may take several seconds, so fetching first would otherwise
             # leave ready messages untouched while the bridge waits on Zulip.
             history_delivered = 0
+            history_batch_size = max(
+                1,
+                min(int(getattr(self, "provider_batch_size", 20)), 100),
+            )
             try:
                 history_delivered = self.flush_provider_events(
-                    minimum_priority=2, maximum_priority=2, limit=10
+                    minimum_priority=2,
+                    maximum_priority=2,
+                    limit=history_batch_size,
                 )
             except (httpx.TransportError, provider_api.ProviderApiRetryableError):
                 self.store.mark_health(
@@ -1947,7 +1951,7 @@ class BridgeService:
             progressed |= history_delivered > 0
             # Do not grow an already full delivery backlog. Once a bounded
             # batch has drained, discover at most one more provider page.
-            if history_delivered < 10:
+            if history_delivered < history_batch_size:
                 progressed |= self._run_history_quantum_once()
         self.health_file.parent.mkdir(parents=True, exist_ok=True)
         self.health_file.write_text(

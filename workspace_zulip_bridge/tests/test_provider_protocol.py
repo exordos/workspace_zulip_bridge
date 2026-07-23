@@ -1,3 +1,4 @@
+import datetime
 import uuid
 
 import pytest
@@ -13,6 +14,14 @@ CHAT_UUID = "60000000-0000-0000-0000-000000000006"
 
 
 class Store:
+    def provider_mapping(self, account_uuid, kind, provider_id):
+        assert (account_uuid, kind, provider_id) == (
+            ACCOUNT_UUID,
+            "message",
+            "101",
+        )
+        return {"metadata": {"provider_timestamp": 1_752_840_000}}
+
     def workspace_mapping(self, account_uuid, kind, workspace_uuid):
         assert account_uuid == ACCOUNT_UUID
         return {
@@ -21,6 +30,15 @@ class Store:
             "message": {
                 "provider_id": "101",
                 "metadata": {"chat_key": "channel:42"},
+            },
+            "identity": {
+                "provider_id": "42",
+                "metadata": {
+                    "display_name": "Former User",
+                    "email": None,
+                    "avatar_urn": None,
+                    "active": True,
+                },
             },
         }[kind]
 
@@ -77,13 +95,57 @@ def test_zulip_record_adapts_to_atomic_provider_event_resource():
     assert resource["uuid"] == MESSAGE_UUID
     assert resource["provider_external_id"] == "101"
     assert resource["user_uuid"] == ACCOUNT_UUID
+    assert resource["created_at"] == (
+        datetime.datetime.fromtimestamp(1_752_840_000, datetime.UTC)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    assert resource["author_identity"] == {
+        "provider_external_id": "42",
+        "display_name": "Former User",
+        "email": None,
+        "avatar_urn": None,
+        "active": True,
+    }
 
 
-def test_identity_projection_is_control_plane_owned_not_provider_event():
+def test_provider_event_normalizes_naive_live_message_timestamp_to_utc():
+    class LiveStore(Store):
+        def provider_mapping(self, account_uuid, kind, provider_id):
+            assert (account_uuid, kind, provider_id) == (
+                ACCOUNT_UUID,
+                "message",
+                "101",
+            )
+            return {"metadata": {}}
+
+    record = provider_protocol.leased_operation_record(LiveStore(), _lease())
+    record["origin"] = "zulip"
+    record["operation_uuid"] = str(uuid.uuid4())
+    record["operation"]["provider"]["entity_id"] = "101"
+    record["operation"]["occurred_at"] = "2026-07-23 21:09:36"
+
+    event = provider_protocol.event_payload(LiveStore(), record)
+
+    assert event["payload"]["resource"]["created_at"] == "2026-07-23T21:09:36Z"
+
+
+def test_missing_identity_is_sent_as_provider_event_without_stream_membership():
     record = provider_protocol.leased_operation_record(Store(), _lease())
     record["operation"]["kind"] = "identity.upsert"
+    record["operation"]["provider"]["entity_id"] = "42"
+    record["operation"]["payload"] = {
+        "display_name": "Former User",
+        "email": None,
+        "avatar_urn": None,
+        "active": True,
+    }
 
-    assert provider_protocol.event_payload(Store(), record) is None
+    event = provider_protocol.event_payload(Store(), record)
+
+    assert event["kind"] == "identity.upsert"
+    assert event["payload"]["resource"]["provider_external_id"] == "42"
+    assert event["payload"]["resource"]["display_name"] == "Former User"
 
 
 def test_provider_read_state_adapts_to_provider_event_without_losing_selector():

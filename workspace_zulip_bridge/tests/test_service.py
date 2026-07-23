@@ -1929,7 +1929,7 @@ def test_incoming_update_file_reuses_mapped_message_external_chat_uuid(monkeypat
     )
 
 
-def test_permanent_attachment_failure_uses_loss_aware_fallback(monkeypatch):
+def test_permanent_attachment_failure_does_not_enqueue_broken_fallback(monkeypatch):
     account_uuid = "00000000-0000-0000-0000-000000000001"
     store = DeliveryStore(
         [
@@ -1948,17 +1948,18 @@ def test_permanent_attachment_failure_uses_loss_aware_fallback(monkeypatch):
     instance = _delivery_service(store)
     instance.file_client = object()
 
-    def records(*args, **kwargs):
-        if args[6] is not None:
-            raise zulip_adapter.ZulipOperationError("provider_file_too_large", False)
-        return [{"record_uuid": "fallback-record"}]
-
-    monkeypatch.setattr(converter, "event_records", records)
+    monkeypatch.setattr(
+        converter,
+        "event_records",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            zulip_adapter.ZulipOperationError("provider_file_too_large", False)
+        ),
+    )
     assert instance.process_provider_journal() == 1
     assert store.retried == []
-    assert store.invalid == []
-    assert store.enqueued == [({"record_uuid": "fallback-record"}, 0)]
-    assert store.processed == [(account_uuid, "queue", 7, True)]
+    assert store.invalid == [(account_uuid, "queue", 7, "provider_file_too_large")]
+    assert store.enqueued == []
+    assert store.processed == []
 
 
 @pytest.mark.parametrize(
@@ -2090,7 +2091,61 @@ def test_backfill_keeps_first_accepted_digest_for_repeated_history(monkeypatch):
     ]
 
 
-def test_backfill_uses_loss_aware_fallback_for_unavailable_attachment(monkeypatch):
+def test_backfill_caches_durable_topic_upsert_per_assignment_generation(monkeypatch):
+    store = DeliveryStore()
+    instance = _delivery_service(store)
+
+    def records(*args, **kwargs):
+        message_id = args[3]["message"]["id"]
+        return [
+            {
+                "record_uuid": f"topic-{message_id}",
+                "operation_uuid": f"topic-operation-{message_id}",
+                "operation": {
+                    "kind": "topic.upsert",
+                    "entity_uuid": "00000000-0000-4000-8000-000000000091",
+                },
+            },
+            {
+                "record_uuid": f"message-{message_id}",
+                "operation_uuid": f"message-operation-{message_id}",
+                "operation": {
+                    "kind": "message.update",
+                    "entity_uuid": f"00000000-0000-4000-8000-{message_id:012d}",
+                },
+            },
+        ]
+
+    monkeypatch.setattr(converter, "event_records", records)
+    monkeypatch.setattr(
+        converter, "provider_chat_reference", lambda message: ("channel", "channel:42")
+    )
+
+    assert (
+        instance.enqueue_backfill(
+            "00000000-0000-0000-0000-000000000001",
+            "channel:42",
+            [{"id": 2, "timestamp": 2}, {"id": 1, "timestamp": 1}],
+        )
+        == 3
+    )
+    assert (
+        instance.enqueue_backfill(
+            "00000000-0000-0000-0000-000000000001",
+            "channel:42",
+            [{"id": 0, "timestamp": 0}],
+        )
+        == 1
+    )
+    assert [record["record_uuid"] for record, _priority in store.enqueued] == [
+        "topic-2",
+        "message-2",
+        "message-1",
+        "message-0",
+    ]
+
+
+def test_backfill_does_not_enqueue_broken_attachment_fallback(monkeypatch):
     store = DeliveryStore()
     instance = _delivery_service(store)
 
@@ -2098,7 +2153,7 @@ def test_backfill_uses_loss_aware_fallback_for_unavailable_attachment(monkeypatc
         resolver = args[6]
         if resolver is not None:
             resolver("/user_uploads/report.pdf", "report.pdf")
-        return [{"record_uuid": "fallback-record"}]
+        pytest.fail("attachment failure must abort conversion")
 
     monkeypatch.setattr(converter, "event_records", records)
     monkeypatch.setattr(
@@ -2112,15 +2167,14 @@ def test_backfill_uses_loss_aware_fallback_for_unavailable_attachment(monkeypatc
         )
     )
 
-    assert (
+    with pytest.raises(zulip_adapter.ZulipOperationError) as captured:
         instance.enqueue_backfill(
             "00000000-0000-0000-0000-000000000001",
             "channel:42",
             [{"id": 7, "timestamp": 7}],
         )
-        == 1
-    )
-    assert store.enqueued == [({"record_uuid": "fallback-record"}, 2)]
+    assert captured.value.code == "workspace_file_import_unavailable"
+    assert store.enqueued == []
 
 
 def test_backfill_discovers_all_topics_before_waiting_for_workspace_mappings(
@@ -2304,7 +2358,7 @@ def test_continuous_live_work_still_runs_bounded_history_quantum(tmp_path, monke
     assert calls == [
         "live",
         "delivery:0:0:10",
-        "delivery:2:2:10",
+        "delivery:2:2:20",
         "backfill",
     ]
 
@@ -2481,7 +2535,7 @@ def test_full_history_delivery_batch_defers_more_provider_io(tmp_path, monkeypat
     instance.flush_provider_events = (
         lambda minimum_priority=0, maximum_priority=2, limit=100: (
             calls.append(f"delivery:{minimum_priority}:{maximum_priority}:{limit}")
-            or (10 if minimum_priority == 2 else 0)
+            or (20 if minimum_priority == 2 else 0)
         )
     )
     instance.run_backfill_once = lambda: calls.append("backfill") or True
@@ -2489,7 +2543,7 @@ def test_full_history_delivery_batch_defers_more_provider_io(tmp_path, monkeypat
     assert instance.tick()
     assert calls == [
         "delivery:0:0:10",
-        "delivery:2:2:10",
+        "delivery:2:2:20",
     ]
 
 
