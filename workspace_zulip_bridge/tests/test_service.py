@@ -1971,6 +1971,51 @@ def test_backfill_is_discovered_newest_first_and_queued_at_priority_two(
     }
 
 
+def test_backfill_keeps_first_accepted_digest_for_repeated_history(monkeypatch):
+    class Store(DeliveryStore):
+        def __init__(self):
+            super().__init__()
+            self.attempted = []
+
+        def enqueue_workspace_delivery(self, record, priority):
+            self.attempted.append((record, priority))
+            if record["operation_uuid"] == "operation-2":
+                raise ValueError("Operation UUID reused with a different digest")
+            return True
+
+    store = Store()
+
+    monkeypatch.setattr(
+        converter,
+        "event_records",
+        lambda *args, **kwargs: [
+            {
+                "record_uuid": f"record-{args[3]['message']['id']}",
+                "operation_uuid": f"operation-{args[3]['message']['id']}",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        converter, "provider_chat_reference", lambda message: ("channel", "channel:42")
+    )
+
+    assert (
+        _delivery_service(store).enqueue_backfill(
+            "00000000-0000-0000-0000-000000000001",
+            "channel:42",
+            [
+                {"id": 1, "timestamp": 10},
+                {"id": 2, "timestamp": 11},
+            ],
+        )
+        == 1
+    )
+    assert [record["operation_uuid"] for record, _ in store.attempted] == [
+        "operation-2",
+        "operation-1",
+    ]
+
+
 def test_backfill_uses_loss_aware_fallback_for_unavailable_attachment(monkeypatch):
     store = DeliveryStore()
     instance = _delivery_service(store)

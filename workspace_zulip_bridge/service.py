@@ -1569,7 +1569,21 @@ class BridgeService:
                 "backfill",
             )
             for record in records:
-                enqueued += int(self.store.enqueue_workspace_delivery(record, 2))
+                try:
+                    enqueued += int(
+                        self.store.enqueue_workspace_delivery(record, 2)
+                    )
+                except ValueError as exc:
+                    if (
+                        str(exc)
+                        != "Operation UUID reused with a different digest"
+                    ):
+                        raise
+                    # A repeated history page can contain the current revision of
+                    # a message whose deterministic backfill operation was already
+                    # accepted from an earlier snapshot. Keep that first operation
+                    # canonical; live queue recovery carries later edits separately.
+                    continue
         return enqueued
 
     def run_backfill_once(self) -> bool:
