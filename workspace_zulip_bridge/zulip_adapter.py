@@ -429,6 +429,7 @@ class OfficialZulipAdapter:
                 "message",
                 "subscription",
                 "realm_user",
+                "realm",
                 "recent_private_conversations",
             ],
             "apply_markdown": False,

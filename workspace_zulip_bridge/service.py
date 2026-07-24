@@ -510,6 +510,18 @@ class BridgeService:
             if adapter is None:
                 adapter = self.provider_adapters(account_uuid)
             cursor = self.store.provider_event_cursor(account_uuid)
+            if cursor is not None and (
+                (
+                    "provider_realm_uuid" in cursor
+                    and cursor["provider_realm_uuid"] is None
+                )
+                or (
+                    "provider_owner_user_id" in cursor
+                    and cursor["provider_owner_user_id"] is None
+                )
+            ):
+                self.store.invalidate_provider_event_cursor(account_uuid)
+                cursor = None
             if cursor is None:
                 queue_id, last_event_id = adapter.ensure_queue()
                 # Persist the queue before catalog, participant, or history work.
@@ -520,6 +532,24 @@ class BridgeService:
                 )
                 registration = adapter.take_registration_snapshot()
                 if registration is not None:
+                    account = self.store.account_resource(account_uuid)
+                    if account is None:
+                        raise ValueError(
+                            "Zulip provider account is unavailable"
+                        )
+                    provider_account_generation = int(account["generation"])
+                    provider_realm_uuid = str(
+                        uuid.UUID(str(registration["realm_uuid"]))
+                    )
+                    provider_owner_user_id = str(int(registration["user_id"]))
+                    self.store.update_provider_event_cursor(
+                        account_uuid,
+                        queue_id,
+                        last_event_id,
+                        provider_realm_uuid,
+                        provider_owner_user_id,
+                        provider_account_generation,
+                    )
                     self._queue_registration_reports(
                         account_uuid,
                         registration,
@@ -761,6 +791,12 @@ class BridgeService:
         owner_uuid = str(account["owner_user_uuid"])
         generation = int(account["generation"])
         project_uuid = str(settings["default_project_id"])
+        provider_realm_uuid_value = registration.get("realm_uuid")
+        if provider_realm_uuid_value is None:
+            cursor = self.store.provider_event_cursor(account_uuid)
+            if cursor is not None:
+                provider_realm_uuid_value = cursor.get("provider_realm_uuid")
+        provider_realm_uuid = str(uuid.UUID(str(provider_realm_uuid_value)))
         provider_user_id = registration.get("user_id")
         if isinstance(provider_user_id, int):
             owner_name = next(
@@ -888,6 +924,8 @@ class BridgeService:
                 participants=participants,
                 topics=topics,
                 authoritative_participants=True,
+                provider_realm_uuid=provider_realm_uuid,
+                provider_owner_user_id=str(int(provider_user_id)),
             )
 
     @staticmethod
@@ -1003,7 +1041,23 @@ class BridgeService:
         participants: list[dict[str, object]] | None = None,
         topics: list[dict[str, object]] | None = None,
         authoritative_participants: bool = False,
+        provider_realm_uuid: str | None = None,
+        provider_owner_user_id: str | None = None,
     ) -> None:
+        if provider_realm_uuid is None or provider_owner_user_id is None:
+            cursor = self.store.provider_event_cursor(account_uuid)
+            if cursor is None:
+                raise ValueError("Zulip provider account identity is unavailable")
+            if provider_realm_uuid is None:
+                provider_realm_uuid = str(
+                    uuid.UUID(str(cursor.get("provider_realm_uuid")))
+                )
+            if provider_owner_user_id is None:
+                provider_owner_user_id = str(
+                    int(str(cursor.get("provider_owner_user_id")))
+                )
+        provider_realm_uuid = str(uuid.UUID(provider_realm_uuid))
+        provider_owner_user_id = str(int(provider_owner_user_id))
         if operation == "upsert" and hasattr(self.store, "merge_catalog_topology"):
             participants, topics = self.store.merge_catalog_topology(
                 account_uuid,
@@ -1049,6 +1103,8 @@ class BridgeService:
                     "kind": "zulip",
                     "chat_type": chat_type,
                     "provider_chat_key": chat_key,
+                    "provider_realm_uuid": provider_realm_uuid,
+                    "provider_owner_user_id": provider_owner_user_id,
                     "original_url": self._catalog_original_url(server_url, chat_key),
                 },
                 "display_name": display_name,

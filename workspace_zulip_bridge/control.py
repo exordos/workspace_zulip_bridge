@@ -57,7 +57,7 @@ class ControlClient:
                 self.settings.certificate_file,
                 self.settings.private_key_file,
             ),
-            timeout=10.0,
+            timeout=self.settings.timeout_seconds,
             follow_redirects=False,
             headers={"Accept": "application/json"},
         )

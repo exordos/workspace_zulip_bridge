@@ -1086,6 +1086,7 @@ def test_registration_snapshot_queues_account_live_ready_and_chat_catalog_report
         account_uuid,
         {
             "user_id": 1,
+            "realm_uuid": "00000000-0000-4000-8000-000000000004",
             "realm_users": [
                 {
                     "user_id": 1,
@@ -1154,8 +1155,15 @@ def test_registration_snapshot_queues_account_live_ready_and_chat_catalog_report
         "kind",
         "chat_type",
         "provider_chat_key",
+        "provider_realm_uuid",
+        "provider_owner_user_id",
         "original_url",
     }
+    assert (
+        channel["catalog"]["source"]["provider_realm_uuid"]
+        == "00000000-0000-4000-8000-000000000004"
+    )
+    assert channel["catalog"]["source"]["provider_owner_user_id"] == "1"
     assert direct["catalog"]["participants"] == [
         {
             "provider_user_id": "1",
@@ -1226,7 +1234,12 @@ def test_selected_channel_participants_gate_messages_until_projection_matches(
             return assignment
 
         def provider_event_cursor(self, requested):
-            return {"queue_id": "queue", "last_event_id": 7}
+            return {
+                "queue_id": "queue",
+                "last_event_id": 7,
+                "provider_realm_uuid": ("00000000-0000-4000-8000-000000000005"),
+                "provider_owner_user_id": "1",
+            }
 
         def account_resource(self, requested):
             return {
@@ -1405,6 +1418,8 @@ def test_catalog_reports_accumulate_full_replacement_topology():
                     "is_default": False,
                 }
             ],
+            provider_realm_uuid="10000000-0000-4000-8000-000000000004",
+            provider_owner_user_id="1",
         )
     final = instance.store.reports[-1]["catalog"]
     assert {value["provider_user_id"] for value in final["participants"]} == {
@@ -1432,6 +1447,12 @@ def test_channel_message_catalog_does_not_turn_authors_or_mentions_into_members(
                 "settings": {
                     "default_project_id": "10000000-0000-4000-8000-000000000002"
                 },
+            }
+
+        def provider_event_cursor(self, _account_uuid):
+            return {
+                "provider_realm_uuid": ("10000000-0000-4000-8000-000000000004"),
+                "provider_owner_user_id": "1",
             }
 
         def merge_catalog_topology(
@@ -1517,11 +1538,55 @@ def test_first_provider_poll_processes_registration_and_reports_live_ready():
             return True
 
         def pending_provider_catchup(self, requested):
-            assert self.cursor == {"queue_id": "queue", "last_event_id": 10}
+            assert self.cursor == {
+                "queue_id": "queue",
+                "last_event_id": 10,
+                "provider_realm_uuid": ("00000000-0000-4000-8000-000000000004"),
+                "provider_owner_user_id": "1",
+                "provider_account_generation": 2,
+            }
             return None
 
-        def update_provider_event_cursor(self, requested, queue_id, event_id):
-            self.cursor = {"queue_id": queue_id, "last_event_id": event_id}
+        def update_provider_event_cursor(
+            self,
+            requested,
+            queue_id,
+            event_id,
+            provider_realm_uuid=None,
+            provider_owner_user_id=None,
+            provider_account_generation=None,
+        ):
+            self.cursor = {
+                "queue_id": queue_id,
+                "last_event_id": event_id,
+                "provider_realm_uuid": (
+                    provider_realm_uuid
+                    if provider_realm_uuid is not None
+                    else (
+                        None
+                        if self.cursor is None
+                        else self.cursor["provider_realm_uuid"]
+                    )
+                ),
+                "provider_owner_user_id": (
+                    provider_owner_user_id
+                    if provider_owner_user_id is not None
+                    else (
+                        None
+                        if self.cursor is None
+                        else self.cursor["provider_owner_user_id"]
+                    )
+                ),
+                "provider_account_generation": (
+                    provider_account_generation
+                    if provider_account_generation is not None
+                    else (
+                        None
+                        if self.cursor is None
+                        else self.cursor["provider_account_generation"]
+                    )
+                ),
+            }
 
         def account_resource(self, requested):
             return {
@@ -1577,6 +1642,7 @@ def test_first_provider_poll_processes_registration_and_reports_live_ready():
         def take_registration_snapshot(self):
             return {
                 "user_id": 1,
+                "realm_uuid": "00000000-0000-4000-8000-000000000004",
                 "subscriptions": [{"stream_id": 42, "name": "Engineering"}],
                 "realm_users": [],
                 "recent_private_conversations": [],
@@ -1598,7 +1664,13 @@ def test_first_provider_poll_processes_registration_and_reports_live_ready():
     )()
 
     assert instance._poll_provider_account(account_uuid) == (0, None)
-    assert instance.store.cursor == {"queue_id": "queue", "last_event_id": 10}
+    assert instance.store.cursor == {
+        "queue_id": "queue",
+        "last_event_id": 10,
+        "provider_realm_uuid": "00000000-0000-4000-8000-000000000004",
+        "provider_owner_user_id": "1",
+        "provider_account_generation": 2,
+    }
     assert {report["resource_type"] for report in instance.store.reports} == {
         "external_account",
         "external_chat_catalog",
