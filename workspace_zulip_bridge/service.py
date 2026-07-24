@@ -172,6 +172,7 @@ class BridgeService:
     MAX_QUEUE_CATCHUP_PAGES = 20
     MAX_CONTROL_SNAPSHOT_PAGES = 10_000
     MAX_CONTROL_SNAPSHOT_RESOURCES = 2_000_000
+    OBSERVED_REPORT_BATCH_SIZE = 1
     PROVIDER_POLL_INTERVAL_SECONDS = 2.0
     HISTORY_QUANTUM_INTERVAL_SECONDS = 1.0
 
@@ -1238,7 +1239,9 @@ class BridgeService:
         )
 
     def flush_observed_reports(self) -> int:
-        reports = self.store.pending_observed_reports(500)
+        reports = self.store.pending_observed_reports(
+            self.OBSERVED_REPORT_BATCH_SIZE
+        )
         if not reports:
             return 0
         response = self.control.observed_reports(reports)
