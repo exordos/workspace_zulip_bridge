@@ -1139,7 +1139,15 @@ def test_registration_snapshot_queues_account_live_ready_and_chat_catalog_report
     )
     assert channel["catalog"]["source"]["original_url"].endswith("/#narrow/channel/42")
     assert direct["catalog"]["source"]["original_url"].endswith("/#narrow/dm/1,2-dm")
-    assert channel["catalog"]["participants"] == []
+    assert channel["catalog"]["participants"] == [
+        {
+            "provider_user_id": "1",
+            "display_name": "Owner",
+            "email": "owner@example.invalid",
+            "avatar_urn": None,
+            "is_owner": True,
+        }
+    ]
     assert channel["catalog"]["capabilities"]["messenger.stream.rename"]["available"]
     assert "messenger.stream.rename" not in direct["catalog"]["capabilities"]
     assert set(channel["catalog"]["source"]) == {
