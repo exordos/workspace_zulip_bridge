@@ -809,7 +809,9 @@ class BridgeService:
                     else None
                 )
                 subscribers = subscription.get("subscribers")
-                participant_ids: set[int] = set()
+                participant_ids: set[int] = (
+                    {provider_user_id} if isinstance(provider_user_id, int) else set()
+                )
                 if assignment is not None and bool(assignment.get("selected", True)):
                     participant_ids.update(
                         value
@@ -820,8 +822,6 @@ class BridgeService:
                         )
                         if isinstance(value, int)
                     )
-                    if isinstance(provider_user_id, int):
-                        participant_ids.add(provider_user_id)
                 channel_participants = [
                     self._catalog_participant(
                         people.get(value, {"user_id": value}),
