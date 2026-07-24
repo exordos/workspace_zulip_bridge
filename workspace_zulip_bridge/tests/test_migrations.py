@@ -62,11 +62,12 @@ def test_migrations_have_one_versioned_dependency_chain():
         "0003-requeue-message-missing-topic-projection-ed8a5e.py",
         "0004-gate-selected-chat-messages-on-participants-23f11f.py",
         "0005-rebuild-message-topic-dependencies-7c52a1.py",
+        "0006-index-pending-Workspace-deliveries-c143b4.py",
     ]
     assert engine.get_latest_migration() == (
-        "0005-rebuild-message-topic-dependencies-7c52a1.py"
+        "0006-index-pending-Workspace-deliveries-c143b4.py"
     )
-    assert len({step["uuid"] for step in all_migrations.values()}) == 6
+    assert len({step["uuid"] for step in all_migrations.values()}) == 7
     assert all_migrations[
         "0001-add-Zulip-provider-scheduler-state-143113.py"
     ]["depends"] == ["0000-initialize-bridge-operational-state-18f707.py"]
@@ -88,6 +89,11 @@ def test_migrations_have_one_versioned_dependency_chain():
     ]["depends"] == [
         "0004-gate-selected-chat-messages-on-participants-23f11f.py"
     ]
+    assert all_migrations[
+        "0006-index-pending-Workspace-deliveries-c143b4.py"
+    ]["depends"] == [
+        "0005-rebuild-message-topic-dependencies-7c52a1.py"
+    ]
 
 
 def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
@@ -108,7 +114,22 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
             applied = session.execute(
                 "SELECT count(*) AS count FROM ra_migrations WHERE applied"
             ).fetchone()
-            assert applied["count"] == 6
+            indexes = session.execute(
+                """
+                SELECT indexname FROM pg_indexes
+                WHERE schemaname = current_schema()
+                  AND indexname IN (
+                      'workspace_delivery_outbox_pending_order_idx',
+                      'workspace_delivery_outbox_pending_dependency_idx'
+                  )
+                ORDER BY indexname
+                """
+            ).fetchall()
+            assert applied["count"] == 7
+            assert [row["indexname"] for row in indexes] == [
+                "workspace_delivery_outbox_pending_dependency_idx",
+                "workspace_delivery_outbox_pending_order_idx",
+            ]
             session.execute("UPDATE bridge_metadata SET control_cursor = 'preserved'")
             session.execute("DROP TABLE ra_migrations")
 
@@ -122,7 +143,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
             cursor = session.execute(
                 "SELECT control_cursor FROM bridge_metadata WHERE singleton"
             ).fetchone()
-            assert applied["count"] == 6
+            assert applied["count"] == 7
             assert cursor["control_cursor"] == "preserved"
     finally:
         with admin_store.session() as session:
