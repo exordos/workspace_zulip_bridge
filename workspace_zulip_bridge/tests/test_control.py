@@ -68,7 +68,7 @@ def test_production_control_client_uses_loaded_mtls_context():
     client_class.assert_called_once_with(
         base_url="https://control.invalid",
         verify=context,
-        timeout=10.0,
+        timeout=300.0,
         follow_redirects=False,
         headers={"Accept": "application/json"},
     )

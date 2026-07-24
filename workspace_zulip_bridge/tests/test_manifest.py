@@ -215,6 +215,7 @@ def test_enrollment_identity_uses_workspace_export_and_readable_secret_files():
 
 def test_control_transport_retry_policy_is_explicit_in_runtime_config():
     text = MANIFEST.read_text(encoding="utf-8")
+    assert "timeout_seconds = 300" in text
     assert "poll_interval_seconds = 2" in text
     assert "heartbeat_interval_seconds = 10" in text
     assert "retry_base_seconds = 1" in text

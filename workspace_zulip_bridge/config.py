@@ -17,6 +17,7 @@ class ControlConfig:
     certificate_file: pathlib.Path
     private_key_file: pathlib.Path
     credential_private_key_file: pathlib.Path
+    timeout_seconds: float = 300.0
     poll_interval_seconds: float = 2.0
     heartbeat_interval_seconds: float = 10.0
     retry_base_seconds: float = 1.0
@@ -94,6 +95,7 @@ def load(path: str | pathlib.Path) -> RuntimeConfig:
             certificate_file=_path(control, "certificate_file"),
             private_key_file=_path(control, "private_key_file"),
             credential_private_key_file=_path(control, "credential_private_key_file"),
+            timeout_seconds=control.getfloat("timeout_seconds", 300.0),
             poll_interval_seconds=control.getfloat("poll_interval_seconds", 2.0),
             heartbeat_interval_seconds=control.getfloat(
                 "heartbeat_interval_seconds", 10.0
