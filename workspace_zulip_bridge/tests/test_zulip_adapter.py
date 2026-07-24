@@ -54,6 +54,7 @@ class FakeClient:
             "queue_id": "queue-1",
             "last_event_id": 7,
             "user_id": 1,
+            "realm_uuid": "00000000-0000-4000-8000-000000000001",
         }
 
     def get_subscriptions(self, request=None):
@@ -777,6 +778,7 @@ def test_registration_requests_and_retains_catalog_snapshot_fields():
         "message",
         "subscription",
         "realm_user",
+        "realm",
         "recent_private_conversations",
     ]
     assert client.registration_request["client_capabilities"] == {

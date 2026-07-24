@@ -64,7 +64,8 @@ def postgres_store(migrated_postgres_dsn):
                      workspace_delivery_outbox,
                      operation_idempotency, producer_lane_counters,
                      producer_operations, causal_lane_state, bridge_operations,
-                     scheduler_accounts, observed_report_outbox CASCADE
+                     scheduler_accounts, observed_report_outbox,
+                     zulip_event_cursors CASCADE
             """
         )
     return store
@@ -113,6 +114,14 @@ def _insert_account_and_assignment(
                 json.dumps(assignment),
             ),
         )
+    store.update_provider_event_cursor(
+        account_uuid,
+        "test-registration",
+        0,
+        provider_realm_uuid=str(uuid.uuid4()),
+        provider_owner_user_id="1",
+        provider_account_generation=1,
+    )
     store.reconcile_participant_sync()
     participant_job = store.claim_participant_sync()
     assert participant_job is not None

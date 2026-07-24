@@ -204,6 +204,65 @@ def test_full_snapshot_fails_closed_before_materialization_or_cursor_commit():
     assert session.statements == []
 
 
+def test_applied_account_generation_invalidates_provider_event_cursor():
+    class AppliedAccountSession(Session):
+        def execute(self, statement, parameters=None):
+            self.statements.append((statement, parameters))
+            if "RETURNING body, deleted" in statement:
+                return Result(({"body": {}, "deleted": False},))
+            return Result()
+
+    session = AppliedAccountSession()
+    store = _store_with_session(session)
+    resource_uuid = str(uuid.uuid4())
+    resource = {
+        "resource_type": "external_account",
+        "uuid": resource_uuid,
+        "generation": 2,
+    }
+    change = {
+        "change_uuid": str(uuid.uuid4()),
+        "sequence": 1,
+        "resource_type": "external_account",
+        "resource_uuid": resource_uuid,
+        "operation": "upsert",
+        "generation": 2,
+        "required_capabilities": {},
+        "resource": resource,
+    }
+
+    store.apply_desired_changes([change], "cursor-2")
+
+    invalidation = next(
+        item
+        for item in session.statements
+        if "DELETE FROM zulip_event_cursors" in item[0]
+    )
+    assert invalidation[1] == (resource_uuid,)
+
+
+def test_snapshot_invalidates_cursors_from_other_account_generations():
+    session = Session()
+    store = _store_with_session(session)
+    resource = {
+        "resource_type": "external_account",
+        "uuid": str(uuid.uuid4()),
+        "generation": 2,
+        "required_capabilities": {},
+    }
+
+    store.install_snapshot([resource], "anchor")
+
+    statement = next(
+        sql
+        for sql, _parameters in session.statements
+        if "DELETE FROM zulip_event_cursors AS cursor" in sql
+    )
+    assert "cursor.provider_account_generation IS NULL" in statement
+    assert "account.generation" in statement
+    assert "cursor.provider_account_generation" in statement
+
+
 def test_expired_running_lease_reaper_is_atomic_and_idempotent():
     session = Session(({"record_uuid": "one"}, {"record_uuid": "two"}))
     store = _store_with_session(session)

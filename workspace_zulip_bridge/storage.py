@@ -179,7 +179,13 @@ class QueueStore(typing.Protocol):
     def provider_event_cursor(self, account_uuid: str) -> dict[str, object] | None: ...
 
     def update_provider_event_cursor(
-        self, account_uuid: str, queue_id: str, last_event_id: int
+        self,
+        account_uuid: str,
+        queue_id: str,
+        last_event_id: int,
+        provider_realm_uuid: str | None = None,
+        provider_owner_user_id: str | None = None,
+        provider_account_generation: int | None = None,
     ) -> None: ...
 
     def record_provider_event(
@@ -428,6 +434,14 @@ class RestAlchemyStore:
                 ).fetchone()
                 if applied is None:
                     continue
+                if resource_type == "external_account":
+                    session.execute(
+                        """
+                        DELETE FROM zulip_event_cursors
+                        WHERE account_uuid = %s
+                        """,
+                        (resource_uuid,),
+                    )
                 if resource_type == "external_chat_assignment":
                     if operation == "upsert":
                         if previous is not None and previous["body"] is not None:
@@ -481,6 +495,21 @@ class RestAlchemyStore:
                 )
                 if resource["resource_type"] == "external_chat_assignment":
                     self._materialize_workspace_projection(session, resource)
+            session.execute(
+                """
+                DELETE FROM zulip_event_cursors AS cursor
+                WHERE cursor.provider_account_generation IS NULL
+                   OR NOT EXISTS (
+                        SELECT 1
+                        FROM desired_resources AS account
+                        WHERE account.resource_type = 'external_account'
+                          AND account.resource_uuid = cursor.account_uuid
+                          AND NOT account.deleted
+                          AND account.generation =
+                              cursor.provider_account_generation
+                   )
+                """
+            )
             session.execute(
                 """
                 UPDATE bridge_metadata SET control_cursor = %s, updated_at = now()
@@ -3188,21 +3217,31 @@ class RestAlchemyStore:
         with self.session() as session:
             return session.execute(
                 """
-                SELECT queue_id, last_event_id FROM zulip_event_cursors
+                SELECT queue_id, last_event_id, provider_realm_uuid,
+                       provider_owner_user_id, provider_account_generation
+                FROM zulip_event_cursors
                 WHERE account_uuid = %s
                 """,
                 (account_uuid,),
             ).fetchone()
 
     def update_provider_event_cursor(
-        self, account_uuid: str, queue_id: str, last_event_id: int
+        self,
+        account_uuid: str,
+        queue_id: str,
+        last_event_id: int,
+        provider_realm_uuid: str | None = None,
+        provider_owner_user_id: str | None = None,
+        provider_account_generation: int | None = None,
     ) -> None:
         with self.session() as session:
             session.execute(
                 """
                 INSERT INTO zulip_event_cursors (
-                    account_uuid, queue_id, last_event_id
-                ) VALUES (%s, %s, %s)
+                    account_uuid, queue_id, last_event_id,
+                    provider_realm_uuid, provider_owner_user_id,
+                    provider_account_generation
+                ) VALUES (%s, %s, %s, %s, %s, %s)
                 ON CONFLICT (account_uuid) DO UPDATE SET
                     queue_id = EXCLUDED.queue_id,
                     last_event_id = CASE
@@ -3213,9 +3252,28 @@ class RestAlchemyStore:
                         )
                         ELSE EXCLUDED.last_event_id
                     END,
+                    provider_realm_uuid = COALESCE(
+                        EXCLUDED.provider_realm_uuid,
+                        zulip_event_cursors.provider_realm_uuid
+                    ),
+                    provider_owner_user_id = COALESCE(
+                        EXCLUDED.provider_owner_user_id,
+                        zulip_event_cursors.provider_owner_user_id
+                    ),
+                    provider_account_generation = COALESCE(
+                        EXCLUDED.provider_account_generation,
+                        zulip_event_cursors.provider_account_generation
+                    ),
                     updated_at = now()
                 """,
-                (account_uuid, queue_id, last_event_id),
+                (
+                    account_uuid,
+                    queue_id,
+                    last_event_id,
+                    provider_realm_uuid,
+                    provider_owner_user_id,
+                    provider_account_generation,
+                ),
             )
 
     def record_provider_event(
