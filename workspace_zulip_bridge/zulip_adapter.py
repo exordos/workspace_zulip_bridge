@@ -31,6 +31,16 @@ WORKSPACE_FILE_RE = re.compile(
 WORKSPACE_MENTION_RE = re.compile(
     r"\[(?P<name>[^\]]+)\]\(urn:user:(?P<uuid>[0-9a-f-]+)\)"
 )
+WORKSPACE_ENTITY_LINK_RE = re.compile(
+    r"\[(?P<label>[^\]]+)\]\("
+    r"urn:(?P<kind>message|stream|topic):(?P<uuid>[0-9a-f-]+)"
+    r"\)"
+)
+WORKSPACE_URL_LINK_RE = re.compile(
+    r"(?P<image>!?)\[(?P<label>[^\]]+)\]\("
+    r"urn:url:(?P<url>https?://[^\s)]+)"
+    r"\)"
+)
 PROVIDER_NETWORK_ERRORS = (
     requests.RequestException,
     zulip.UnrecoverableNetworkError,
@@ -592,9 +602,37 @@ class OfficialZulipAdapter:
             mapping = self.routing.workspace_mapping("identity", match.group("uuid"))
             if mapping is None:
                 return f"@{match.group('name')}"
-            return f"@**{match.group('name')}|{mapping['provider_id']}**"
+            metadata = mapping.get("metadata")
+            metadata = metadata if isinstance(metadata, dict) else {}
+            provider_name = metadata.get("display_name")
+            if not isinstance(provider_name, str) or not provider_name:
+                provider_name = match.group("name")
+            return f"@**{provider_name}|{mapping['provider_id']}**"
 
         converted = WORKSPACE_MENTION_RE.sub(mention, content)
+
+        def entity_link(match: re.Match[str]) -> str:
+            if self.routing is None:
+                return match.group("label")
+            mapping = self.routing.workspace_mapping(
+                match.group("kind"), match.group("uuid")
+            )
+            if mapping is None:
+                return match.group("label")
+            return self._provider_entity_link(
+                match.group("kind"),
+                match.group("label"),
+                mapping,
+            )
+
+        converted = WORKSPACE_ENTITY_LINK_RE.sub(entity_link, converted)
+
+        def external_link(match: re.Match[str]) -> str:
+            return (
+                f"{match.group('image')}[{match.group('label')}]({match.group('url')})"
+            )
+
+        converted = WORKSPACE_URL_LINK_RE.sub(external_link, converted)
 
         def attachment(match: re.Match[str]) -> str:
             if (
@@ -626,6 +664,145 @@ class OfficialZulipAdapter:
             return f"{match.group('image')}[{match.group('name')}]({provider_uri})"
 
         return WORKSPACE_FILE_RE.sub(attachment, converted)
+
+    @staticmethod
+    def _encode_hash_component(value: str) -> str:
+        encoded = urllib.parse.quote(value, safe="")
+        replacements = {"%": ".", "(": ".28", ")": ".29", ".": ".2E"}
+        return "".join(replacements.get(character, character) for character in encoded)
+
+    @staticmethod
+    def _native_link_safe(value: str) -> bool:
+        return "*" not in value and "\n" not in value and "\r" not in value
+
+    def _provider_url(self, fragment: str) -> str:
+        provider_site = self.server_url.rstrip("/")
+        return f"{provider_site}/{fragment}" if provider_site else fragment
+
+    def _channel_mapping(self, provider_channel_id: str) -> dict[str, object] | None:
+        if self.routing is None:
+            return None
+        return self.routing.provider_mapping("stream", f"channel:{provider_channel_id}")
+
+    @staticmethod
+    def _channel_name(mapping: dict[str, object] | None) -> str | None:
+        if mapping is None:
+            return None
+        metadata = mapping.get("metadata")
+        if not isinstance(metadata, dict):
+            return None
+        name = metadata.get("name")
+        return name if isinstance(name, str) and name else None
+
+    def _channel_link(
+        self,
+        label: str,
+        provider_channel_id: str,
+        channel_name: str,
+        topic_name: str | None = None,
+        provider_message_id: str | None = None,
+    ) -> str:
+        if self._native_link_safe(channel_name) and (
+            topic_name is None or self._native_link_safe(topic_name)
+        ):
+            reference = channel_name
+            if topic_name is not None:
+                reference += f">{topic_name}"
+            if provider_message_id is not None:
+                reference += f"@{provider_message_id}"
+            return f"#**{reference}**"
+        fragment = f"#narrow/channel/{provider_channel_id}"
+        if topic_name is not None:
+            fragment += f"/topic/{self._encode_hash_component(topic_name)}"
+        if provider_message_id is not None:
+            fragment += f"/near/{provider_message_id}"
+        return f"[{label}]({self._provider_url(fragment)})"
+
+    def _direct_stream_link(self, label: str, provider_id: str) -> str:
+        _chat_type, separator, raw_ids = provider_id.partition(":")
+        if not separator:
+            return label
+        try:
+            provider_user_ids = {int(value) for value in raw_ids.split(",") if value}
+        except ValueError:
+            return label
+        original_provider_user_ids = provider_user_ids.copy()
+        if self.owner_user_uuid is not None and self.routing is not None:
+            owner = self.routing.workspace_mapping("identity", self.owner_user_uuid)
+            if owner is not None:
+                try:
+                    provider_user_ids.discard(int(str(owner["provider_id"])))
+                except (KeyError, TypeError, ValueError):
+                    return label
+        if not provider_user_ids:
+            provider_user_ids = original_provider_user_ids
+        if not provider_user_ids:
+            return label
+        sorted_ids = sorted(provider_user_ids)
+        slug = ",".join(str(value) for value in sorted_ids)
+        slug += "-user" if len(sorted_ids) == 1 else "-group"
+        return f"[{label}]({self._provider_url(f'#narrow/dm/{slug}')})"
+
+    def _provider_entity_link(
+        self,
+        entity_kind: str,
+        label: str,
+        mapping: dict[str, object],
+    ) -> str:
+        provider_id = str(mapping.get("provider_id", ""))
+        metadata = mapping.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        if entity_kind == "stream":
+            if provider_id.startswith("channel:"):
+                provider_channel_id = provider_id.removeprefix("channel:")
+                channel_name = self._channel_name(mapping)
+                if channel_name is None:
+                    return label
+                return self._channel_link(label, provider_channel_id, channel_name)
+            if provider_id.startswith(("direct:", "group_direct:")):
+                return self._direct_stream_link(label, provider_id)
+            return label
+
+        if entity_kind == "topic":
+            chat_key = metadata.get("chat_key")
+            if isinstance(chat_key, str) and chat_key.startswith(
+                ("direct:", "group_direct:")
+            ):
+                return self._direct_stream_link(label, chat_key)
+            provider_channel_id, separator, topic_name = provider_id.partition(":")
+            if not separator:
+                return label
+            channel_mapping = self._channel_mapping(provider_channel_id)
+            channel_name = self._channel_name(channel_mapping)
+            if channel_name is None:
+                return label
+            return self._channel_link(
+                label,
+                provider_channel_id,
+                channel_name,
+                topic_name,
+            )
+
+        if entity_kind == "message":
+            if not provider_id.isdigit():
+                return label
+            chat_key = metadata.get("chat_key")
+            if isinstance(chat_key, str) and chat_key.startswith("channel:"):
+                provider_channel_id = chat_key.removeprefix("channel:")
+                channel_mapping = self._channel_mapping(provider_channel_id)
+                channel_name = self._channel_name(channel_mapping)
+                topic_name = metadata.get("subject")
+                if channel_name is not None and isinstance(topic_name, str):
+                    return self._channel_link(
+                        label,
+                        provider_channel_id,
+                        channel_name,
+                        topic_name,
+                        provider_id,
+                    )
+            return f"[{label}]({self._provider_url(f'#narrow/near/{provider_id}')})"
+
+        return label
 
     def _reply_quote(self, reply_to_message_uuid: object) -> str:
         mapping = self._workspace_mapping("message", reply_to_message_uuid)

@@ -24,6 +24,28 @@ that branch's `zerver/openapi/python_examples.py` and generated OpenAPI:
 - files use `upload_file` with an opened binary file object and the returned URL
   is embedded only after Workspace file-plane authorization/copy.
 
+Zulip-internal links follow the documented Markdown and URL contracts:
+
+- raw channel, topic, and message references use `#**channel**`,
+  `#**channel>topic**`, and `#**channel>topic@message-id**`;
+- deep links use `#narrow/` operator/operand pairs. The bridge accepts
+  `channel` and legacy `stream`, `dm` and legacy `pm`/`pm-with`, `topic`,
+  `near`, and the stable topic anchor `with`;
+- modern channel operands start with the numeric channel ID; any suffix is only
+  a readable hint. Topic operands replace percent signs with dots after URL
+  encoding, so decoding reverses dots to percent signs before URL decoding;
+- `near/<message-id>` identifies a message, while `with/<message-id>` keeps a
+  conversation link stable and therefore resolves to the channel/topic rather
+  than the message;
+- user profile links use `#user/<user-id>`, and DM operands contain provider
+  user IDs.
+
+Inbound links are stored as Workspace Markdown entity URNs (`urn:user`,
+`urn:message`, `urn:stream`, and `urn:topic`). Other HTTP(S) targets are stored
+as `urn:url:<absolute-url>`. Outbound entity URNs are rendered with Zulip's
+native reference syntax when available, while DM and fallback links use
+absolute Zulip URLs.
+
 The bridge requests `notification_settings_null`, `bulk_message_deletion`, and
 `empty_topic_name` client capabilities. It accepts `null` channel notification
 settings as an instruction to inherit the user's global notification settings.

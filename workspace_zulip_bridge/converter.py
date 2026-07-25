@@ -2,6 +2,7 @@ import datetime
 import hashlib
 import re
 import typing
+import urllib.parse
 import uuid
 
 from workspace_zulip_bridge import canonical
@@ -20,6 +21,22 @@ QUOTE_RE = re.compile(r"~~~ quote\n(?P<body>.*?)\n~~~", re.DOTALL)
 REPLY_LINK_RE = re.compile(
     r"\]\((?:https?://[^)]+)?/?#narrow/(?:[^)]+/)?near/(?P<id>[0-9]+)\)"
 )
+ZULIP_NATIVE_LINK_RE = re.compile(r"#\*\*(?P<reference>[^*]+)\*\*")
+MARKDOWN_LINK_RE = re.compile(
+    r"(?P<image>!?)\[(?P<label>(?:\\.|[^\]])*)\]\("
+    r"(?P<target>[^\s)]+)"
+    r"(?P<title>\s+(?:\"[^\"]*\"|'[^']*'))?"
+    r"\)"
+)
+ANGLE_URL_RE = re.compile(r"<(?P<url>https?://[^>\s]+)>")
+BARE_URL_RE = re.compile(r"(?<!urn:url:)(?P<url>https?://[^\s<]+|www\.[^\s<]+)")
+CODE_RE = re.compile(
+    r"(```.*?```|~~~(?!\s*quote\s*$).*?~~~|`[^`\n]*`)",
+    re.DOTALL | re.MULTILINE,
+)
+SCHEMELESS_WEB_TARGET_RE = re.compile(
+    r"(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?::[0-9]+)?(?:[/?#].*)?"
+)
 
 
 class ConversionStore(typing.Protocol):
@@ -37,6 +54,14 @@ class ConversionStore(typing.Protocol):
 
     def provider_mapping(
         self, account_uuid: str, entity_kind: str, provider_id: str
+    ) -> dict[str, object] | None: ...
+
+    def provider_mapping_by_name(
+        self, account_uuid: str, entity_kind: str, name: str
+    ) -> dict[str, object] | None: ...
+
+    def workspace_mapping(
+        self, account_uuid: str, entity_kind: str, workspace_uuid: str
     ) -> dict[str, object] | None: ...
 
     def remember_provider_mapping(
@@ -61,6 +86,94 @@ class ConversionStore(typing.Protocol):
 
 
 FileResolver = typing.Callable[[str, str], str]
+
+
+class ZulipLinkResolver:
+    def __init__(
+        self,
+        store: ConversionStore,
+        account_uuid: str,
+        owner_uuid: str,
+    ):
+        self.store = store
+        self.account_uuid = account_uuid
+        self.owner_uuid = owner_uuid
+        self._channels_by_name: dict[str, dict[str, object] | None] = {}
+        self._owner_provider_id_loaded = False
+        self._owner_provider_id: int | None = None
+
+    @staticmethod
+    def _urn(entity_kind: str, mapping: dict[str, object] | None) -> str | None:
+        if mapping is None:
+            return None
+        urn_kind = {
+            "identity": "user",
+            "message": "message",
+            "stream": "stream",
+            "topic": "topic",
+        }.get(entity_kind)
+        if urn_kind is None:
+            return None
+        return f"urn:{urn_kind}:{mapping['workspace_uuid']}"
+
+    def provider_urn(self, entity_kind: str, provider_id: str) -> str | None:
+        return self._urn(
+            entity_kind,
+            self.store.provider_mapping(self.account_uuid, entity_kind, provider_id),
+        )
+
+    def channel_mapping(self, channel_name: str) -> dict[str, object] | None:
+        cache_key = channel_name.casefold()
+        if cache_key in self._channels_by_name:
+            return self._channels_by_name[cache_key]
+        mapping = self.store.provider_mapping_by_name(
+            self.account_uuid, "stream", channel_name
+        )
+        if mapping is None:
+            self._channels_by_name[cache_key] = None
+            return None
+        metadata = mapping.get("metadata")
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("chat_type") != "channel"
+            or not str(mapping.get("provider_id", "")).startswith("channel:")
+        ):
+            self._channels_by_name[cache_key] = None
+            return None
+        self._channels_by_name[cache_key] = mapping
+        return mapping
+
+    def channel_urn(self, channel_name: str) -> str | None:
+        return self._urn("stream", self.channel_mapping(channel_name))
+
+    def topic_urn(self, channel_name: str, topic_name: str) -> str | None:
+        channel = self.channel_mapping(channel_name)
+        if channel is None:
+            return None
+        provider_id = str(channel["provider_id"]).removeprefix("channel:")
+        return self.provider_urn("topic", f"{provider_id}:{topic_name}")
+
+    def direct_stream_urn(self, provider_user_ids: list[int]) -> str | None:
+        ids = {int(value) for value in provider_user_ids}
+        if not self._owner_provider_id_loaded:
+            owner = self.store.workspace_mapping(
+                self.account_uuid, "identity", self.owner_uuid
+            )
+            try:
+                self._owner_provider_id = (
+                    None if owner is None else int(str(owner["provider_id"]))
+                )
+            except (KeyError, TypeError, ValueError):
+                self._owner_provider_id = None
+            self._owner_provider_id_loaded = True
+        if self._owner_provider_id is None:
+            return None
+        ids.add(self._owner_provider_id)
+        if not ids:
+            return None
+        chat_type = "direct" if len(ids) <= 2 else "group_direct"
+        provider_id = f"{chat_type}:{','.join(str(value) for value in sorted(ids))}"
+        return self.provider_urn("stream", provider_id)
 
 
 def stable_entity_uuid(account_uuid: str, kind: str, provider_id: str) -> str:
@@ -151,6 +264,7 @@ def convert_markdown(
     mention_uuids: dict[str, str],
     original_url: str,
     file_resolver: FileResolver | None = None,
+    link_resolver: ZulipLinkResolver | None = None,
 ) -> tuple[str, bool]:
     """Convert raw Zulip Markdown without leaking provider-only file URLs."""
     lossy = False
@@ -192,9 +306,291 @@ def convert_markdown(
     if "/user_uploads/" in converted:
         lossy = True
         converted = converted.replace("/user_uploads/", original_url + "#file-")
+
+    converted, links_lossy = _convert_zulip_links(
+        converted,
+        original_url,
+        link_resolver,
+    )
+    lossy = lossy or links_lossy
     if lossy and original_url and original_url not in converted:
-        converted = f"{converted}\n\n[Open original]({original_url})"
+        converted = f"{converted}\n\n[Open original](urn:url:{original_url})"
     return converted, lossy
+
+
+def _provider_site(original_url: str) -> str:
+    parsed = urllib.parse.urlsplit(original_url)
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}"
+    return ""
+
+
+def _decode_hash_component(value: str) -> str:
+    return urllib.parse.unquote(value.replace(".", "%"))
+
+
+def _channel_id_from_slug(slug: str) -> str | None:
+    candidate = slug.split("-", 1)[0]
+    return candidate if candidate.isdigit() else None
+
+
+def _dm_user_ids_from_slug(slug: str) -> list[int] | None:
+    candidate = slug.split("-", 1)[0]
+    if not candidate:
+        return None
+    parts = candidate.split(",")
+    if not all(part.isdigit() for part in parts):
+        return None
+    return [int(part) for part in parts]
+
+
+def _same_provider_url(target: str, provider_site: str) -> bool:
+    if target.startswith("#") or (
+        target.startswith("/") and not target.startswith("//")
+    ):
+        return True
+    parsed = urllib.parse.urlsplit(target)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return False
+    if not provider_site:
+        return False
+    provider = urllib.parse.urlsplit(provider_site)
+    return (
+        parsed.scheme.lower(),
+        parsed.netloc.lower(),
+    ) == (
+        provider.scheme.lower(),
+        provider.netloc.lower(),
+    )
+
+
+def _zulip_url_urn(
+    target: str,
+    provider_site: str,
+    resolver: ZulipLinkResolver | None,
+) -> str | None:
+    if resolver is None or not _same_provider_url(target, provider_site):
+        return None
+    parsed = urllib.parse.urlsplit(target)
+    fragment = parsed.fragment
+    if fragment.startswith("user/"):
+        provider_user_id = fragment.removeprefix("user/").split("/", 1)[0]
+        if provider_user_id.isdigit():
+            return resolver.provider_urn("identity", provider_user_id)
+        return None
+    if not fragment.startswith("narrow/"):
+        return None
+
+    parts = fragment.split("/")
+    terms: list[tuple[str, str]] = []
+    for index in range(1, len(parts), 2):
+        operator = _decode_hash_component(parts[index]).lower().removeprefix("-")
+        operator = {
+            "stream": "channel",
+            "pm": "dm",
+            "pm-with": "dm",
+        }.get(operator, operator)
+        operand = parts[index + 1] if index + 1 < len(parts) else ""
+        terms.append((operator, operand))
+
+    near = next(
+        (
+            operand
+            for operator, operand in terms
+            if operator == "near" and operand.isdigit()
+        ),
+        None,
+    )
+    if near is not None:
+        return resolver.provider_urn("message", near)
+
+    channel_operand = next(
+        (operand for operator, operand in terms if operator == "channel"),
+        None,
+    )
+    if channel_operand is not None:
+        channel_id = _channel_id_from_slug(channel_operand)
+        channel_mapping = (
+            resolver.store.provider_mapping(
+                resolver.account_uuid, "stream", f"channel:{channel_id}"
+            )
+            if channel_id is not None
+            else None
+        )
+        if channel_mapping is None and channel_id is None:
+            legacy_name = _decode_hash_component(channel_operand)
+            channel_mapping = resolver.channel_mapping(legacy_name)
+            if channel_mapping is None and "-" in legacy_name:
+                channel_mapping = resolver.channel_mapping(
+                    legacy_name.replace("-", " ")
+                )
+        if channel_mapping is None:
+            return None
+        topic_operand = next(
+            (operand for operator, operand in terms if operator == "topic"),
+            None,
+        )
+        if topic_operand is None:
+            return resolver._urn("stream", channel_mapping)
+        provider_channel_id = str(channel_mapping["provider_id"]).removeprefix(
+            "channel:"
+        )
+        return resolver.provider_urn(
+            "topic",
+            f"{provider_channel_id}:{_decode_hash_component(topic_operand)}",
+        )
+
+    dm_operand = next(
+        (operand for operator, operand in terms if operator == "dm"),
+        None,
+    )
+    if dm_operand is not None:
+        provider_user_ids = _dm_user_ids_from_slug(dm_operand)
+        if provider_user_ids is not None:
+            return resolver.direct_stream_urn(provider_user_ids)
+    return None
+
+
+def _absolute_provider_url(target: str, provider_site: str) -> str | None:
+    if target.startswith(("#", "/")):
+        if not provider_site:
+            return None
+        return urllib.parse.urljoin(provider_site.rstrip("/") + "/", target)
+    parsed = urllib.parse.urlsplit(target)
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return target
+    if SCHEMELESS_WEB_TARGET_RE.fullmatch(target):
+        return f"https://{target}"
+    return None
+
+
+def _workspace_link_target(
+    target: str,
+    provider_site: str,
+    resolver: ZulipLinkResolver | None,
+) -> str:
+    if target.startswith("urn:"):
+        return target
+    entity_urn = _zulip_url_urn(target, provider_site, resolver)
+    if entity_urn is not None:
+        return entity_urn
+    absolute_url = _absolute_provider_url(target, provider_site)
+    if absolute_url is not None:
+        return f"urn:url:{absolute_url}"
+    return target
+
+
+def _native_zulip_link(
+    match: re.Match[str],
+    resolver: ZulipLinkResolver | None,
+) -> tuple[str, bool]:
+    reference = match.group("reference")
+    if resolver is None:
+        return match.group(0), True
+    if ">" not in reference:
+        urn = resolver.channel_urn(reference)
+        if urn is None:
+            return match.group(0), True
+        return f"[#{reference}]({urn})", False
+
+    channel_name, topic_reference = reference.split(">", 1)
+    message_match = re.fullmatch(
+        r"(?P<topic>.*)@(?P<message_id>[0-9]+)", topic_reference
+    )
+    if message_match is not None:
+        urn = resolver.provider_urn("message", message_match.group("message_id"))
+        if urn is None:
+            return match.group(0), True
+        topic_name = message_match.group("topic")
+        return f"[#{channel_name} > {topic_name} @ 💬]({urn})", False
+
+    urn = resolver.topic_urn(channel_name, topic_reference)
+    if urn is None:
+        return match.group(0), True
+    return f"[#{channel_name} > {topic_reference}]({urn})", False
+
+
+def _trim_bare_url(value: str) -> tuple[str, str]:
+    url = value
+    suffix = ""
+    while url and url[-1] in ".,;:!?":
+        suffix = url[-1] + suffix
+        url = url[:-1]
+    while url.endswith(")") and url.count("(") < url.count(")"):
+        suffix = ")" + suffix
+        url = url[:-1]
+    return url, suffix
+
+
+def _convert_zulip_links(
+    content: str,
+    original_url: str,
+    resolver: ZulipLinkResolver | None,
+) -> tuple[str, bool]:
+    provider_site = _provider_site(original_url)
+    lossy = False
+
+    def transform(segment: str) -> str:
+        nonlocal lossy
+        protected_links: list[str] = []
+
+        def protect(value: str) -> str:
+            placeholder = f"\x00zulip-link-{len(protected_links)}\x00"
+            protected_links.append(value)
+            return placeholder
+
+        def native(match: re.Match[str]) -> str:
+            nonlocal lossy
+            replacement, replacement_lossy = _native_zulip_link(match, resolver)
+            lossy = lossy or replacement_lossy
+            return replacement
+
+        converted = ZULIP_NATIVE_LINK_RE.sub(native, segment)
+
+        def markdown_link(match: re.Match[str]) -> str:
+            target = _workspace_link_target(
+                match.group("target"), provider_site, resolver
+            )
+            return protect(
+                (
+                    f"{match.group('image')}[{match.group('label')}]"
+                    f"({target}{match.group('title') or ''})"
+                )
+            )
+
+        converted = MARKDOWN_LINK_RE.sub(markdown_link, converted)
+
+        def angle_url(match: re.Match[str]) -> str:
+            url = match.group("url")
+            target = _workspace_link_target(url, provider_site, resolver)
+            return protect(f"[{url}]({target})")
+
+        converted = ANGLE_URL_RE.sub(angle_url, converted)
+
+        def bare_url(match: re.Match[str]) -> str:
+            raw_url, suffix = _trim_bare_url(match.group("url"))
+            target = (
+                raw_url
+                if raw_url.startswith(("http://", "https://"))
+                else f"https://{raw_url}"
+            )
+            workspace_target = _workspace_link_target(
+                target, provider_site, resolver
+            )
+            return f"[{raw_url}]({workspace_target}){suffix}"
+
+        converted = BARE_URL_RE.sub(bare_url, converted)
+        for index, protected_link in enumerate(protected_links):
+            converted = converted.replace(
+                f"\x00zulip-link-{index}\x00",
+                protected_link,
+            )
+        return converted
+
+    parts = CODE_RE.split(content)
+    for index in range(0, len(parts), 2):
+        parts[index] = transform(parts[index])
+    return "".join(parts), lossy
 
 
 def _provider(
@@ -623,7 +1019,11 @@ def message_event_records(
         else f"#narrow/near/{provider_message_id}"
     )
     markdown, lossy = convert_markdown(
-        str(message["content"]), mention_uuids, message_url, file_resolver
+        str(message["content"]),
+        mention_uuids,
+        message_url,
+        file_resolver,
+        ZulipLinkResolver(store, account_uuid, owner_uuid),
     )
     reply_match = REPLY_LINK_RE.search(str(message["content"]))
     reply_provider_id = reply_match.group("id") if reply_match is not None else None
@@ -1088,7 +1488,11 @@ def _mapped_event_records(
                 )
                 next_subindex += 1
             markdown, lossy = convert_markdown(
-                str(event["content"]), mention_uuids, message_url, file_resolver
+                str(event["content"]),
+                mention_uuids,
+                message_url,
+                file_resolver,
+                ZulipLinkResolver(store, account_uuid, owner_uuid),
             )
             topic_name = str(event.get("subject", metadata.get("subject", "")))
             if not topic_name:
