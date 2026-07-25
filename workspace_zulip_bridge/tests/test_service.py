@@ -1807,7 +1807,7 @@ def test_tick_reconciles_global_backfill_state_once_not_once_per_account(
     assert instance.store.reconciliations == 1
 
 
-def test_observed_report_flush_preserves_order_and_applies_partial_results():
+def test_observed_report_flush_commits_each_control_report_separately():
     reports = [
         {"report_uuid": str(uuid.uuid4())},
         {"report_uuid": str(uuid.uuid4())},
@@ -1816,32 +1816,38 @@ def test_observed_report_flush_preserves_order_and_applies_partial_results():
     class Store:
         def __init__(self):
             self.applied = []
+            self.pending = list(reports)
 
         def pending_observed_reports(self, limit):
-            assert limit == 500
-            return reports
+            assert limit == 1
+            return self.pending[:limit]
 
         def apply_observed_report_results(self, results):
             self.applied.extend(results)
+            self.pending.pop(0)
 
     class Control:
+        def __init__(self):
+            self.batches = []
+
         def observed_reports(self, supplied):
-            assert supplied == reports
+            self.batches.append(list(supplied))
+            report = supplied[0]
+            retryable = report == reports[1]
             return {
                 "results": [
                     {
-                        "report_uuid": reports[0]["report_uuid"],
-                        "status": "applied",
-                        "safe_error": None,
-                    },
-                    {
-                        "report_uuid": reports[1]["report_uuid"],
-                        "status": "rejected",
-                        "safe_error": {
-                            "code": "temporarily_unavailable",
-                            "message": "Try again later.",
-                            "retryable": True,
-                        },
+                        "report_uuid": report["report_uuid"],
+                        "status": "rejected" if retryable else "applied",
+                        "safe_error": (
+                            {
+                                "code": "temporarily_unavailable",
+                                "message": "Try again later.",
+                                "retryable": True,
+                            }
+                            if retryable
+                            else None
+                        ),
                     },
                 ]
             }
@@ -1849,7 +1855,9 @@ def test_observed_report_flush_preserves_order_and_applies_partial_results():
     instance = object.__new__(service.BridgeService)
     instance.store = Store()
     instance.control = Control()
-    assert instance.flush_observed_reports() == 2
+    assert instance.flush_observed_reports() == 1
+    assert instance.flush_observed_reports() == 1
+    assert instance.control.batches == [[reports[0]], [reports[1]]]
     assert [result["status"] for result in instance.store.applied] == [
         "applied",
         "rejected",
