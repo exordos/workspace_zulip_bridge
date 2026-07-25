@@ -64,11 +64,12 @@ def test_migrations_have_one_versioned_dependency_chain():
         "0005-rebuild-message-topic-dependencies-7c52a1.py",
         "0006-index-pending-Workspace-deliveries-c143b4.py",
         "0007-persist-Zulip-provider-identity-c721d9.py",
+        "0008-refresh-Zulip-reaction-queues-c511aa.py",
     ]
     assert engine.get_latest_migration() == (
-        "0007-persist-Zulip-provider-identity-c721d9.py"
+        "0008-refresh-Zulip-reaction-queues-c511aa.py"
     )
-    assert len({step["uuid"] for step in all_migrations.values()}) == 8
+    assert len({step["uuid"] for step in all_migrations.values()}) == 9
     assert all_migrations[
         "0001-add-Zulip-provider-scheduler-state-143113.py"
     ]["depends"] == ["0000-initialize-bridge-operational-state-18f707.py"]
@@ -99,6 +100,11 @@ def test_migrations_have_one_versioned_dependency_chain():
         "0007-persist-Zulip-provider-identity-c721d9.py"
     ]["depends"] == [
         "0006-index-pending-Workspace-deliveries-c143b4.py"
+    ]
+    assert all_migrations[
+        "0008-refresh-Zulip-reaction-queues-c511aa.py"
+    ]["depends"] == [
+        "0007-persist-Zulip-provider-identity-c721d9.py"
     ]
 
 
@@ -131,12 +137,20 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                 ORDER BY indexname
                 """
             ).fetchall()
-            assert applied["count"] == 8
+            assert applied["count"] == 9
             assert [row["indexname"] for row in indexes] == [
                 "workspace_delivery_outbox_pending_dependency_idx",
                 "workspace_delivery_outbox_pending_order_idx",
             ]
             session.execute("UPDATE bridge_metadata SET control_cursor = 'preserved'")
+            session.execute(
+                """
+                INSERT INTO zulip_event_cursors (
+                    account_uuid, queue_id, last_event_id
+                ) VALUES (%s, 'legacy-reaction-queue', 42)
+                """,
+                (str(uuid.uuid4()),),
+            )
             session.execute("DROP TABLE ra_migrations")
 
         _apply_migrations(scoped_url, config_path)
@@ -149,8 +163,12 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
             cursor = session.execute(
                 "SELECT control_cursor FROM bridge_metadata WHERE singleton"
             ).fetchone()
-            assert applied["count"] == 8
+            provider_cursor_count = session.execute(
+                "SELECT count(*) AS count FROM zulip_event_cursors"
+            ).fetchone()
+            assert applied["count"] == 9
             assert cursor["control_cursor"] == "preserved"
+            assert provider_cursor_count["count"] == 0
     finally:
         with admin_store.session() as session:
             session.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')

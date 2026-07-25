@@ -1075,6 +1075,7 @@ class BridgeService:
             "messenger.message.edit",
             "messenger.message.delete",
             "messenger.message.read",
+            "messenger.reaction.write",
             "messenger.file.transfer",
         }
         if chat_type == "channel":
@@ -1523,6 +1524,7 @@ class BridgeService:
             "update_message",
             "delete_message",
             "update_message_flags",
+            "reaction",
             "subscription",
             "realm_user",
         }

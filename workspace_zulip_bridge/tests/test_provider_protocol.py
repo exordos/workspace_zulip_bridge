@@ -11,6 +11,7 @@ STREAM_UUID = "30000000-0000-0000-0000-000000000003"
 TOPIC_UUID = "40000000-0000-0000-0000-000000000004"
 MESSAGE_UUID = "50000000-0000-0000-0000-000000000005"
 CHAT_UUID = "60000000-0000-0000-0000-000000000006"
+REACTION_UUID = "70000000-0000-0000-0000-000000000007"
 
 
 class Store:
@@ -78,6 +79,24 @@ def test_provider_lease_adapts_to_existing_durable_zulip_scheduler():
     assert record["operation"]["provider"]["chat_id"] == "channel:42"
     assert record["operation"]["kind"] == "message.create"
     assert record["transport"]["lease_uuid"] == leased["lease_uuid"]
+
+
+def test_provider_reaction_lease_resolves_the_target_message_mapping():
+    leased = _lease("reaction.create")
+    leased["required_capability"] = "messenger.reaction.write"
+    leased["payload"] = {
+        "uuid": REACTION_UUID,
+        "message_uuid": MESSAGE_UUID,
+        "user_uuid": ACCOUNT_UUID,
+        "emoji_name": "thumbs_up",
+    }
+
+    record = provider_protocol.leased_operation_record(Store(), leased)
+
+    assert record["operation"]["kind"] == "reaction.create"
+    assert record["operation"]["entity_uuid"] == REACTION_UUID
+    assert record["operation"]["provider"]["entity_id"] == "101"
+    assert record["operation"]["provider"]["chat_id"] == "channel:42"
 
 
 def test_zulip_record_adapts_to_atomic_provider_event_resource():
@@ -186,6 +205,47 @@ def test_provider_read_state_adapts_to_provider_event_without_losing_selector():
     assert resource["reader_uuid"] == ACCOUNT_UUID
     assert resource["message_uuids"] == [first_message_uuid, last_message_uuid]
     assert resource["read"] is True
+
+
+def test_provider_reaction_event_includes_actor_identity_and_delete_selector():
+    record = provider_protocol.leased_operation_record(Store(), _lease())
+    record["origin"] = "zulip"
+    record["operation_uuid"] = str(uuid.uuid4())
+    record["operation"].update(
+        {
+            "kind": "reaction.delete",
+            "entity_uuid": REACTION_UUID,
+            "actor_uuid": ACCOUNT_UUID,
+            "provider": {
+                "kind": "zulip",
+                "chat_id": "channel:42",
+                "entity_id": "101:42:unicode_emoji:1f44d",
+                "revision": None,
+            },
+            "payload": {
+                "stream_uuid": STREAM_UUID,
+                "topic_uuid": TOPIC_UUID,
+                "message_uuid": MESSAGE_UUID,
+                "user_uuid": ACCOUNT_UUID,
+                "emoji_name": "thumbs_up",
+            },
+            "extensions": {
+                "emoji_code": "1f44d",
+                "reaction_type": "unicode_emoji",
+            },
+        }
+    )
+
+    event = provider_protocol.event_payload(Store(), record)
+
+    assert event["kind"] == "reaction.delete"
+    resource = event["payload"]["resource"]
+    assert resource["uuid"] == REACTION_UUID
+    assert resource["message_uuid"] == MESSAGE_UUID
+    assert resource["user_uuid"] == ACCOUNT_UUID
+    assert resource["emoji_name"] == "thumbs_up"
+    assert resource["provider_metadata"]["emoji_code"] == "1f44d"
+    assert resource["user_identity"]["provider_external_id"] == "42"
 
 
 def test_unknown_provider_mutation_fails_closed_instead_of_being_discarded():

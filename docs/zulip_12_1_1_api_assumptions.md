@@ -18,6 +18,9 @@ that branch's `zerver/openapi/python_examples.py` and generated OpenAPI:
 - deletion uses `delete_message(message_id)`;
 - read state uses `update_message_flags` with message IDs, `op=add/remove`, and
   `flag=read`;
+- reactions use `add_reaction` and `remove_reaction` with the provider message
+  ID and emoji name; live `reaction` events carry `op=add/remove`,
+  `message_id`, `user_id`, `emoji_name`, `emoji_code`, and `reaction_type`;
 - files use `upload_file` with an opened binary file object and the returned URL
   is embedded only after Workspace file-plane authorization/copy.
 

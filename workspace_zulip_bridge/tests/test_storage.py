@@ -300,23 +300,27 @@ def test_workspace_delivery_outbox_orders_live_before_backfill():
         )
         == []
     )
-    assert len(session.statements) == 3
+    assert len(session.statements) == 4
     read_promotion = session.statements[0][0]
-    topic_promotion = session.statements[1][0]
-    statement = session.statements[2][0]
+    reaction_promotion = session.statements[1][0]
+    topic_promotion = session.statements[2][0]
+    statement = session.statements[3][0]
     assert "SET priority = read_delivery.priority" in read_promotion
+    assert "SET priority = reaction_delivery.priority" in reaction_promotion
+    assert "'reaction.upsert', 'reaction.delete'" in reaction_promotion
     assert "SET priority = message_delivery.priority" in topic_promotion
     assert "submission_state IN ('pending', 'ambiguous')" in statement
     assert "submission_state = 'awaiting_result'" in statement
     assert "next_submission_at <= now()" in statement
     assert "delivery.priority BETWEEN %s AND %s" in statement
-    assert session.statements[2][1] == (2, 2, 101)
+    assert session.statements[3][1] == (2, 2, 101)
     assert "topic_delivery.sent_at IS NULL" in statement
     assert "'message.create', 'message.update', 'read_state.set'" in statement
     assert "message_create.record->'operation'->>'kind'" in statement
     assert "jsonb_array_elements_text" in statement
     assert "workspace_delivery_state" in statement
     assert "provider_mappings AS message_mapping" in statement
+    assert "'reaction.upsert', 'reaction.delete'" in statement
     assert "ORDER BY priority, created_at" in statement
 
 
@@ -780,6 +784,39 @@ def test_committed_message_mapping_preserves_workspace_alias():
         in session.statements[0][0]
     )
     assert "INSERT INTO provider_mapping_aliases" in session.statements[1][0]
+
+
+def test_committed_reaction_mapping_preserves_workspace_identity():
+    session = Session()
+    record = {
+        "account_uuid": str(uuid.uuid4()),
+        "project_uuid": str(uuid.uuid4()),
+        "origin": "workspace",
+        "operation": {
+            "kind": "reaction.create",
+            "entity_uuid": str(uuid.uuid4()),
+            "provider": {"chat_id": "channel:42"},
+            "payload": {
+                "message_uuid": str(uuid.uuid4()),
+                "user_uuid": str(uuid.uuid4()),
+                "emoji_name": "heart",
+            },
+        },
+    }
+
+    storage.RestAlchemyStore._persist_committed_mapping(
+        session,
+        record,
+        "99:1:heart",
+        None,
+    )
+
+    statement, parameters = session.statements[0]
+    assert "VALUES (%s, 'reaction', %s, %s, %s, %s, false)" in statement
+    assert parameters[4:6] == (
+        record["operation"]["entity_uuid"],
+        "99:1:heart",
+    )
 
 
 def test_stale_assignment_delivery_is_removed_and_provider_event_replayed():

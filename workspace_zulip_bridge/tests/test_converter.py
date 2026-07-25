@@ -368,6 +368,99 @@ def test_message_mutations_and_topic_rename_reuse_stable_mappings():
     assert "through_message_uuid" not in read[0]["payload"]
 
 
+def test_message_snapshot_and_live_events_project_reactions_with_stable_identity():
+    store = FakeStore()
+    message = _stream_message()
+    message["reactions"] = [
+        {
+            "user_id": 3,
+            "emoji_name": "thumbs_up",
+            "emoji_code": "1f44d",
+            "reaction_type": "unicode_emoji",
+        }
+    ]
+    snapshot = _operations(
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "queue",
+            {"id": 10, "type": "message", "message": message},
+        )
+    )
+    snapshot_reaction = next(
+        operation for operation in snapshot if operation["kind"] == "reaction.upsert"
+    )
+    message_operation = next(
+        operation for operation in snapshot if operation["kind"] == "message.create"
+    )
+
+    assert snapshot.index(message_operation) < snapshot.index(snapshot_reaction)
+    assert snapshot_reaction["payload"] == {
+        "stream_uuid": message_operation["payload"]["stream_uuid"],
+        "topic_uuid": message_operation["payload"]["topic_uuid"],
+        "message_uuid": message_operation["entity_uuid"],
+        "user_uuid": converter.stable_entity_uuid(ACCOUNT_UUID, "identity", "3"),
+        "emoji_name": "thumbs_up",
+    }
+    assert snapshot_reaction["extensions"] == {
+        "provider_badge": "zulip",
+        "emoji_code": "1f44d",
+        "reaction_type": "unicode_emoji",
+        "delivery_class": "live",
+    }
+
+    removed = _operations(
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "queue",
+            {
+                "id": 11,
+                "type": "reaction",
+                "op": "remove",
+                "message_id": 601,
+                "user_id": 3,
+                "emoji_name": "thumbs_up",
+                "emoji_code": "1f44d",
+                "reaction_type": "unicode_emoji",
+            },
+        )
+    )
+    removed_reaction = next(
+        operation for operation in removed if operation["kind"] == "reaction.delete"
+    )
+
+    assert removed_reaction["entity_uuid"] == snapshot_reaction["entity_uuid"]
+    assert removed_reaction["payload"] == snapshot_reaction["payload"]
+
+
+def test_reaction_event_rejects_unknown_operation():
+    store = FakeStore()
+    converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {"id": 10, "type": "message", "message": _stream_message()},
+    )
+
+    with pytest.raises(ValueError, match="reaction operation is invalid"):
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "queue",
+            {
+                "id": 11,
+                "type": "reaction",
+                "op": "replace",
+                "message_id": 601,
+                "user_id": 3,
+                "emoji_name": "thumbs_up",
+                "emoji_code": "1f44d",
+                "reaction_type": "unicode_emoji",
+            },
+        )
+
+
 @pytest.mark.parametrize(("flags", "expected_read"), [(["read"], True), ([], False)])
 def test_message_snapshot_carries_exact_owner_read_state(flags, expected_read):
     store = FakeStore()

@@ -208,6 +208,133 @@ def _provider(
     }
 
 
+def _reaction_provider_id(
+    provider_message_id: object,
+    provider_user_id: object,
+    emoji_name: object,
+) -> str:
+    return ":".join(
+        (
+            str(int(str(provider_message_id))),
+            str(int(str(provider_user_id))),
+            str(emoji_name),
+        )
+    )
+
+
+def _reaction_operations(
+    store: ConversionStore,
+    account_uuid: str,
+    owner_uuid: str,
+    project_uuid: str,
+    stream_uuid: str,
+    topic_uuid: str,
+    chat_key: str,
+    provider_message_id: object,
+    message_uuid: str,
+    reaction: dict[str, object],
+    kind: str,
+    occurred_at: str,
+) -> list[dict[str, object]]:
+    provider_user_id = str(int(str(reaction["user_id"])))
+    emoji_name = str(reaction["emoji_name"])
+    emoji_code = str(reaction["emoji_code"])
+    reaction_type = str(reaction["reaction_type"])
+    identity = store.provider_mapping(
+        account_uuid,
+        "identity",
+        provider_user_id,
+    )
+    operations: list[dict[str, object]] = []
+    if identity is None:
+        identity_uuid = stable_entity_uuid(
+            account_uuid,
+            "identity",
+            provider_user_id,
+        )
+        identity_metadata = {
+            "display_name": f"Zulip user {provider_user_id}",
+            "email": None,
+            "avatar_urn": None,
+            "active": True,
+        }
+        store.remember_provider_mapping(
+            account_uuid,
+            "identity",
+            provider_user_id,
+            identity_uuid,
+            identity_metadata,
+        )
+        operations.append(
+            {
+                "kind": "identity.upsert",
+                "entity_uuid": identity_uuid,
+                "actor_uuid": owner_uuid,
+                "occurred_at": occurred_at,
+                "provider": _provider(chat_key, provider_user_id),
+                "payload": identity_metadata,
+                "extensions": {"provider_badge": "zulip"},
+            }
+        )
+    else:
+        identity_uuid = str(identity["workspace_uuid"])
+    provider_reaction_id = _reaction_provider_id(
+        provider_message_id,
+        provider_user_id,
+        emoji_name,
+    )
+    existing = store.provider_mapping(
+        account_uuid,
+        "reaction",
+        provider_reaction_id,
+    )
+    reaction_uuid = (
+        str(existing["workspace_uuid"])
+        if existing is not None
+        else stable_entity_uuid(account_uuid, "reaction", provider_reaction_id)
+    )
+    reaction_metadata = {
+        "project_uuid": project_uuid,
+        "stream_uuid": stream_uuid,
+        "topic_uuid": topic_uuid,
+        "message_uuid": message_uuid,
+        "user_uuid": identity_uuid,
+        "chat_key": chat_key,
+        "emoji_name": emoji_name,
+        "emoji_code": emoji_code,
+        "reaction_type": reaction_type,
+    }
+    store.remember_provider_mapping(
+        account_uuid,
+        "reaction",
+        provider_reaction_id,
+        reaction_uuid,
+        reaction_metadata,
+    )
+    operations.append(
+        {
+            "kind": kind,
+            "entity_uuid": reaction_uuid,
+            "actor_uuid": identity_uuid,
+            "occurred_at": occurred_at,
+            "provider": _provider(chat_key, provider_reaction_id),
+            "payload": {
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "message_uuid": message_uuid,
+                "user_uuid": identity_uuid,
+                "emoji_name": emoji_name,
+            },
+            "extensions": {
+                "provider_badge": "zulip",
+                "emoji_code": emoji_code,
+                "reaction_type": reaction_type,
+            },
+        }
+    )
+    return operations
+
+
 def _identity_operations(
     store: ConversionStore,
     account_uuid: str,
@@ -653,6 +780,27 @@ def message_event_records(
             identity_uuid,
             payload,
         )
+    reactions = message.get("reactions")
+    if isinstance(reactions, list):
+        for reaction in reactions:
+            if not isinstance(reaction, dict):
+                raise ValueError("Provider message reaction is invalid")
+            operations.extend(
+                _reaction_operations(
+                    store,
+                    account_uuid,
+                    owner_uuid,
+                    project_uuid,
+                    stream_uuid,
+                    topic_uuid,
+                    chat_key,
+                    provider_message_id,
+                    message_uuid,
+                    reaction,
+                    "reaction.upsert",
+                    occurred_at,
+                )
+            )
     record_source = f"provider-message:{provider_message_id}"
     if delivery_class == "backfill":
         record_source = (
@@ -680,6 +828,63 @@ def message_event_records(
             )
         )
     return records
+
+
+def _reaction_event_records(
+    store: ConversionStore,
+    account_uuid: str,
+    queue_id: str,
+    event: dict[str, object],
+    delivery_class: str,
+) -> list[dict[str, object]]:
+    account = store.account_resource(account_uuid)
+    if account is None:
+        return []
+    message = store.provider_mapping(
+        account_uuid,
+        "message",
+        str(event["message_id"]),
+    )
+    if message is None:
+        raise ValueError("provider_chat_assignment_pending")
+    metadata = typing.cast(dict[str, object], message["metadata"])
+    event_time = _event_time(event)
+    reaction_op = str(event["op"])
+    if reaction_op not in {"add", "remove"}:
+        raise ValueError("Provider reaction operation is invalid")
+    operations = _reaction_operations(
+        store,
+        account_uuid,
+        str(account["owner_user_uuid"]),
+        str(metadata["project_uuid"]),
+        str(metadata["stream_uuid"]),
+        str(metadata["topic_uuid"]),
+        str(metadata["chat_key"]),
+        event["message_id"],
+        str(message["workspace_uuid"]),
+        event,
+        "reaction.upsert" if reaction_op == "add" else "reaction.delete",
+        event_time.isoformat().replace("+00:00", "Z"),
+    )
+    return [
+        _record(
+            store,
+            account_uuid,
+            str(metadata["project_uuid"]),
+            queue_id,
+            int(event["id"]),
+            index,
+            operation,
+            (
+                f"identity:{account_uuid}:{operation['entity_uuid']}"
+                if operation["kind"] == "identity.upsert"
+                else f"chat:{account_uuid}:{metadata['stream_uuid']}"
+            ),
+            event_time,
+            delivery_class,
+        )
+        for index, operation in enumerate(operations)
+    ]
 
 
 def _mapped_event_records(
@@ -1178,6 +1383,14 @@ def event_records(
             delivery_class,
             original_url,
             file_resolver,
+        )
+    if event_type == "reaction":
+        return _reaction_event_records(
+            store,
+            account_uuid,
+            queue_id,
+            event,
+            delivery_class,
         )
     if event_type == "subscription":
         return _subscription_records(

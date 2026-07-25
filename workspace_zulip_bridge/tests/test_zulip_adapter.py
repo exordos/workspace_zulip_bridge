@@ -31,6 +31,10 @@ class FakeClient:
         self.stream_updates = []
         self.read_streams = []
         self.read_topics = []
+        self.added_reactions = []
+        self.removed_reactions = []
+        self.add_reaction_result = {"result": "success"}
+        self.remove_reaction_result = {"result": "success"}
         self.uploads = []
         self.registration_request = None
         self.subscriptions_request = None
@@ -136,6 +140,14 @@ class FakeClient:
         self.read_topics.append((stream_id, topic_name))
         return {"result": "success"}
 
+    def add_reaction(self, request):
+        self.added_reactions.append(request)
+        return self.add_reaction_result
+
+    def remove_reaction(self, request):
+        self.removed_reactions.append(request)
+        return self.remove_reaction_result
+
     def upload_file(self, file):
         self.uploads.append((file.name, file.read()))
         return {"result": "success", "uri": "/user_uploads/file"}
@@ -168,6 +180,7 @@ class FakeRouting:
     workspace = {
         ("topic", TOPIC_UUID): {"provider_id": "42:bridge", "metadata": {}},
         ("message", MESSAGE_UUID): {"provider_id": "99", "metadata": {}},
+        ("identity", OWNER_UUID): {"provider_id": "1", "metadata": {}},
         ("identity", USER_2_UUID): {"provider_id": "2", "metadata": {}},
         ("identity", USER_3_UUID): {"provider_id": "3", "metadata": {}},
     }
@@ -542,6 +555,169 @@ def test_exact_read_state_updates_only_listed_messages():
     assert client.flags == [{"messages": [99], "op": "remove", "flag": "read"}]
 
 
+def test_reaction_create_update_and_delete_use_official_client_semantics():
+    client = FakeClient()
+    adapter = _adapter(client)
+    create = {
+        "kind": "reaction.create",
+        "provider": {"kind": "zulip", "chat_id": "channel:42"},
+        "payload": {
+            "message_uuid": MESSAGE_UUID,
+            "user_uuid": OWNER_UUID,
+            "emoji_name": "thumbs_up",
+        },
+    }
+
+    assert adapter.apply(create) == ("99:1:thumbs_up", None)
+    assert client.added_reactions == [
+        {"message_id": 99, "emoji_name": "thumbs_up"}
+    ]
+
+    update = {
+        "kind": "reaction.update",
+        "provider": {"kind": "zulip", "chat_id": "channel:42"},
+        "payload": {
+            "message_uuid": MESSAGE_UUID,
+            "user_uuid": OWNER_UUID,
+            "emoji_name": "heart",
+            "previous_message_uuid": MESSAGE_UUID,
+            "previous_emoji_name": "thumbs_up",
+            "provider": {
+                "emoji_code": "1f44d",
+                "reaction_type": "unicode_emoji",
+            },
+        },
+    }
+
+    assert adapter.apply(update) == ("99:1:heart", None)
+    assert client.removed_reactions == [
+        {
+            "message_id": 99,
+            "emoji_name": "thumbs_up",
+            "emoji_code": "1f44d",
+            "reaction_type": "unicode_emoji",
+        }
+    ]
+    assert client.added_reactions[-1] == {"message_id": 99, "emoji_name": "heart"}
+
+    delete = {
+        "kind": "reaction.delete",
+        "provider": {"kind": "zulip", "chat_id": "channel:42"},
+        "payload": {
+            "message_uuid": MESSAGE_UUID,
+            "user_uuid": OWNER_UUID,
+            "emoji_name": "heart",
+        },
+    }
+
+    assert adapter.apply(delete) == ("99:1:heart", None)
+    assert client.removed_reactions[-1] == {
+        "message_id": 99,
+        "emoji_name": "heart",
+    }
+
+
+def test_workspace_unicode_reaction_uses_zulip_server_emoji_identity(monkeypatch):
+    class EmojiResponse:
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def json():
+            return {
+                "code_to_names": {
+                    "1f44d": ["+1", "thumbs_up", "like"],
+                    "2764": ["heart", "love"],
+                }
+            }
+
+    requests = []
+
+    def get(url, **kwargs):
+        requests.append((url, kwargs))
+        return EmojiResponse()
+
+    monkeypatch.setattr(zulip_adapter.requests, "get", get)
+    zulip_adapter._zulip_unicode_emoji_names.cache_clear()
+    client = FakeClient()
+    client.base_url = "https://zulip.example.test/api/"
+    client.tls_verification = "/tmp/test-ca.pem"
+    adapter = _adapter(client)
+
+    create = {
+        "kind": "reaction.create",
+        "provider": {"kind": "zulip", "chat_id": "channel:42"},
+        "payload": {
+            "message_uuid": MESSAGE_UUID,
+            "user_uuid": OWNER_UUID,
+            "emoji_name": "👍",
+        },
+    }
+    delete = {
+        "kind": "reaction.delete",
+        "provider": {"kind": "zulip", "chat_id": "channel:42"},
+        "payload": {
+            "message_uuid": MESSAGE_UUID,
+            "user_uuid": OWNER_UUID,
+            "emoji_name": "👍",
+        },
+    }
+
+    assert adapter.apply(create) == ("99:1:+1", None)
+    assert adapter.apply(delete) == ("99:1:+1", None)
+    assert client.added_reactions[-1] == {
+        "message_id": 99,
+        "emoji_name": "+1",
+        "emoji_code": "1f44d",
+        "reaction_type": "unicode_emoji",
+    }
+    assert client.removed_reactions[-1] == client.added_reactions[-1]
+    assert requests == [
+        (
+            "https://zulip.example.test/static/generated/emoji/emoji_api.json",
+            {"verify": "/tmp/test-ca.pem", "timeout": 60.0},
+        )
+    ]
+    zulip_adapter._zulip_unicode_emoji_names.cache_clear()
+
+
+def test_reaction_retries_converge_after_ambiguous_provider_commit():
+    client = FakeClient()
+    client.add_reaction_result = {
+        "result": "error",
+        "code": "REACTION_ALREADY_EXISTS",
+    }
+    client.remove_reaction_result = {
+        "result": "error",
+        "code": "REACTION_DOES_NOT_EXIST",
+    }
+    adapter = _adapter(client)
+
+    assert adapter.apply(
+        {
+            "kind": "reaction.create",
+            "provider": {"kind": "zulip", "chat_id": "channel:42"},
+            "payload": {
+                "message_uuid": MESSAGE_UUID,
+                "user_uuid": OWNER_UUID,
+                "emoji_name": "eyes",
+            },
+        }
+    ) == ("99:1:eyes", None)
+    assert adapter.apply(
+        {
+            "kind": "reaction.delete",
+            "provider": {"kind": "zulip", "chat_id": "channel:42"},
+            "payload": {
+                "message_uuid": MESSAGE_UUID,
+                "user_uuid": OWNER_UUID,
+                "emoji_name": "eyes",
+            },
+        }
+    ) == ("99:1:eyes", None)
+
+
 def test_exact_read_state_does_not_reinterpret_workspace_order_as_provider_boundary():
     first_workspace_uuid = "10000000-0000-0000-0000-000000000010"
     boundary_workspace_uuid = "20000000-0000-0000-0000-000000000020"
@@ -781,6 +957,7 @@ def test_registration_requests_and_retains_catalog_snapshot_fields():
         "realm",
         "recent_private_conversations",
     ]
+    assert "reaction" in client.registration_request["event_types"]
     assert client.registration_request["client_capabilities"] == {
         "notification_settings_null": True,
         "bulk_message_deletion": True,
