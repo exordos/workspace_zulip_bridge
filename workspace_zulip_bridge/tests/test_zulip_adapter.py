@@ -14,6 +14,9 @@ MESSAGE_UUID = "10000000-0000-4000-8000-000000000004"
 USER_2_UUID = "10000000-0000-4000-8000-000000000005"
 USER_3_UUID = "10000000-0000-4000-8000-000000000006"
 EXTERNAL_CHAT_UUID = "10000000-0000-4000-8000-000000000007"
+DIRECT_STREAM_UUID = "10000000-0000-4000-8000-000000000008"
+DIRECT_TOPIC_UUID = "10000000-0000-4000-8000-000000000009"
+SELF_STREAM_UUID = "10000000-0000-4000-8000-000000000010"
 
 
 class FakeClient:
@@ -178,11 +181,62 @@ class FakeRouting:
         },
     }
     workspace = {
-        ("topic", TOPIC_UUID): {"provider_id": "42:bridge", "metadata": {}},
-        ("message", MESSAGE_UUID): {"provider_id": "99", "metadata": {}},
-        ("identity", OWNER_UUID): {"provider_id": "1", "metadata": {}},
-        ("identity", USER_2_UUID): {"provider_id": "2", "metadata": {}},
-        ("identity", USER_3_UUID): {"provider_id": "3", "metadata": {}},
+        ("stream", STREAM_UUID): {
+            "provider_id": "channel:42",
+            "metadata": {
+                "chat_type": "channel",
+                "name": "engineering",
+                "participants": [],
+            },
+        },
+        ("topic", TOPIC_UUID): {
+            "provider_id": "42:bridge",
+            "metadata": {"stream_uuid": STREAM_UUID},
+        },
+        ("message", MESSAGE_UUID): {
+            "provider_id": "99",
+            "metadata": {
+                "chat_key": "channel:42",
+                "stream_uuid": STREAM_UUID,
+                "topic_uuid": TOPIC_UUID,
+                "subject": "bridge",
+            },
+        },
+        ("stream", DIRECT_STREAM_UUID): {
+            "provider_id": "direct:2",
+            "metadata": {
+                "chat_type": "direct",
+                "name": "Direct message",
+                "participants": [OWNER_UUID, USER_2_UUID],
+            },
+        },
+        ("topic", DIRECT_TOPIC_UUID): {
+            "provider_id": "direct:1,2:default",
+            "metadata": {
+                "stream_uuid": DIRECT_STREAM_UUID,
+                "chat_key": "direct:1,2",
+            },
+        },
+        ("stream", SELF_STREAM_UUID): {
+            "provider_id": "direct:1",
+            "metadata": {
+                "chat_type": "direct",
+                "name": "Direct message",
+                "participants": [OWNER_UUID],
+            },
+        },
+        ("identity", OWNER_UUID): {
+            "provider_id": "1",
+            "metadata": {"display_name": "Owner"},
+        },
+        ("identity", USER_2_UUID): {
+            "provider_id": "2",
+            "metadata": {"display_name": "Other User"},
+        },
+        ("identity", USER_3_UUID): {
+            "provider_id": "3",
+            "metadata": {"display_name": "Third User"},
+        },
     }
 
     def provider_mapping(self, entity_kind, provider_id):
@@ -335,6 +389,41 @@ def test_outbound_mentions_and_attachments_use_provider_formats_without_raw_urns
     export_args = file_client.exports[0][0]
     assert str(export_args[2]) == OWNER_UUID
     assert str(export_args[3]) == EXTERNAL_CHAT_UUID
+
+
+def test_outbound_workspace_links_use_zulip_native_and_url_formats():
+    client = FakeClient()
+    adapter = _adapter(client)
+    operation = _operation()
+    operation["payload"]["payload"]["content"] = " ".join(
+        (
+            f"[Workspace alias](urn:user:{USER_2_UUID})",
+            f"[channel](urn:stream:{STREAM_UUID})",
+            f"[topic](urn:topic:{TOPIC_UUID})",
+            f"[message](urn:message:{MESSAGE_UUID})",
+            f"[dm](urn:stream:{DIRECT_STREAM_UUID})",
+            f"[dm topic](urn:topic:{DIRECT_TOPIC_UUID})",
+            f"[self dm](urn:stream:{SELF_STREAM_UUID})",
+            "[site](urn:url:https://example.com/a?x=1#section)",
+        )
+    )
+
+    correlation = adapter.prepare(operation, "operation-1")
+
+    assert correlation is not None
+    assert correlation.provider_rendered_content == " ".join(
+        (
+            "@**Other User|2**",
+            "#**engineering**",
+            "#**engineering>bridge**",
+            "#**engineering>bridge@99**",
+            "[dm](https://zulip.example.invalid/#narrow/dm/2-user)",
+            "[dm topic](https://zulip.example.invalid/#narrow/dm/2-user)",
+            "[self dm](https://zulip.example.invalid/#narrow/dm/1-user)",
+            "[site](https://example.com/a?x=1#section)",
+        )
+    )
+    assert "urn:" not in correlation.provider_rendered_content
 
 
 def test_reply_uses_zulip_native_quote_and_reply_semantics():

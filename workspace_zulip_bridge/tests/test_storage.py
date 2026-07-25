@@ -61,6 +61,25 @@ def _desired_change():
     }
 
 
+def test_provider_mapping_by_name_uses_case_insensitive_live_metadata_lookup():
+    row = {
+        "workspace_uuid": uuid.uuid4(),
+        "provider_id": "channel:42",
+        "provider_revision": None,
+        "metadata": {"name": "Engineering"},
+        "convergent_alias": False,
+    }
+    session = Session((row,))
+    store = _store_with_session(session)
+    account_uuid = str(uuid.uuid4())
+
+    assert store.provider_mapping_by_name(account_uuid, "stream", "engineering") == row
+    statement, parameters = session.statements[0]
+    assert "LOWER(mapping.metadata->>'name') = LOWER(%s)" in statement
+    assert "NOT mapping.deleted" in statement
+    assert parameters == (account_uuid, "stream", "engineering")
+
+
 def test_catalog_participants_merge_is_monotonic_and_enriches_placeholders():
     current = [
         {

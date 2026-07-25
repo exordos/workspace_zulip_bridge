@@ -92,6 +92,27 @@ class FakeStore:
         self.mappings[(entity_kind, provider_id)] = mapping
         return mapping
 
+    def provider_mapping_by_name(self, account_uuid, entity_kind, name):
+        for (kind, _provider_id), mapping in self.mappings.items():
+            metadata = mapping.get("metadata", {})
+            if (
+                kind == entity_kind
+                and str(metadata.get("name", "")).casefold() == name.casefold()
+                and (entity_kind != "stream" or metadata.get("chat_type") == "channel")
+            ):
+                return mapping
+        return None
+
+    def workspace_mapping(self, account_uuid, entity_kind, workspace_uuid):
+        return next(
+            (
+                mapping
+                for (kind, _provider_id), mapping in self.mappings.items()
+                if kind == entity_kind and mapping["workspace_uuid"] == workspace_uuid
+            ),
+            None,
+        )
+
     def remember_provider_mapping(
         self,
         account_uuid,
@@ -221,6 +242,118 @@ def test_lossy_markdown_without_original_url_does_not_add_empty_link():
     assert lossy
     assert converted == "@Unknown User"
     assert "[Open original]" not in converted
+
+
+def test_zulip_internal_and_external_links_become_workspace_urns():
+    store = FakeStore()
+    store.remember_provider_mapping(
+        ACCOUNT_UUID,
+        "identity",
+        "1",
+        OWNER_UUID,
+        {"display_name": "Owner", "active": True},
+    )
+    converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {"id": 8, "type": "message", "message": _dm_message(501)},
+        original_url="https://chat.example.invalid",
+    )
+    converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {"id": 9, "type": "message", "message": _stream_message(601)},
+        original_url="https://chat.example.invalid",
+    )
+    linked = _stream_message(602)
+    linked["content"] = "\n".join(
+        (
+            "#**Engineering**",
+            "#**Engineering>Topic**",
+            "#**Engineering>Topic@601**",
+            "[message](https://chat.example.invalid/#narrow/channel/42-Engineering/topic/Topic/near/601)",
+            "[stable topic](#narrow/channel/42-Engineering/topic/Topic/with/601)",
+            "[dm](https://chat.example.invalid/#narrow/dm/2-Other-User)",
+            "[profile](https://chat.example.invalid/#user/2)",
+            "[site](https://example.com/a?x=1#section)",
+            "Plain https://chat.example.invalid/#narrow/channel/42-Engineering/topic/Topic/near/601",
+            "[external narrow](//evil.example/#narrow/channel/42-Engineering/topic/Topic/near/601)",
+            "[help](/help/link-to-a-message-or-conversation)",
+            "Bare https://example.org/docs.",
+            "<https://example.edu/autolink>",
+            "`https://example.net/code`",
+        )
+    )
+
+    records = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {"id": 10, "type": "message", "message": linked},
+        original_url="https://chat.example.invalid",
+    )
+    message = next(
+        operation
+        for operation in _operations(records)
+        if operation["kind"] == "message.create"
+    )
+    markdown = message["payload"]["payload"]["content"]
+    stream_uuid = store.mappings[("stream", "channel:42")]["workspace_uuid"]
+    topic_uuid = store.mappings[("topic", "42:Topic")]["workspace_uuid"]
+    message_uuid = store.mappings[("message", "601")]["workspace_uuid"]
+    dm_uuid = store.mappings[("stream", "direct:1,2")]["workspace_uuid"]
+    user_uuid = store.mappings[("identity", "2")]["workspace_uuid"]
+
+    assert f"[#Engineering](urn:stream:{stream_uuid})" in markdown
+    assert f"[#Engineering > Topic](urn:topic:{topic_uuid})" in markdown
+    assert f"[#Engineering > Topic @ 💬](urn:message:{message_uuid})" in markdown
+    assert f"[message](urn:message:{message_uuid})" in markdown
+    assert f"[stable topic](urn:topic:{topic_uuid})" in markdown
+    assert f"[dm](urn:stream:{dm_uuid})" in markdown
+    assert f"[profile](urn:user:{user_uuid})" in markdown
+    assert "[site](urn:url:https://example.com/a?x=1#section)" in markdown
+    assert (
+        "[https://chat.example.invalid/#narrow/channel/42-Engineering/topic/Topic/"
+        f"near/601](urn:message:{message_uuid})" in markdown
+    )
+    assert (
+        "[external narrow](urn:url:https://evil.example/#narrow/channel/"
+        "42-Engineering/topic/Topic/near/601)" in markdown
+    )
+    assert (
+        "[help](urn:url:https://chat.example.invalid/help/"
+        "link-to-a-message-or-conversation)" in markdown
+    )
+    assert "[https://example.org/docs](urn:url:https://example.org/docs)." in markdown
+    assert (
+        "[https://example.edu/autolink](urn:url:https://example.edu/autolink)"
+        in markdown
+    )
+    assert "[[" not in markdown
+    assert "`https://example.net/code`" in markdown
+    assert "#**" not in markdown
+    assert "Open original" not in markdown
+
+
+def test_unresolved_native_zulip_link_is_preserved_and_marks_conversion_lossy():
+    store = FakeStore(auto_materialize=False)
+    resolver = converter.ZulipLinkResolver(store, ACCOUNT_UUID, OWNER_UUID)
+
+    converted, lossy = converter.convert_markdown(
+        "See #**Unknown>missing**",
+        {},
+        "https://chat.example.invalid/#narrow/near/700",
+        link_resolver=resolver,
+    )
+
+    assert lossy
+    assert "#**Unknown>missing**" in converted
+    assert (
+        "[Open original](urn:url:https://chat.example.invalid/#narrow/near/700)"
+        in converted
+    )
 
 
 def test_new_chat_waits_for_backend_assignment_before_materialization():

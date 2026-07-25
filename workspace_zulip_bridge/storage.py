@@ -897,6 +897,36 @@ class RestAlchemyStore:
                 (account_uuid, entity_kind, provider_id),
             ).fetchone()
 
+    def provider_mapping_by_name(
+        self, account_uuid: str, entity_kind: str, name: str
+    ) -> dict[str, object] | None:
+        with self.session() as session:
+            return session.execute(
+                """
+                SELECT mapping.workspace_uuid, mapping.provider_id,
+                       mapping.provider_revision, mapping.metadata,
+                       EXISTS (
+                           SELECT 1 FROM provider_mapping_aliases AS alias
+                           WHERE alias.account_uuid = mapping.account_uuid
+                             AND alias.entity_kind = mapping.entity_kind
+                             AND alias.workspace_uuid = mapping.workspace_uuid
+                             AND alias.provider_id = mapping.provider_id
+                             AND NOT alias.deleted
+                       ) AS convergent_alias
+                FROM provider_mappings AS mapping
+                WHERE mapping.account_uuid = %s AND mapping.entity_kind = %s
+                  AND LOWER(mapping.metadata->>'name') = LOWER(%s)
+                  AND (
+                      mapping.entity_kind <> 'stream'
+                      OR mapping.metadata->>'chat_type' = 'channel'
+                  )
+                  AND NOT mapping.deleted
+                ORDER BY mapping.updated_at DESC
+                LIMIT 1
+                """,
+                (account_uuid, entity_kind, name),
+            ).fetchone()
+
     def workspace_mapping(
         self, account_uuid: str, entity_kind: str, workspace_uuid: str
     ) -> dict[str, object] | None:
