@@ -794,6 +794,54 @@ def test_account_global_identity_delivery_uses_account_generation(postgres_store
     assert row["assignment_uuid"] is None
 
 
+def test_provider_identity_replay_keeps_first_accepted_record(postgres_store):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    record = _provider_record(
+        account_uuid, project_uuid, chat_id="account", kind="identity.upsert"
+    )
+    record["operation"]["provider"]["entity_id"] = "42"
+    record["causal_lane"] = (
+        f"identity:{account_uuid}:{record['operation']['entity_uuid']}"
+    )
+    record["operation_sha256"] = canonical.operation_digest(record)
+    assert postgres_store.enqueue_workspace_delivery(record, 0, "queue", 7)
+    accepted = json.loads(json.dumps(record))
+
+    canonical_replay = json.loads(json.dumps(record))
+    canonical_replay["operation"]["entity_uuid"] = str(uuid.uuid4())
+    canonical_replay["causal_lane"] = (
+        f"identity:{account_uuid}:"
+        f"{canonical_replay['operation']['entity_uuid']}"
+    )
+    canonical_replay["operation_sha256"] = canonical.operation_digest(
+        canonical_replay
+    )
+
+    assert not postgres_store.enqueue_workspace_delivery(
+        canonical_replay, 0, "queue", 7
+    )
+    with postgres_store.session() as session:
+        stored = session.execute(
+            """
+            SELECT delivery.record, idempotency.operation_sha256
+            FROM workspace_delivery_outbox AS delivery
+            JOIN operation_idempotency AS idempotency USING (operation_uuid)
+            WHERE delivery.operation_uuid = %s
+            """,
+            (record["operation_uuid"],),
+        ).fetchone()
+    assert stored["record"] == accepted
+    assert stored["operation_sha256"] == accepted["operation_sha256"]
+
+    changed_payload = json.loads(json.dumps(canonical_replay))
+    changed_payload["operation"]["payload"]["display_name"] = "Changed"
+    changed_payload["operation_sha256"] = canonical.operation_digest(changed_payload)
+    with pytest.raises(
+        ValueError, match="Operation UUID reused with a different digest"
+    ):
+        postgres_store.enqueue_workspace_delivery(changed_payload, 0, "queue", 7)
+
+
 def test_outbound_commit_suppresses_queue_loss_history_duplicate(postgres_store):
     account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
     stream_uuid, topic_uuid, author_uuid = _materialize_channel_projection(
