@@ -8,6 +8,9 @@ _OUTBOUND_KIND = {
     "message.create": "message.create",
     "message.update": "message.update",
     "message.delete": "message.delete",
+    "reaction.create": "reaction.create",
+    "reaction.update": "reaction.update",
+    "reaction.delete": "reaction.delete",
     "read_state.set": "read_state.set",
     "stream.update": "stream.upsert",
     "topic.update": "topic.upsert",
@@ -109,7 +112,15 @@ def leased_operation_record(store, leased: dict[str, object]) -> dict[str, objec
         entity_uuid = str(uuid.UUID(str(payload["uuid"])))
     chat_key = _chat_key(store, account_uuid, kind, payload)
     entity_id = None
-    if kind not in {"message.create", "read_state.set"}:
+    if kind.startswith("reaction."):
+        message = _provider_mapping(
+            store,
+            account_uuid,
+            "message",
+            payload["message_uuid"],
+        )
+        entity_id = str(message["provider_id"])
+    elif kind not in {"message.create", "read_state.set"}:
         mapping = _provider_mapping(store, account_uuid, entity_kind, entity_uuid)
         entity_id = str(mapping["provider_id"])
     operation = {
@@ -227,7 +238,9 @@ def event_payload(store, record: dict[str, object]) -> dict[str, object] | None:
             **typing.cast(dict[str, object], operation.get("extensions", {})),
         },
     }
-    if not kind.endswith(".delete"):
+    if kind.startswith("reaction."):
+        resource.update(payload)
+    elif not kind.endswith(".delete"):
         resource.update(payload)
         if "author_uuid" in resource:
             resource["user_uuid"] = resource.pop("author_uuid")
@@ -263,6 +276,26 @@ def event_payload(store, record: dict[str, object]) -> dict[str, object] | None:
         for relation in ("stream_uuid", "topic_uuid", "message_uuid"):
             if relation in payload:
                 resource[relation] = payload[relation]
+    if kind.startswith("reaction.") and "user_uuid" in resource:
+        actor = store.workspace_mapping(
+            account_uuid,
+            "identity",
+            str(resource["user_uuid"]),
+        )
+        if actor is not None:
+            actor_metadata = typing.cast(
+                dict[str, object],
+                actor.get("metadata", {}),
+            )
+            resource["user_identity"] = {
+                "provider_external_id": str(actor["provider_id"]),
+                "display_name": str(
+                    actor_metadata.get("display_name", actor["provider_id"])
+                ),
+                "email": actor_metadata.get("email"),
+                "avatar_urn": actor_metadata.get("avatar_urn"),
+                "active": bool(actor_metadata.get("active", True)),
+            }
     return {
         "provider_event_uuid": str(record["operation_uuid"]),
         "external_account_uuid": account_uuid,

@@ -1478,6 +1478,34 @@ class RestAlchemyStore:
             )
             session.execute(
                 """
+                UPDATE workspace_delivery_outbox AS message_delivery
+                SET priority = reaction_delivery.priority
+                FROM workspace_delivery_outbox AS reaction_delivery
+                WHERE message_delivery.sent_at IS NULL
+                  AND reaction_delivery.sent_at IS NULL
+                  AND message_delivery.priority > reaction_delivery.priority
+                  AND message_delivery.account_uuid =
+                      reaction_delivery.account_uuid
+                  AND message_delivery.assignment_uuid IS NOT DISTINCT FROM
+                      reaction_delivery.assignment_uuid
+                  AND message_delivery.assignment_generation
+                      IS NOT DISTINCT FROM
+                      reaction_delivery.assignment_generation
+                  AND message_delivery.assignment_project_uuid
+                      IS NOT DISTINCT FROM
+                      reaction_delivery.assignment_project_uuid
+                  AND reaction_delivery.record->'operation'->>'kind' IN (
+                      'reaction.upsert', 'reaction.delete'
+                  )
+                  AND message_delivery.record->'operation'->>'kind'
+                      IN ('message.create', 'message.update')
+                  AND message_delivery.record->'operation'->>'entity_uuid' =
+                      reaction_delivery.record->'operation'->'payload'
+                          ->>'message_uuid'
+                """
+            )
+            session.execute(
+                """
                 UPDATE workspace_delivery_outbox AS topic_delivery
                 SET priority = message_delivery.priority
                 FROM workspace_delivery_outbox AS message_delivery
@@ -1497,7 +1525,8 @@ class RestAlchemyStore:
                   AND topic_delivery.record->'operation'->>'kind' =
                       'topic.upsert'
                   AND message_delivery.record->'operation'->>'kind' IN (
-                      'message.create', 'message.update', 'read_state.set'
+                      'message.create', 'message.update', 'read_state.set',
+                      'reaction.upsert', 'reaction.delete'
                   )
                   AND topic_delivery.record->'operation'->>'entity_uuid' =
                       message_delivery.record->'operation'->'payload'
@@ -1537,7 +1566,8 @@ class RestAlchemyStore:
                       )
                       AND (
                           delivery.record->'operation'->>'kind' NOT IN (
-                              'message.create', 'message.update', 'read_state.set'
+                              'message.create', 'message.update', 'read_state.set',
+                              'reaction.upsert', 'reaction.delete'
                           )
                           OR NOT EXISTS (
                               SELECT 1
@@ -1636,6 +1666,52 @@ class RestAlchemyStore:
                                             ->>'workspace_delivery_state' =
                                         'committed'
                               )
+                          )
+                      )
+                      AND (
+                          delivery.record->'operation'->>'kind' NOT IN (
+                              'reaction.upsert', 'reaction.delete'
+                          )
+                          OR NOT EXISTS (
+                              SELECT 1
+                              FROM workspace_delivery_outbox AS message_create
+                              WHERE message_create.sent_at IS NULL
+                                AND message_create.account_uuid =
+                                    delivery.account_uuid
+                                AND message_create.assignment_uuid
+                                    IS NOT DISTINCT FROM
+                                    delivery.assignment_uuid
+                                AND message_create.assignment_generation
+                                    IS NOT DISTINCT FROM
+                                    delivery.assignment_generation
+                                AND message_create.assignment_project_uuid
+                                    IS NOT DISTINCT FROM
+                                    delivery.assignment_project_uuid
+                                AND message_create.record->'operation'->>'kind' =
+                                    'message.create'
+                                AND message_create.record->'operation'
+                                        ->>'entity_uuid' =
+                                    delivery.record->'operation'->'payload'
+                                        ->>'message_uuid'
+                          )
+                      )
+                      AND (
+                          delivery.record->'operation'->>'kind' NOT IN (
+                              'reaction.upsert', 'reaction.delete'
+                          )
+                          OR EXISTS (
+                              SELECT 1
+                              FROM provider_mappings AS message_mapping
+                              WHERE message_mapping.account_uuid =
+                                  delivery.account_uuid
+                                AND message_mapping.entity_kind = 'message'
+                                AND message_mapping.workspace_uuid::text =
+                                    delivery.record->'operation'->'payload'
+                                        ->>'message_uuid'
+                                AND NOT message_mapping.deleted
+                                AND message_mapping.metadata
+                                        ->>'workspace_delivery_state' =
+                                    'committed'
                           )
                       )
                     ORDER BY priority, created_at LIMIT %s
@@ -2983,6 +3059,47 @@ class RestAlchemyStore:
                     ),
                 ),
             )
+        elif kind in {"reaction.create", "reaction.update"}:
+            if provider_entity_id is None:
+                raise ValueError("Committed reaction mutation has no provider identifier")
+            metadata = {
+                "project_uuid": record["project_uuid"],
+                "message_uuid": payload["message_uuid"],
+                "user_uuid": payload["user_uuid"],
+                "emoji_name": payload["emoji_name"],
+                "chat_key": provider["chat_id"],
+                "mapping_origin": str(record["origin"]),
+                "workspace_delivery_state": "committed",
+            }
+            session.execute(
+                """
+                WITH removed_stale_workspace_mapping AS (
+                    DELETE FROM provider_mappings
+                    WHERE account_uuid = %s AND entity_kind = 'reaction'
+                      AND workspace_uuid = %s AND provider_id <> %s
+                )
+                INSERT INTO provider_mappings (
+                    account_uuid, entity_kind, workspace_uuid, provider_id,
+                    provider_revision, metadata, deleted
+                ) VALUES (%s, 'reaction', %s, %s, %s, %s, false)
+                ON CONFLICT (account_uuid, entity_kind, provider_id) DO UPDATE SET
+                    workspace_uuid = EXCLUDED.workspace_uuid,
+                    provider_revision = EXCLUDED.provider_revision,
+                    metadata = provider_mappings.metadata || EXCLUDED.metadata,
+                    deleted = false,
+                    updated_at = now()
+                """,
+                (
+                    account_uuid,
+                    workspace_uuid,
+                    provider_entity_id,
+                    account_uuid,
+                    workspace_uuid,
+                    provider_entity_id,
+                    provider_revision,
+                    json.dumps(metadata),
+                ),
+            )
         elif kind == "message.update":
             extensions = typing.cast(dict[str, object], operation.get("extensions", {}))
             session.execute(
@@ -3036,6 +3153,16 @@ class RestAlchemyStore:
                 UPDATE provider_mapping_aliases
                 SET deleted = true, updated_at = now()
                 WHERE account_uuid = %s AND entity_kind = 'message'
+                  AND workspace_uuid = %s
+                """,
+                (account_uuid, workspace_uuid),
+            )
+        elif kind == "reaction.delete":
+            session.execute(
+                """
+                UPDATE provider_mappings
+                SET deleted = true, updated_at = now()
+                WHERE account_uuid = %s AND entity_kind = 'reaction'
                   AND workspace_uuid = %s
                 """,
                 (account_uuid, workspace_uuid),

@@ -513,6 +513,62 @@ def test_read_state_waits_until_every_message_projection_is_committed(
     assert postgres_store.pending_workspace_deliveries() == [record]
 
 
+def test_reaction_waits_until_message_projection_is_committed(postgres_store):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    message_uuid = str(uuid.uuid4())
+    reaction_uuid = str(uuid.uuid4())
+    stream_uuid = str(uuid.uuid4())
+    topic_uuid = str(uuid.uuid4())
+    actor_uuid = str(uuid.uuid4())
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "message",
+        "9259",
+        message_uuid,
+        {
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "workspace_delivery_state": "pending",
+        },
+    )
+    reaction_record = _provider_record(
+        account_uuid,
+        project_uuid,
+        kind="reaction.upsert",
+    )
+    reaction_record["operation"]["entity_uuid"] = reaction_uuid
+    reaction_record["operation"]["actor_uuid"] = actor_uuid
+    reaction_record["operation"]["payload"] = {
+        "stream_uuid": stream_uuid,
+        "topic_uuid": topic_uuid,
+        "message_uuid": message_uuid,
+        "user_uuid": actor_uuid,
+        "emoji_name": "thumbs_up",
+    }
+    reaction_record["operation_sha256"] = canonical.operation_digest(reaction_record)
+    message_record = _provider_record(account_uuid, project_uuid)
+    message_record["operation"]["entity_uuid"] = message_uuid
+    message_record["operation"]["provider"]["entity_id"] = "9259"
+    message_record["operation"]["payload"] = {
+        "stream_uuid": stream_uuid,
+        "topic_uuid": topic_uuid,
+        "author_uuid": str(uuid.uuid4()),
+        "payload": {"kind": "markdown", "content": "history"},
+        "reply_to_message_uuid": None,
+    }
+    message_record["operation_sha256"] = canonical.operation_digest(message_record)
+
+    assert postgres_store.enqueue_workspace_delivery(message_record, 2)
+    assert postgres_store.enqueue_workspace_delivery(reaction_record, 0)
+    assert postgres_store.pending_workspace_deliveries() == [message_record]
+
+    postgres_store.accept_result(
+        _committed_result(message_record, provider_entity_id="9259")
+    )
+
+    assert postgres_store.pending_workspace_deliveries() == [reaction_record]
+
+
 def test_reconcile_repairs_legacy_pending_direct_participant_gate(postgres_store):
     account_uuid, _project_uuid = _insert_account_and_assignment(postgres_store)
     direct_chat = {
@@ -879,6 +935,74 @@ def test_outbound_commit_suppresses_queue_loss_history_duplicate(postgres_store)
             """
         ).fetchall()
     assert duplicate == []
+
+
+def test_outbound_reaction_echo_reuses_workspace_identity(postgres_store):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    stream_uuid, topic_uuid, author_uuid = _materialize_channel_projection(
+        postgres_store, account_uuid, project_uuid
+    )
+    message_uuid = str(uuid.uuid4())
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "message",
+        "601",
+        message_uuid,
+        {
+            "project_uuid": project_uuid,
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "author_uuid": author_uuid,
+            "chat_key": "channel:42",
+            "workspace_delivery_state": "committed",
+        },
+    )
+    workspace_reaction_uuid = str(uuid.uuid4())
+    outbound = _provider_record(
+        account_uuid,
+        project_uuid,
+        kind="reaction.create",
+    )
+    outbound["origin"] = "workspace"
+    outbound["operation"]["entity_uuid"] = workspace_reaction_uuid
+    outbound["operation"]["actor_uuid"] = author_uuid
+    outbound["operation"]["payload"] = {
+        "stream_uuid": stream_uuid,
+        "topic_uuid": topic_uuid,
+        "message_uuid": message_uuid,
+        "user_uuid": author_uuid,
+        "emoji_name": "thumbs_up",
+    }
+    with postgres_store.session() as session:
+        postgres_store._persist_committed_mapping(
+            session,
+            outbound,
+            "601:2:thumbs_up",
+            None,
+        )
+
+    records = converter.event_records(
+        postgres_store,
+        account_uuid,
+        "provider-reaction:601",
+        {
+            "id": 700,
+            "type": "reaction",
+            "op": "add",
+            "message_id": 601,
+            "user_id": 2,
+            "emoji_name": "thumbs_up",
+            "emoji_code": "1f44d",
+            "reaction_type": "unicode_emoji",
+        },
+    )
+
+    reaction = next(
+        record
+        for record in records
+        if record["operation"]["kind"] == "reaction.upsert"
+    )
+    assert reaction["operation"]["entity_uuid"] == workspace_reaction_uuid
 
 
 def test_provider_mapping_written_before_event_delivery_recovers_same_message(

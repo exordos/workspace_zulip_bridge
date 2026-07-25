@@ -1,5 +1,6 @@
 import dataclasses
 import datetime
+import functools
 import hashlib
 import io
 import pathlib
@@ -21,6 +22,7 @@ PROVIDER_QUEUE_IDLE_TIMEOUT_SECONDS = 43_200
 # should amortize one request across a useful batch while the delivery outbox
 # still drains it in bounded Provider API quanta.
 HISTORY_PAGE_SIZE = 100
+ZULIP_EMOJI_DATA_PATH = "/static/generated/emoji/emoji_api.json"
 TRANSFER_NAMESPACE = uuid.UUID("8aa58582-d782-4e98-bfc3-7b5ee96e3bd6")
 WORKSPACE_FILE_RE = re.compile(
     r"(?P<image>!?)\[(?P<name>[^\]]+)\]\("
@@ -60,6 +62,10 @@ class ZulipClient(typing.Protocol):
     def delete_message(self, message_id: int) -> dict[str, object]: ...
 
     def update_message_flags(self, request: dict[str, object]) -> dict[str, object]: ...
+
+    def add_reaction(self, request: dict[str, object]) -> dict[str, object]: ...
+
+    def remove_reaction(self, request: dict[str, object]) -> dict[str, object]: ...
 
     def mark_stream_as_read(self, stream_id: int) -> dict[str, object]: ...
 
@@ -141,6 +147,49 @@ def _successful(result: dict[str, object]) -> dict[str, object]:
         "provider_error",
     }
     raise ZulipOperationError(code, retryable)
+
+
+def _unicode_emoji_code(emoji: str) -> str:
+    return "-".join(
+        f"{ord(character):04x}"
+        for character in emoji
+        if character not in {"\ufe0e", "\ufe0f"}
+    )
+
+
+@functools.lru_cache(maxsize=32)
+def _zulip_unicode_emoji_names(
+    server_url: str,
+    tls_verification: bool | str,
+) -> dict[str, tuple[str, ...]]:
+    try:
+        response = requests.get(
+            urllib.parse.urljoin(
+                server_url.rstrip("/") + "/",
+                ZULIP_EMOJI_DATA_PATH.lstrip("/"),
+            ),
+            verify=tls_verification,
+            timeout=60.0,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException as exc:
+        raise ZulipOperationError("provider_unavailable", True) from exc
+    except ValueError as exc:
+        raise ZulipOperationError("invalid_record", False) from exc
+    if not isinstance(payload, dict):
+        raise ZulipOperationError("invalid_record", False)
+    code_to_names = payload.get("code_to_names")
+    if not isinstance(code_to_names, dict):
+        raise ZulipOperationError("invalid_record", False)
+    names_by_code: dict[str, tuple[str, ...]] = {}
+    for code, names in code_to_names.items():
+        if not isinstance(code, str) or not isinstance(names, list):
+            continue
+        valid_names = tuple(name for name in names if isinstance(name, str) and name)
+        if valid_names:
+            names_by_code[code] = valid_names
+    return names_by_code
 
 
 class OfficialZulipAdapter:
@@ -422,6 +471,7 @@ class OfficialZulipAdapter:
                 "update_message",
                 "delete_message",
                 "update_message_flags",
+                "reaction",
                 "subscription",
                 "realm_user",
             ],
@@ -740,6 +790,135 @@ class OfficialZulipAdapter:
         except PROVIDER_NETWORK_ERRORS as exc:
             raise ZulipOperationError("provider_unavailable", True) from exc
 
+    @staticmethod
+    def _reaction_result(
+        result: dict[str, object],
+        already_converged_code: str,
+    ) -> None:
+        try:
+            _successful(result)
+        except ZulipOperationError as exc:
+            if exc.code != already_converged_code:
+                raise
+
+    def _reaction_request(
+        self,
+        payload: dict[str, object],
+        message_uuid: object,
+        emoji_name: object,
+        *,
+        include_provider_identity: bool,
+    ) -> dict[str, object]:
+        message = self._workspace_mapping("message", message_uuid)
+        provider_emoji_name, emoji_code, reaction_type = (
+            self._provider_reaction_identity(emoji_name)
+        )
+        request: dict[str, object] = {
+            "message_id": int(str(message["provider_id"])),
+            "emoji_name": provider_emoji_name,
+        }
+        if emoji_code is not None and reaction_type is not None:
+            request.update(
+                {
+                    "emoji_code": emoji_code,
+                    "reaction_type": reaction_type,
+                }
+            )
+        provider = payload.get("provider")
+        if (
+            include_provider_identity
+            and emoji_code is None
+            and isinstance(provider, dict)
+        ):
+            emoji_code = provider.get("emoji_code")
+            reaction_type = provider.get("reaction_type")
+            if isinstance(emoji_code, str) and isinstance(reaction_type, str):
+                request.update(
+                    {
+                        "emoji_code": emoji_code,
+                        "reaction_type": reaction_type,
+                    }
+                )
+        return request
+
+    def _provider_reaction_identity(
+        self,
+        emoji_name: object,
+    ) -> tuple[str, str | None, str | None]:
+        value = str(emoji_name)
+        if value.isascii():
+            return value, None, None
+        emoji_code = _unicode_emoji_code(value)
+        if not emoji_code:
+            raise ZulipOperationError("invalid_record", False)
+        names = _zulip_unicode_emoji_names(
+            self.server_url,
+            typing.cast(
+                bool | str,
+                getattr(self.client, "tls_verification", True),
+            ),
+        ).get(emoji_code)
+        if not names:
+            raise ZulipOperationError("unsupported_operation", False)
+        return names[0], emoji_code, "unicode_emoji"
+
+    def _add_reaction(
+        self,
+        payload: dict[str, object],
+        message_uuid: object,
+        emoji_name: object,
+    ) -> str:
+        request = self._reaction_request(
+            payload,
+            message_uuid,
+            emoji_name,
+            include_provider_identity=False,
+        )
+        self._reaction_result(
+            self.client.add_reaction(request),
+            "reaction_already_exists",
+        )
+        return self._reaction_provider_id(payload, request)
+
+    def _remove_reaction(
+        self,
+        payload: dict[str, object],
+        message_uuid: object,
+        emoji_name: object,
+    ) -> str:
+        request = self._reaction_request(
+            payload,
+            message_uuid,
+            emoji_name,
+            include_provider_identity=True,
+        )
+        self._reaction_result(
+            self.client.remove_reaction(request),
+            "reaction_does_not_exist",
+        )
+        return self._reaction_provider_id(payload, request)
+
+    def _reaction_provider_id(
+        self,
+        payload: dict[str, object],
+        request: dict[str, object],
+    ) -> str:
+        if self.routing is None:
+            raise ZulipOperationError("not_found", False)
+        identity = self.routing.workspace_mapping(
+            "identity",
+            str(payload["user_uuid"]),
+        )
+        if identity is None:
+            raise ZulipOperationError("not_found", False)
+        return ":".join(
+            (
+                str(int(str(request["message_id"]))),
+                str(int(str(identity["provider_id"]))),
+                str(request["emoji_name"]),
+            )
+        )
+
     def _apply(
         self,
         operation: dict[str, object],
@@ -786,6 +965,36 @@ class OfficialZulipAdapter:
         if kind == "message.delete":
             _successful(self.client.delete_message(int(str(provider["entity_id"]))))
             return str(provider["entity_id"]), None
+        if kind == "reaction.create":
+            entity_id = self._add_reaction(
+                payload,
+                payload["message_uuid"],
+                payload["emoji_name"],
+            )
+            return entity_id, None
+        if kind == "reaction.update":
+            previous_message_uuid = payload.get("previous_message_uuid")
+            previous_emoji_name = payload.get("previous_emoji_name")
+            if previous_message_uuid is None or previous_emoji_name is None:
+                raise ZulipOperationError("invalid_record", False)
+            self._remove_reaction(
+                payload,
+                previous_message_uuid,
+                previous_emoji_name,
+            )
+            entity_id = self._add_reaction(
+                payload,
+                payload["message_uuid"],
+                payload["emoji_name"],
+            )
+            return entity_id, None
+        if kind == "reaction.delete":
+            entity_id = self._remove_reaction(
+                payload,
+                payload["message_uuid"],
+                payload["emoji_name"],
+            )
+            return entity_id, None
         if kind == "read_state.set":
             exact_uuids = typing.cast(list[object] | None, payload.get("message_uuids"))
             through_uuid = payload.get("through_message_uuid")
