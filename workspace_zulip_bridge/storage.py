@@ -12,6 +12,31 @@ from restalchemy.storage.sql import engines, sessions
 from workspace_zulip_bridge import canonical, control
 
 
+def _same_provider_identity_replay(
+    accepted: dict[str, object],
+    current: dict[str, object],
+) -> bool:
+    """Recognize one immutable provider identity after canonical UUID linking."""
+
+    normalized = []
+    for record in (accepted, current):
+        operation = record.get("operation")
+        if not isinstance(operation, dict) or operation.get("kind") != "identity.upsert":
+            return False
+        entity_uuid = operation.get("entity_uuid")
+        account_uuid = record.get("account_uuid")
+        if not isinstance(entity_uuid, str) or not isinstance(account_uuid, str):
+            return False
+        if record.get("causal_lane") != f"identity:{account_uuid}:{entity_uuid}":
+            return False
+        value = json.loads(json.dumps(record))
+        value["operation_sha256"] = ""
+        value["causal_lane"] = f"identity:{account_uuid}:<canonical-identity>"
+        value["operation"]["entity_uuid"] = "<canonical-identity>"
+        normalized.append(value)
+    return normalized[0] == normalized[1]
+
+
 def _merge_catalog_participants(
     current: list[object],
     observed: list[dict[str, object]],
@@ -1274,6 +1299,25 @@ class RestAlchemyStore:
                 existing is not None
                 and existing["operation_sha256"] != operation_sha256
             ):
+                accepted = session.execute(
+                    """
+                    SELECT record, provider_queue_id, provider_event_id
+                    FROM workspace_delivery_outbox
+                    WHERE operation_uuid = %s
+                    FOR UPDATE
+                    """,
+                    (operation_uuid,),
+                ).fetchone()
+                if (
+                    provider_queue_id is not None
+                    and provider_event_id is not None
+                    and accepted is not None
+                    and accepted["provider_queue_id"] == provider_queue_id
+                    and accepted["provider_event_id"] == provider_event_id
+                    and isinstance(accepted["record"], dict)
+                    and _same_provider_identity_replay(accepted["record"], record)
+                ):
+                    return False
                 raise ValueError("Operation UUID reused with a different digest")
             session.execute(
                 """
