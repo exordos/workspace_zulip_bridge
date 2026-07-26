@@ -201,6 +201,78 @@ def _backfill_service(store: storage.RestAlchemyStore):
     return instance
 
 
+def test_desired_assignment_can_replace_provider_id_for_workspace_uuid(
+    postgres_store,
+):
+    account_uuid = str(uuid.uuid4())
+    assignment_uuid = str(uuid.uuid4())
+    project_uuid = str(uuid.uuid4())
+    stream_uuid = str(uuid.uuid4())
+    topic_uuid = str(uuid.uuid4())
+
+    def change(generation, provider_topic_id, topic_name):
+        resource = {
+            "resource_type": "external_chat_assignment",
+            "uuid": assignment_uuid,
+            "generation": generation,
+            "external_account_uuid": account_uuid,
+            "project_id": project_uuid,
+            "provider_chat": {
+                "provider_chat_key": "channel:42",
+                "chat_type": "channel",
+            },
+            "workspace_projection": {
+                "stream": {
+                    "uuid": stream_uuid,
+                    "name": "Engineering",
+                    "description": "",
+                    "private": False,
+                    "default_topic_uuid": None,
+                },
+                "participants": [],
+                "topics": [
+                    {
+                        "topic_uuid": topic_uuid,
+                        "provider_topic_id": provider_topic_id,
+                        "name": topic_name,
+                        "is_default": False,
+                    }
+                ],
+            },
+        }
+        return {
+            "change_uuid": str(uuid.uuid4()),
+            "sequence": generation,
+            "resource_type": "external_chat_assignment",
+            "resource_uuid": assignment_uuid,
+            "operation": "upsert",
+            "generation": generation,
+            "required_capabilities": {},
+            "resource": resource,
+        }
+
+    postgres_store.apply_desired_changes(
+        [change(1, "42:old-topic", "old topic")],
+        "cursor-1",
+    )
+    postgres_store.apply_desired_changes(
+        [change(2, "42:new-topic", "new topic")],
+        "cursor-2",
+    )
+
+    assert postgres_store.provider_mapping(
+        account_uuid, "topic", "42:old-topic"
+    ) is None
+    replacement = postgres_store.provider_mapping(
+        account_uuid, "topic", "42:new-topic"
+    )
+    assert replacement is not None
+    assert str(replacement["workspace_uuid"]) == topic_uuid
+    assert replacement["metadata"]["name"] == "new topic"
+    assert replacement["metadata"]["stream_uuid"] == stream_uuid
+    assert postgres_store.control_cursor() == "cursor-2"
+
+
 def test_observed_report_state_can_recover_to_a_previous_value(postgres_store):
     resource_uuid = str(uuid.uuid4())
     instance = object.__new__(service.BridgeService)

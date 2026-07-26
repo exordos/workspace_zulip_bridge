@@ -544,6 +544,43 @@ class RestAlchemyStore:
             )
 
     @staticmethod
+    def _replace_projection_mapping(
+        session: sessions.PgSQLSession,
+        account_uuid: str,
+        entity_kind: str,
+        workspace_uuid: str,
+        provider_id: str,
+        metadata: dict[str, object],
+    ) -> None:
+        session.execute(
+            """
+            DELETE FROM provider_mappings
+            WHERE account_uuid = %s AND entity_kind = %s
+              AND workspace_uuid = %s AND provider_id <> %s
+            """,
+            (account_uuid, entity_kind, workspace_uuid, provider_id),
+        )
+        session.execute(
+            """
+            INSERT INTO provider_mappings (
+                account_uuid, entity_kind, workspace_uuid, provider_id,
+                metadata, deleted
+            ) VALUES (%s, %s, %s, %s, %s, false)
+            ON CONFLICT (account_uuid, entity_kind, provider_id) DO UPDATE SET
+                workspace_uuid = EXCLUDED.workspace_uuid,
+                metadata = EXCLUDED.metadata,
+                deleted = false, updated_at = now()
+            """,
+            (
+                account_uuid,
+                entity_kind,
+                workspace_uuid,
+                provider_id,
+                json.dumps(metadata),
+            ),
+        )
+
+    @staticmethod
     def _materialize_workspace_projection(
         session: sessions.PgSQLSession,
         assignment: dict[str, object],
@@ -570,112 +607,52 @@ class RestAlchemyStore:
                 raise ValueError("Invalid workspace projection participant")
             identity_uuid = str(raw_participant["identity_uuid"])
             participant_uuids.append(identity_uuid)
-            session.execute(
-                """
-                WITH removed_stale_workspace_mapping AS (
-                    DELETE FROM provider_mappings
-                    WHERE account_uuid = %s AND entity_kind = 'identity'
-                      AND workspace_uuid = %s AND provider_id <> %s
-                )
-                INSERT INTO provider_mappings (
-                    account_uuid, entity_kind, workspace_uuid, provider_id,
-                    metadata, deleted
-                ) VALUES (%s, 'identity', %s, %s, %s, false)
-                ON CONFLICT (account_uuid, entity_kind, provider_id) DO UPDATE SET
-                    workspace_uuid = EXCLUDED.workspace_uuid,
-                    metadata = EXCLUDED.metadata,
-                    deleted = false, updated_at = now()
-                """,
-                (
-                    account_uuid,
-                    identity_uuid,
-                    str(raw_participant["provider_user_id"]),
-                    account_uuid,
-                    identity_uuid,
-                    str(raw_participant["provider_user_id"]),
-                    json.dumps(
-                        {
-                            "display_name": raw_participant["display_name"],
-                            "email": raw_participant.get("email"),
-                            "avatar_urn": raw_participant.get("avatar_urn"),
-                            "active": True,
-                            "role": raw_participant["role"],
-                        }
-                    ),
-                ),
+            RestAlchemyStore._replace_projection_mapping(
+                session,
+                account_uuid,
+                "identity",
+                identity_uuid,
+                str(raw_participant["provider_user_id"]),
+                {
+                    "display_name": raw_participant["display_name"],
+                    "email": raw_participant.get("email"),
+                    "avatar_urn": raw_participant.get("avatar_urn"),
+                    "active": True,
+                    "role": raw_participant["role"],
+                },
             )
         stream_uuid = str(stream["uuid"])
-        session.execute(
-            """
-            WITH removed_stale_workspace_mapping AS (
-                DELETE FROM provider_mappings
-                WHERE account_uuid = %s AND entity_kind = 'stream'
-                  AND workspace_uuid = %s AND provider_id <> %s
-            )
-            INSERT INTO provider_mappings (
-                account_uuid, entity_kind, workspace_uuid, provider_id,
-                metadata, deleted
-            ) VALUES (%s, 'stream', %s, %s, %s, false)
-            ON CONFLICT (account_uuid, entity_kind, provider_id) DO UPDATE SET
-                workspace_uuid = EXCLUDED.workspace_uuid,
-                metadata = EXCLUDED.metadata,
-                deleted = false, updated_at = now()
-            """,
-            (
-                account_uuid,
-                stream_uuid,
-                chat_key,
-                account_uuid,
-                stream_uuid,
-                chat_key,
-                json.dumps(
-                    {
-                        "chat_type": provider_chat["chat_type"],
-                        "project_uuid": project_uuid,
-                        "participants": participant_uuids,
-                        "name": stream["name"],
-                        "description": stream["description"],
-                        "private": stream["private"],
-                        "default_topic_uuid": stream.get("default_topic_uuid"),
-                    }
-                ),
-            ),
+        RestAlchemyStore._replace_projection_mapping(
+            session,
+            account_uuid,
+            "stream",
+            stream_uuid,
+            chat_key,
+            {
+                "chat_type": provider_chat["chat_type"],
+                "project_uuid": project_uuid,
+                "participants": participant_uuids,
+                "name": stream["name"],
+                "description": stream["description"],
+                "private": stream["private"],
+                "default_topic_uuid": stream.get("default_topic_uuid"),
+            },
         )
         for raw_topic in topics:
             if not isinstance(raw_topic, dict):
                 raise ValueError("Invalid workspace projection topic")
-            session.execute(
-                """
-                WITH removed_stale_workspace_mapping AS (
-                    DELETE FROM provider_mappings
-                    WHERE account_uuid = %s AND entity_kind = 'topic'
-                      AND workspace_uuid = %s AND provider_id <> %s
-                )
-                INSERT INTO provider_mappings (
-                    account_uuid, entity_kind, workspace_uuid, provider_id,
-                    metadata, deleted
-                ) VALUES (%s, 'topic', %s, %s, %s, false)
-                ON CONFLICT (account_uuid, entity_kind, provider_id) DO UPDATE SET
-                    workspace_uuid = EXCLUDED.workspace_uuid,
-                    metadata = EXCLUDED.metadata,
-                    deleted = false, updated_at = now()
-                """,
-                (
-                    account_uuid,
-                    str(raw_topic["topic_uuid"]),
-                    str(raw_topic["provider_topic_id"]),
-                    account_uuid,
-                    str(raw_topic["topic_uuid"]),
-                    str(raw_topic["provider_topic_id"]),
-                    json.dumps(
-                        {
-                            "stream_uuid": stream_uuid,
-                            "chat_key": chat_key,
-                            "name": raw_topic["name"],
-                            "is_default": raw_topic["is_default"],
-                        }
-                    ),
-                ),
+            RestAlchemyStore._replace_projection_mapping(
+                session,
+                account_uuid,
+                "topic",
+                str(raw_topic["topic_uuid"]),
+                str(raw_topic["provider_topic_id"]),
+                {
+                    "stream_uuid": stream_uuid,
+                    "chat_key": chat_key,
+                    "name": raw_topic["name"],
+                    "is_default": raw_topic["is_default"],
+                },
             )
 
     @staticmethod

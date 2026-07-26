@@ -624,6 +624,41 @@ def test_stale_result_cannot_replace_terminal_result():
         store.accept_result(stale)
 
 
+def test_projection_mapping_replacement_deletes_workspace_conflict_before_upsert():
+    session = Session()
+    account_uuid = str(uuid.uuid4())
+    workspace_uuid = str(uuid.uuid4())
+
+    storage.RestAlchemyStore._replace_projection_mapping(
+        session,
+        account_uuid,
+        "topic",
+        workspace_uuid,
+        "42:new-topic",
+        {"name": "new topic"},
+    )
+
+    assert len(session.statements) == 2
+    delete_statement, delete_parameters = session.statements[0]
+    insert_statement, insert_parameters = session.statements[1]
+    assert "DELETE FROM provider_mappings" in delete_statement
+    assert delete_parameters == (
+        account_uuid,
+        "topic",
+        workspace_uuid,
+        "42:new-topic",
+    )
+    assert "INSERT INTO provider_mappings" in insert_statement
+    assert "WITH removed_stale_workspace_mapping" not in insert_statement
+    assert insert_parameters[:4] == (
+        account_uuid,
+        "topic",
+        workspace_uuid,
+        "42:new-topic",
+    )
+    assert json.loads(insert_parameters[4]) == {"name": "new topic"}
+
+
 def test_workspace_projection_contract_materializes_first_outbound_mappings():
     session = Session()
     account_uuid = str(uuid.uuid4())
@@ -679,18 +714,34 @@ def test_workspace_projection_contract_materializes_first_outbound_mappings():
 
     storage.RestAlchemyStore._materialize_workspace_projection(session, assignment)
 
-    assert len(session.statements) == 4
-    identity_parameters = session.statements[0][1]
-    stream_parameters = session.statements[2][1]
-    topic_parameters = session.statements[3][1]
-    assert identity_parameters[:3] == (account_uuid, owner_uuid, "1")
-    assert stream_parameters[:3] == (account_uuid, stream_uuid, "direct:1,2")
-    assert topic_parameters[:3] == (
+    assert len(session.statements) == 8
+    inserts = [
+        parameters
+        for statement, parameters in session.statements
+        if "INSERT INTO provider_mappings" in statement
+    ]
+    identity_parameters = inserts[0]
+    stream_parameters = inserts[2]
+    topic_parameters = inserts[3]
+    assert identity_parameters[:4] == (
         account_uuid,
+        "identity",
+        owner_uuid,
+        "1",
+    )
+    assert stream_parameters[:4] == (
+        account_uuid,
+        "stream",
+        stream_uuid,
+        "direct:1,2",
+    )
+    assert topic_parameters[:4] == (
+        account_uuid,
+        "topic",
         topic_uuid,
         "direct:1,2:default",
     )
-    stream_metadata = json.loads(stream_parameters[6])
+    stream_metadata = json.loads(stream_parameters[4])
     assert stream_metadata["participants"] == [owner_uuid, peer_uuid]
     assert stream_metadata["default_topic_uuid"] == topic_uuid
 
@@ -705,14 +756,18 @@ def test_exact_backend_assignment_fixture_materializes_owned_topology():
     )
     session = Session()
     storage.RestAlchemyStore._materialize_workspace_projection(session, fixture)
-    assert len(session.statements) == 5
+    assert len(session.statements) == 10
     materialized = []
     for statement, parameters in session.statements:
-        entity_kind = next(
-            kind for kind in ("identity", "stream", "topic") if f"'{kind}'" in statement
-        )
+        if "INSERT INTO provider_mappings" not in statement:
+            continue
         materialized.append(
-            (entity_kind, parameters[4], parameters[5], json.loads(parameters[6]))
+            (
+                parameters[1],
+                parameters[2],
+                parameters[3],
+                json.loads(parameters[4]),
+            )
         )
     stream_mapping = next(value for value in materialized if value[0] == "stream")
     assert stream_mapping[1:3] == (
