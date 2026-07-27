@@ -37,6 +37,21 @@ CODE_RE = re.compile(
 SCHEMELESS_WEB_TARGET_RE = re.compile(
     r"(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?::[0-9]+)?(?:[/?#].*)?"
 )
+ZULIP_EMPTY_TOPIC_FALLBACK_NAME = "general chat"
+
+
+def is_empty_channel_topic(subject: str) -> bool:
+    return subject == "" or subject.casefold() == ZULIP_EMPTY_TOPIC_FALLBACK_NAME
+
+
+def channel_topic_name(subject: str) -> str:
+    if is_empty_channel_topic(subject):
+        return ZULIP_EMPTY_TOPIC_FALLBACK_NAME
+    return subject
+
+
+def channel_topic_provider_id(stream_id: object, subject: str) -> str:
+    return f"{stream_id}:{channel_topic_name(subject)}"
 
 
 class ConversionStore(typing.Protocol):
@@ -896,11 +911,26 @@ def _message_context(
     if stream_mapping is None:
         raise ValueError("provider_chat_assignment_pending")
     stream_uuid = str(stream_mapping["workspace_uuid"])
+    subject = str(message["subject"])
     topic_provider_id = (
-        f"{message['stream_id']}:{message['subject']}"
+        channel_topic_provider_id(message["stream_id"], subject)
         if chat_type == "channel"
         else f"{chat_key}:default"
     )
+    stream_metadata = typing.cast(
+        dict[str, object], stream_mapping.get("metadata", {})
+    )
+    if chat_type == "channel" and is_empty_channel_topic(subject):
+        default_topic_uuid = stream_metadata.get("default_topic_uuid")
+        if default_topic_uuid is None:
+            raise ValueError("provider_chat_assignment_pending")
+        return (
+            chat_type,
+            chat_key,
+            project_uuid,
+            stream_uuid,
+            str(default_topic_uuid),
+        )
     topic_mapping = store.provider_mapping(account_uuid, "topic", topic_provider_id)
     if topic_mapping is None:
         raise ValueError("provider_chat_assignment_pending")
@@ -1039,8 +1069,9 @@ def message_event_records(
     provider_content_sha256 = hashlib.sha256(
         str(message["content"]).encode("utf-8")
     ).hexdigest()
+    channel_subject = channel_topic_name(str(message.get("subject", "")))
     topic_provider_id = (
-        f"{message['stream_id']}:{message['subject']}"
+        channel_topic_provider_id(message["stream_id"], channel_subject)
         if chat_type == "channel"
         else f"{chat_key}:default"
     )
@@ -1092,7 +1123,7 @@ def message_event_records(
             "provider": _provider(chat_key, topic_provider_id),
             "payload": {
                 "stream_uuid": stream_uuid,
-                "name": message["subject"] if chat_type == "channel" else "default",
+                "name": channel_subject if chat_type == "channel" else "default",
             },
             "extensions": {"provider_badge": "zulip"},
         },
@@ -1154,7 +1185,7 @@ def message_event_records(
             "provider_timestamp": float(message["timestamp"]),
             "content_sha256": content_sha256,
             "provider_content_sha256": provider_content_sha256,
-            "subject": str(message.get("subject", "")),
+            "subject": channel_subject if chat_type == "channel" else "",
             "mapping_origin": existing_message_metadata.get("mapping_origin", "zulip"),
             "workspace_delivery_state": (
                 "committed"
@@ -1314,13 +1345,20 @@ def _mapped_event_records(
         and event.get("orig_subject") is not None
         and event.get("subject") is not None
         and event.get("stream_id") is not None
-        and event["orig_subject"] != event["subject"]
+        and channel_topic_name(str(event["orig_subject"]))
+        != channel_topic_name(str(event["subject"]))
     ):
-        old_provider_id = f"{event['stream_id']}:{event['orig_subject']}"
+        old_topic_name = channel_topic_name(str(event["orig_subject"]))
+        new_topic_name = channel_topic_name(str(event["subject"]))
+        old_provider_id = channel_topic_provider_id(
+            event["stream_id"], old_topic_name
+        )
         old_topic = store.provider_mapping(account_uuid, "topic", old_provider_id)
         if old_topic is not None:
             topic_metadata = typing.cast(dict[str, object], old_topic["metadata"])
-            new_provider_id = f"{event['stream_id']}:{event['subject']}"
+            new_provider_id = channel_topic_provider_id(
+                event["stream_id"], new_topic_name
+            )
             renamed = store.rename_provider_mapping(
                 account_uuid,
                 "topic",
@@ -1351,7 +1389,7 @@ def _mapped_event_records(
                         ),
                         "payload": {
                             "stream_uuid": stream_uuid,
-                            "name": str(event["subject"]),
+                            "name": new_topic_name,
                         },
                         "extensions": {"provider_badge": "zulip"},
                     }
@@ -1495,10 +1533,14 @@ def _mapped_event_records(
                 ZulipLinkResolver(store, account_uuid, owner_uuid),
             )
             topic_name = str(event.get("subject", metadata.get("subject", "")))
-            if not topic_name:
+            if chat_key.startswith("channel:"):
+                topic_name = channel_topic_name(topic_name)
+            elif not topic_name:
                 topic_name = "default"
             topic_provider_id = (
-                f"{chat_key.removeprefix('channel:')}:{topic_name}"
+                channel_topic_provider_id(
+                    chat_key.removeprefix("channel:"), topic_name
+                )
                 if chat_key.startswith("channel:")
                 else f"{chat_key}:default"
             )

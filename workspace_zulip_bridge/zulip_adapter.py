@@ -493,10 +493,13 @@ class OfficialZulipAdapter:
                 "recent_private_conversations",
             ],
             "apply_markdown": False,
+            # Topic mappings require a non-empty provider name. Omitting the
+            # empty_topic_name capability makes Zulip use its "general chat"
+            # fallback for the special empty topic on live events, matching
+            # the representation returned by message history.
             "client_capabilities": {
                 "notification_settings_null": True,
                 "bulk_message_deletion": True,
-                "empty_topic_name": True,
             },
         }
         if int(getattr(self.client, "feature_level", 0)) >= 481:

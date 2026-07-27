@@ -1050,7 +1050,6 @@ def test_registration_requests_and_retains_catalog_snapshot_fields():
     assert client.registration_request["client_capabilities"] == {
         "notification_settings_null": True,
         "bulk_message_deletion": True,
-        "empty_topic_name": True,
     }
     assert client.registration_request["idle_queue_timeout"] == (
         zulip_adapter.PROVIDER_QUEUE_IDLE_TIMEOUT_SECONDS

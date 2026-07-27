@@ -424,6 +424,79 @@ def test_channel_message_waits_for_topic_and_accepts_former_author():
     assert not any(value["kind"] == "stream.upsert" for value in operations)
 
 
+@pytest.mark.parametrize("subject", ["", "general chat", "General Chat"])
+def test_empty_channel_topic_uses_backend_owned_default_topic(subject):
+    store = FakeStore(auto_materialize=False)
+    stream_uuid = str(uuid.uuid4())
+    default_topic_uuid = str(uuid.uuid4())
+    store.remember_provider_mapping(
+        ACCOUNT_UUID,
+        "stream",
+        "channel:42",
+        stream_uuid,
+        {
+            "chat_type": "channel",
+            "project_uuid": PROJECT_UUID,
+            "participants": [OWNER_UUID],
+            "name": "Engineering",
+            "description": "",
+            "private": False,
+            "default_topic_uuid": default_topic_uuid,
+        },
+    )
+
+    records = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {"id": 10, "type": "message", "message": _stream_message(subject=subject)},
+    )
+    operations = _operations(records)
+    message = next(value for value in operations if value["kind"] == "message.create")
+    topic = next(value for value in operations if value["kind"] == "topic.upsert")
+
+    assert message["payload"]["topic_uuid"] == default_topic_uuid
+    assert topic["entity_uuid"] == default_topic_uuid
+    assert topic["payload"] == {
+        "stream_uuid": stream_uuid,
+        "name": "general chat",
+    }
+    assert store.mappings[("topic", "42:general chat")]["workspace_uuid"] == (
+        default_topic_uuid
+    )
+    assert store.mappings[("message", "601")]["metadata"]["subject"] == (
+        "general chat"
+    )
+
+
+def test_empty_channel_topic_waits_for_backend_default_topic_assignment():
+    store = FakeStore(auto_materialize=False)
+    stream_uuid = str(uuid.uuid4())
+    store.remember_provider_mapping(
+        ACCOUNT_UUID,
+        "stream",
+        "channel:42",
+        stream_uuid,
+        {
+            "chat_type": "channel",
+            "project_uuid": PROJECT_UUID,
+            "participants": [OWNER_UUID],
+            "name": "Engineering",
+            "description": "",
+            "private": False,
+            "default_topic_uuid": None,
+        },
+    )
+
+    with pytest.raises(ValueError, match="provider_chat_assignment_pending"):
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "queue",
+            {"id": 10, "type": "message", "message": _stream_message(subject="")},
+        )
+
+
 def test_message_mutations_and_topic_rename_reuse_stable_mappings():
     store = FakeStore()
     create = {"id": 10, "type": "message", "message": _stream_message()}
