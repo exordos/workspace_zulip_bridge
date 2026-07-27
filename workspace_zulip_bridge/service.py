@@ -524,6 +524,7 @@ class BridgeService:
                 self.store.invalidate_provider_event_cursor(account_uuid)
                 cursor = None
             if cursor is None:
+                adapter.invalidate_queue()
                 queue_id, last_event_id = adapter.ensure_queue()
                 # Persist the queue before catalog, participant, or history work.
                 # A restart can then resume the same queue instead of opening a
@@ -1237,6 +1238,19 @@ class BridgeService:
         if account is None:
             return False
         generation = int(account["generation"])
+        cursor = self.store.provider_event_cursor(account_uuid)
+        if (
+            cursor is None
+            or cursor.get("provider_realm_uuid") is None
+            or cursor.get("provider_owner_user_id") is None
+        ):
+            return False
+        try:
+            provider_account_generation = int(cursor["provider_account_generation"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if provider_account_generation != generation:
+            return False
         return (
             self.store.provider_catchup_ready(account_uuid)
             and self.store.catalog_reports_accepted(account_uuid, generation)
