@@ -1255,6 +1255,66 @@ def test_pending_create_blocks_later_exact_read_in_same_causal_lane(postgres_sto
     assert postgres_store.claim("worker-two") is None
 
 
+def test_create_then_edit_lease_waits_for_message_mapping(postgres_store):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    stream_uuid, topic_uuid, author_uuid = _materialize_channel_projection(
+        postgres_store,
+        account_uuid,
+        project_uuid,
+    )
+    message_uuid = str(uuid.uuid4())
+    lease_expires_at = (
+        (datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=5))
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+    def leased(kind: str) -> dict[str, object]:
+        return {
+            "provider_operation_uuid": str(uuid.uuid4()),
+            "external_operation_uuid": str(uuid.uuid4()),
+            "lease_uuid": str(uuid.uuid4()),
+            "lease_expires_at": lease_expires_at,
+            "external_account_uuid": account_uuid,
+            "project_id": project_uuid,
+            "operation_kind": kind,
+            "required_capability": (
+                "messenger.message.send"
+                if kind == "message.create"
+                else "messenger.message.edit"
+            ),
+            "attempt": 1,
+            "payload": {
+                "uuid": message_uuid,
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "author_uuid": author_uuid,
+                "payload": {"kind": "markdown", "content": "edited"},
+            },
+        }
+
+    create = provider_protocol.leased_operation_record(
+        postgres_store,
+        leased("message.create"),
+    )
+    update = provider_protocol.leased_operation_record(
+        postgres_store,
+        leased("message.update"),
+    )
+
+    assert update["operation"]["provider"]["entity_id"] is None
+    assert postgres_store.enqueue(create, 0)
+    assert postgres_store.enqueue(update, 0)
+    assert create["sequence"] == 1
+    assert update["sequence"] == 2
+    assert update["predecessor_operation_uuid"] == create["operation_uuid"]
+
+    claimed = postgres_store.claim("create-worker")
+    assert claimed is not None
+    assert claimed.record["operation"]["kind"] == "message.create"
+    assert postgres_store.claim("update-worker") is None
+
+
 def test_exact_provider_read_lease_is_idempotent_and_ordered_in_postgres_scheduler(
     postgres_store,
 ):

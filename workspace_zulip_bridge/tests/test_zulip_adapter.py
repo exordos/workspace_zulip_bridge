@@ -531,6 +531,23 @@ def test_outbound_update_attachment_uses_real_external_chat_uuid():
     assert client.updated[0]["content"] == "[report.pdf](/user_uploads/file)"
 
 
+@pytest.mark.parametrize("kind", ["message.update", "message.delete"])
+def test_message_mutation_resolves_provider_id_after_create(kind):
+    client = FakeClient()
+    adapter = _adapter(client)
+    operation = _operation()
+    operation["kind"] = kind
+    operation["entity_uuid"] = MESSAGE_UUID
+
+    assert adapter.apply(operation) == ("99", None)
+    if kind == "message.update":
+        assert client.updated == [{"message_id": 99, "content": "hello"}]
+        assert client.deleted == []
+    else:
+        assert client.updated == []
+        assert client.deleted == [99]
+
+
 def test_zb_msg_003_lost_send_response_is_ambiguous_not_retryable():
     client = FakeClient()
     client.fail_send = True
