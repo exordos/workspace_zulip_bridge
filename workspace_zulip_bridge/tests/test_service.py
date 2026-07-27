@@ -1434,7 +1434,30 @@ def test_catalog_reports_accumulate_full_replacement_topology():
     }
 
 
-def test_channel_message_catalog_does_not_turn_authors_or_mentions_into_members():
+@pytest.mark.parametrize(
+    ("subject", "expected_topic"),
+    [
+        (
+            "General",
+            {
+                "provider_topic_id": "42:General",
+                "name": "General",
+                "is_default": False,
+            },
+        ),
+        (
+            "",
+            {
+                "provider_topic_id": "42:general chat",
+                "name": "general chat",
+                "is_default": True,
+            },
+        ),
+    ],
+)
+def test_channel_message_catalog_does_not_turn_authors_or_mentions_into_members(
+    subject, expected_topic
+):
     class Store:
         def __init__(self):
             self.reports = []
@@ -1483,7 +1506,7 @@ def test_channel_message_catalog_does_not_turn_authors_or_mentions_into_members(
                 "type": "stream",
                 "stream_id": 42,
                 "display_recipient": "Engineering",
-                "subject": "General",
+                "subject": subject,
                 "sender_id": 2,
                 "sender_full_name": "Former Member",
                 "sender_email": "former@example.test",
@@ -1495,13 +1518,7 @@ def test_channel_message_catalog_does_not_turn_authors_or_mentions_into_members(
 
     participants, topics, authoritative = instance.store.merge_calls[0]
     assert participants == []
-    assert topics == [
-        {
-            "provider_topic_id": "42:General",
-            "name": "General",
-            "is_default": False,
-        }
-    ]
+    assert topics == [expected_topic]
     assert authoritative is False
 
 

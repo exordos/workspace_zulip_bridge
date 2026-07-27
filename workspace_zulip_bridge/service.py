@@ -1154,12 +1154,17 @@ class BridgeService:
                 display_name = recipient
                 subject = message.get("subject")
                 stream_id = message.get("stream_id")
-                if isinstance(stream_id, int) and isinstance(subject, str) and subject:
+                if isinstance(stream_id, int) and isinstance(subject, str):
+                    topic_name = converter.channel_topic_name(subject)
                     topics.append(
                         {
-                            "provider_topic_id": f"{stream_id}:{subject}",
-                            "name": subject,
-                            "is_default": False,
+                            "provider_topic_id": (
+                                converter.channel_topic_provider_id(
+                                    stream_id, topic_name
+                                )
+                            ),
+                            "name": topic_name,
+                            "is_default": converter.is_empty_channel_topic(subject),
                         }
                     )
             elif isinstance(recipient, list):
@@ -1328,10 +1333,15 @@ class BridgeService:
             provider_content_sha256 = hashlib.sha256(
                 str(message["content"]).encode("utf-8")
             ).hexdigest()
-            current_subject = str(message.get("subject", ""))
+            current_subject = converter.channel_topic_name(
+                str(message.get("subject", ""))
+            )
+            mapped_subject = converter.channel_topic_name(
+                str(metadata.get("subject", ""))
+            )
             if (
                 metadata.get("provider_content_sha256") == provider_content_sha256
-                and metadata.get("subject", "") == current_subject
+                and mapped_subject == current_subject
             ):
                 continue
             event = {
@@ -1344,7 +1354,7 @@ class BridgeService:
                     "last_edit_timestamp", message["timestamp"]
                 ),
                 "stream_id": message.get("stream_id"),
-                "orig_subject": metadata.get("subject", current_subject),
+                "orig_subject": mapped_subject,
                 "subject": current_subject,
             }
             records = self._event_records_with_file_fallback(

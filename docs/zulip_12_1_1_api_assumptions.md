@@ -46,11 +46,16 @@ as `urn:url:<absolute-url>`. Outbound entity URNs are rendered with Zulip's
 native reference syntax when available, while DM and fallback links use
 absolute Zulip URLs.
 
-The bridge requests `notification_settings_null`, `bulk_message_deletion`, and
-`empty_topic_name` client capabilities. It accepts `null` channel notification
-settings as an instruction to inherit the user's global notification settings.
-It does not assume event IDs are gapless and persists each queue's last
-acknowledged event ID on the element's persistent PostgreSQL disk.
+The bridge requests the `notification_settings_null` and
+`bulk_message_deletion` client capabilities. It intentionally does not request
+`empty_topic_name`. Both the empty string from an older persisted queue and
+Zulip's history fallback name `general chat` identify the special empty topic;
+the bridge reports that topic as the Workspace channel's default topic and
+routes its messages through the backend-owned `default_topic_uuid`. It accepts
+`null` channel notification settings as an instruction to inherit the user's
+global notification settings. It does not assume event IDs are gapless and
+persists each queue's last acknowledged event ID on the element's persistent
+PostgreSQL disk.
 
 Zulip does not provide a general idempotency key for every mutation. For
 outgoing messages the bridge registers an event queue and persists `queue_id`
