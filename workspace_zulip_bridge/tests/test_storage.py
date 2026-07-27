@@ -705,7 +705,7 @@ def test_workspace_projection_contract_materializes_first_outbound_mappings():
                 {
                     "topic_uuid": topic_uuid,
                     "provider_topic_id": "direct:1,2:default",
-                    "name": "default",
+                    "name": "Zulip",
                     "is_default": True,
                 }
             ],

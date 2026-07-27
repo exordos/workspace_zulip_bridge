@@ -1183,7 +1183,7 @@ def test_registration_snapshot_queues_account_live_ready_and_chat_catalog_report
     assert direct["catalog"]["topics"] == [
         {
             "provider_topic_id": "direct:1,2:default",
-            "name": "default",
+            "name": "Zulip",
             "is_default": True,
         }
     ]

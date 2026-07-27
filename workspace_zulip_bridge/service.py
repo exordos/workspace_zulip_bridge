@@ -907,7 +907,7 @@ class BridgeService:
                 [
                     {
                         "provider_topic_id": f"{chat_key}:default",
-                        "name": "default",
+                        "name": converter.ZULIP_DIRECT_TOPIC_NAME,
                         "is_default": True,
                     }
                 ]
@@ -1199,7 +1199,7 @@ class BridgeService:
                         else [
                             {
                                 "provider_topic_id": f"{chat_key}:default",
-                                "name": "default",
+                                "name": converter.ZULIP_DIRECT_TOPIC_NAME,
                                 "is_default": True,
                             }
                         ]
