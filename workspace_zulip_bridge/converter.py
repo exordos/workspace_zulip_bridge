@@ -38,6 +38,7 @@ SCHEMELESS_WEB_TARGET_RE = re.compile(
     r"(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?::[0-9]+)?(?:[/?#].*)?"
 )
 ZULIP_EMPTY_TOPIC_FALLBACK_NAME = "general chat"
+ZULIP_DIRECT_TOPIC_NAME = "Zulip"
 
 
 def is_empty_channel_topic(subject: str) -> bool:
@@ -1123,7 +1124,11 @@ def message_event_records(
             "provider": _provider(chat_key, topic_provider_id),
             "payload": {
                 "stream_uuid": stream_uuid,
-                "name": channel_subject if chat_type == "channel" else "default",
+                "name": (
+                    channel_subject
+                    if chat_type == "channel"
+                    else ZULIP_DIRECT_TOPIC_NAME
+                ),
             },
             "extensions": {"provider_badge": "zulip"},
         },
@@ -1535,8 +1540,8 @@ def _mapped_event_records(
             topic_name = str(event.get("subject", metadata.get("subject", "")))
             if chat_key.startswith("channel:"):
                 topic_name = channel_topic_name(topic_name)
-            elif not topic_name:
-                topic_name = "default"
+            else:
+                topic_name = ZULIP_DIRECT_TOPIC_NAME
             topic_provider_id = (
                 channel_topic_provider_id(
                     chat_key.removeprefix("channel:"), topic_name

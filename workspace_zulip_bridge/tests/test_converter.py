@@ -223,6 +223,7 @@ def test_dm_conversion_has_owner_membership_identity_urn_and_copied_file():
     )
     operations = _operations(records)
     message = next(op for op in operations if op["kind"] == "message.create")
+    topic = next(op for op in operations if op["kind"] == "topic.upsert")
     participants = store.mappings[("stream", "direct:1,2")]["metadata"][
         "participants"
     ]
@@ -234,6 +235,7 @@ def test_dm_conversion_has_owner_membership_identity_urn_and_copied_file():
     assert "urn:file:" in markdown
     assert "/user_uploads/" not in markdown
     assert "> quoted" in markdown
+    assert topic["payload"]["name"] == "Zulip"
 
 
 def test_lossy_markdown_without_original_url_does_not_add_empty_link():
