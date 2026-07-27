@@ -1650,7 +1650,16 @@ def test_first_provider_poll_processes_registration_and_reports_live_ready():
     class Adapter:
         server_url = "https://zulip.example.invalid"
 
+        def __init__(self):
+            self.cached_queue = True
+            self.invalidations = 0
+
+        def invalidate_queue(self):
+            self.cached_queue = False
+            self.invalidations += 1
+
         def ensure_queue(self):
+            assert not self.cached_queue
             return "queue", 10
 
         def restore_queue(self, queue_id, event_id):
@@ -1668,9 +1677,10 @@ def test_first_provider_poll_processes_registration_and_reports_live_ready():
         def events(self, queue_id, event_id):
             return []
 
+    adapter = Adapter()
     instance = object.__new__(service.BridgeService)
     instance.store = Store()
-    instance.provider_adapters = lambda requested: Adapter()
+    instance.provider_adapters = lambda requested: adapter
     instance.scheduler = type(
         "Scheduler", (), {"reconcile_local_echo": lambda *args: None}
     )()
@@ -1681,6 +1691,7 @@ def test_first_provider_poll_processes_registration_and_reports_live_ready():
     )()
 
     assert instance._poll_provider_account(account_uuid) == (0, None)
+    assert adapter.invalidations == 1
     assert instance.store.cursor == {
         "queue_id": "queue",
         "last_event_id": 10,
@@ -1725,6 +1736,7 @@ def test_live_ready_requires_catalog_assignment_and_initial_backfill_gates():
 
     class Store:
         def __init__(self):
+            self.cursor = None
             self.ready = {
                 "catchup": True,
                 "catalog": False,
@@ -1734,6 +1746,9 @@ def test_live_ready_requires_catalog_assignment_and_initial_backfill_gates():
 
         def account_resource(self, requested):
             return {"generation": 3}
+
+        def provider_event_cursor(self, requested):
+            return self.cursor
 
         def reconcile_backfill_jobs(self):
             return None
@@ -1752,6 +1767,15 @@ def test_live_ready_requires_catalog_assignment_and_initial_backfill_gates():
 
     instance = object.__new__(service.BridgeService)
     instance.store = Store()
+    assert not instance._initial_sync_ready(account_uuid)
+    instance.store.cursor = {
+        "provider_realm_uuid": "00000000-0000-4000-8000-000000000002",
+        "provider_owner_user_id": "1",
+    }
+    assert not instance._initial_sync_ready(account_uuid)
+    instance.store.cursor["provider_account_generation"] = 2
+    assert not instance._initial_sync_ready(account_uuid)
+    instance.store.cursor["provider_account_generation"] = 3
     assert not instance._initial_sync_ready(account_uuid)
     instance.store.ready["catalog"] = True
     assert not instance._initial_sync_ready(account_uuid)
