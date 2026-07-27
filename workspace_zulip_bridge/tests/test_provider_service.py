@@ -180,6 +180,34 @@ def test_poll_provider_operations_durably_enqueues_exact_lease_binding():
     assert instance.store.health == [("provider_api", "healthy", None)]
 
 
+def test_poll_provider_operations_keeps_create_then_edit_in_durable_lane():
+    instance = _instance()
+    original_workspace_mapping = instance.store.workspace_mapping
+
+    def mapping_without_message(account_uuid, kind, workspace_uuid):
+        if kind == "message":
+            return None
+        return original_workspace_mapping(account_uuid, kind, workspace_uuid)
+
+    instance.store.workspace_mapping = mapping_without_message
+    create = _lease()
+    update = _lease()
+    update["operation_kind"] = "message.update"
+    update["required_capability"] = "messenger.message.edit"
+    instance.provider_api.leased = [create, update]
+
+    assert instance.poll_provider_operations() == 2
+
+    records = [record for record, priority in instance.store.enqueued if priority == 0]
+    assert [record["operation"]["kind"] for record in records] == [
+        "message.create",
+        "message.update",
+    ]
+    assert records[0]["causal_lane"] == records[1]["causal_lane"]
+    assert records[1]["operation"]["provider"]["entity_id"] is None
+    assert instance.provider_api.reported == []
+
+
 def test_empty_provider_operation_poll_recovers_api_health():
     instance = _instance()
 

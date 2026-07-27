@@ -266,6 +266,14 @@ class OfficialZulipAdapter:
             raise ZulipOperationError("not_found", False)
         return mapping
 
+    def _provider_message_id(self, operation: dict[str, object]) -> int:
+        provider = typing.cast(dict[str, object], operation["provider"])
+        entity_id = provider.get("entity_id")
+        if entity_id is None:
+            mapping = self._workspace_mapping("message", operation["entity_uuid"])
+            entity_id = mapping["provider_id"]
+        return int(str(entity_id))
+
     def _topic_message_mapping(self, topic_uuid: object) -> dict[str, object]:
         if self.routing is None:
             raise ZulipOperationError("not_found", False)
@@ -1129,8 +1137,9 @@ class OfficialZulipAdapter:
             chat_key = provider.get("chat_id")
             if not isinstance(chat_key, str):
                 raise ZulipOperationError("invalid_record", False)
+            message_id = self._provider_message_id(operation)
             request = {
-                "message_id": int(str(provider["entity_id"])),
+                "message_id": message_id,
                 "content": self._convert_workspace_markdown(
                     str(message["content"]), operation_uuid, chat_key
                 ),
@@ -1141,10 +1150,11 @@ class OfficialZulipAdapter:
                     previous.encode("utf-8")
                 ).hexdigest()
             _successful(self.client.update_message(request))
-            return str(provider["entity_id"]), None
+            return str(message_id), None
         if kind == "message.delete":
-            _successful(self.client.delete_message(int(str(provider["entity_id"]))))
-            return str(provider["entity_id"]), None
+            message_id = self._provider_message_id(operation)
+            _successful(self.client.delete_message(message_id))
+            return str(message_id), None
         if kind == "reaction.create":
             entity_id = self._add_reaction(
                 payload,

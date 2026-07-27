@@ -120,6 +120,16 @@ def leased_operation_record(store, leased: dict[str, object]) -> dict[str, objec
             payload["message_uuid"],
         )
         entity_id = str(message["provider_id"])
+    elif kind in {"message.update", "message.delete"}:
+        # A create and its mutation can arrive in the same lease batch. Keep
+        # the mutation durable; its causal predecessor installs this mapping.
+        mapping = store.workspace_mapping(
+            account_uuid,
+            entity_kind,
+            entity_uuid,
+        )
+        if mapping is not None:
+            entity_id = str(mapping["provider_id"])
     elif kind not in {"message.create", "read_state.set"}:
         mapping = _provider_mapping(store, account_uuid, entity_kind, entity_uuid)
         entity_id = str(mapping["provider_id"])

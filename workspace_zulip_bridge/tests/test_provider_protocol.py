@@ -48,6 +48,13 @@ class Store:
         return {"uuid": CHAT_UUID}
 
 
+class PendingMessageMappingStore(Store):
+    def workspace_mapping(self, account_uuid, kind, workspace_uuid):
+        if kind == "message":
+            return None
+        return super().workspace_mapping(account_uuid, kind, workspace_uuid)
+
+
 def _lease(kind="message.create"):
     return {
         "provider_operation_uuid": str(uuid.uuid4()),
@@ -96,6 +103,21 @@ def test_provider_reaction_lease_resolves_the_target_message_mapping():
     assert record["operation"]["kind"] == "reaction.create"
     assert record["operation"]["entity_uuid"] == REACTION_UUID
     assert record["operation"]["provider"]["entity_id"] == "101"
+    assert record["operation"]["provider"]["chat_id"] == "channel:42"
+
+
+@pytest.mark.parametrize("kind", ["message.update", "message.delete"])
+def test_provider_message_mutation_defers_missing_create_mapping(kind):
+    leased = _lease(kind)
+
+    record = provider_protocol.leased_operation_record(
+        PendingMessageMappingStore(),
+        leased,
+    )
+
+    assert record["operation"]["kind"] == kind
+    assert record["operation"]["entity_uuid"] == MESSAGE_UUID
+    assert record["operation"]["provider"]["entity_id"] is None
     assert record["operation"]["provider"]["chat_id"] == "channel:42"
 
 
