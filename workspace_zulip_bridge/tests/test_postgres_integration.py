@@ -71,6 +71,14 @@ def postgres_store(migrated_postgres_dsn):
     return store
 
 
+def _explain_text(session, query: str, parameters=()) -> str:
+    rows = session.execute(
+        f"EXPLAIN (COSTS OFF) {query}",
+        parameters,
+    ).fetchall()
+    return "\n".join(str(next(iter(row.values()))) for row in rows)
+
+
 def _insert_account_and_assignment(
     store: storage.RestAlchemyStore, history_depth: str = "30_days"
 ) -> tuple[str, str]:
@@ -355,6 +363,75 @@ def test_pending_observed_reports_supersede_older_unsent_resource_states(
         {"result_status": None, "count": 1},
         {"result_status": "superseded", "count": 2},
     ]
+
+
+def test_observed_report_hot_queries_use_migration_indexes(postgres_store):
+    resource_uuid = str(uuid.uuid4())
+    report = {
+        "report_uuid": str(uuid.uuid4()),
+        "resource_type": "external_account",
+        "resource_uuid": resource_uuid,
+        "observed_generation": 1,
+        "status": "backfill",
+        "observed_at": datetime.datetime.now(datetime.UTC).isoformat(),
+    }
+    assert postgres_store.enqueue_observed_report(report)
+
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            INSERT INTO observed_report_outbox (
+                report_uuid, body, completed_at
+            )
+            SELECT
+                md5('completed-report-' || sample::text)::uuid,
+                jsonb_build_object(
+                    'resource_type', 'external_account',
+                    'resource_uuid',
+                    md5('completed-resource-' || sample::text)::uuid::text
+                ),
+                now()
+            FROM generate_series(1, 1000) AS sample
+            ON CONFLICT (report_uuid) DO NOTHING
+            """
+        )
+        session.execute("ANALYZE observed_report_outbox")
+        dedup_plan = _explain_text(
+            session,
+            """
+            SELECT body FROM observed_report_outbox
+            WHERE body->>'resource_type' = %s
+              AND body->>'resource_uuid' = %s
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            ("external_account", resource_uuid),
+        )
+        pending_rank_plan = _explain_text(
+            session,
+            """
+            SELECT report_uuid,
+                   row_number() OVER (
+                       PARTITION BY body->>'resource_type',
+                                    body->>'resource_uuid'
+                       ORDER BY created_at DESC, report_uuid DESC
+                   ) AS position
+            FROM observed_report_outbox
+            WHERE completed_at IS NULL
+            """,
+        )
+        pending_order_plan = _explain_text(
+            session,
+            """
+            SELECT body FROM observed_report_outbox
+            WHERE completed_at IS NULL AND available_at <= now()
+            ORDER BY created_at LIMIT 500
+            """,
+        )
+
+    assert "observed_report_outbox_resource_latest_idx" in dedup_plan
+    assert "observed_report_outbox_pending_order_idx" in pending_rank_plan
+    assert "observed_report_outbox_pending_order_idx" in pending_order_plan
 
 
 def _provider_record(
