@@ -440,6 +440,38 @@ class OfficialZulipAdapter:
             reverse=True,
         )
 
+    def message_by_id(
+        self, provider_message_id: int
+    ) -> dict[str, object] | None:
+        try:
+            result = _successful(
+                self.client.get_messages(
+                    {
+                        "anchor": provider_message_id,
+                        "num_before": 0,
+                        "num_after": 0,
+                        "apply_markdown": False,
+                        "narrow": [
+                            {"operator": "id", "operand": provider_message_id}
+                        ],
+                    }
+                )
+            )
+        except PROVIDER_NETWORK_ERRORS as exc:
+            raise ZulipOperationError("provider_unavailable", True) from exc
+        messages = result.get("messages")
+        if not isinstance(messages, list):
+            raise ZulipOperationError("invalid_record", False)
+        return next(
+            (
+                typing.cast(dict[str, object], message)
+                for message in messages
+                if isinstance(message, dict)
+                and message.get("id") == provider_message_id
+            ),
+            None,
+        )
+
     def restore_queue(self, queue_id: str, last_event_id: int) -> None:
         self._queue_id = queue_id
         self._last_event_id = last_event_id

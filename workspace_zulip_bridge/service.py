@@ -1613,6 +1613,26 @@ class BridgeService:
                                     self.store, account_uuid
                                 ).external_chat_uuid(chat_key)
                             )
+                elif event["type"] == "reaction":
+                    provider_message_id = int(str(event["message_id"]))
+                    mapping = self.store.provider_mapping(
+                        account_uuid, "message", str(provider_message_id)
+                    )
+                    if mapping is None:
+                        provider_message = adapter.message_by_id(provider_message_id)
+                        if provider_message is None:
+                            raise ValueError("provider_message_not_found")
+                        _, chat_key = converter.provider_chat_reference(
+                            provider_message
+                        )
+                        converter.provider_chat_assignment(
+                            self.store, account_uuid, chat_key
+                        )
+                        external_chat_uuid = uuid.UUID(
+                            converter.stable_entity_uuid(
+                                account_uuid, "external_chat", chat_key
+                            )
+                        )
                 records = self._event_records_with_file_fallback(
                     adapter,
                     account_uuid,
@@ -1646,7 +1666,10 @@ class BridgeService:
                         str(exc),
                     )
                     continue
-                if str(exc) == "provider_chat_not_selected":
+                if str(exc) in {
+                    "provider_chat_not_selected",
+                    "provider_message_not_found",
+                }:
                     records = []
                 else:
                     self.store.mark_provider_event_invalid(
