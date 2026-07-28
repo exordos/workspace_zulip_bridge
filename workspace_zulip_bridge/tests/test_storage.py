@@ -80,6 +80,135 @@ def test_provider_mapping_by_name_uses_case_insensitive_live_metadata_lookup():
     assert parameters == (account_uuid, "stream", "engineering")
 
 
+def test_workspace_mapping_prefers_active_alias_over_stale_primary_mapping():
+    alias_row = {
+        "workspace_uuid": uuid.uuid4(),
+        "provider_id": "42:current topic",
+        "provider_revision": "3",
+        "metadata": {"name": "current topic"},
+    }
+    session = Session((alias_row,))
+    store = _store_with_session(session)
+    account_uuid = str(uuid.uuid4())
+    workspace_uuid = str(alias_row["workspace_uuid"])
+
+    assert (
+        store.workspace_mapping(account_uuid, "topic", workspace_uuid) == alias_row
+    )
+    statement, parameters = session.statements[0]
+    assert "alias.metadata, 0 AS source_order" in statement
+    assert "1 AS source_order" in statement
+    assert parameters == (
+        account_uuid,
+        "topic",
+        workspace_uuid,
+        account_uuid,
+        "topic",
+        workspace_uuid,
+    )
+
+
+def test_accepted_provider_message_context_uses_immutable_delivery_record():
+    context = {
+        "project_uuid": str(uuid.uuid4()),
+        "message_uuid": str(uuid.uuid4()),
+        "chat_key": "channel:42",
+        "stream_uuid": str(uuid.uuid4()),
+        "topic_uuid": str(uuid.uuid4()),
+        "author_uuid": str(uuid.uuid4()),
+        "message_operation": {
+            "kind": "message.create",
+            "payload": {"payload": {"kind": "markdown", "content": "rendered"}},
+        },
+        "accepted_records": [
+            {
+                "operation_uuid": str(uuid.uuid4()),
+                "operation": {"kind": "identity.upsert"},
+            },
+            {
+                "operation_uuid": str(uuid.uuid4()),
+                "operation": {"kind": "message.create"},
+            },
+        ],
+        "accepted_records_complete": True,
+    }
+    session = Session((context,))
+    store = _store_with_session(session)
+    account_uuid = str(uuid.uuid4())
+    queue_id = str(uuid.uuid4())
+
+    assert (
+        store.accepted_provider_message_context(account_uuid, queue_id, 17)
+        == context
+    )
+    statement, parameters = session.statements[0]
+    assert "WITH provider_event AS" in statement
+    assert "provider_event.prepared_records" in statement
+    assert "FROM workspace_delivery_outbox" in statement
+    assert "provider_queue_id = %s" in statement
+    assert "provider_event_id = %s" in statement
+    assert "'message.create'" in statement
+    assert "record->'operation' AS message_operation" in statement
+    assert "jsonb_agg(" in statement
+    assert "AS accepted_records" in statement
+    assert "AS accepted_records_complete" in statement
+    assert parameters == (
+        account_uuid,
+        queue_id,
+        17,
+        account_uuid,
+        queue_id,
+        17,
+    )
+
+
+def test_prepare_provider_event_records_allocates_and_persists_full_sequence():
+    account_uuid = str(uuid.uuid4())
+    queue_id = "queue"
+    event_id = 17
+    record = {
+        "record_uuid": str(uuid.uuid4()),
+        "operation_uuid": str(uuid.uuid4()),
+        "account_uuid": account_uuid,
+        "project_uuid": str(uuid.uuid4()),
+        "origin": "zulip",
+        "causal_lane": f"chat:{account_uuid}:channel:42",
+        "sequence": 0,
+        "predecessor_operation_uuid": None,
+        "operation_sha256": "",
+        "operation": {"kind": "message.create"},
+    }
+
+    class PreparingSession(Session):
+        def execute(self, statement, parameters=None):
+            self.statements.append((statement, parameters))
+            if "SELECT processing_state, prepared_records" in statement:
+                return Result(
+                    ({"processing_state": "pending", "prepared_records": None},)
+                )
+            if "INSERT INTO producer_lane_counters" in statement:
+                return Result(({"last_sequence": 0, "last_operation_uuid": None},))
+            return Result()
+
+    session = PreparingSession()
+    store = _store_with_session(session)
+
+    prepared = store.prepare_provider_event_records(
+        account_uuid, queue_id, event_id, [record]
+    )
+
+    assert prepared[0]["sequence"] == 1
+    assert prepared[0]["operation_sha256"]
+    assert record["sequence"] == 0
+    update = next(
+        (statement, parameters)
+        for statement, parameters in session.statements
+        if "SET prepared_records = %s" in statement
+    )
+    assert json.loads(update[1][0]) == prepared
+    assert update[1][1:] == (account_uuid, queue_id, event_id)
+
+
 def test_catalog_participants_merge_is_monotonic_and_enriches_placeholders():
     current = [
         {
@@ -280,6 +409,13 @@ def test_snapshot_invalidates_cursors_from_other_account_generations():
     assert "cursor.provider_account_generation IS NULL" in statement
     assert "account.generation" in statement
     assert "cursor.provider_account_generation" in statement
+    alias_tombstone = next(
+        sql
+        for sql, _parameters in session.statements
+        if "UPDATE provider_mapping_aliases" in sql
+    )
+    assert "entity_kind = 'topic'" in alias_tombstone
+    assert "NOT deleted" in alias_tombstone
 
 
 def test_expired_running_lease_reaper_is_atomic_and_idempotent():
@@ -624,7 +760,7 @@ def test_stale_result_cannot_replace_terminal_result():
         store.accept_result(stale)
 
 
-def test_projection_mapping_replacement_deletes_workspace_conflict_before_upsert():
+def test_topic_projection_replacement_preserves_displaced_workspace_alias():
     session = Session()
     account_uuid = str(uuid.uuid4())
     workspace_uuid = str(uuid.uuid4())
@@ -638,15 +774,37 @@ def test_projection_mapping_replacement_deletes_workspace_conflict_before_upsert
         {"name": "new topic"},
     )
 
-    assert len(session.statements) == 2
+    assert len(session.statements) == 4
     delete_statement, delete_parameters = session.statements[0]
-    insert_statement, insert_parameters = session.statements[1]
+    restore_statement, restore_parameters = session.statements[1]
+    alias_statement, alias_parameters = session.statements[2]
+    insert_statement, insert_parameters = session.statements[3]
     assert "DELETE FROM provider_mappings" in delete_statement
     assert delete_parameters == (
         account_uuid,
         "topic",
         workspace_uuid,
         "42:new-topic",
+    )
+    assert "UPDATE provider_mapping_aliases" in restore_statement
+    assert "provider_id = %s" in restore_statement
+    assert "workspace_uuid <> %s" in restore_statement
+    assert restore_parameters == (
+        json.dumps({"name": "new topic"}),
+        account_uuid,
+        "topic",
+        "42:new-topic",
+        workspace_uuid,
+    )
+    assert "INSERT INTO provider_mapping_aliases" in alias_statement
+    assert "mapping.workspace_uuid <> %s" in alias_statement
+    assert alias_parameters == (
+        "42:new-topic",
+        json.dumps({"name": "new topic"}),
+        account_uuid,
+        "topic",
+        "42:new-topic",
+        workspace_uuid,
     )
     assert "INSERT INTO provider_mappings" in insert_statement
     assert "WITH removed_stale_workspace_mapping" not in insert_statement
@@ -657,6 +815,49 @@ def test_projection_mapping_replacement_deletes_workspace_conflict_before_upsert
         "42:new-topic",
     )
     assert json.loads(insert_parameters[4]) == {"name": "new topic"}
+
+
+def test_provider_topic_rename_moves_workspace_aliases_to_current_provider_id():
+    account_uuid = str(uuid.uuid4())
+    workspace_uuid = str(uuid.uuid4())
+    row = {
+        "workspace_uuid": workspace_uuid,
+        "provider_id": "42:renamed",
+        "provider_revision": "2",
+        "metadata": {"name": "renamed"},
+    }
+    session = Session((row,))
+    store = _store_with_session(session)
+
+    assert store.rename_provider_mapping(
+        account_uuid,
+        "topic",
+        "42:old",
+        "42:renamed",
+        {"name": "renamed"},
+        "2",
+    ) == row
+
+    assert len(session.statements) == 2
+    primary_statement, primary_parameters = session.statements[0]
+    alias_statement, alias_parameters = session.statements[1]
+    assert "UPDATE provider_mappings" in primary_statement
+    assert primary_parameters == (
+        "42:renamed",
+        "2",
+        json.dumps({"name": "renamed"}),
+        account_uuid,
+        "topic",
+        "42:old",
+    )
+    assert "UPDATE provider_mapping_aliases" in alias_statement
+    assert alias_parameters == (
+        "42:renamed",
+        json.dumps({"name": "renamed"}),
+        account_uuid,
+        "topic",
+        "42:old",
+    )
 
 
 def test_workspace_projection_contract_materializes_first_outbound_mappings():
@@ -714,7 +915,7 @@ def test_workspace_projection_contract_materializes_first_outbound_mappings():
 
     storage.RestAlchemyStore._materialize_workspace_projection(session, assignment)
 
-    assert len(session.statements) == 8
+    assert len(session.statements) == 10
     inserts = [
         parameters
         for statement, parameters in session.statements
@@ -756,7 +957,7 @@ def test_exact_backend_assignment_fixture_materializes_owned_topology():
     )
     session = Session()
     storage.RestAlchemyStore._materialize_workspace_projection(session, fixture)
-    assert len(session.statements) == 10
+    assert len(session.statements) == 14
     materialized = []
     for statement, parameters in session.statements:
         if "INSERT INTO provider_mappings" not in statement:
@@ -824,6 +1025,17 @@ def test_projection_tombstone_includes_all_assignment_owned_entities():
         "80000000-0000-4000-8000-000000000008",
         "81000000-0000-4000-8000-000000000081",
     }
+    alias_statement, alias_parameters = session.statements[1]
+    assert "UPDATE provider_mapping_aliases" in alias_statement
+    assert "metadata->>'stream_uuid' = %s" in alias_statement
+    assert alias_parameters == (
+        fixture["external_account_uuid"],
+        [
+            "70000000-0000-4000-8000-000000000007",
+            "71000000-0000-4000-8000-000000000071",
+        ],
+        fixture["workspace_projection"]["stream"]["uuid"],
+    )
 
 
 def test_backfill_depth_is_assignment_owned():
@@ -903,3 +1115,4 @@ def test_stale_assignment_delivery_is_removed_and_provider_event_replayed():
     assert "assignment.body->>'project_id'" in statement
     assert "RETURNING operation_uuid" in statement
     assert "priority, record" in statement
+    assert "assignment_project_uuid" in statement

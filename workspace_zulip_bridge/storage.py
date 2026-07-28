@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import dataclasses
 import datetime
 import hashlib
@@ -503,6 +504,13 @@ class RestAlchemyStore:
                 WHERE entity_kind IN ('identity', 'stream', 'topic') AND NOT deleted
                 """
             )
+            session.execute(
+                """
+                UPDATE provider_mapping_aliases
+                SET deleted = true, updated_at = now()
+                WHERE entity_kind = 'topic' AND NOT deleted
+                """
+            )
             session.execute("DELETE FROM desired_resources")
             for resource in validated:
                 session.execute(
@@ -560,6 +568,54 @@ class RestAlchemyStore:
             """,
             (account_uuid, entity_kind, workspace_uuid, provider_id),
         )
+        if entity_kind == "topic":
+            # A provider rename can make the backend recanonicalize the same
+            # provider topic under a new Workspace UUID. Keep the displaced
+            # UUID routable instead of silently orphaning its existing topic.
+            session.execute(
+                """
+                UPDATE provider_mapping_aliases
+                SET metadata = %s, deleted = false, updated_at = now()
+                WHERE account_uuid = %s AND entity_kind = %s
+                  AND provider_id = %s AND workspace_uuid <> %s
+                """,
+                (
+                    json.dumps(metadata),
+                    account_uuid,
+                    entity_kind,
+                    provider_id,
+                    workspace_uuid,
+                ),
+            )
+            session.execute(
+                """
+                INSERT INTO provider_mapping_aliases (
+                    account_uuid, entity_kind, workspace_uuid, provider_id,
+                    metadata, deleted
+                )
+                SELECT mapping.account_uuid, mapping.entity_kind,
+                       mapping.workspace_uuid, %s, %s, false
+                FROM provider_mappings AS mapping
+                WHERE mapping.account_uuid = %s
+                  AND mapping.entity_kind = %s
+                  AND mapping.provider_id = %s
+                  AND mapping.workspace_uuid <> %s
+                ON CONFLICT (
+                    account_uuid, entity_kind, workspace_uuid
+                ) DO UPDATE SET
+                    provider_id = EXCLUDED.provider_id,
+                    metadata = EXCLUDED.metadata,
+                    deleted = false, updated_at = now()
+                """,
+                (
+                    provider_id,
+                    json.dumps(metadata),
+                    account_uuid,
+                    entity_kind,
+                    provider_id,
+                    workspace_uuid,
+                ),
+            )
         session.execute(
             """
             INSERT INTO provider_mappings (
@@ -713,6 +769,22 @@ class RestAlchemyStore:
                 str(stream["uuid"]),
                 topic_uuids,
                 participant_uuids,
+            ),
+        )
+        session.execute(
+            """
+            UPDATE provider_mapping_aliases
+            SET deleted = true, updated_at = now()
+            WHERE account_uuid = %s AND entity_kind = 'topic'
+              AND (
+                  workspace_uuid = ANY(%s)
+                  OR metadata->>'stream_uuid' = %s
+              )
+            """,
+            (
+                str(assignment["external_account_uuid"]),
+                topic_uuids,
+                str(stream["uuid"]),
             ),
         )
 
@@ -907,19 +979,21 @@ class RestAlchemyStore:
     def workspace_mapping(
         self, account_uuid: str, entity_kind: str, workspace_uuid: str
     ) -> dict[str, object] | None:
+        # An active alias is an explicit redirect from a displaced Workspace
+        # UUID and must outrank a stale primary row retained in a full projection.
         with self.session() as session:
             return session.execute(
                 """
                 SELECT workspace_uuid, provider_id, provider_revision, metadata
                 FROM (
                     SELECT workspace_uuid, provider_id, provider_revision, metadata,
-                           0 AS source_order
+                           1 AS source_order
                     FROM provider_mappings
                     WHERE account_uuid = %s AND entity_kind = %s
                       AND workspace_uuid = %s AND NOT deleted
                     UNION ALL
                     SELECT alias.workspace_uuid, alias.provider_id,
-                           mapping.provider_revision, alias.metadata, 1 AS source_order
+                           mapping.provider_revision, alias.metadata, 0 AS source_order
                     FROM provider_mapping_aliases AS alias
                     LEFT JOIN provider_mappings AS mapping
                       ON mapping.account_uuid = alias.account_uuid
@@ -957,6 +1031,77 @@ class RestAlchemyStore:
                 LIMIT 1
                 """,
                 (account_uuid, topic_uuid),
+            ).fetchone()
+
+    def accepted_provider_message_context(
+        self, account_uuid: str, queue_id: str, event_id: int
+    ) -> dict[str, object] | None:
+        with self.session() as session:
+            return session.execute(
+                """
+                WITH provider_event AS (
+                    SELECT prepared_records, processing_state
+                    FROM zulip_provider_events
+                    WHERE account_uuid = %s AND queue_id = %s
+                      AND event_id = %s
+                ),
+                outbox_records AS (
+                    SELECT record, created_at
+                    FROM workspace_delivery_outbox
+                    WHERE account_uuid = %s AND provider_queue_id = %s
+                      AND provider_event_id = %s
+                ),
+                accepted_sequence AS (
+                    SELECT COALESCE(
+                        provider_event.prepared_records,
+                        (
+                            SELECT jsonb_agg(
+                                outbox_record.record
+                                ORDER BY outbox_record.created_at
+                            )
+                            FROM outbox_records AS outbox_record
+                        )
+                    ) AS records,
+                    provider_event.prepared_records IS NOT NULL
+                    OR provider_event.processing_state IN (
+                        'delivering', 'processed'
+                    ) AS complete
+                    FROM provider_event
+                ),
+                accepted AS (
+                    SELECT accepted_record.record
+                    FROM accepted_sequence,
+                    LATERAL jsonb_array_elements(
+                        accepted_sequence.records
+                    ) WITH ORDINALITY AS accepted_record(record, position)
+                )
+                SELECT message_delivery.record->>'project_uuid' AS project_uuid,
+                       message_delivery.record->'operation'->>'entity_uuid'
+                           AS message_uuid,
+                       message_delivery.record->'operation'->'provider'->>'chat_id'
+                           AS chat_key,
+                       message_delivery.record->'operation'->'payload'->>'stream_uuid'
+                           AS stream_uuid,
+                       message_delivery.record->'operation'->'payload'->>'topic_uuid'
+                           AS topic_uuid,
+                       message_delivery.record->'operation'->'payload'->>'author_uuid'
+                           AS author_uuid,
+                       message_delivery.record->'operation' AS message_operation,
+                       accepted_sequence.records AS accepted_records,
+                       accepted_sequence.complete AS accepted_records_complete
+                FROM accepted AS message_delivery, accepted_sequence
+                WHERE message_delivery.record->'operation'->>'kind'
+                    = 'message.create'
+                LIMIT 1
+                """,
+                (
+                    account_uuid,
+                    queue_id,
+                    event_id,
+                    account_uuid,
+                    queue_id,
+                    event_id,
+                ),
             ).fetchone()
 
     def workspace_message_mappings_through(
@@ -1075,6 +1220,23 @@ class RestAlchemyStore:
                     old_provider_id,
                 ),
             ).fetchone()
+            if row is not None:
+                session.execute(
+                    """
+                    UPDATE provider_mapping_aliases
+                    SET provider_id = %s, metadata = %s,
+                        deleted = false, updated_at = now()
+                    WHERE account_uuid = %s AND entity_kind = %s
+                      AND provider_id = %s AND NOT deleted
+                    """,
+                    (
+                        new_provider_id,
+                        json.dumps(metadata),
+                        account_uuid,
+                        entity_kind,
+                        old_provider_id,
+                    ),
+                )
             return row
 
     def mark_provider_mapping_deleted(
@@ -1274,6 +1436,47 @@ class RestAlchemyStore:
             None if predecessor is None else str(predecessor)
         )
         record["operation_sha256"] = canonical.operation_digest(record)
+
+    def prepare_provider_event_records(
+        self,
+        account_uuid: str,
+        queue_id: str,
+        event_id: int,
+        records: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        """Persist the complete immutable event sequence before enqueueing it."""
+        with self.session() as session:
+            provider_event = session.execute(
+                """
+                SELECT processing_state, prepared_records
+                FROM zulip_provider_events
+                WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
+                FOR UPDATE
+                """,
+                (account_uuid, queue_id, event_id),
+            ).fetchone()
+            if provider_event is None:
+                raise ValueError("unknown_provider_event")
+            prepared = provider_event["prepared_records"]
+            if prepared is not None:
+                if not isinstance(prepared, list):
+                    raise ValueError("invalid_prepared_provider_event")
+                return copy.deepcopy(prepared)
+            if provider_event["processing_state"] != "pending":
+                raise ValueError("provider_event_not_pending")
+            prepared = copy.deepcopy(records)
+            for record in prepared:
+                self._allocate_producer_lane(session, record)
+            session.execute(
+                """
+                UPDATE zulip_provider_events
+                SET prepared_records = %s
+                WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
+                  AND processing_state = 'pending'
+                """,
+                (json.dumps(prepared), account_uuid, queue_id, event_id),
+            )
+            return prepared
 
     def enqueue_workspace_delivery(
         self,
@@ -1727,6 +1930,152 @@ class RestAlchemyStore:
             ).fetchall()
             return [typing.cast(dict[str, object], row["record"]) for row in rows]
 
+    @staticmethod
+    def _recover_provider_event_assignment_change(
+        session: sessions.PgSQLSession,
+        account_uuid: str,
+        queue_id: str,
+        event_id: int,
+        selected_assignment_exists: bool | None = None,
+    ) -> bool:
+        """Drop abandoned projections and replay an unsubmitted message."""
+        provider_event = session.execute(
+            """
+            SELECT prepared_records
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
+            FOR UPDATE
+            """,
+            (account_uuid, queue_id, event_id),
+        ).fetchone()
+        if provider_event is None:
+            return False
+        prepared_records = provider_event["prepared_records"]
+        prepared = (
+            typing.cast(list[dict[str, object]], prepared_records)
+            if isinstance(prepared_records, list)
+            else []
+        )
+        chat_keys: set[str] = set()
+        message_create_operation_uuids: list[str] = []
+        for record in prepared:
+            operation = record.get("operation")
+            if not isinstance(operation, dict):
+                continue
+            provider = operation.get("provider")
+            if isinstance(provider, dict) and provider.get("chat_id") is not None:
+                chat_keys.add(str(provider["chat_id"]))
+            if operation.get("kind") != "message.create":
+                continue
+            operation_uuid = record.get("operation_uuid")
+            if not isinstance(operation_uuid, str):
+                continue
+            message_create_operation_uuids.append(operation_uuid)
+            provider_id = (
+                None
+                if not isinstance(provider, dict)
+                else provider.get("entity_id")
+            )
+            if provider_id is None:
+                continue
+            session.execute(
+                """
+                UPDATE provider_mappings AS mapping
+                SET deleted = true, updated_at = now()
+                WHERE mapping.account_uuid = %s
+                  AND mapping.entity_kind = 'message'
+                  AND mapping.provider_id = %s
+                  AND mapping.workspace_uuid = %s
+                  AND mapping.metadata->>'project_uuid' = %s
+                  AND mapping.metadata->>'workspace_delivery_state' = 'pending'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM workspace_delivery_outbox AS delivery
+                      WHERE delivery.operation_uuid = %s
+                  )
+                """,
+                (
+                    account_uuid,
+                    str(provider_id),
+                    str(operation["entity_uuid"]),
+                    str(record["project_uuid"]),
+                    operation_uuid,
+                ),
+            )
+        if selected_assignment_exists is None:
+            selected_assignment_exists = False
+            if chat_keys:
+                selected_assignment_exists = (
+                    session.execute(
+                        """
+                        SELECT 1
+                        FROM desired_resources
+                        WHERE resource_type = 'external_chat_assignment'
+                          AND NOT deleted
+                          AND body->>'external_account_uuid' = %s
+                          AND body->'provider_chat'->>'provider_chat_key'
+                              = ANY(%s)
+                          AND COALESCE(
+                              (body->>'selected')::boolean, true
+                          )
+                        LIMIT 1
+                        """,
+                        (account_uuid, sorted(chat_keys)),
+                    ).fetchone()
+                    is not None
+                )
+        submitted_message = None
+        if message_create_operation_uuids:
+            submitted_message = session.execute(
+                """
+                SELECT 1
+                FROM workspace_delivery_outbox
+                WHERE account_uuid = %s AND provider_queue_id = %s
+                  AND provider_event_id = %s
+                  AND operation_uuid = ANY(%s)
+                LIMIT 1
+                """,
+                (
+                    account_uuid,
+                    queue_id,
+                    event_id,
+                    message_create_operation_uuids,
+                ),
+            ).fetchone()
+        if (
+            selected_assignment_exists
+            and message_create_operation_uuids
+            and submitted_message is None
+        ):
+            # Setup operations can already be submitting while message.create
+            # has not reached the outbox. Forget the old target snapshot and
+            # reconvert that message against the current assignment before
+            # processing later edits.
+            session.execute(
+                """
+                UPDATE zulip_provider_events
+                SET processing_state = 'pending', available_at = now(),
+                    processing_reason = 'assignment_changed',
+                    prepared_records = NULL
+                WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
+                  AND processing_state IN ('pending', 'delivering')
+                """,
+                (account_uuid, queue_id, event_id),
+            )
+            return True
+        session.execute(
+            """
+            UPDATE zulip_provider_events
+            SET processing_state = 'processed',
+                processing_reason = 'assignment_changed',
+                prepared_records = NULL
+            WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
+              AND processing_state IN ('pending', 'delivering')
+            """,
+            (account_uuid, queue_id, event_id),
+        )
+        return False
+
     def reset_stale_workspace_deliveries(self) -> int:
         with self.session() as session:
             stale = session.execute(
@@ -1761,7 +2110,8 @@ class RestAlchemyStore:
                     )
                 )
                 RETURNING operation_uuid, account_uuid,
-                          provider_queue_id, provider_event_id, priority, record
+                          assignment_project_uuid, provider_queue_id,
+                          provider_event_id, priority, record
                 """
             ).fetchall()
             if not stale:
@@ -1775,6 +2125,7 @@ class RestAlchemyStore:
                 """,
                 (operation_ids,),
             )
+            recovered_provider_events: set[tuple[str, str, int]] = set()
             for row in stale:
                 if row["priority"] == 2:
                     record = typing.cast(dict[str, object], row["record"])
@@ -1804,21 +2155,104 @@ class RestAlchemyStore:
                         )
                 if row["provider_queue_id"] is None:
                     continue
-                session.execute(
+                provider_event_key = (
+                    str(row["account_uuid"]),
+                    str(row["provider_queue_id"]),
+                    int(row["provider_event_id"]),
+                )
+                if provider_event_key in recovered_provider_events:
+                    continue
+                recovered_provider_events.add(provider_event_key)
+                record = typing.cast(dict[str, object], row["record"])
+                operation = typing.cast(
+                    dict[str, object] | None,
+                    record.get("operation"),
+                )
+                provider = (
+                    typing.cast(dict[str, object], operation["provider"])
+                    if operation is not None
+                    else {}
+                )
+                current_assignment = session.execute(
                     """
-                    UPDATE zulip_provider_events
-                    SET processing_state = 'pending', available_at = now(),
-                        processing_reason = 'assignment_changed'
-                    WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
-                      AND processing_state = 'delivering'
+                    SELECT body->>'project_id' AS project_uuid
+                    FROM desired_resources
+                    WHERE resource_type = 'external_chat_assignment'
+                      AND NOT deleted
+                      AND body->>'external_account_uuid' = %s
+                      AND body->'provider_chat'->>'provider_chat_key' = %s
+                      AND COALESCE((body->>'selected')::boolean, true)
+                    LIMIT 1
                     """,
                     (
-                        row["account_uuid"],
-                        row["provider_queue_id"],
-                        row["provider_event_id"],
+                        str(row["account_uuid"]),
+                        str(provider.get("chat_id", "")),
                     ),
+                ).fetchone()
+                same_project = (
+                    current_assignment is not None
+                    and str(current_assignment["project_uuid"])
+                    == str(row["assignment_project_uuid"])
+                )
+                if same_project:
+                    session.execute(
+                        """
+                        UPDATE zulip_provider_events
+                        SET processing_state = 'pending', available_at = now(),
+                            processing_reason = 'assignment_changed'
+                        WHERE account_uuid = %s AND queue_id = %s
+                          AND event_id = %s
+                          AND processing_state = 'delivering'
+                        """,
+                        (
+                            row["account_uuid"],
+                            row["provider_queue_id"],
+                            row["provider_event_id"],
+                        ),
+                    )
+                    continue
+                self._recover_provider_event_assignment_change(
+                    session,
+                    str(row["account_uuid"]),
+                    str(row["provider_queue_id"]),
+                    int(row["provider_event_id"]),
+                    current_assignment is not None,
                 )
             return len(stale)
+
+    def finalize_provider_event_assignment_changed(
+        self,
+        account_uuid: str,
+        queue_id: str,
+        event_id: int,
+    ) -> bool:
+        """Recover or finish an event whose prepared target is no longer active."""
+        with self.session() as session:
+            removed = session.execute(
+                """
+                DELETE FROM workspace_delivery_outbox
+                WHERE account_uuid = %s AND provider_queue_id = %s
+                  AND provider_event_id = %s AND sent_at IS NULL
+                  AND submission_state = 'pending'
+                RETURNING operation_uuid
+                """,
+                (account_uuid, queue_id, event_id),
+            ).fetchall()
+            if removed:
+                session.execute(
+                    """
+                    DELETE FROM operation_idempotency
+                    WHERE operation_uuid = ANY(%s)
+                      AND terminal_outcome IS NULL
+                    """,
+                    ([row["operation_uuid"] for row in removed],),
+                )
+            return self._recover_provider_event_assignment_change(
+                session,
+                account_uuid,
+                queue_id,
+                event_id,
+            )
 
     def mark_interrupted_workspace_deliveries_ambiguous(self) -> int:
         with self.session() as session:
@@ -1944,7 +2378,8 @@ class RestAlchemyStore:
                     )
                 session.execute(
                     """
-                    UPDATE zulip_provider_events SET processing_state = 'processed'
+                    UPDATE zulip_provider_events
+                    SET processing_state = 'processed', prepared_records = NULL
                     WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
                       AND processing_state = 'delivering'
                     """,

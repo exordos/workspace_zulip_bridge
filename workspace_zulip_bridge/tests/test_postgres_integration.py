@@ -65,7 +65,7 @@ def postgres_store(migrated_postgres_dsn):
                      operation_idempotency, producer_lane_counters,
                      producer_operations, causal_lane_state, bridge_operations,
                      scheduler_accounts, observed_report_outbox,
-                     zulip_event_cursors CASCADE
+                     zulip_provider_events, zulip_event_cursors CASCADE
             """
         )
     return store
@@ -279,6 +279,176 @@ def test_desired_assignment_can_replace_provider_id_for_workspace_uuid(
     assert replacement["metadata"]["name"] == "new topic"
     assert replacement["metadata"]["stream_uuid"] == stream_uuid
     assert postgres_store.control_cursor() == "cursor-2"
+
+
+def test_topic_recanonicalization_keeps_previous_workspace_route(postgres_store):
+    account_uuid = str(uuid.uuid4())
+    assignment_uuid = str(uuid.uuid4())
+    project_uuid = str(uuid.uuid4())
+    stream_uuid = str(uuid.uuid4())
+    original_topic_uuid = str(uuid.uuid4())
+    canonical_topic_uuid = str(uuid.uuid4())
+
+    def change(generation, topic_uuid, provider_topic_id, topic_name):
+        resource = {
+            "resource_type": "external_chat_assignment",
+            "uuid": assignment_uuid,
+            "generation": generation,
+            "external_account_uuid": account_uuid,
+            "project_id": project_uuid,
+            "provider_chat": {
+                "provider_chat_key": "channel:42",
+                "chat_type": "channel",
+            },
+            "workspace_projection": {
+                "stream": {
+                    "uuid": stream_uuid,
+                    "name": "Engineering",
+                    "description": "",
+                    "private": False,
+                    "default_topic_uuid": None,
+                },
+                "participants": [],
+                "topics": [
+                    {
+                        "topic_uuid": topic_uuid,
+                        "provider_topic_id": provider_topic_id,
+                        "name": topic_name,
+                        "is_default": False,
+                    }
+                ],
+            },
+        }
+        return {
+            "change_uuid": str(uuid.uuid4()),
+            "sequence": generation,
+            "resource_type": "external_chat_assignment",
+            "resource_uuid": assignment_uuid,
+            "operation": "upsert",
+            "generation": generation,
+            "required_capabilities": {},
+            "resource": resource,
+        }
+
+    postgres_store.apply_desired_changes(
+        [change(1, original_topic_uuid, "42:topic", "topic")],
+        "cursor-1",
+    )
+    renamed = postgres_store.rename_provider_mapping(
+        account_uuid,
+        "topic",
+        "42:topic",
+        "42:resolved topic",
+        {
+            "stream_uuid": stream_uuid,
+            "chat_key": "channel:42",
+            "name": "resolved topic",
+            "is_default": False,
+        },
+        "2",
+    )
+    assert renamed is not None
+    assert str(renamed["workspace_uuid"]) == original_topic_uuid
+
+    postgres_store.apply_desired_changes(
+        [
+            change(
+                2,
+                canonical_topic_uuid,
+                "42:resolved topic",
+                "resolved topic",
+            )
+        ],
+        "cursor-2",
+    )
+
+    current = postgres_store.provider_mapping(
+        account_uuid, "topic", "42:resolved topic"
+    )
+    assert current is not None
+    assert str(current["workspace_uuid"]) == canonical_topic_uuid
+    previous_route = postgres_store.workspace_mapping(
+        account_uuid, "topic", original_topic_uuid
+    )
+    assert previous_route is not None
+    assert previous_route["provider_id"] == "42:resolved topic"
+    assert previous_route["metadata"]["name"] == "resolved topic"
+    canonical_route = postgres_store.workspace_mapping(
+        account_uuid, "topic", canonical_topic_uuid
+    )
+    assert canonical_route is not None
+    assert canonical_route["provider_id"] == "42:resolved topic"
+
+    postgres_store.apply_desired_changes(
+        [
+            change(
+                3,
+                canonical_topic_uuid,
+                "42:resolved topic",
+                "resolved topic",
+            )
+        ],
+        "cursor-3",
+    )
+    retained_route = postgres_store.workspace_mapping(
+        account_uuid, "topic", original_topic_uuid
+    )
+    assert retained_route is not None
+    assert retained_route["provider_id"] == "42:resolved topic"
+
+    retained_snapshot = dict(
+        change(
+            4,
+            canonical_topic_uuid,
+            "42:resolved topic",
+            "resolved topic",
+        )["resource"]
+    )
+    retained_snapshot["required_capabilities"] = {}
+    postgres_store.install_snapshot([retained_snapshot], "cursor-4")
+    snapshot_route = postgres_store.workspace_mapping(
+        account_uuid, "topic", original_topic_uuid
+    )
+    assert snapshot_route is not None
+    assert snapshot_route["provider_id"] == "42:resolved topic"
+
+    postgres_store.rename_provider_mapping(
+        account_uuid,
+        "topic",
+        "42:resolved topic",
+        "42:renamed again",
+        {
+            "stream_uuid": stream_uuid,
+            "chat_key": "channel:42",
+            "name": "renamed again",
+            "is_default": False,
+        },
+        "5",
+    )
+
+    mixed_projection = change(
+        5,
+        canonical_topic_uuid,
+        "42:renamed again",
+        "renamed again",
+    )
+    projection = mixed_projection["resource"]["workspace_projection"]
+    projection["topics"].insert(
+        0,
+        {
+            "topic_uuid": original_topic_uuid,
+            "provider_topic_id": "42:resolved topic",
+            "name": "resolved topic",
+            "is_default": False,
+        },
+    )
+    postgres_store.apply_desired_changes([mixed_projection], "cursor-5")
+
+    for topic_uuid in (original_topic_uuid, canonical_topic_uuid):
+        route = postgres_store.workspace_mapping(account_uuid, "topic", topic_uuid)
+        assert route is not None
+        assert route["provider_id"] == "42:renamed again"
+        assert route["metadata"]["name"] == "renamed again"
 
 
 def test_observed_report_state_can_recover_to_a_previous_value(postgres_store):
@@ -1189,6 +1359,761 @@ def test_provider_mapping_written_before_event_delivery_recovers_same_message(
     assert len(recovered) == 1
     assert recovered[0]["record"]["operation"]["entity_uuid"] == pending_workspace_uuid
     assert recovered[0]["record"]["record_uuid"] == first_create["record_uuid"]
+
+
+def test_live_message_replay_reuses_accepted_link_after_topic_recanonicalization(
+    postgres_store,
+):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    _, original_topic_uuid, _ = _materialize_channel_projection(
+        postgres_store, account_uuid, project_uuid
+    )
+    postgres_store.rename_provider_mapping(
+        account_uuid,
+        "topic",
+        "42:Topic",
+        "42:✔ resolved topic",
+        {"stream_uuid": str(uuid.uuid4()), "chat_key": "channel:42"},
+    )
+    message = _provider_history_message(602)
+    message["subject"] = "✔ resolved topic"
+    message["content"] = (
+        "#**Engineering>✔ resolved topic** @**Mentioned user|99**"
+    )
+    message["flags"] = ["read"]
+    queue_id = "provider-message:602"
+    event_id = 17
+    event = {"id": event_id, "type": "message", "message": message}
+    assert postgres_store.record_provider_event(account_uuid, queue_id, event)
+    accepted = converter.event_records(
+        postgres_store,
+        account_uuid,
+        queue_id,
+        event,
+    )
+    accepted = postgres_store.prepare_provider_event_records(
+        account_uuid, queue_id, event_id, accepted
+    )
+    assert accepted[-1]["operation"]["kind"] == "read_state.set"
+    for record in accepted[:-1]:
+        assert postgres_store.enqueue_workspace_delivery(
+            record, 0, queue_id, event_id
+        )
+    accepted_message = next(
+        record
+        for record in accepted
+        if record["operation"]["kind"] == "message.create"
+    )
+    assert any(
+        record["operation"]["kind"] == "identity.upsert"
+        and record["operation"]["provider"]["entity_id"] == "99"
+        for record in accepted
+    )
+    assert (
+        f"urn:topic:{original_topic_uuid}"
+        in accepted_message["operation"]["payload"]["payload"]["content"]
+    )
+
+    canonical_topic_uuid = str(uuid.uuid4())
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE provider_mappings
+            SET workspace_uuid = %s
+            WHERE account_uuid = %s AND entity_kind = 'topic'
+              AND provider_id = '42:✔ resolved topic'
+            """,
+            (canonical_topic_uuid, account_uuid),
+        )
+        session.execute(
+            """
+            UPDATE provider_mappings
+            SET metadata = jsonb_set(metadata, '{topic_uuid}', to_jsonb(%s::text))
+            WHERE account_uuid = %s AND entity_kind = 'message'
+              AND provider_id = '602'
+            """,
+            (canonical_topic_uuid, account_uuid),
+        )
+
+    replay = converter.event_records(
+        postgres_store,
+        account_uuid,
+        queue_id,
+        event,
+    )
+
+    assert [
+        (
+            record["operation_uuid"],
+            record["operation"]["kind"],
+            record["operation_sha256"],
+        )
+        for record in replay
+    ] == [
+        (
+            record["operation_uuid"],
+            record["operation"]["kind"],
+            record["operation_sha256"],
+        )
+        for record in accepted
+    ]
+    enqueue_results = [
+        postgres_store.enqueue_workspace_delivery(record, 0, queue_id, event_id)
+        for record in replay
+    ]
+    assert enqueue_results == [False] * (len(replay) - 1) + [True]
+    with postgres_store.session() as session:
+        stored_kinds = [
+            row["kind"]
+            for row in session.execute(
+                """
+                SELECT record->'operation'->>'kind' AS kind
+                FROM workspace_delivery_outbox
+                WHERE account_uuid = %s AND provider_queue_id = %s
+                  AND provider_event_id = %s
+                ORDER BY created_at
+                """,
+                (account_uuid, queue_id, event_id),
+            ).fetchall()
+        ]
+    assert stored_kinds == [
+        record["operation"]["kind"] for record in accepted
+    ]
+
+    # A sent prefix can survive an assignment replacement while an unsent tail
+    # is discarded as stale. Keep the prepared snapshot through delivering so
+    # the event can requeue the missing tail under the new generation.
+    postgres_store.mark_provider_event_delivering(
+        account_uuid, queue_id, event_id
+    )
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE workspace_delivery_outbox
+            SET submission_state = 'sent', sent_at = now()
+            WHERE account_uuid = %s AND provider_queue_id = %s
+              AND provider_event_id = %s
+              AND record->'operation'->>'kind' != 'read_state.set'
+            """,
+            (account_uuid, queue_id, event_id),
+        )
+        session.execute(
+            """
+            UPDATE desired_resources
+            SET generation = generation + 1
+            WHERE resource_type = 'external_chat_assignment'
+            """
+        )
+
+    assert postgres_store.reset_stale_workspace_deliveries() == 1
+    with postgres_store.session() as session:
+        interrupted = session.execute(
+            """
+            SELECT processing_state, prepared_records
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
+            """,
+            (account_uuid, queue_id, event_id),
+        ).fetchone()
+    assert interrupted["processing_state"] == "pending"
+    assert interrupted["prepared_records"] == accepted
+
+    assignment_replay = converter.event_records(
+        postgres_store,
+        account_uuid,
+        queue_id,
+        event,
+    )
+    assignment_replay = postgres_store.prepare_provider_event_records(
+        account_uuid, queue_id, event_id, assignment_replay
+    )
+    assert assignment_replay == accepted
+    assignment_enqueue_results = [
+        postgres_store.enqueue_workspace_delivery(record, 0, queue_id, event_id)
+        for record in assignment_replay
+    ]
+    assert assignment_enqueue_results == [False] * (len(accepted) - 1) + [True]
+    with postgres_store.session() as session:
+        restored = session.execute(
+            """
+            SELECT count(*) AS total,
+                   count(*) FILTER (
+                       WHERE record->'operation'->>'kind' = 'message.create'
+                   ) AS messages,
+                   count(*) FILTER (
+                       WHERE record->'operation'->>'kind' = 'read_state.set'
+                   ) AS read_states
+            FROM workspace_delivery_outbox
+            WHERE account_uuid = %s AND provider_queue_id = %s
+              AND provider_event_id = %s
+            """,
+            (account_uuid, queue_id, event_id),
+        ).fetchone()
+    assert restored == {
+        "total": len(accepted),
+        "messages": 1,
+        "read_states": 1,
+    }
+    postgres_store.mark_provider_event_delivering(
+        account_uuid, queue_id, event_id
+    )
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE workspace_delivery_outbox
+            SET submission_state = 'sent', sent_at = now()
+            WHERE account_uuid = %s AND provider_queue_id = %s
+              AND provider_event_id = %s
+            """,
+            (account_uuid, queue_id, event_id),
+        )
+    assert postgres_store.finalize_ready_provider_events() == 1
+    with postgres_store.session() as session:
+        completed = session.execute(
+            """
+            SELECT processing_state, prepared_records
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
+            """,
+            (account_uuid, queue_id, event_id),
+        ).fetchone()
+    assert completed == {
+        "processing_state": "processed",
+        "prepared_records": None,
+    }
+
+
+@pytest.mark.parametrize("assignment_change", ["project", "deselected", "deleted"])
+def test_partial_live_event_finishes_when_assignment_target_is_removed(
+    postgres_store,
+    assignment_change,
+):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    _materialize_channel_projection(postgres_store, account_uuid, project_uuid)
+    message = _provider_history_message(603)
+    message["flags"] = ["read"]
+    queue_id = "provider-message:603"
+    event_id = 18
+    event = {"id": event_id, "type": "message", "message": message}
+    assert postgres_store.record_provider_event(account_uuid, queue_id, event)
+    prepared = converter.event_records(
+        postgres_store,
+        account_uuid,
+        queue_id,
+        event,
+    )
+    prepared = postgres_store.prepare_provider_event_records(
+        account_uuid, queue_id, event_id, prepared
+    )
+    for record in prepared:
+        assert postgres_store.enqueue_workspace_delivery(
+            record, 0, queue_id, event_id
+        )
+    postgres_store.mark_provider_event_delivering(
+        account_uuid, queue_id, event_id
+    )
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE workspace_delivery_outbox
+            SET submission_state = 'sent', sent_at = now()
+            WHERE account_uuid = %s AND provider_queue_id = %s
+              AND provider_event_id = %s
+              AND record->'operation'->>'kind' != 'read_state.set'
+            """,
+            (account_uuid, queue_id, event_id),
+        )
+        if assignment_change == "project":
+            session.execute(
+                """
+                UPDATE desired_resources
+                SET generation = generation + 1,
+                    body = jsonb_set(
+                        body,
+                        '{project_id}',
+                        to_jsonb(%s::text)
+                    )
+                WHERE resource_type = 'external_chat_assignment'
+                """,
+                (str(uuid.uuid4()),),
+            )
+        elif assignment_change == "deselected":
+            session.execute(
+                """
+                UPDATE desired_resources
+                SET generation = generation + 1,
+                    body = jsonb_set(body, '{selected}', 'false'::jsonb)
+                WHERE resource_type = 'external_chat_assignment'
+                """
+            )
+        else:
+            session.execute(
+                """
+                UPDATE desired_resources
+                SET generation = generation + 1, deleted = true
+                WHERE resource_type = 'external_chat_assignment'
+                """
+            )
+
+    assert postgres_store.reset_stale_workspace_deliveries() == 1
+    with postgres_store.session() as session:
+        provider_event = session.execute(
+            """
+            SELECT processing_state, processing_reason, prepared_records
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
+            """,
+            (account_uuid, queue_id, event_id),
+        ).fetchone()
+        deliveries = session.execute(
+            """
+            SELECT count(*) AS total,
+                   count(*) FILTER (WHERE sent_at IS NULL) AS unsent,
+                   count(*) FILTER (
+                       WHERE record->'operation'->>'kind' = 'message.create'
+                   ) AS messages,
+                   count(*) FILTER (
+                       WHERE record->'operation'->>'kind' = 'read_state.set'
+                   ) AS read_states
+            FROM workspace_delivery_outbox
+            WHERE account_uuid = %s AND provider_queue_id = %s
+              AND provider_event_id = %s
+            """,
+            (account_uuid, queue_id, event_id),
+        ).fetchone()
+    assert provider_event == {
+        "processing_state": "processed",
+        "processing_reason": "assignment_changed",
+        "prepared_records": None,
+    }
+    assert deliveries == {
+        "total": len(prepared) - 1,
+        "unsent": 0,
+        "messages": 1,
+        "read_states": 0,
+    }
+    assert postgres_store.pending_provider_events() == []
+
+
+def test_enqueue_assignment_change_race_requeues_unsubmitted_prefix(postgres_store):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    queue_id = "provider-message:604"
+    event_id = 19
+    event = {"id": event_id, "type": "heartbeat"}
+    assert postgres_store.record_provider_event(account_uuid, queue_id, event)
+    records = [
+        _provider_record(account_uuid, project_uuid),
+        _provider_record(account_uuid, project_uuid),
+    ]
+    records = postgres_store.prepare_provider_event_records(
+        account_uuid, queue_id, event_id, records
+    )
+    assert postgres_store.enqueue_workspace_delivery(
+        records[0], 0, queue_id, event_id
+    )
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE desired_resources
+            SET generation = generation + 1,
+                body = jsonb_set(
+                    body,
+                    '{project_id}',
+                    to_jsonb(%s::text)
+                )
+            WHERE resource_type = 'external_chat_assignment'
+            """,
+            (str(uuid.uuid4()),),
+        )
+    with pytest.raises(ValueError, match="provider_chat_assignment_pending"):
+        postgres_store.enqueue_workspace_delivery(
+            records[1], 0, queue_id, event_id
+        )
+
+    assert (
+        postgres_store.finalize_provider_event_assignment_changed(
+            account_uuid,
+            queue_id,
+            event_id,
+        )
+        is True
+    )
+
+    with postgres_store.session() as session:
+        provider_event = session.execute(
+            """
+            SELECT processing_state, processing_reason, prepared_records
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
+            """,
+            (account_uuid, queue_id, event_id),
+        ).fetchone()
+        pending_deliveries = session.execute(
+            """
+            SELECT count(*) AS count
+            FROM workspace_delivery_outbox
+            WHERE account_uuid = %s AND provider_queue_id = %s
+              AND provider_event_id = %s AND sent_at IS NULL
+            """,
+            (account_uuid, queue_id, event_id),
+        ).fetchone()["count"]
+        idempotency_rows = session.execute(
+            """
+            SELECT count(*) AS count
+            FROM operation_idempotency
+            WHERE operation_uuid = ANY(%s)
+            """,
+            ([record["operation_uuid"] for record in records],),
+        ).fetchone()["count"]
+    assert provider_event == {
+        "processing_state": "pending",
+        "processing_reason": "assignment_changed",
+        "prepared_records": None,
+    }
+    assert pending_deliveries == 0
+    assert idempotency_rows == 0
+    postgres_store.mark_provider_event_processed(
+        account_uuid,
+        queue_id,
+        event_id,
+        True,
+    )
+
+
+@pytest.mark.parametrize(
+    "submit_topic_prefix",
+    [False, True],
+    ids=["pending-prefix", "submitted-topic-prefix"],
+)
+def test_assignment_move_before_message_enqueue_replays_create_and_update(
+    postgres_store,
+    submit_topic_prefix,
+):
+    account_uuid, old_project_uuid = _insert_account_and_assignment(postgres_store)
+    _materialize_channel_projection(
+        postgres_store,
+        account_uuid,
+        old_project_uuid,
+    )
+    message = _provider_history_message(605)
+    create_queue_id = "provider-message:605"
+    create_event_id = 20
+    create_event = {
+        "id": create_event_id,
+        "type": "message",
+        "message": message,
+    }
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        create_queue_id,
+        create_event,
+    )
+    prepared = converter.event_records(
+        postgres_store,
+        account_uuid,
+        create_queue_id,
+        create_event,
+    )
+    prepared = postgres_store.prepare_provider_event_records(
+        account_uuid,
+        create_queue_id,
+        create_event_id,
+        prepared,
+    )
+    message_index = next(
+        index
+        for index, record in enumerate(prepared)
+        if record["operation"]["kind"] == "message.create"
+    )
+    for record in prepared[:message_index]:
+        assert postgres_store.enqueue_workspace_delivery(
+            record,
+            0,
+            create_queue_id,
+            create_event_id,
+        )
+    if submit_topic_prefix:
+        topic_record = next(
+            record
+            for record in prepared[:message_index]
+            if record["operation"]["kind"] == "topic.upsert"
+        )
+        assert postgres_store.mark_workspace_delivery_submitting(
+            topic_record["record_uuid"]
+        )
+        postgres_store.mark_workspace_delivery_submitted(
+            topic_record["record_uuid"]
+        )
+
+    pending_mapping = postgres_store.provider_mapping(
+        account_uuid,
+        "message",
+        "605",
+    )
+    assert pending_mapping["metadata"]["workspace_delivery_state"] == "pending"
+    assert pending_mapping["metadata"]["project_uuid"] == old_project_uuid
+
+    new_project_uuid = str(uuid.uuid4())
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE desired_resources
+            SET generation = generation + 1,
+                body = jsonb_set(
+                    body,
+                    '{project_id}',
+                    to_jsonb(%s::text)
+                )
+            WHERE resource_type = 'external_chat_assignment'
+            """,
+            (new_project_uuid,),
+        )
+
+    with pytest.raises(ValueError, match="provider_chat_assignment_pending"):
+        postgres_store.enqueue_workspace_delivery(
+            prepared[message_index],
+            0,
+            create_queue_id,
+            create_event_id,
+        )
+    assert (
+        postgres_store.finalize_provider_event_assignment_changed(
+            account_uuid,
+            create_queue_id,
+            create_event_id,
+        )
+        is True
+    )
+
+    with postgres_store.session() as session:
+        create_state = session.execute(
+            """
+            SELECT processing_state, processing_reason, prepared_records
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
+            """,
+            (account_uuid, create_queue_id, create_event_id),
+        ).fetchone()
+        remaining_deliveries = session.execute(
+            """
+            SELECT count(*) AS count
+            FROM workspace_delivery_outbox
+            WHERE account_uuid = %s AND provider_queue_id = %s
+              AND provider_event_id = %s
+            """,
+            (account_uuid, create_queue_id, create_event_id),
+        ).fetchone()["count"]
+    assert create_state == {
+        "processing_state": "pending",
+        "processing_reason": "assignment_changed",
+        "prepared_records": None,
+    }
+    assert remaining_deliveries == int(submit_topic_prefix)
+    assert postgres_store.provider_mapping(account_uuid, "message", "605") is None
+
+    replay = converter.event_records(
+        postgres_store,
+        account_uuid,
+        create_queue_id,
+        create_event,
+    )
+    replay = postgres_store.prepare_provider_event_records(
+        account_uuid,
+        create_queue_id,
+        create_event_id,
+        replay,
+    )
+    assert {record["project_uuid"] for record in replay} == {new_project_uuid}
+    assert {
+        record["operation_uuid"] for record in replay
+    }.isdisjoint(
+        record["operation_uuid"] for record in prepared
+    )
+    replay_results = [
+        postgres_store.enqueue_workspace_delivery(
+            record,
+            0,
+            create_queue_id,
+            create_event_id,
+        )
+        for record in replay
+    ]
+    assert any(
+        enqueued and record["operation"]["kind"] == "message.create"
+        for record, enqueued in zip(replay, replay_results, strict=True)
+    )
+
+    moved_mapping = postgres_store.provider_mapping(
+        account_uuid,
+        "message",
+        "605",
+    )
+    assert moved_mapping["metadata"]["workspace_delivery_state"] == "pending"
+    assert moved_mapping["metadata"]["project_uuid"] == new_project_uuid
+
+    update_queue_id = "provider-message-update:605"
+    update_event_id = 21
+    update_event = {
+        "id": update_event_id,
+        "type": "update_message",
+        "message_id": 605,
+        "message_ids": [605],
+        "content": "edited after assignment move",
+        "edit_timestamp": 1_700_000_001,
+        "stream_id": 42,
+        "orig_subject": "Topic",
+        "subject": "Topic",
+    }
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        update_queue_id,
+        update_event,
+    )
+    update_records = converter.event_records(
+        postgres_store,
+        account_uuid,
+        update_queue_id,
+        update_event,
+    )
+    update_records = postgres_store.prepare_provider_event_records(
+        account_uuid,
+        update_queue_id,
+        update_event_id,
+        update_records,
+    )
+    assert {record["project_uuid"] for record in update_records} == {
+        new_project_uuid
+    }
+    assert any(
+        record["operation"]["kind"] == "message.update"
+        for record in update_records
+    )
+    update_enqueue_results = [
+        postgres_store.enqueue_workspace_delivery(
+            record,
+            0,
+            update_queue_id,
+            update_event_id,
+        )
+        for record in update_records
+    ]
+    assert any(
+        enqueued and record["operation"]["kind"] == "message.update"
+        for record, enqueued in zip(
+            update_records,
+            update_enqueue_results,
+            strict=True,
+        )
+    )
+    postgres_store.mark_provider_event_processed(
+        account_uuid,
+        create_queue_id,
+        create_event_id,
+        True,
+    )
+    postgres_store.mark_provider_event_processed(
+        account_uuid,
+        update_queue_id,
+        update_event_id,
+        True,
+    )
+
+
+def test_stale_reset_replays_message_when_project_moves_before_submission(
+    postgres_store,
+):
+    account_uuid, old_project_uuid = _insert_account_and_assignment(postgres_store)
+    _materialize_channel_projection(
+        postgres_store,
+        account_uuid,
+        old_project_uuid,
+    )
+    message = _provider_history_message(606)
+    queue_id = "provider-message:606"
+    event_id = 22
+    event = {"id": event_id, "type": "message", "message": message}
+    assert postgres_store.record_provider_event(account_uuid, queue_id, event)
+    prepared = converter.event_records(
+        postgres_store,
+        account_uuid,
+        queue_id,
+        event,
+    )
+    prepared = postgres_store.prepare_provider_event_records(
+        account_uuid,
+        queue_id,
+        event_id,
+        prepared,
+    )
+    for record in prepared:
+        assert postgres_store.enqueue_workspace_delivery(
+            record,
+            0,
+            queue_id,
+            event_id,
+        )
+    postgres_store.mark_provider_event_delivering(
+        account_uuid,
+        queue_id,
+        event_id,
+    )
+
+    new_project_uuid = str(uuid.uuid4())
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE desired_resources
+            SET generation = generation + 1,
+                body = jsonb_set(
+                    body,
+                    '{project_id}',
+                    to_jsonb(%s::text)
+                )
+            WHERE resource_type = 'external_chat_assignment'
+            """,
+            (new_project_uuid,),
+        )
+
+    assert postgres_store.reset_stale_workspace_deliveries() == len(prepared)
+    with postgres_store.session() as session:
+        provider_event = session.execute(
+            """
+            SELECT processing_state, processing_reason, prepared_records
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
+            """,
+            (account_uuid, queue_id, event_id),
+        ).fetchone()
+        remaining_deliveries = session.execute(
+            """
+            SELECT count(*) AS count
+            FROM workspace_delivery_outbox
+            WHERE account_uuid = %s AND provider_queue_id = %s
+              AND provider_event_id = %s
+            """,
+            (account_uuid, queue_id, event_id),
+        ).fetchone()["count"]
+    assert provider_event == {
+        "processing_state": "pending",
+        "processing_reason": "assignment_changed",
+        "prepared_records": None,
+    }
+    assert remaining_deliveries == 0
+    assert postgres_store.provider_mapping(account_uuid, "message", "606") is None
+
+    replay = converter.event_records(
+        postgres_store,
+        account_uuid,
+        queue_id,
+        event,
+    )
+    assert {record["project_uuid"] for record in replay} == {new_project_uuid}
+    postgres_store.mark_provider_event_processed(
+        account_uuid,
+        queue_id,
+        event_id,
+        True,
+    )
 
 
 def test_lane_allocation_is_atomic_with_durable_outbox(postgres_store):

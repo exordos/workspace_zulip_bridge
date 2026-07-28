@@ -1,8 +1,9 @@
+import copy
 import uuid
 
 import pytest
 
-from workspace_zulip_bridge import converter
+from workspace_zulip_bridge import canonical, converter
 
 ACCOUNT_UUID = str(uuid.uuid4())
 OWNER_UUID = str(uuid.uuid4())
@@ -22,6 +23,7 @@ class FakeStore:
         self.assignments = {}
         self.mappings = {}
         self.positions = {}
+        self.accepted_contexts = {}
         self.auto_materialize = auto_materialize
 
     def account_resource(self, account_uuid):
@@ -112,6 +114,9 @@ class FakeStore:
             ),
             None,
         )
+
+    def accepted_provider_message_context(self, account_uuid, queue_id, event_id):
+        return self.accepted_contexts.get((account_uuid, queue_id, event_id))
 
     def remember_provider_mapping(
         self,
@@ -1036,6 +1041,190 @@ def test_provider_mapping_before_event_delivery_replays_same_workspace_message_u
     assert message["entity_uuid"] == pending_workspace_uuid
     assert message["entity_uuid"] != converter.stable_entity_uuid(
         ACCOUNT_UUID, "message", "601"
+    )
+
+
+def test_live_message_replay_keeps_digest_after_topic_recanonicalization():
+    class InitiallyUnmappedMentionStore(FakeStore):
+        def provider_mapping(self, account_uuid, entity_kind, provider_id):
+            if (
+                entity_kind == "identity"
+                and provider_id == "99"
+                and (entity_kind, provider_id) not in self.mappings
+            ):
+                return None
+            return super().provider_mapping(account_uuid, entity_kind, provider_id)
+
+    store = InitiallyUnmappedMentionStore()
+    event = {
+        "id": 17,
+        "type": "message",
+        "message": _stream_message(601, "✔ resolved topic"),
+    }
+    event["message"]["content"] = (
+        "#**Engineering>✔ resolved topic** @**Mentioned user|99**"
+    )
+    accepted = converter.event_records(store, ACCOUNT_UUID, "queue", event)
+    assert any(
+        record["operation"]["kind"] == "identity.upsert"
+        and record["operation"]["provider"]["entity_id"] == "99"
+        for record in accepted
+    )
+    message_mapping = store.mappings[("message", "601")]
+    original_topic_uuid = message_mapping["metadata"]["topic_uuid"]
+    accepted_message = next(
+        record
+        for record in accepted
+        if record["operation"]["kind"] == "message.create"
+    )
+    accepted_payload = accepted_message["operation"]["payload"]
+    store.accepted_contexts[(ACCOUNT_UUID, "queue", 17)] = {
+        "project_uuid": accepted_message["project_uuid"],
+        "message_uuid": accepted_message["operation"]["entity_uuid"],
+        "chat_key": accepted_message["operation"]["provider"]["chat_id"],
+        "stream_uuid": accepted_payload["stream_uuid"],
+        "topic_uuid": accepted_payload["topic_uuid"],
+        "author_uuid": accepted_payload["author_uuid"],
+        "message_operation": accepted_message["operation"],
+        "accepted_records": accepted,
+        "accepted_records_complete": True,
+    }
+    message_mapping["metadata"]["workspace_delivery_state"] = "committed"
+    del message_mapping["metadata"]["provider_event_id"]
+    topic_mapping = store.mappings[("topic", "42:✔ resolved topic")]
+    canonical_topic_uuid = str(uuid.uuid4())
+    topic_mapping["workspace_uuid"] = canonical_topic_uuid
+    message_mapping["metadata"]["topic_uuid"] = canonical_topic_uuid
+
+    replay = converter.event_records(store, ACCOUNT_UUID, "queue", event)
+
+    assert [
+        (
+            record["operation_uuid"],
+            record["operation"]["kind"],
+            record["operation_sha256"],
+        )
+        for record in replay
+    ] == [
+        (
+            record["operation_uuid"],
+            record["operation"]["kind"],
+            record["operation_sha256"],
+        )
+        for record in accepted
+    ]
+    replay_message = next(
+        operation
+        for operation in _operations(replay)
+        if operation["kind"] == "message.create"
+    )
+    assert replay_message["payload"]["topic_uuid"] == original_topic_uuid
+    assert (
+        replay_message["payload"]["payload"]["content"]
+        == accepted_payload["payload"]["content"]
+    )
+    assert f"urn:topic:{original_topic_uuid}" in accepted_payload["payload"]["content"]
+
+
+def test_live_message_replay_rejects_partial_accepted_sequence():
+    store = FakeStore()
+    event = {
+        "id": 17,
+        "type": "message",
+        "message": _stream_message(601, "Topic"),
+    }
+    event["message"]["flags"] = ["read"]
+    accepted = converter.event_records(store, ACCOUNT_UUID, "queue", event)
+    assert accepted[-1]["operation"]["kind"] == "read_state.set"
+    accepted_message = next(
+        record
+        for record in accepted
+        if record["operation"]["kind"] == "message.create"
+    )
+    accepted_payload = accepted_message["operation"]["payload"]
+    store.accepted_contexts[(ACCOUNT_UUID, "queue", 17)] = {
+        "project_uuid": accepted_message["project_uuid"],
+        "message_uuid": accepted_message["operation"]["entity_uuid"],
+        "chat_key": accepted_message["operation"]["provider"]["chat_id"],
+        "stream_uuid": accepted_payload["stream_uuid"],
+        "topic_uuid": accepted_payload["topic_uuid"],
+        "author_uuid": accepted_payload["author_uuid"],
+        "message_operation": accepted_message["operation"],
+        "accepted_records": accepted[:-1],
+        "accepted_records_complete": False,
+    }
+
+    with pytest.raises(ValueError, match="provider_event_replay_incomplete"):
+        converter.event_records(store, ACCOUNT_UUID, "queue", event)
+
+
+def test_live_message_replay_accepts_legacy_unscoped_operation_ids():
+    event = {
+        "id": 17,
+        "type": "message",
+        "message": _stream_message(601, "Topic"),
+    }
+    accepted = converter.event_records(
+        FakeStore(),
+        ACCOUNT_UUID,
+        "queue",
+        event,
+    )
+    legacy = copy.deepcopy(accepted)
+    operation_uuids = {
+        record["operation_uuid"]: converter.operation_uuid_for(
+            ACCOUNT_UUID,
+            "provider-message:601",
+            17,
+            index,
+        )
+        for index, record in enumerate(legacy)
+    }
+    for record in legacy:
+        operation_uuid = operation_uuids[record["operation_uuid"]]
+        predecessor = record["predecessor_operation_uuid"]
+        record["operation_uuid"] = operation_uuid
+        record["record_uuid"] = str(
+            uuid.uuid5(
+                converter.OPERATION_NAMESPACE,
+                f"{operation_uuid}:record",
+            )
+        )
+        record["predecessor_operation_uuid"] = operation_uuids.get(
+            predecessor,
+            predecessor,
+        )
+        record["operation_sha256"] = canonical.operation_digest(record)
+
+    assert converter._accepted_live_replay_records(
+        ACCOUNT_UUID,
+        event,
+        {
+            "project_uuid": PROJECT_UUID,
+            "accepted_records": legacy,
+            "accepted_records_complete": True,
+        },
+    ) == legacy
+
+
+def test_different_live_event_does_not_recreate_committed_provider_message():
+    store = FakeStore()
+    event = {"id": 17, "type": "message", "message": _stream_message(601)}
+    converter.event_records(store, ACCOUNT_UUID, "queue", event)
+    store.mappings[("message", "601")]["metadata"][
+        "workspace_delivery_state"
+    ] = "committed"
+
+    repeated_event = {**event, "id": 18}
+    records = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        repeated_event,
+    )
+
+    assert not any(
+        operation["kind"] == "message.create" for operation in _operations(records)
     )
 
 
