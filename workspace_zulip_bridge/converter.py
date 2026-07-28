@@ -39,6 +39,9 @@ SCHEMELESS_WEB_TARGET_RE = re.compile(
 )
 ZULIP_EMPTY_TOPIC_FALLBACK_NAME = "general chat"
 ZULIP_DIRECT_TOPIC_NAME = "Zulip"
+# Keep provider message projections within Workspace MarkdownPayload.content.
+WORKSPACE_MARKDOWN_MAX_LENGTH = 40_000
+WORKSPACE_MARKDOWN_TRUNCATION_MARKER = "\n\n[Message truncated]"
 
 
 def is_empty_channel_topic(subject: str) -> bool:
@@ -331,6 +334,18 @@ def convert_markdown(
     lossy = lossy or links_lossy
     if lossy and original_url and original_url not in converted:
         converted = f"{converted}\n\n[Open original](urn:url:{original_url})"
+    if len(converted) > WORKSPACE_MARKDOWN_MAX_LENGTH:
+        marker = WORKSPACE_MARKDOWN_TRUNCATION_MARKER
+        if _provider_site(original_url):
+            linked_marker = (
+                f"\n\n[Message truncated; open original](urn:url:{original_url})"
+            )
+            if len(linked_marker) < WORKSPACE_MARKDOWN_MAX_LENGTH:
+                marker = linked_marker
+        converted = (
+            converted[: WORKSPACE_MARKDOWN_MAX_LENGTH - len(marker)] + marker
+        )
+        lossy = True
     return converted, lossy
 
 
