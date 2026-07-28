@@ -213,7 +213,7 @@ def provider_chat_reference(message: dict[str, object]) -> tuple[str, str]:
     return chat_type, f"{chat_type}:{','.join(map(str, participant_ids))}"
 
 
-def _assignment(
+def provider_chat_assignment(
     store: ConversionStore, account_uuid: str, provider_chat_key: str
 ) -> tuple[str, bool]:
     assignment = store.assignment_for_provider_chat(account_uuid, provider_chat_key)
@@ -922,7 +922,9 @@ def _message_context(
     message: dict[str, object],
 ) -> tuple[str, str, str, str, str]:
     chat_type, chat_key = provider_chat_reference(message)
-    project_uuid, _assignment_exists = _assignment(store, account_uuid, chat_key)
+    project_uuid, _assignment_exists = provider_chat_assignment(
+        store, account_uuid, chat_key
+    )
     stream_mapping = store.provider_mapping(account_uuid, "stream", chat_key)
     if stream_mapping is None:
         raise ValueError("provider_chat_assignment_pending")
@@ -1091,7 +1093,7 @@ def message_event_records(
         if chat_type == "channel"
         else f"{chat_key}:default"
     )
-    flags = message.get("flags")
+    flags = message.get("flags", event.get("flags"))
     message_payload = {
         "stream_uuid": stream_uuid,
         "topic_uuid": topic_uuid,
@@ -1675,7 +1677,9 @@ def _subscription_records(
     for index, subscription in enumerate(subscriptions):
         chat_key = f"channel:{int(subscription['stream_id'])}"
         try:
-            project_uuid, assignment_exists = _assignment(store, account_uuid, chat_key)
+            project_uuid, assignment_exists = provider_chat_assignment(
+                store, account_uuid, chat_key
+            )
         except ValueError as exc:
             if str(exc) == "provider_chat_assignment_pending":
                 raise

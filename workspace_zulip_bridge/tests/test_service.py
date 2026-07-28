@@ -845,6 +845,216 @@ def test_unselected_provider_event_is_finalized_without_crashing(monkeypatch):
     assert store.processed == [(account_uuid, "queue", 7, True)]
 
 
+def test_reaction_event_is_delivered_only_for_account_with_selected_chat(monkeypatch):
+    selected_account_uuid = "00000000-0000-0000-0000-000000000001"
+    unselected_account_uuid = "00000000-0000-0000-0000-000000000002"
+    reaction = {
+        "id": 7,
+        "type": "reaction",
+        "op": "add",
+        "message_id": 601,
+        "user_id": 3,
+        "emoji_name": "thumbs_up",
+        "emoji_code": "1f44d",
+        "reaction_type": "unicode_emoji",
+    }
+
+    class Store(DeliveryStore):
+        def provider_mapping(self, account_uuid, entity_kind, provider_id):
+            assert entity_kind == "message"
+            assert provider_id == "601"
+            if account_uuid == selected_account_uuid:
+                return {"workspace_uuid": "00000000-0000-0000-0000-000000000601"}
+            return None
+
+        def assignment_for_provider_chat(self, account_uuid, provider_chat_key):
+            assert account_uuid == unselected_account_uuid
+            assert provider_chat_key == "channel:42"
+            return None
+
+        def account_settings(self, account_uuid):
+            assert account_uuid == unselected_account_uuid
+            return {"selection_mode": "manual"}
+
+    store = Store(
+        [
+            {
+                "account_uuid": selected_account_uuid,
+                "queue_id": "selected-queue",
+                "event_id": 7,
+                "body": reaction,
+            },
+            {
+                "account_uuid": unselected_account_uuid,
+                "queue_id": "unselected-queue",
+                "event_id": 7,
+                "body": reaction,
+            },
+        ]
+    )
+    instance = _delivery_service(store)
+
+    class Adapter(ProviderAdapter):
+        def __init__(self, account_uuid):
+            self.account_uuid = account_uuid
+
+        def message_by_id(self, provider_message_id):
+            assert self.account_uuid == unselected_account_uuid
+            assert provider_message_id == 601
+            return {
+                "id": 601,
+                "type": "stream",
+                "stream_id": 42,
+                "display_recipient": "Engineering",
+            }
+
+    instance.provider_adapters = Adapter
+
+    def records_for_selected_account(
+        _adapter,
+        account_uuid,
+        _external_chat_uuid,
+        _queue_id,
+        _event,
+        _delivery_class,
+    ):
+        assert account_uuid == selected_account_uuid
+        return [{"record_uuid": "selected-reaction"}]
+
+    monkeypatch.setattr(
+        instance,
+        "_event_records_with_file_fallback",
+        records_for_selected_account,
+    )
+
+    assert instance.process_provider_journal() == 2
+    assert store.enqueued == [({"record_uuid": "selected-reaction"}, 0)]
+    assert store.retried == []
+    assert store.processed == [
+        (selected_account_uuid, "selected-queue", 7, True),
+        (unselected_account_uuid, "unselected-queue", 7, True),
+    ]
+
+
+def test_reaction_event_for_selected_chat_waits_for_message_mapping():
+    account_uuid = "00000000-0000-0000-0000-000000000001"
+    reaction = {
+        "id": 7,
+        "type": "reaction",
+        "op": "add",
+        "message_id": 601,
+        "user_id": 3,
+        "emoji_name": "thumbs_up",
+        "emoji_code": "1f44d",
+        "reaction_type": "unicode_emoji",
+    }
+
+    class Store(DeliveryStore):
+        def account_resource(self, requested):
+            assert requested == account_uuid
+            return {
+                "owner_user_uuid": "00000000-0000-0000-0000-000000000010",
+                "generation": 1,
+                "settings": {
+                    "default_project_id": "00000000-0000-0000-0000-000000000020"
+                },
+            }
+
+        def provider_mapping(self, requested, entity_kind, provider_id):
+            assert requested == account_uuid
+            assert entity_kind == "message"
+            assert provider_id == "601"
+            return None
+
+        def assignment_for_provider_chat(self, requested, provider_chat_key):
+            assert requested == account_uuid
+            assert provider_chat_key == "channel:42"
+            return {
+                "project_id": "00000000-0000-0000-0000-000000000020",
+                "selected": True,
+            }
+
+    store = Store(
+        [
+            {
+                "account_uuid": account_uuid,
+                "queue_id": "queue",
+                "event_id": 7,
+                "body": reaction,
+            }
+        ]
+    )
+    instance = _delivery_service(store)
+
+    class Adapter(ProviderAdapter):
+        def message_by_id(self, provider_message_id):
+            assert provider_message_id == 601
+            return {
+                "id": 601,
+                "type": "stream",
+                "stream_id": 42,
+                "display_recipient": "Engineering",
+            }
+
+    instance.provider_adapters = lambda _account_uuid: Adapter()
+
+    assert instance.process_provider_journal() == 0
+    assert store.enqueued == []
+    assert store.processed == []
+    assert store.retried == [
+        (
+            account_uuid,
+            "queue",
+            7,
+            "provider_chat_assignment_pending",
+        )
+    ]
+
+
+def test_reaction_event_for_missing_provider_message_is_terminal():
+    account_uuid = "00000000-0000-0000-0000-000000000001"
+
+    class Store(DeliveryStore):
+        def provider_mapping(self, requested, entity_kind, provider_id):
+            assert requested == account_uuid
+            assert entity_kind == "message"
+            assert provider_id == "601"
+            return None
+
+    store = Store(
+        [
+            {
+                "account_uuid": account_uuid,
+                "queue_id": "queue",
+                "event_id": 7,
+                "body": {
+                    "id": 7,
+                    "type": "reaction",
+                    "op": "remove",
+                    "message_id": 601,
+                    "user_id": 3,
+                    "emoji_name": "thumbs_up",
+                    "emoji_code": "1f44d",
+                    "reaction_type": "unicode_emoji",
+                },
+            }
+        ]
+    )
+    instance = _delivery_service(store)
+
+    class Adapter(ProviderAdapter):
+        def message_by_id(self, provider_message_id):
+            assert provider_message_id == 601
+            return None
+
+    instance.provider_adapters = lambda _account_uuid: Adapter()
+
+    assert instance.process_provider_journal() == 1
+    assert store.enqueued == []
+    assert store.retried == []
+    assert store.processed == [(account_uuid, "queue", 7, True)]
+
+
 def test_provider_journal_waits_for_assignment_bound_delivery(monkeypatch):
     class Store(DeliveryStore):
         def __init__(self, events):

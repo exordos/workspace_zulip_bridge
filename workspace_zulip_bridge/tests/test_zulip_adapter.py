@@ -991,6 +991,49 @@ def test_backfill_history_is_raw_and_newest_first():
     ]
 
 
+def test_message_by_id_returns_exact_raw_provider_message():
+    client = FakeClient()
+    client.messages = [
+        {"id": 600, "type": "stream", "stream_id": 41},
+        {"id": 601, "type": "stream", "stream_id": 42},
+    ]
+    adapter = zulip_adapter.OfficialZulipAdapter(client=client)
+
+    assert adapter.message_by_id(601) == {
+        "id": 601,
+        "type": "stream",
+        "stream_id": 42,
+    }
+    assert client.last_get_messages == {
+        "anchor": 601,
+        "num_before": 0,
+        "num_after": 0,
+        "apply_markdown": False,
+        "narrow": [{"operator": "id", "operand": 601}],
+    }
+
+
+def test_message_by_id_returns_none_when_provider_message_is_absent():
+    client = FakeClient()
+    adapter = zulip_adapter.OfficialZulipAdapter(client=client)
+
+    assert adapter.message_by_id(601) is None
+
+
+def test_message_by_id_preserves_retryable_provider_failures():
+    class FailingClient(FakeClient):
+        def get_messages(self, request):
+            raise requests.Timeout("provider unavailable")
+
+    adapter = zulip_adapter.OfficialZulipAdapter(client=FailingClient())
+
+    with pytest.raises(zulip_adapter.ZulipOperationError) as error:
+        adapter.message_by_id(601)
+
+    assert error.value.code == "provider_unavailable"
+    assert error.value.retryable is True
+
+
 def test_provider_event_poll_uses_official_longpoll_boundary():
     client = FakeClient()
     adapter = zulip_adapter.OfficialZulipAdapter(client=client)
