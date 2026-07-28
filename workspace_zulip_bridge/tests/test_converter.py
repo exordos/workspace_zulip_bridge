@@ -246,6 +246,62 @@ def test_lossy_markdown_without_original_url_does_not_add_empty_link():
     assert "[Open original]" not in converted
 
 
+def test_markdown_at_workspace_limit_is_preserved():
+    content = "x" * converter.WORKSPACE_MARKDOWN_MAX_LENGTH
+
+    converted, lossy = converter.convert_markdown(content, {}, "")
+
+    assert converted == content
+    assert not lossy
+
+
+def test_markdown_over_workspace_limit_is_truncated_with_marker():
+    content = "x" * (converter.WORKSPACE_MARKDOWN_MAX_LENGTH + 1)
+
+    converted, lossy = converter.convert_markdown(content, {}, "")
+
+    assert len(converted) == converter.WORKSPACE_MARKDOWN_MAX_LENGTH
+    assert converted.endswith(converter.WORKSPACE_MARKDOWN_TRUNCATION_MARKER)
+    assert lossy
+
+
+def test_truncated_markdown_links_to_original_message():
+    content = "x" * (converter.WORKSPACE_MARKDOWN_MAX_LENGTH + 1)
+    original_url = "https://chat.example.invalid/#narrow/near/601"
+
+    converted, lossy = converter.convert_markdown(content, {}, original_url)
+
+    assert len(converted) == converter.WORKSPACE_MARKDOWN_MAX_LENGTH
+    assert converted.endswith(
+        f"[Message truncated; open original](urn:url:{original_url})"
+    )
+    assert lossy
+
+
+def test_backfill_message_over_workspace_limit_is_truncated():
+    store = FakeStore()
+    message = _stream_message()
+    message["content"] = "x" * (converter.WORKSPACE_MARKDOWN_MAX_LENGTH + 48)
+
+    operations = _operations(
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "history",
+            {"id": 10, "type": "message", "message": message},
+            delivery_class="backfill",
+        )
+    )
+
+    created = next(
+        operation for operation in operations if operation["kind"] == "message.create"
+    )
+    converted = created["payload"]["payload"]["content"]
+    assert len(converted) == converter.WORKSPACE_MARKDOWN_MAX_LENGTH
+    assert converted.endswith(converter.WORKSPACE_MARKDOWN_TRUNCATION_MARKER)
+    assert created["extensions"]["lossy_conversion"] is True
+
+
 def test_zulip_internal_and_external_links_become_workspace_urns():
     store = FakeStore()
     store.remember_provider_mapping(
