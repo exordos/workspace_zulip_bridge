@@ -6,7 +6,7 @@ import typing
 import urllib.parse
 import uuid
 
-from workspace_zulip_bridge import canonical
+from workspace_zulip_bridge import canonical, markdown_conversion
 
 OPERATION_NAMESPACE = uuid.UUID("9d8b6952-b2de-4c80-a9c7-9619aaf5f35d")
 ENTITY_NAMESPACE = uuid.UUID("9a1d0e75-50a5-413c-b3e8-d070232ef57f")
@@ -17,24 +17,10 @@ MENTION_RE = re.compile(
     r"|(?P<name_only>[^*]+)"
     r")\*\*"
 )
-UPLOAD_RE = re.compile(r"\[(?P<name>[^\]]+)\]\((?P<url>/user_uploads/[^)]+)\)")
-QUOTE_RE = re.compile(r"~~~ quote\n(?P<body>.*?)\n~~~", re.DOTALL)
-REPLY_LINK_RE = re.compile(
-    r"\]\((?:https?://[^)]+)?/?#narrow/(?:[^)]+/)?near/(?P<id>[0-9]+)\)"
-)
+REPLY_FRAGMENT_RE = re.compile(r"^narrow/(?:.*/)?near/(?P<id>[0-9]+)$")
 ZULIP_NATIVE_LINK_RE = re.compile(r"#\*\*(?P<reference>[^*]+)\*\*")
-MARKDOWN_LINK_RE = re.compile(
-    r"(?P<image>!?)\[(?P<label>(?:\\.|[^\]])*)\]\("
-    r"(?P<target>[^\s)]+)"
-    r"(?P<title>\s+(?:\"[^\"]*\"|'[^']*'))?"
-    r"\)"
-)
 ANGLE_URL_RE = re.compile(r"<(?P<url>https?://[^>\s]+)>")
 BARE_URL_RE = re.compile(r"(?<!urn:url:)(?P<url>https?://[^\s<]+|www\.[^\s<]+)")
-CODE_RE = re.compile(
-    r"(```.*?```|~~~(?!\s*quote\s*$).*?~~~|`[^`\n]*`)",
-    re.DOTALL | re.MULTILINE,
-)
 SCHEMELESS_WEB_TARGET_RE = re.compile(
     r"(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?::[0-9]+)?(?:[/?#].*)?"
 )
@@ -338,52 +324,13 @@ def convert_markdown(
     link_resolver: ZulipLinkResolver | None = None,
 ) -> tuple[str, bool]:
     """Convert raw Zulip Markdown without leaking provider-only file URLs."""
-    lossy = False
-
-    def quote(match: re.Match[str]) -> str:
-        return "\n".join(f"> {line}" for line in match.group("body").splitlines())
-
-    converted = QUOTE_RE.sub(quote, content)
-
-    def mention(match: re.Match[str]) -> str:
-        nonlocal lossy
-        provider_user_id = match.group("user_id") or match.group("user_id_only")
-        name = (
-            match.group("name_with_id")
-            or match.group("name_only")
-            or provider_user_id
-            or "User"
-        )
-        user_uuid = (
-            mention_uuids.get(f"id:{provider_user_id}")
-            if provider_user_id is not None
-            else None
-        ) or mention_uuids.get(name)
-        if user_uuid is None:
-            lossy = True
-            return f"@{name}"
-        return f"[{name}](urn:user:{user_uuid})"
-
-    converted = MENTION_RE.sub(mention, converted)
-
-    def upload(match: re.Match[str]) -> str:
-        nonlocal lossy
-        if file_resolver is None:
-            lossy = True
-            return f"[{match.group('name')}]({original_url})"
-        return f"[{match.group('name')}]({file_resolver(match.group('url'), match.group('name'))})"
-
-    converted = UPLOAD_RE.sub(upload, converted)
-    if "/user_uploads/" in converted:
-        lossy = True
-        converted = converted.replace("/user_uploads/", original_url + "#file-")
-
-    converted, links_lossy = _convert_zulip_links(
-        converted,
+    converted, lossy = _convert_zulip_links(
+        content,
         original_url,
         link_resolver,
+        mention_uuids=mention_uuids,
+        file_resolver=file_resolver,
     )
-    lossy = lossy or links_lossy
     if lossy and original_url and original_url not in converted:
         converted = f"{converted}\n\n[Open original](urn:url:{original_url})"
     if len(converted) > WORKSPACE_MARKDOWN_MAX_LENGTH:
@@ -605,75 +552,142 @@ def _trim_bare_url(value: str) -> tuple[str, str]:
     return url, suffix
 
 
+def _semantic_reply_provider_id(content: str) -> str | None:
+    for link in markdown_conversion.semantic_quote_links(content):
+        target = urllib.parse.urlsplit(link.destination)
+        if target.scheme and target.scheme.casefold() not in {"http", "https"}:
+            continue
+        match = REPLY_FRAGMENT_RE.fullmatch(target.fragment)
+        if match is not None:
+            return match.group("id")
+    return None
+
+
 def _convert_zulip_links(
     content: str,
     original_url: str,
     resolver: ZulipLinkResolver | None,
+    *,
+    mention_uuids: dict[str, str] | None = None,
+    file_resolver: FileResolver | None = None,
 ) -> tuple[str, bool]:
     provider_site = _provider_site(original_url)
     lossy = False
+    mention_uuids = mention_uuids or {}
 
-    def transform(segment: str) -> str:
+    def transform_text(segment: str) -> str:
         nonlocal lossy
-        protected_links: list[str] = []
+        converted: list[str] = []
+        cursor = 0
+        patterns = (
+            ("mention", MENTION_RE),
+            ("native", ZULIP_NATIVE_LINK_RE),
+            ("angle", ANGLE_URL_RE),
+            ("bare", BARE_URL_RE),
+        )
+        while cursor < len(segment):
+            candidates: list[tuple[int, int, str, re.Match[str] | None]] = []
+            for priority, (kind, pattern) in enumerate(patterns):
+                match = pattern.search(segment, cursor)
+                if match is not None:
+                    candidates.append((match.start(), priority, kind, match))
+            upload_index = segment.find("/user_uploads/", cursor)
+            if upload_index >= 0:
+                candidates.append((upload_index, len(patterns), "upload", None))
+            if not candidates:
+                converted.append(segment[cursor:])
+                break
 
-        def protect(value: str) -> str:
-            placeholder = f"\x00zulip-link-{len(protected_links)}\x00"
-            protected_links.append(value)
-            return placeholder
+            start, _priority, kind, match = min(candidates)
+            converted.append(segment[cursor:start])
+            if kind == "upload":
+                lossy = True
+                converted.append(original_url + "#file-")
+                cursor = start + len("/user_uploads/")
+                continue
+            if match is None:
+                raise AssertionError("text token match is required")
+            cursor = match.end()
 
-        def native(match: re.Match[str]) -> str:
-            nonlocal lossy
-            replacement, replacement_lossy = _native_zulip_link(match, resolver)
-            lossy = lossy or replacement_lossy
-            return replacement
-
-        converted = ZULIP_NATIVE_LINK_RE.sub(native, segment)
-
-        def markdown_link(match: re.Match[str]) -> str:
-            target = _workspace_link_target(
-                match.group("target"), provider_site, resolver
-            )
-            return protect(
-                (
-                    f"{match.group('image')}[{match.group('label')}]"
-                    f"({target}{match.group('title') or ''})"
+            if kind == "mention":
+                provider_user_id = (
+                    match.group("user_id") or match.group("user_id_only")
                 )
+                name = (
+                    match.group("name_with_id")
+                    or match.group("name_only")
+                    or provider_user_id
+                    or "User"
+                )
+                user_uuid = (
+                    mention_uuids.get(f"id:{provider_user_id}")
+                    if provider_user_id is not None
+                    else None
+                ) or mention_uuids.get(name)
+                if user_uuid is None:
+                    lossy = True
+                    converted.append(f"@{name}")
+                else:
+                    converted.append(f"[{name}](urn:user:{user_uuid})")
+                continue
+            if kind == "native":
+                replacement, replacement_lossy = _native_zulip_link(
+                    match, resolver
+                )
+                lossy = lossy or replacement_lossy
+                converted.append(replacement)
+                continue
+            if kind == "angle":
+                url = match.group("url")
+                target = _workspace_link_target(url, provider_site, resolver)
+                converted.append(f"[{url}]({target})")
+                continue
+            if kind == "bare":
+                raw_url, suffix = _trim_bare_url(match.group("url"))
+                target = (
+                    raw_url
+                    if raw_url.startswith(("http://", "https://"))
+                    else f"https://{raw_url}"
+                )
+                workspace_target = _workspace_link_target(
+                    target, provider_site, resolver
+                )
+                converted.append(
+                    f"[{raw_url}]({workspace_target}){suffix}"
+                )
+                continue
+            raise AssertionError(f"unknown text token kind: {kind}")
+        return "".join(converted)
+
+    def transform_link(link: markdown_conversion.MarkdownLink) -> str:
+        nonlocal lossy
+        if link.destination.startswith("/user_uploads/"):
+            if file_resolver is None:
+                lossy = True
+                return link.with_destination(original_url)
+            return link.with_destination(
+                file_resolver(link.destination, link.label)
             )
+        target = _workspace_link_target(
+            link.destination,
+            provider_site,
+            resolver,
+        )
+        return (
+            link.raw
+            if target == link.destination
+            else link.with_destination(target)
+        )
 
-        converted = MARKDOWN_LINK_RE.sub(markdown_link, converted)
-
-        def angle_url(match: re.Match[str]) -> str:
-            url = match.group("url")
-            target = _workspace_link_target(url, provider_site, resolver)
-            return protect(f"[{url}]({target})")
-
-        converted = ANGLE_URL_RE.sub(angle_url, converted)
-
-        def bare_url(match: re.Match[str]) -> str:
-            raw_url, suffix = _trim_bare_url(match.group("url"))
-            target = (
-                raw_url
-                if raw_url.startswith(("http://", "https://"))
-                else f"https://{raw_url}"
-            )
-            workspace_target = _workspace_link_target(
-                target, provider_site, resolver
-            )
-            return f"[{raw_url}]({workspace_target}){suffix}"
-
-        converted = BARE_URL_RE.sub(bare_url, converted)
-        for index, protected_link in enumerate(protected_links):
-            converted = converted.replace(
-                f"\x00zulip-link-{index}\x00",
-                protected_link,
-            )
-        return converted
-
-    parts = CODE_RE.split(content)
-    for index in range(0, len(parts), 2):
-        parts[index] = transform(parts[index])
-    return "".join(parts), lossy
+    return (
+        markdown_conversion.transform_markdown(
+            content,
+            text_transform=transform_text,
+            link_transform=transform_link,
+            convert_semantic_quotes=True,
+        ),
+        lossy,
+    )
 
 
 def _provider(
@@ -1179,8 +1193,7 @@ def message_event_records(
         file_resolver,
         ZulipLinkResolver(store, account_uuid, owner_uuid),
     )
-    reply_match = REPLY_LINK_RE.search(str(message["content"]))
-    reply_provider_id = reply_match.group("id") if reply_match is not None else None
+    reply_provider_id = _semantic_reply_provider_id(str(message["content"]))
     reply_mapping = (
         store.provider_mapping(account_uuid, "message", reply_provider_id)
         if reply_provider_id is not None

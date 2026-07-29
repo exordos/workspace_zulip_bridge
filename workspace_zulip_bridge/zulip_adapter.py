@@ -12,7 +12,7 @@ import uuid
 import requests
 import zulip
 
-from workspace_zulip_bridge import file_api
+from workspace_zulip_bridge import file_api, markdown_conversion
 
 MAX_PROVIDER_FILE_BYTES = 52_428_800
 PROVIDER_QUEUE_IDLE_TIMEOUT_SECONDS = 43_200
@@ -24,22 +24,27 @@ PROVIDER_QUEUE_IDLE_TIMEOUT_SECONDS = 43_200
 HISTORY_PAGE_SIZE = 100
 ZULIP_EMOJI_DATA_PATH = "/static/generated/emoji/emoji_api.json"
 TRANSFER_NAMESPACE = uuid.UUID("8aa58582-d782-4e98-bfc3-7b5ee96e3bd6")
-WORKSPACE_FILE_RE = re.compile(
-    r"(?P<image>!?)\[(?P<name>[^\]]+)\]\("
-    r"(?P<urn>urn:(?:file|image|video):[0-9a-f-]+(?:\?[^)]*)?)\)"
+WORKSPACE_FILE_URN_RE = re.compile(
+    r"^urn:(?:file|image|video):[0-9a-f-]+(?:\?.*)?$",
+    re.IGNORECASE,
 )
-WORKSPACE_MENTION_RE = re.compile(
-    r"\[(?P<name>[^\]]+)\]\(urn:user:(?P<uuid>[0-9a-f-]+)\)"
+WORKSPACE_MENTION_URN_RE = re.compile(
+    r"^urn:user:(?P<uuid>[0-9a-f-]+)$",
+    re.IGNORECASE,
 )
-WORKSPACE_ENTITY_LINK_RE = re.compile(
-    r"\[(?P<label>[^\]]+)\]\("
-    r"urn:(?P<kind>message|stream|topic):(?P<uuid>[0-9a-f-]+)"
-    r"\)"
+WORKSPACE_ENTITY_URN_RE = re.compile(
+    r"^urn:(?P<kind>message|stream|topic):(?P<uuid>[0-9a-f-]+)$",
+    re.IGNORECASE,
 )
-WORKSPACE_URL_LINK_RE = re.compile(
-    r"(?P<image>!?)\[(?P<label>[^\]]+)\]\("
-    r"urn:url:(?P<url>https?://[^\s)]+)"
-    r"\)"
+WORKSPACE_URL_URN_RE = re.compile(
+    r"^urn:url:(?P<url>https?://.+)$",
+    re.IGNORECASE,
+)
+WORKSPACE_QUOTE_URN_RE = re.compile(
+    r"^urn:quote:(?P<uuid>[0-9a-f-]+)"
+    r"(?:\?(?P<query>[^\s)]*))?"
+    r"$",
+    re.IGNORECASE,
 )
 PROVIDER_NETWORK_ERRORS = (
     requests.RequestException,
@@ -641,51 +646,74 @@ class OfficialZulipAdapter:
             raise ZulipOperationError("not_found", False)
         return uuid.UUID(self.routing.external_chat_uuid(provider_chat_key))
 
-    def _convert_workspace_markdown(
+    @staticmethod
+    def _workspace_quote_text(query: str | None) -> str | None:
+        if query is None:
+            return None
+        query_parts = query.split("&")
+        if len(query_parts) != 1 or not query_parts[0].startswith("text="):
+            raise ZulipOperationError("invalid_record", False)
+        encoded_text = query_parts[0].removeprefix("text=")
+        if re.search(r"%(?![0-9a-f]{2})", encoded_text, re.IGNORECASE):
+            raise ZulipOperationError("invalid_record", False)
+        try:
+            selected_text = urllib.parse.unquote(
+                encoded_text,
+                encoding="utf-8",
+                errors="strict",
+            )
+        except UnicodeDecodeError as exc:
+            raise ZulipOperationError("invalid_record", False) from exc
+        return selected_text or None
+
+    def _convert_workspace_content(
         self,
         content: str,
         operation_uuid: str | None,
         provider_chat_key: str,
-    ) -> str:
-        def mention(match: re.Match[str]) -> str:
-            if self.routing is None:
-                return f"@{match.group('name')}"
-            mapping = self.routing.workspace_mapping("identity", match.group("uuid"))
-            if mapping is None:
-                return f"@{match.group('name')}"
-            metadata = mapping.get("metadata")
-            metadata = metadata if isinstance(metadata, dict) else {}
-            provider_name = metadata.get("display_name")
-            if not isinstance(provider_name, str) or not provider_name:
-                provider_name = match.group("name")
-            return f"@**{provider_name}|{mapping['provider_id']}**"
+    ) -> tuple[str, set[str]]:
+        quote_message_uuids: set[str] = set()
 
-        converted = WORKSPACE_MENTION_RE.sub(mention, content)
+        def transform_link(link: markdown_conversion.MarkdownLink) -> str:
+            mention_match = WORKSPACE_MENTION_URN_RE.fullmatch(link.destination)
+            if mention_match is not None:
+                name = link.label
+                if self.routing is None:
+                    return f"@{name}"
+                mapping = self.routing.workspace_mapping(
+                    "identity", mention_match.group("uuid")
+                )
+                if mapping is None:
+                    return f"@{name}"
+                metadata = mapping.get("metadata")
+                metadata = metadata if isinstance(metadata, dict) else {}
+                provider_name = metadata.get("display_name")
+                if not isinstance(provider_name, str) or not provider_name:
+                    provider_name = name
+                return f"@**{provider_name}|{mapping['provider_id']}**"
 
-        def entity_link(match: re.Match[str]) -> str:
-            if self.routing is None:
-                return match.group("label")
-            mapping = self.routing.workspace_mapping(
-                match.group("kind"), match.group("uuid")
-            )
-            if mapping is None:
-                return match.group("label")
-            return self._provider_entity_link(
-                match.group("kind"),
-                match.group("label"),
-                mapping,
-            )
+            entity_match = WORKSPACE_ENTITY_URN_RE.fullmatch(link.destination)
+            if entity_match is not None:
+                if self.routing is None:
+                    return link.label
+                mapping = self.routing.workspace_mapping(
+                    entity_match.group("kind"),
+                    entity_match.group("uuid"),
+                )
+                if mapping is None:
+                    return link.label
+                return self._provider_entity_link(
+                    entity_match.group("kind"),
+                    link.label,
+                    mapping,
+                )
 
-        converted = WORKSPACE_ENTITY_LINK_RE.sub(entity_link, converted)
+            url_match = WORKSPACE_URL_URN_RE.fullmatch(link.destination)
+            if url_match is not None:
+                return link.with_destination(url_match.group("url"))
 
-        def external_link(match: re.Match[str]) -> str:
-            return (
-                f"{match.group('image')}[{match.group('label')}]({match.group('url')})"
-            )
-
-        converted = WORKSPACE_URL_LINK_RE.sub(external_link, converted)
-
-        def attachment(match: re.Match[str]) -> str:
+            if not WORKSPACE_FILE_URN_RE.fullmatch(link.destination):
+                return link.raw
             if (
                 self.file_client is None
                 or self.file_limit is None
@@ -693,7 +721,7 @@ class OfficialZulipAdapter:
                 or operation_uuid is None
             ):
                 raise ZulipOperationError("provider_file_transfer_disabled", False)
-            file_urn = match.group("urn")
+            file_urn = link.destination
             transfer_uuid = uuid.uuid5(
                 TRANSFER_NAMESPACE,
                 f"{operation_uuid}:{file_urn}",
@@ -712,9 +740,43 @@ class OfficialZulipAdapter:
             provider_uri = uploaded.get("uri")
             if not isinstance(provider_uri, str) or not provider_uri:
                 raise ZulipOperationError("provider_file_unavailable", True)
-            return f"{match.group('image')}[{match.group('name')}]({provider_uri})"
+            return link.with_destination(provider_uri)
 
-        return WORKSPACE_FILE_RE.sub(attachment, converted)
+        def transform_quote(
+            link: markdown_conversion.MarkdownLink,
+        ) -> str | None:
+            quote_match = WORKSPACE_QUOTE_URN_RE.fullmatch(link.destination)
+            if quote_match is None:
+                return None
+            message_uuid = quote_match.group("uuid")
+            selected_text = self._workspace_quote_text(
+                quote_match.group("query")
+            )
+            quote_message_uuids.add(message_uuid.casefold())
+            return self._reply_quote(message_uuid, selected_text).rstrip()
+
+        return (
+            markdown_conversion.transform_markdown(
+                content,
+                text_transform=lambda value: value,
+                link_transform=transform_link,
+                standalone_link_transform=transform_quote,
+            ),
+            quote_message_uuids,
+        )
+
+    def _convert_workspace_markdown(
+        self,
+        content: str,
+        operation_uuid: str | None,
+        provider_chat_key: str,
+    ) -> str:
+        converted, _quote_message_uuids = self._convert_workspace_content(
+            content,
+            operation_uuid,
+            provider_chat_key,
+        )
+        return converted
 
     @staticmethod
     def _encode_hash_component(value: str) -> str:
@@ -855,7 +917,11 @@ class OfficialZulipAdapter:
 
         return label
 
-    def _reply_quote(self, reply_to_message_uuid: object) -> str:
+    def _reply_quote(
+        self,
+        reply_to_message_uuid: object,
+        selected_text: str | None = None,
+    ) -> str:
         mapping = self._workspace_mapping("message", reply_to_message_uuid)
         provider_message_id = int(str(mapping["provider_id"]))
         try:
@@ -892,9 +958,17 @@ class OfficialZulipAdapter:
             if provider_site
             else f"#narrow/near/{provider_message_id}"
         )
+        quote_content = (
+            selected_text if selected_text is not None else str(message["content"])
+        )
+        longest_backtick_run = max(
+            (len(run) for run in re.findall(r"`+", quote_content)),
+            default=0,
+        )
+        quote_fence = "`" * max(3, longest_backtick_run + 1)
         return (
             f"@_**{sender_name}|{sender_id}** [said]({link}):\n"
-            f"```quote\n{message['content']}\n```\n\n"
+            f"{quote_fence}quote\n{quote_content}\n{quote_fence}\n\n"
         )
 
     def _provider_message_content(
@@ -906,11 +980,13 @@ class OfficialZulipAdapter:
         if not isinstance(chat_key, str):
             raise ZulipOperationError("invalid_record", False)
         message = typing.cast(dict[str, object], payload["payload"])
-        content = self._convert_workspace_markdown(
-            str(message["content"]), operation_uuid, chat_key
+        content, quote_message_uuids = self._convert_workspace_content(
+            str(message["content"]),
+            operation_uuid,
+            chat_key,
         )
         reply_to = payload.get("reply_to_message_uuid")
-        if reply_to is not None:
+        if reply_to is not None and str(reply_to).casefold() not in quote_message_uuids:
             content = self._reply_quote(reply_to) + content
         return content
 
