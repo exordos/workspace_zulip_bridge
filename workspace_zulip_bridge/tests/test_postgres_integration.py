@@ -938,6 +938,33 @@ def test_reconcile_repairs_legacy_pending_direct_participant_gate(postgres_store
     assert postgres_store.claim_participant_sync() is None
 
 
+def test_ready_channel_participants_are_rechecked_after_bounded_interval(
+    postgres_store,
+):
+    account_uuid, _project_uuid = _insert_account_and_assignment(postgres_store)
+
+    assert postgres_store.claim_participant_sync() is None
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_participant_sync
+            SET updated_at = now() - make_interval(secs => %s)
+            WHERE account_uuid = %s AND provider_chat_key = 'channel:42'
+            """,
+            (
+                storage.PARTICIPANT_RECHECK_INTERVAL_SECONDS + 1,
+                account_uuid,
+            ),
+        )
+
+    claimed = postgres_store.claim_participant_sync()
+
+    assert claimed is not None
+    assert str(claimed["account_uuid"]) == account_uuid
+    assert claimed["provider_chat_key"] == "channel:42"
+    assert claimed["assignment_generation"] == 1
+
+
 @pytest.mark.parametrize(
     ("status", "expected_code", "expected_manual", "expected_evidence"),
     [

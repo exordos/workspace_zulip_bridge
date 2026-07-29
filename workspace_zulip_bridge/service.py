@@ -1081,7 +1081,11 @@ class BridgeService:
         }
         if chat_type == "channel":
             common_capabilities.update(
-                {"messenger.stream.rename", "messenger.topic.rename"}
+                {
+                    "messenger.membership.write",
+                    "messenger.stream.rename",
+                    "messenger.topic.rename",
+                }
             )
         capabilities = {
             name: {"available": True, **control.CAPABILITIES[name]}

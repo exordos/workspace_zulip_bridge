@@ -73,6 +73,14 @@ class ZulipClient(typing.Protocol):
 
     def update_message_flags(self, request: dict[str, object]) -> dict[str, object]: ...
 
+    def add_subscriptions(
+        self, streams: list[dict[str, object]], **kwargs: object
+    ) -> dict[str, object]: ...
+
+    def remove_subscriptions(
+        self, streams: list[str], principals: list[int] | None = None
+    ) -> dict[str, object]: ...
+
     def add_reaction(self, request: dict[str, object]) -> dict[str, object]: ...
 
     def remove_reaction(self, request: dict[str, object]) -> dict[str, object]: ...
@@ -1277,6 +1285,32 @@ class OfficialZulipAdapter:
             }
             _successful(self.client.update_message_flags(request))
             return str(max(provider_ids)), None
+        if kind in {"membership.add", "membership.remove"}:
+            chat_key = provider.get("chat_id")
+            provider_channel_id = self._channel_id(chat_key)
+            channel_mapping = self._channel_mapping(str(provider_channel_id))
+            channel_name = self._channel_name(channel_mapping)
+            if channel_name is None:
+                raise ZulipOperationError("not_found", False)
+            try:
+                provider_user_id = int(str(provider["entity_id"]))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ZulipOperationError("not_found", False) from exc
+            if kind == "membership.add":
+                _successful(
+                    self.client.add_subscriptions(
+                        [{"name": channel_name}],
+                        principals=[provider_user_id],
+                    )
+                )
+            else:
+                _successful(
+                    self.client.remove_subscriptions(
+                        [channel_name],
+                        principals=[provider_user_id],
+                    )
+                )
+            return str(provider_user_id), None
         if kind == "stream.upsert":
             chat_key = provider.get("chat_id")
             stream_id = self._channel_id(chat_key)

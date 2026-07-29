@@ -12,6 +12,7 @@ STREAM_UUID = "30000000-0000-0000-0000-000000000003"
 TOPIC_UUID = "40000000-0000-0000-0000-000000000004"
 MESSAGE_UUID = "50000000-0000-0000-0000-000000000005"
 CHAT_UUID = "60000000-0000-0000-0000-000000000006"
+BINDING_UUID = "70000000-0000-0000-0000-000000000007"
 
 
 class Store:
@@ -246,6 +247,37 @@ def test_poll_provider_operations_durably_enqueues_exact_read_state_selector():
     ]
     assert record["operation"]["provider"]["entity_id"] is None
     assert record["transport"]["required_capability"] == "messenger.message.read"
+
+
+def test_poll_provider_operations_durably_enqueues_membership_write():
+    instance = _instance()
+    leased = _lease()
+    leased.update(
+        {
+            "operation_kind": "membership.remove",
+            "required_capability": "messenger.membership.write",
+            "payload": {
+                "uuid": BINDING_UUID,
+                "stream_uuid": STREAM_UUID,
+                "user_uuid": ACCOUNT_UUID,
+                "who_uuid": PROJECT_UUID,
+                "role": "member",
+            },
+        }
+    )
+    instance.provider_api.leased = [leased]
+
+    assert instance.poll_provider_operations() == 1
+
+    record, priority = instance.store.enqueued[0]
+    assert priority == 0
+    assert record["operation"]["kind"] == "membership.remove"
+    assert record["operation"]["entity_uuid"] == BINDING_UUID
+    assert record["operation"]["provider"]["chat_id"] == "channel:42"
+    assert record["operation"]["provider"]["entity_id"] == "9"
+    assert (
+        record["transport"]["required_capability"] == "messenger.membership.write"
+    )
 
 
 def test_flush_provider_results_reports_and_persists_backend_acceptance():

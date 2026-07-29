@@ -12,6 +12,7 @@ TOPIC_UUID = "40000000-0000-0000-0000-000000000004"
 MESSAGE_UUID = "50000000-0000-0000-0000-000000000005"
 CHAT_UUID = "60000000-0000-0000-0000-000000000006"
 REACTION_UUID = "70000000-0000-0000-0000-000000000007"
+BINDING_UUID = "80000000-0000-0000-0000-000000000008"
 
 
 class Store:
@@ -103,6 +104,27 @@ def test_provider_reaction_lease_resolves_the_target_message_mapping():
     assert record["operation"]["kind"] == "reaction.create"
     assert record["operation"]["entity_uuid"] == REACTION_UUID
     assert record["operation"]["provider"]["entity_id"] == "101"
+    assert record["operation"]["provider"]["chat_id"] == "channel:42"
+
+
+@pytest.mark.parametrize("kind", ["membership.add", "membership.remove"])
+def test_provider_membership_lease_resolves_target_identity(kind):
+    leased = _lease(kind)
+    leased["required_capability"] = "messenger.membership.write"
+    leased["payload"] = {
+        "uuid": BINDING_UUID,
+        "stream_uuid": STREAM_UUID,
+        "user_uuid": ACCOUNT_UUID,
+        "who_uuid": PROJECT_UUID,
+        "role": "member",
+    }
+
+    record = provider_protocol.leased_operation_record(Store(), leased)
+
+    assert record["operation"]["kind"] == kind
+    assert record["operation"]["entity_uuid"] == BINDING_UUID
+    assert record["operation"]["actor_uuid"] == PROJECT_UUID
+    assert record["operation"]["provider"]["entity_id"] == "42"
     assert record["operation"]["provider"]["chat_id"] == "channel:42"
 
 

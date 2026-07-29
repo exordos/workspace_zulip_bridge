@@ -1451,7 +1451,9 @@ def test_registration_snapshot_queues_account_live_ready_and_chat_catalog_report
         }
     ]
     assert channel["catalog"]["capabilities"]["messenger.stream.rename"]["available"]
+    assert channel["catalog"]["capabilities"]["messenger.membership.write"]["available"]
     assert "messenger.stream.rename" not in direct["catalog"]["capabilities"]
+    assert "messenger.membership.write" not in direct["catalog"]["capabilities"]
     assert set(channel["catalog"]["source"]) == {
         "kind",
         "chat_type",

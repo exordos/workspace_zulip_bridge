@@ -12,6 +12,8 @@ from restalchemy.storage.sql import engines, sessions
 
 from workspace_zulip_bridge import canonical, control
 
+PARTICIPANT_RECHECK_INTERVAL_SECONDS = 30
+
 
 def _same_provider_identity_replay(
     accepted: dict[str, object],
@@ -2533,6 +2535,11 @@ class RestAlchemyStore:
                            AND participant_sync.updated_at <
                                now() - interval '30 seconds'
                        )
+                       OR (
+                           participant_sync.state = 'ready'
+                           AND participant_sync.updated_at <
+                               now() - make_interval(secs => %s)
+                       )
                     ORDER BY participant_sync.updated_at,
                              participant_sync.provider_chat_key
                     FOR UPDATE SKIP LOCKED
@@ -2549,7 +2556,8 @@ class RestAlchemyStore:
                 RETURNING participant_sync.account_uuid,
                           participant_sync.provider_chat_key,
                           participant_sync.assignment_generation
-                """
+                """,
+                (PARTICIPANT_RECHECK_INTERVAL_SECONDS,),
             ).fetchone()
 
     def complete_participant_sync(

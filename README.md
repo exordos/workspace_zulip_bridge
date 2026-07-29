@@ -89,7 +89,10 @@ The current implementation provides:
   ambiguous-send reconciliation;
 - durable queue registration before discovery, names-only initial channel
   discovery, and an authoritative selected-channel participant gate before
-  live or historical messages are projected;
+  live or historical messages are projected, followed by bounded ready-state
+  participant rechecks;
+- capability-gated Workspace membership add/remove operations through the
+  official Zulip subscription API;
 - owner-scoped projections and stable identity/chat/topic/message mappings;
 - private file-plane transfers with short-lived URLs;
 - one dedicated persistent Zulip long-poll thread per active account, with
