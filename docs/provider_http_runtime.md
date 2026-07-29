@@ -57,7 +57,15 @@ only. Once Workspace selects a channel, the bridge fetches the authoritative
 Zulip subscriber list and reports it before admitting live messages or
 starting the configured history backfill. The participant gate opens only when
 the current Workspace assignment projection contains the same provider user
-IDs.
+IDs. A ready selected channel becomes eligible for another subscriber check
+after 30 seconds, so add/remove changes made by another Zulip administrator
+return through the same catalog and desired-state handshake.
+
+Provider-backed Workspace binding changes arrive as durable `membership.add`
+and `membership.remove` operations gated by `messenger.membership.write`. The
+bridge resolves the mapped Zulip user and channel, then uses the official
+subscription add/remove methods. Duplicate delivery, retry, removal, and re-add
+therefore converge without a bridge-local membership source of truth.
 
 Zulip topics are discovered from messages. The durable provider mapping table
 is the local processed-topic cache: a missing topic queues an idempotent catalog

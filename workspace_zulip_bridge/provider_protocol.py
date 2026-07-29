@@ -12,6 +12,8 @@ _OUTBOUND_KIND = {
     "reaction.update": "reaction.update",
     "reaction.delete": "reaction.delete",
     "read_state.set": "read_state.set",
+    "membership.add": "membership.add",
+    "membership.remove": "membership.remove",
     "stream.update": "stream.upsert",
     "topic.update": "topic.upsert",
 }
@@ -41,7 +43,10 @@ def _provider_mapping(store, account_uuid: str, kind: str, workspace_uuid: objec
 def _chat_key(store, account_uuid: str, kind: str, payload: dict[str, object]):
     if kind.startswith("stream."):
         stream_uuid = payload["uuid"]
-    elif kind.startswith(("topic.", "message.")) or kind == "read_state.set":
+    elif (
+        kind.startswith(("topic.", "message.", "membership."))
+        or kind == "read_state.set"
+    ):
         stream_uuid = payload["stream_uuid"]
     elif kind.startswith("reaction."):
         message = _provider_mapping(
@@ -112,7 +117,15 @@ def leased_operation_record(store, leased: dict[str, object]) -> dict[str, objec
         entity_uuid = str(uuid.UUID(str(payload["uuid"])))
     chat_key = _chat_key(store, account_uuid, kind, payload)
     entity_id = None
-    if kind.startswith("reaction."):
+    if kind.startswith("membership."):
+        identity = _provider_mapping(
+            store,
+            account_uuid,
+            "identity",
+            payload["user_uuid"],
+        )
+        entity_id = str(identity["provider_id"])
+    elif kind.startswith("reaction."):
         message = _provider_mapping(
             store,
             account_uuid,
@@ -138,6 +151,7 @@ def leased_operation_record(store, leased: dict[str, object]) -> dict[str, objec
         "entity_uuid": entity_uuid,
         "actor_uuid": str(
             payload.get("reader_uuid")
+            or payload.get("who_uuid")
             or payload.get("user_uuid")
             or payload.get("author_uuid")
             or uuid.UUID(int=0)

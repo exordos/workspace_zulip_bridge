@@ -616,6 +616,11 @@ def test_participant_claim_only_refreshes_channels():
     assert "JOIN desired_resources AS assignment" in statement
     assert "->>'chat_type' =" in statement
     assert "'channel'" in statement
+    assert "participant_sync.state = 'ready'" in statement
+    assert "make_interval(secs => %s)" in statement
+    assert session.statements[0][1] == (
+        storage.PARTICIPANT_RECHECK_INTERVAL_SECONDS,
+    )
 
 
 def test_dead_queue_restarts_participants_and_configured_history():

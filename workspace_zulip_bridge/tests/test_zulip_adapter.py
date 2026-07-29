@@ -36,6 +36,8 @@ class FakeClient:
         self.read_topics = []
         self.added_reactions = []
         self.removed_reactions = []
+        self.added_subscriptions = []
+        self.removed_subscriptions = []
         self.add_reaction_result = {"result": "success"}
         self.remove_reaction_result = {"result": "success"}
         self.uploads = []
@@ -150,6 +152,14 @@ class FakeClient:
     def remove_reaction(self, request):
         self.removed_reactions.append(request)
         return self.remove_reaction_result
+
+    def add_subscriptions(self, streams, **kwargs):
+        self.added_subscriptions.append((streams, kwargs))
+        return {"result": "success"}
+
+    def remove_subscriptions(self, streams, principals=None):
+        self.removed_subscriptions.append((streams, principals))
+        return {"result": "success"}
 
     def upload_file(self, file):
         self.uploads.append((file.name, file.read()))
@@ -951,6 +961,85 @@ def test_stream_rename_uses_canonical_provider_chat_id():
     assert client.stream_updates == [
         {"stream_id": 42, "new_name": "renamed engineering"}
     ]
+
+
+@pytest.mark.parametrize("kind", ["membership.add", "membership.remove"])
+def test_membership_write_uses_official_subscription_api(kind):
+    client = FakeClient()
+    adapter = _adapter(client)
+    operation = {
+        "kind": kind,
+        "entity_uuid": "10000000-0000-4000-8000-000000000011",
+        "provider": {
+            "kind": "zulip",
+            "chat_id": "channel:42",
+            "entity_id": "2",
+            "revision": None,
+        },
+        "payload": {
+            "stream_uuid": STREAM_UUID,
+            "user_uuid": USER_2_UUID,
+            "role": "member",
+        },
+    }
+
+    assert adapter.apply(operation) == ("2", None)
+    if kind == "membership.add":
+        assert client.added_subscriptions == [
+            ([{"name": "engineering"}], {"principals": [2]})
+        ]
+        assert client.removed_subscriptions == []
+    else:
+        assert client.added_subscriptions == []
+        assert client.removed_subscriptions == [(["engineering"], [2])]
+
+
+def test_membership_write_converges_across_retry_remove_and_readd():
+    class MembershipClient(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.subscribers = set()
+
+        def add_subscriptions(self, streams, **kwargs):
+            super().add_subscriptions(streams, **kwargs)
+            self.subscribers.update(kwargs["principals"])
+            return {"result": "success"}
+
+        def remove_subscriptions(self, streams, principals=None):
+            super().remove_subscriptions(streams, principals)
+            self.subscribers.difference_update(principals or [])
+            return {"result": "success"}
+
+    client = MembershipClient()
+    adapter = _adapter(client)
+    operation = {
+        "kind": "membership.add",
+        "entity_uuid": "10000000-0000-4000-8000-000000000011",
+        "provider": {
+            "kind": "zulip",
+            "chat_id": "channel:42",
+            "entity_id": "2",
+            "revision": None,
+        },
+        "payload": {
+            "stream_uuid": STREAM_UUID,
+            "user_uuid": USER_2_UUID,
+            "role": "member",
+        },
+    }
+
+    assert adapter.apply(operation) == ("2", None)
+    assert adapter.apply(operation) == ("2", None)
+    assert client.subscribers == {2}
+
+    operation["kind"] = "membership.remove"
+    assert adapter.apply(operation) == ("2", None)
+    assert adapter.apply(operation) == ("2", None)
+    assert client.subscribers == set()
+
+    operation["kind"] = "membership.add"
+    assert adapter.apply(operation) == ("2", None)
+    assert client.subscribers == {2}
 
 
 def test_topic_rename_uses_canonical_topic_uuid_mapping():
