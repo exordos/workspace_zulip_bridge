@@ -11,13 +11,24 @@ PROJECT_UUID = str(uuid.uuid4())
 
 
 class FakeStore:
-    def __init__(self, selection_mode="all", auto_materialize=True):
+    def __init__(
+        self,
+        selection_mode="all",
+        auto_materialize=True,
+        *,
+        account_uuid=ACCOUNT_UUID,
+        owner_uuid=OWNER_UUID,
+        project_uuid=PROJECT_UUID,
+    ):
+        self.account_uuid = account_uuid
+        self.owner_uuid = owner_uuid
+        self.project_uuid = project_uuid
         self.account = {
             "generation": 1,
-            "owner_user_uuid": OWNER_UUID,
+            "owner_user_uuid": owner_uuid,
             "settings": {
                 "selection_mode": selection_mode,
-                "default_project_id": PROJECT_UUID,
+                "default_project_id": project_uuid,
             },
         }
         self.assignments = {}
@@ -27,7 +38,7 @@ class FakeStore:
         self.auto_materialize = auto_materialize
 
     def account_resource(self, account_uuid):
-        return self.account if account_uuid == ACCOUNT_UUID else None
+        return self.account if account_uuid == self.account_uuid else None
 
     def account_settings(self, account_uuid):
         resource = self.account_resource(account_uuid)
@@ -37,7 +48,7 @@ class FakeStore:
         if provider_chat_key in self.assignments:
             return self.assignments[provider_chat_key]
         if self.account["settings"]["selection_mode"] == "all":
-            return {"selected": True, "project_id": PROJECT_UUID}
+            return {"selected": True, "project_id": self.project_uuid}
         return None
 
     def producer_lane_position(self, operation_uuid, origin, causal_lane):
@@ -52,7 +63,7 @@ class FakeStore:
         if mapping is not None or not self.auto_materialize:
             return mapping
         workspace_uuid = converter.stable_entity_uuid(
-            ACCOUNT_UUID, entity_kind, provider_id
+            self.account_uuid, entity_kind, provider_id
         )
         metadata = {}
         if entity_kind == "identity":
@@ -66,11 +77,13 @@ class FakeStore:
             )
             metadata = {
                 "chat_type": chat_type,
-                "project_uuid": PROJECT_UUID,
+                "project_uuid": self.project_uuid,
                 "participants": [
-                    OWNER_UUID,
+                    self.owner_uuid,
                     *[
-                        converter.stable_entity_uuid(ACCOUNT_UUID, "identity", value)
+                        converter.stable_entity_uuid(
+                            self.account_uuid, "identity", value
+                        )
                         for value in participant_ids
                         if value != "1"
                     ],
@@ -398,6 +411,229 @@ def test_zulip_internal_and_external_links_become_workspace_urns():
     assert "`https://example.net/code`" in markdown
     assert "#**" not in markdown
     assert "Open original" not in markdown
+
+
+def test_zulip_quote_fences_convert_prose_links_and_preserve_nested_code():
+    store = FakeStore()
+    converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {"id": 9, "type": "message", "message": _stream_message(601)},
+        original_url="https://chat.example.invalid",
+    )
+    resolver = converter.ZulipLinkResolver(store, ACCOUNT_UUID, OWNER_UUID)
+    stream_uuid = store.mappings[("stream", "channel:42")]["workspace_uuid"]
+    topic_uuid = store.mappings[("topic", "42:Topic")]["workspace_uuid"]
+    message_uuid = store.mappings[("message", "601")]["workspace_uuid"]
+    content = "\n".join(
+        (
+            "````quote",
+            "[docs](https://example.com/a?x=1#section)",
+            "#**Engineering**",
+            "#**Engineering>Topic**",
+            "#**Engineering>Topic@601**",
+            "```text",
+            "https://example.net/code",
+            "#**Engineering**",
+            "```",
+            "````",
+        )
+    )
+
+    converted, lossy = converter.convert_markdown(
+        content,
+        {},
+        "https://chat.example.invalid/#narrow/near/602",
+        link_resolver=resolver,
+    )
+
+    assert not lossy
+    assert "> [docs](urn:url:https://example.com/a?x=1#section)" in converted
+    assert f"> [#Engineering](urn:stream:{stream_uuid})" in converted
+    assert f"> [#Engineering > Topic](urn:topic:{topic_uuid})" in converted
+    assert f"> [#Engineering > Topic @ 💬](urn:message:{message_uuid})" in converted
+    assert (
+        "> ```text\n> https://example.net/code\n> #**Engineering**\n> ```" in converted
+    )
+    assert "urn:url:https://example.net/code" not in converted
+
+
+def test_zulip_triple_backtick_quote_converts_to_workspace_blockquote():
+    converted, lossy = converter.convert_markdown(
+        "```quote\n[docs](https://example.com/reference)\n```",
+        {},
+        "https://chat.example.invalid/#narrow/near/602",
+    )
+
+    assert not lossy
+    assert converted == "> [docs](urn:url:https://example.com/reference)"
+
+
+def test_zulip_quote_closing_fence_may_be_longer_than_opener():
+    converted, lossy = converter.convert_markdown(
+        "````quote\n[docs](https://example.com/reference)\n`````",
+        {},
+        "https://chat.example.invalid/#narrow/near/602",
+    )
+
+    assert not lossy
+    assert converted == "> [docs](urn:url:https://example.com/reference)"
+
+
+def test_zulip_quote_with_crlf_line_endings_is_converted():
+    converted, lossy = converter.convert_markdown(
+        "```quote\r\n[docs](https://example.com/reference)\r\n```\r\nnext",
+        {},
+        "https://chat.example.invalid/#narrow/near/602",
+    )
+
+    assert not lossy
+    assert converted == (
+        "> [docs](urn:url:https://example.com/reference)\r\nnext"
+    )
+
+
+def test_zulip_quote_inside_outer_fence_remains_literal_code():
+    content = (
+        "`````markdown\n"
+        "```quote\n"
+        "[docs](https://example.com/reference)\n"
+        "```\n"
+        "`````"
+    )
+
+    converted, lossy = converter.convert_markdown(
+        content,
+        {},
+        "https://chat.example.invalid/#narrow/near/602",
+    )
+
+    assert not lossy
+    assert converted == content
+
+
+def test_zulip_quote_preserves_list_item_indentation():
+    converted, lossy = converter.convert_markdown(
+        "- item\n  ```quote\n  [docs](https://example.com/reference)\n  ```",
+        {},
+        "https://chat.example.invalid/#narrow/near/602",
+    )
+
+    assert not lossy
+    assert converted == (
+        "- item\n"
+        "  > [docs](urn:url:https://example.com/reference)"
+    )
+
+
+def test_four_space_indented_quote_fence_remains_literal_code():
+    content = (
+        "    ```quote\n"
+        "    [docs](https://example.com/reference)\n"
+        "    ```"
+    )
+
+    converted, lossy = converter.convert_markdown(
+        content,
+        {},
+        "https://chat.example.invalid/#narrow/near/602",
+    )
+
+    assert not lossy
+    assert converted == content
+
+
+def test_four_space_indented_fence_does_not_close_top_level_quote():
+    content = (
+        "```quote\n"
+        "[docs](https://example.com/reference)\n"
+        "    ```"
+    )
+
+    converted, lossy = converter.convert_markdown(
+        content,
+        {},
+        "https://chat.example.invalid/#narrow/near/602",
+    )
+
+    assert not lossy
+    assert converted == content
+
+
+def test_zulip_link_title_is_preserved_during_urn_conversion():
+    converted, lossy = converter.convert_markdown(
+        '[docs](https://example.com/reference "Documentation")',
+        {},
+        "https://chat.example.invalid/#narrow/near/602",
+    )
+
+    assert not lossy
+    assert converted == (
+        '[docs](urn:url:https://example.com/reference "Documentation")'
+    )
+
+
+def test_commonmark_reference_link_becomes_inline_workspace_link():
+    converted, lossy = converter.convert_markdown(
+        '[docs][reference]\n\n[reference]: https://example.com/reference "Docs"',
+        {},
+        "https://chat.example.invalid/#narrow/near/602",
+    )
+
+    assert not lossy
+    assert converted == (
+        '[docs](urn:url:https://example.com/reference "Docs")\n\n'
+    )
+
+
+@pytest.mark.parametrize(
+    "literal_code",
+    (
+        "`[docs][reference]`",
+        "```markdown\n[docs][reference]\n```",
+    ),
+)
+def test_reference_definition_is_kept_when_used_by_literal_code(
+    literal_code,
+):
+    content = (
+        "[docs][reference]\n\n"
+        f"{literal_code}\n\n"
+        '[reference]: https://example.com/reference "Docs"'
+    )
+
+    converted, lossy = converter.convert_markdown(
+        content,
+        {},
+        "https://chat.example.invalid/#narrow/near/602",
+    )
+
+    assert not lossy
+    assert converted == content.replace(
+        "[docs][reference]",
+        '[docs](urn:url:https://example.com/reference "Docs")',
+        1,
+    )
+
+
+def test_multiline_commonmark_link_preserves_container_prefixes():
+    converted, lossy = converter.convert_markdown(
+        "> [docs](\n"
+        ">   https://example.com/reference\n"
+        '>   "Documentation"\n'
+        "> )",
+        {},
+        "https://chat.example.invalid/#narrow/near/602",
+    )
+
+    assert not lossy
+    assert converted == (
+        "> [docs](\n"
+        ">   urn:url:https://example.com/reference\n"
+        '>   "Documentation"\n'
+        "> )"
+    )
 
 
 def test_unresolved_native_zulip_link_is_preserved_and_marks_conversion_lossy():
@@ -969,6 +1205,128 @@ def test_inbound_zulip_reply_resolves_provider_target_to_workspace_message():
 
     assert message["payload"]["reply_to_message_uuid"] == original["workspace_uuid"]
     assert message["extensions"]["unresolved_reply_provider_id"] is None
+
+
+def test_inbound_zulip_reply_accepts_localized_quote_link_label():
+    store = FakeStore()
+    converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {"id": 10, "type": "message", "message": _stream_message(601)},
+    )
+    original = store.provider_mapping(ACCOUNT_UUID, "message", "601")
+    reply = _stream_message(602)
+    reply["content"] = (
+        "@_**Other User|2** "
+        "[сказал/а](https://zulip.example.invalid/#narrow/near/601):\n"
+        "```quote\noriginal\n```\n\nreply"
+    )
+
+    records = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {"id": 11, "type": "message", "message": reply},
+    )
+    message = next(
+        operation
+        for operation in _operations(records)
+        if operation["kind"] == "message.create"
+    )
+
+    assert message["payload"]["reply_to_message_uuid"] == original["workspace_uuid"]
+    assert message["extensions"]["unresolved_reply_provider_id"] is None
+
+
+def test_inbound_zulip_reply_resolves_within_each_account_projection():
+    second_account_uuid = str(uuid.uuid4())
+    stores = (
+        FakeStore(),
+        FakeStore(
+            account_uuid=second_account_uuid,
+            owner_uuid=str(uuid.uuid4()),
+            project_uuid=str(uuid.uuid4()),
+        ),
+    )
+    account_uuids = (ACCOUNT_UUID, second_account_uuid)
+    source_uuids = []
+
+    for store, account_uuid in zip(stores, account_uuids, strict=True):
+        converter.event_records(
+            store,
+            account_uuid,
+            "queue",
+            {"id": 10, "type": "message", "message": _stream_message(601)},
+        )
+        source = store.provider_mapping(account_uuid, "message", "601")
+        source_uuids.append(source["workspace_uuid"])
+        reply = _stream_message(602)
+        reply["content"] = (
+            "@_**Other User|2** "
+            "[said](https://zulip.example.invalid/#narrow/near/601):\n"
+            "```quote\noriginal\n```\n\nreply"
+        )
+
+        records = converter.event_records(
+            store,
+            account_uuid,
+            "queue",
+            {"id": 11, "type": "message", "message": reply},
+        )
+        message = next(
+            operation
+            for operation in _operations(records)
+            if operation["kind"] == "message.create"
+        )
+
+        assert message["payload"]["reply_to_message_uuid"] == source["workspace_uuid"]
+        assert message["extensions"]["unresolved_reply_provider_id"] is None
+
+    assert source_uuids[0] != source_uuids[1]
+
+
+@pytest.mark.parametrize(
+    "content",
+    (
+        "[message](https://zulip.example.invalid/#narrow/near/601)",
+        (
+            "[said](https://zulip.example.invalid/#narrow/near/601):\n"
+            "plain text, not a semantic quote"
+        ),
+        (
+            "````markdown\n"
+            "[said](https://zulip.example.invalid/#narrow/near/601):\n"
+            "```quote\nliteral example\n```\n"
+            "````"
+        ),
+    ),
+)
+def test_inbound_zulip_non_quote_links_do_not_create_reply_relationship(content):
+    store = FakeStore()
+    converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {"id": 10, "type": "message", "message": _stream_message(601)},
+    )
+    message = _stream_message(602)
+    message["content"] = content
+
+    records = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {"id": 11, "type": "message", "message": message},
+    )
+    created = next(
+        operation
+        for operation in _operations(records)
+        if operation["kind"] == "message.create"
+    )
+
+    assert created["payload"]["reply_to_message_uuid"] is None
+    assert created["extensions"]["unresolved_reply_provider_id"] is None
 
 
 def test_convergent_workspace_alias_replays_idempotent_backfill_upsert():

@@ -4,7 +4,7 @@ import pytest
 import requests
 import zulip
 
-from workspace_zulip_bridge import zulip_adapter
+from workspace_zulip_bridge import converter, zulip_adapter
 
 OWNER_UUID = "10000000-0000-4000-8000-000000000001"
 AUTHOR_UUID = OWNER_UUID
@@ -459,6 +459,271 @@ def test_reply_uses_zulip_native_quote_and_reply_semantics():
     assert client.last_get_messages["narrow"] == [{"operator": "id", "operand": 99}]
     assert adapter.apply(operation, correlation) == ("99", None)
     assert client.sent[0]["content"] == correlation.provider_rendered_content
+
+
+def test_canonical_workspace_quote_uses_zulip_native_reply_semantics():
+    client = FakeClient()
+    client.messages = [
+        {
+            "id": 99,
+            "sender_id": 2,
+            "sender_full_name": "Other User",
+            "content": "original text\n```text\nnested code\n```",
+        }
+    ]
+    operation = _operation()
+    operation["payload"]["payload"]["content"] = (
+        f"[Other User](urn:quote:{MESSAGE_UUID})\n\nreply text"
+    )
+    adapter = _adapter(client)
+
+    correlation = adapter.prepare(operation, "operation-1")
+
+    assert correlation.provider_rendered_content == (
+        "@_**Other User|2** "
+        "[said](https://zulip.example.invalid/#narrow/near/99):\n"
+        "````quote\noriginal text\n```text\nnested code\n```\n````\n\n"
+        "reply text"
+    )
+    assert "urn:quote:" not in correlation.provider_rendered_content
+
+
+def test_canonical_workspace_selected_quote_preserves_exact_selected_text():
+    client = FakeClient()
+    client.messages = [
+        {
+            "id": 99,
+            "sender_id": 2,
+            "sender_full_name": "Other User",
+            "content": "full original text",
+        }
+    ]
+    operation = _operation()
+    operation["payload"]["payload"]["content"] = (
+        f"[Other User](urn:quote:{MESSAGE_UUID}"
+        "?text=%20Selected%20text%0Asecond%20line%20%26%20%23%20)\n\nreply"
+    )
+    adapter = _adapter(client)
+
+    correlation = adapter.prepare(operation, "operation-1")
+
+    assert "```quote\n Selected text\nsecond line & # \n```" in (
+        correlation.provider_rendered_content
+    )
+    assert "full original text" not in correlation.provider_rendered_content
+    assert "urn:quote:" not in correlation.provider_rendered_content
+
+
+def test_canonical_quote_deduplicates_matching_reply_payload_reference():
+    client = FakeClient()
+    client.messages = [
+        {
+            "id": 99,
+            "sender_id": 2,
+            "sender_full_name": "Other User",
+            "content": "original text",
+        }
+    ]
+    operation = _operation()
+    operation["payload"]["reply_to_message_uuid"] = MESSAGE_UUID
+    operation["payload"]["payload"]["content"] = (
+        f"[Other User](urn:quote:{MESSAGE_UUID})\n\nreply"
+    )
+    adapter = _adapter(client)
+
+    correlation = adapter.prepare(operation, "operation-1")
+
+    assert correlation.provider_rendered_content.count("[said](") == 1
+    assert correlation.provider_rendered_content.endswith("\n\nreply")
+
+
+@pytest.mark.parametrize(
+    "query",
+    (
+        "unknown=value",
+        "text=first&text=second",
+        "text=%E0%A4%A",
+    ),
+)
+def test_canonical_quote_with_invalid_query_fails_without_leaking_raw_urn(query):
+    client = FakeClient()
+    operation = _operation()
+    operation["payload"]["payload"]["content"] = (
+        f"[Other User](urn:quote:{MESSAGE_UUID}?{query})\n\nreply"
+    )
+    adapter = _adapter(client)
+
+    with pytest.raises(zulip_adapter.ZulipOperationError) as error:
+        adapter.prepare(operation, "operation-1")
+
+    assert error.value.code == "invalid_record"
+    assert not error.value.retryable
+    assert client.sent == []
+
+
+def test_canonical_quote_inside_fenced_code_remains_literal():
+    client = FakeClient()
+    operation = _operation()
+    operation["payload"]["payload"]["content"] = (
+        f"````md\n[Other User](urn:quote:{MESSAGE_UUID})\n```text\nnested\n```\n````"
+    )
+    adapter = _adapter(client)
+
+    correlation = adapter.prepare(operation, "operation-1")
+
+    assert correlation.provider_rendered_content == operation["payload"]["payload"]["content"]
+    assert not hasattr(client, "last_get_messages")
+
+
+def test_canonical_quote_without_provider_mapping_fails_not_found():
+    client = FakeClient()
+    routing = FakeRouting()
+    routing.workspace = dict(routing.workspace)
+    routing.workspace.pop(("message", MESSAGE_UUID))
+    operation = _operation()
+    operation["payload"]["payload"]["content"] = (
+        f"[Other User](urn:quote:{MESSAGE_UUID})\n\nreply"
+    )
+    adapter = _adapter(client, routing)
+
+    with pytest.raises(zulip_adapter.ZulipOperationError) as error:
+        adapter.prepare(operation, "operation-1")
+
+    assert error.value.code == "not_found"
+    assert not error.value.retryable
+    assert not hasattr(client, "last_get_messages")
+
+
+def test_workspace_links_inside_code_remain_literal():
+    client = FakeClient()
+    operation = _operation()
+    operation["payload"]["payload"]["content"] = (
+        f"`[user](urn:user:{USER_2_UUID}) "
+        "[docs](urn:url:https://example.com/inline)`\n"
+        "```markdown\n"
+        f"[message](urn:message:{MESSAGE_UUID})\n"
+        "[docs](urn:url:https://example.com/fenced)\n"
+        "```\n\n"
+        "    [docs](urn:url:https://example.com/indented)"
+    )
+    adapter = _adapter(client)
+
+    correlation = adapter.prepare(operation, "operation-1")
+
+    assert correlation.provider_rendered_content == (
+        operation["payload"]["payload"]["content"]
+    )
+
+
+def test_external_link_title_round_trips_between_zulip_and_workspace():
+    zulip_content = '[docs](https://example.com/reference "Documentation")'
+    workspace_content, lossy = converter.convert_markdown(
+        zulip_content,
+        {},
+        "https://zulip.example.invalid/#narrow/near/99",
+    )
+    client = FakeClient()
+    operation = _operation()
+    operation["payload"]["payload"]["content"] = workspace_content
+    adapter = _adapter(client)
+
+    correlation = adapter.prepare(operation, "operation-1")
+
+    assert not lossy
+    assert correlation.provider_rendered_content == zulip_content
+
+
+def test_workspace_reference_link_uses_zulip_url_and_drops_definition():
+    client = FakeClient()
+    operation = _operation()
+    operation["payload"]["payload"]["content"] = (
+        "[docs][reference]\n\n"
+        "[reference]: urn:url:https://example.com/reference"
+    )
+    adapter = _adapter(client)
+
+    correlation = adapter.prepare(operation, "operation-1")
+
+    assert correlation.provider_rendered_content == (
+        "[docs](https://example.com/reference)\n\n"
+    )
+    assert "urn:" not in correlation.provider_rendered_content
+
+
+@pytest.mark.parametrize(
+    "literal_code",
+    (
+        "`[docs][reference]`",
+        "```markdown\n[docs][reference]\n```",
+    ),
+)
+def test_workspace_reference_definition_is_kept_for_literal_code(
+    literal_code,
+):
+    content = (
+        "[docs][reference]\n\n"
+        f"{literal_code}\n\n"
+        "[reference]: urn:url:https://example.com/reference"
+    )
+    client = FakeClient()
+    operation = _operation()
+    operation["payload"]["payload"]["content"] = content
+    adapter = _adapter(client)
+
+    correlation = adapter.prepare(operation, "operation-1")
+
+    assert correlation.provider_rendered_content == content.replace(
+        "[docs][reference]",
+        "[docs](https://example.com/reference)",
+        1,
+    )
+
+
+def test_nested_workspace_image_and_link_destinations_are_both_converted():
+    client = FakeClient()
+    operation = _operation()
+    operation["payload"]["payload"]["content"] = (
+        "[![diagram](urn:url:https://example.com/image.png)]"
+        "(urn:url:https://example.com/page)"
+    )
+    adapter = _adapter(client)
+
+    correlation = adapter.prepare(operation, "operation-1")
+
+    assert correlation.provider_rendered_content == (
+        "[![diagram](https://example.com/image.png)]"
+        "(https://example.com/page)"
+    )
+    assert "urn:" not in correlation.provider_rendered_content
+
+
+def test_canonical_workspace_quote_is_converted_during_message_update():
+    client = FakeClient()
+    client.messages = [
+        {
+            "id": 99,
+            "sender_id": 2,
+            "sender_full_name": "Other User",
+            "content": "original text",
+        }
+    ]
+    operation = _operation()
+    operation["kind"] = "message.update"
+    operation["provider"]["entity_id"] = "99"
+    operation["payload"]["payload"]["content"] = (
+        f"[Other User](urn:quote:{MESSAGE_UUID})\n\nedited reply"
+    )
+    adapter = _adapter(client)
+
+    adapter.prepare(operation, "operation-1")
+    assert adapter.apply(operation) == ("99", None)
+
+    assert client.updated[0]["content"] == (
+        "@_**Other User|2** "
+        "[said](https://zulip.example.invalid/#narrow/near/99):\n"
+        "```quote\noriginal text\n```\n\nedited reply"
+    )
+    assert "urn:quote:" not in client.updated[0]["content"]
 
 
 def test_reconciliation_uses_persisted_exact_provider_rendering_without_reupload():
