@@ -1,3 +1,4 @@
+import copy
 import datetime
 import hashlib
 import re
@@ -81,6 +82,10 @@ class ConversionStore(typing.Protocol):
 
     def workspace_mapping(
         self, account_uuid: str, entity_kind: str, workspace_uuid: str
+    ) -> dict[str, object] | None: ...
+
+    def accepted_provider_message_context(
+        self, account_uuid: str, queue_id: str, event_id: int
     ) -> dict[str, object] | None: ...
 
     def remember_provider_mapping(
@@ -236,6 +241,53 @@ def operation_uuid_for(
             f"{account_uuid}:{queue_id}:{event_id}:{subindex}",
         )
     )
+
+
+def _accepted_live_replay_records(
+    account_uuid: str,
+    event: dict[str, object],
+    accepted_context: dict[str, object],
+) -> list[dict[str, object]] | None:
+    accepted_records = accepted_context.get("accepted_records")
+    if not isinstance(accepted_records, list) or not accepted_records:
+        return None
+    if accepted_context.get("accepted_records_complete") is not True:
+        raise ValueError("provider_event_replay_incomplete")
+    provider_message_id = str(
+        typing.cast(dict[str, object], event["message"])["id"]
+    )
+    records_by_uuid: dict[str, dict[str, object]] = {}
+    for record in accepted_records:
+        if not isinstance(record, dict):
+            return None
+        operation_uuid = record.get("operation_uuid")
+        if not isinstance(operation_uuid, str) or operation_uuid in records_by_uuid:
+            return None
+        records_by_uuid[operation_uuid] = record
+    record_sources = [f"provider-message:{provider_message_id}"]
+    accepted_project_uuid = accepted_context.get("project_uuid")
+    if isinstance(accepted_project_uuid, str):
+        record_sources.insert(
+            0,
+            f"provider-message:{provider_message_id}:project:{accepted_project_uuid}",
+        )
+    for record_source in record_sources:
+        remaining = dict(records_by_uuid)
+        ordered: list[dict[str, object]] = []
+        for subindex in range(len(remaining)):
+            operation_uuid = operation_uuid_for(
+                account_uuid,
+                record_source,
+                int(event["id"]),
+                subindex,
+            )
+            record = remaining.pop(operation_uuid, None)
+            if record is None:
+                break
+            ordered.append(copy.deepcopy(record))
+        if not remaining:
+            return ordered
+    return None
 
 
 def _record(
@@ -972,13 +1024,6 @@ def message_event_records(
     if account is None:
         raise ValueError("unknown_external_account")
     owner_uuid = str(account["owner_user_uuid"])
-    (
-        chat_type,
-        chat_key,
-        project_uuid,
-        stream_uuid,
-        topic_uuid,
-    ) = _message_context(store, account_uuid, message)
     provider_message_id = str(message["id"])
     existing_message = store.provider_mapping(
         account_uuid, "message", provider_message_id
@@ -988,8 +1033,67 @@ def message_event_records(
         if existing_message is not None
         else {}
     )
+    event_chat_type, event_chat_key = provider_chat_reference(message)
+    stored_provider_event_id = existing_message_metadata.get("provider_event_id")
+    accepted_context_lookup = getattr(
+        store, "accepted_provider_message_context", None
+    )
+    accepted_context = (
+        accepted_context_lookup(account_uuid, queue_id, int(event["id"]))
+        if callable(accepted_context_lookup)
+        else None
+    )
+    replay_context = (
+        accepted_context
+        if accepted_context is not None
+        else existing_message_metadata
+    )
+    same_live_event_replay = (
+        delivery_class == "live"
+        and existing_message is not None
+        and (
+            accepted_context is not None
+            or existing_message_metadata.get("mapping_origin") == "zulip"
+        )
+        and replay_context.get("chat_key") == event_chat_key
+        and (
+            accepted_context is not None
+            or stored_provider_event_id is None
+            or int(stored_provider_event_id) == int(event["id"])
+        )
+        and all(
+            replay_context.get(name) is not None
+            for name in ("project_uuid", "stream_uuid", "topic_uuid", "chat_key")
+        )
+    )
+    if same_live_event_replay and accepted_context is not None:
+        accepted_records = _accepted_live_replay_records(
+            account_uuid,
+            event,
+            accepted_context,
+        )
+        if accepted_records is not None:
+            # An exact live-event replay is an immutable journal replay, not a
+            # fresh conversion. Reuse the complete accepted sequence so a
+            # newly remembered identity or another mutable mapping cannot
+            # remove an operation and shift every later deterministic UUID.
+            return accepted_records
+    if same_live_event_replay:
+        chat_type = event_chat_type
+        chat_key = event_chat_key
+        project_uuid = str(replay_context["project_uuid"])
+        stream_uuid = str(replay_context["stream_uuid"])
+        topic_uuid = str(replay_context["topic_uuid"])
+    else:
+        (
+            chat_type,
+            chat_key,
+            project_uuid,
+            stream_uuid,
+            topic_uuid,
+        ) = _message_context(store, account_uuid, message)
     message_uuid = (
-        str(existing_message["workspace_uuid"])
+        str(replay_context.get("message_uuid", existing_message["workspace_uuid"]))
         if existing_message is not None
         else stable_entity_uuid(account_uuid, "message", provider_message_id)
     )
@@ -1020,6 +1124,8 @@ def message_event_records(
     author_uuid = identity_uuids.get(sender_id)
     if author_uuid is None:
         raise ValueError("provider_chat_assignment_pending")
+    if same_live_event_replay and replay_context.get("author_uuid") is not None:
+        author_uuid = str(replay_context["author_uuid"])
     existing_stream = store.provider_mapping(account_uuid, "stream", chat_key)
     existing_stream_metadata = (
         typing.cast(dict[str, object], existing_stream["metadata"])
@@ -1128,6 +1234,13 @@ def message_event_records(
             ),
         },
     }
+    accepted_message_operation = replay_context.get("message_operation")
+    if same_live_event_replay and isinstance(accepted_message_operation, dict):
+        # Exact live-event replay must reuse the accepted rendering as well as
+        # its structural UUIDs. Native Zulip links resolve through mutable
+        # topic mappings, so rendering them again after recanonicalization can
+        # otherwise change the digest of the same deterministic operation UUID.
+        message_operation = copy.deepcopy(accepted_message_operation)
     # Control-plane assignments materialize the stream projection. Provider
     # messages still need a topic upsert because the backend-owned topic UUID
     # mapping can precede materialization of that topic in Messenger storage.
@@ -1150,7 +1263,11 @@ def message_event_records(
             "extensions": {"provider_badge": "zulip"},
         },
     ]
-    if not workspace_delivery_committed or delivery_class == "backfill":
+    if (
+        not workspace_delivery_committed
+        or delivery_class == "backfill"
+        or same_live_event_replay
+    ):
         operations.append(message_operation)
     if isinstance(flags, list) and delivery_class != "backfill":
         operations.append(
@@ -1209,6 +1326,9 @@ def message_event_records(
             "provider_content_sha256": provider_content_sha256,
             "subject": channel_subject if chat_type == "channel" else "",
             "mapping_origin": existing_message_metadata.get("mapping_origin", "zulip"),
+            "provider_event_id": existing_message_metadata.get(
+                "provider_event_id", int(event["id"])
+            ),
             "workspace_delivery_state": (
                 "committed"
                 if workspace_delivery_committed
@@ -1255,7 +1375,14 @@ def message_event_records(
                 )
             )
     record_source = f"provider-message:{provider_message_id}"
-    if delivery_class == "backfill":
+    if delivery_class == "live":
+        # A live project move changes the target and therefore the operation
+        # digests. Scope these deterministic UUIDs to that target so a
+        # retained submitted prefix from the old project cannot collide with
+        # the journal replay required for the new project. Backfill keeps its
+        # established source to preserve upgrade-time page idempotency.
+        record_source = f"{record_source}:project:{project_uuid}"
+    elif delivery_class == "backfill":
         record_source = (
             f"{record_source}:reconcile-generation:{int(account['generation'])}"
         )

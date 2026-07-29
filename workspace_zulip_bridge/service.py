@@ -1641,6 +1641,16 @@ class BridgeService:
                     event,
                     "live",
                 )
+                prepare_records = getattr(
+                    self.store, "prepare_provider_event_records", None
+                )
+                if records and callable(prepare_records):
+                    records = prepare_records(
+                        account_uuid,
+                        queue_id,
+                        event_id,
+                        records,
+                    )
             except zulip_adapter.ZulipOperationError as exc:
                 if exc.retryable:
                     self.store.retry_provider_event(
@@ -1658,6 +1668,7 @@ class BridgeService:
                 if str(exc) in {
                     "provider_chat_assignment_pending",
                     "provider_chat_participants_pending",
+                    "provider_event_replay_incomplete",
                 }:
                     self.store.retry_provider_event(
                         account_uuid,
@@ -1683,11 +1694,41 @@ class BridgeService:
                 )
                 processed += 1
                 continue
-            for record in records:
-                if hasattr(self.store, "mark_provider_event_delivering"):
-                    self.store.enqueue_workspace_delivery(record, 0, queue_id, event_id)
+            try:
+                for record in records:
+                    if hasattr(self.store, "mark_provider_event_delivering"):
+                        self.store.enqueue_workspace_delivery(
+                            record, 0, queue_id, event_id
+                        )
+                    else:
+                        self.store.enqueue_workspace_delivery(record, 0)
+            except ValueError as exc:
+                if str(exc) != "provider_chat_assignment_pending":
+                    raise
+                finalize_assignment_change = getattr(
+                    self.store,
+                    "finalize_provider_event_assignment_changed",
+                    None,
+                )
+                if callable(finalize_assignment_change):
+                    requeued = finalize_assignment_change(
+                        account_uuid,
+                        queue_id,
+                        event_id,
+                    )
+                    if requeued is True:
+                        # The recovered create must run before any later edit
+                        # that was already present in this fetched journal page.
+                        break
+                    processed += 1
                 else:
-                    self.store.enqueue_workspace_delivery(record, 0)
+                    self.store.retry_provider_event(
+                        account_uuid,
+                        queue_id,
+                        event_id,
+                        str(exc),
+                    )
+                continue
             deleted_message_ids: list[str] = []
             if event.get("type") == "delete_message":
                 raw_ids = event.get("message_ids")

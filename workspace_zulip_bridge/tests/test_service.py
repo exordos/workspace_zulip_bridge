@@ -1060,12 +1060,19 @@ def test_provider_journal_waits_for_assignment_bound_delivery(monkeypatch):
         def __init__(self, events):
             super().__init__(events)
             self.delivering = []
+            self.prepared = []
 
         def reset_stale_workspace_deliveries(self):
             return 0
 
         def mark_provider_event_delivering(self, account_uuid, queue_id, event_id):
             self.delivering.append((account_uuid, queue_id, event_id))
+
+        def prepare_provider_event_records(
+            self, account_uuid, queue_id, event_id, records
+        ):
+            self.prepared.append((account_uuid, queue_id, event_id, records))
+            return [{**records[0], "prepared": True}]
 
         def enqueue_workspace_delivery(
             self, record, priority, provider_queue_id, provider_event_id
@@ -1092,9 +1099,93 @@ def test_provider_journal_waits_for_assignment_bound_delivery(monkeypatch):
         lambda *args, **kwargs: [{"record_uuid": "record"}],
     )
     assert _delivery_service(store).process_provider_journal() == 1
-    assert store.enqueued == [({"record_uuid": "record"}, 0, "queue", 7)]
+    assert store.prepared == [
+        (
+            account_uuid,
+            "queue",
+            7,
+            [{"record_uuid": "record"}],
+        )
+    ]
+    assert store.enqueued == [
+        ({"record_uuid": "record", "prepared": True}, 0, "queue", 7)
+    ]
     assert store.delivering == [(account_uuid, "queue", 7)]
     assert store.processed == []
+
+
+def test_provider_journal_finishes_assignment_change_during_enqueue(monkeypatch):
+    class Store(DeliveryStore):
+        def __init__(self, events):
+            super().__init__(events)
+            self.assignment_changes = []
+            self.delivering = []
+
+        def reset_stale_workspace_deliveries(self):
+            return 0
+
+        def prepare_provider_event_records(
+            self, account_uuid, queue_id, event_id, records
+        ):
+            return records
+
+        def enqueue_workspace_delivery(
+            self, record, priority, provider_queue_id, provider_event_id
+        ):
+            if record["record_uuid"] == "stale-target":
+                raise ValueError("provider_chat_assignment_pending")
+            self.enqueued.append(
+                (record, priority, provider_queue_id, provider_event_id)
+            )
+            return True
+
+        def finalize_provider_event_assignment_changed(
+            self, account_uuid, queue_id, event_id
+        ):
+            self.assignment_changes.append((account_uuid, queue_id, event_id))
+            return True
+
+        def mark_provider_event_delivering(self, account_uuid, queue_id, event_id):
+            self.delivering.append((account_uuid, queue_id, event_id))
+
+    account_uuid = "00000000-0000-0000-0000-000000000001"
+    store = Store(
+        [
+            {
+                "account_uuid": account_uuid,
+                "queue_id": "queue",
+                "event_id": 7,
+                "body": {"id": 7, "type": "realm_user", "person": {}},
+            },
+            {
+                "account_uuid": account_uuid,
+                "queue_id": "later",
+                "event_id": 8,
+                "body": {"id": 8, "type": "realm_user", "person": {}},
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        converter,
+        "event_records",
+        lambda *args, **kwargs: [
+            {"record_uuid": "accepted-prefix"},
+            {"record_uuid": "stale-target"},
+        ],
+    )
+
+    assert _delivery_service(store).process_provider_journal() == 0
+    assert store.enqueued == [
+        (
+            {"record_uuid": "accepted-prefix"},
+            0,
+            "queue",
+            7,
+        )
+    ]
+    assert store.assignment_changes == [(account_uuid, "queue", 7)]
+    assert store.delivering == []
+    assert store.retried == []
 
 
 def test_live_event_preempts_large_backfill_and_is_exactly_once_across_restart(
