@@ -281,6 +281,102 @@ def test_desired_assignment_can_replace_provider_id_for_workspace_uuid(
     assert postgres_store.control_cursor() == "cursor-2"
 
 
+def test_assignment_projection_repair_restores_mapping_and_wakes_event(
+    postgres_store,
+):
+    account_uuid = str(uuid.uuid4())
+    assignment_uuid = str(uuid.uuid4())
+    project_uuid = str(uuid.uuid4())
+    stream_uuid = str(uuid.uuid4())
+    topic_uuid = str(uuid.uuid4())
+    queue_id = "queue"
+    event_id = 17
+    resource = {
+        "resource_type": "external_chat_assignment",
+        "uuid": assignment_uuid,
+        "generation": 1,
+        "external_account_uuid": account_uuid,
+        "project_id": project_uuid,
+        "provider_chat": {
+            "provider_chat_key": "channel:42",
+            "chat_type": "channel",
+        },
+        "workspace_projection": {
+            "stream": {
+                "uuid": stream_uuid,
+                "name": "Engineering",
+                "description": "",
+                "private": False,
+                "default_topic_uuid": None,
+            },
+            "participants": [],
+            "topics": [
+                {
+                    "topic_uuid": topic_uuid,
+                    "provider_topic_id": "42:Topic",
+                    "name": "Topic",
+                    "is_default": False,
+                }
+            ],
+        },
+    }
+    postgres_store.apply_desired_changes(
+        [
+            {
+                "change_uuid": str(uuid.uuid4()),
+                "sequence": 1,
+                "resource_type": "external_chat_assignment",
+                "resource_uuid": assignment_uuid,
+                "operation": "upsert",
+                "generation": 1,
+                "required_capabilities": {},
+                "resource": resource,
+            }
+        ],
+        "cursor-1",
+    )
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            DELETE FROM provider_mappings
+            WHERE account_uuid = %s AND entity_kind IN ('stream', 'topic')
+            """,
+            (account_uuid,),
+        )
+        session.execute(
+            """
+            INSERT INTO zulip_provider_events (
+                account_uuid, queue_id, event_id, event_type, body,
+                processing_state, processing_reason, available_at
+            ) VALUES (
+                %s, %s, %s, 'message', '{}'::jsonb, 'pending',
+                'provider_chat_assignment_pending',
+                now() + interval '5 minutes'
+            )
+            """,
+            (account_uuid, queue_id, event_id),
+        )
+
+    assert postgres_store.reconcile_assignment_projection(
+        account_uuid, "channel:42"
+    )
+    topic = postgres_store.provider_mapping(
+        account_uuid, "topic", "42:Topic"
+    )
+    assert topic is not None
+    assert str(topic["workspace_uuid"]) == topic_uuid
+    with postgres_store.session() as session:
+        event = session.execute(
+            """
+            SELECT available_at <= now() AS due
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
+            """,
+            (account_uuid, queue_id, event_id),
+        ).fetchone()
+    assert event["due"]
+
+
 def test_topic_recanonicalization_keeps_previous_workspace_route(postgres_store):
     account_uuid = str(uuid.uuid4())
     assignment_uuid = str(uuid.uuid4())
@@ -2428,6 +2524,65 @@ def test_submitted_delivery_survives_assignment_change_as_ambiguous(postgres_sto
         ).fetchone()
     assert resolved["submission_state"] == "sent"
     assert resolved["sent_at"] is not None
+
+
+def test_permanent_provider_rejection_is_quarantined_with_safe_evidence(
+    postgres_store,
+):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    queue_id = "queue"
+    event_id = 9
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            INSERT INTO zulip_provider_events (
+                account_uuid, queue_id, event_id, event_type, body,
+                processing_state
+            ) VALUES (%s, %s, %s, 'message', '{}'::jsonb, 'delivering')
+            """,
+            (account_uuid, queue_id, event_id),
+        )
+    record = _provider_record(account_uuid, project_uuid)
+    assert postgres_store.enqueue_workspace_delivery(
+        record, 0, queue_id, event_id
+    )
+    assert postgres_store.mark_workspace_delivery_submitting(
+        record["record_uuid"]
+    )
+
+    assert postgres_store.reject_provider_event_submission(
+        record["record_uuid"],
+        "provider_api_http_422",
+    )
+    assert postgres_store.pending_workspace_deliveries() == []
+    postgres_store.release_provider_event_submissions([record["record_uuid"]])
+
+    with postgres_store.session() as session:
+        delivery = session.execute(
+            """
+            SELECT submission_state, submission_error_code, sent_at
+            FROM workspace_delivery_outbox
+            WHERE record_uuid = %s
+            """,
+            (record["record_uuid"],),
+        ).fetchone()
+        event = session.execute(
+            """
+            SELECT processing_state, processing_reason
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
+            """,
+            (account_uuid, queue_id, event_id),
+        ).fetchone()
+    assert delivery == {
+        "submission_state": "rejected",
+        "submission_error_code": "provider_api_http_422",
+        "sent_at": None,
+    }
+    assert event == {
+        "processing_state": "delivering",
+        "processing_reason": "workspace_delivery_rejected",
+    }
 
 
 def test_pre_provider_result_crash_retries_same_immutable_record_until_result(

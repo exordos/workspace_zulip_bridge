@@ -218,6 +218,17 @@ def provider_chat_assignment(
     raise ValueError("provider_chat_assignment_pending")
 
 
+def _reconcile_assignment_projection(
+    store: ConversionStore,
+    account_uuid: str,
+    provider_chat_key: str,
+) -> bool:
+    reconcile = getattr(store, "reconcile_assignment_projection", None)
+    return bool(
+        callable(reconcile) and reconcile(account_uuid, provider_chat_key)
+    )
+
+
 def operation_uuid_for(
     account_uuid: str, queue_id: str, event_id: int, subindex: int
 ) -> str:
@@ -992,6 +1003,10 @@ def _message_context(
         store, account_uuid, chat_key
     )
     stream_mapping = store.provider_mapping(account_uuid, "stream", chat_key)
+    if stream_mapping is None and _reconcile_assignment_projection(
+        store, account_uuid, chat_key
+    ):
+        stream_mapping = store.provider_mapping(account_uuid, "stream", chat_key)
     if stream_mapping is None:
         raise ValueError("provider_chat_assignment_pending")
     stream_uuid = str(stream_mapping["workspace_uuid"])
@@ -1016,6 +1031,12 @@ def _message_context(
             str(default_topic_uuid),
         )
     topic_mapping = store.provider_mapping(account_uuid, "topic", topic_provider_id)
+    if topic_mapping is None and _reconcile_assignment_projection(
+        store, account_uuid, chat_key
+    ):
+        topic_mapping = store.provider_mapping(
+            account_uuid, "topic", topic_provider_id
+        )
     if topic_mapping is None:
         raise ValueError("provider_chat_assignment_pending")
     topic_uuid = str(topic_mapping["workspace_uuid"])
@@ -1579,11 +1600,37 @@ def _mapped_event_records(
             if mapping is None:
                 continue
             metadata = typing.cast(dict[str, object], mapping["metadata"])
+            chat_key = str(metadata["chat_key"])
+            assignment = store.assignment_for_provider_chat(
+                account_uuid, chat_key
+            )
+            stream_mapping = store.provider_mapping(
+                account_uuid, "stream", chat_key
+            )
+            if stream_mapping is None and _reconcile_assignment_projection(
+                store, account_uuid, chat_key
+            ):
+                stream_mapping = store.provider_mapping(
+                    account_uuid, "stream", chat_key
+                )
+            if (
+                assignment is None
+                or stream_mapping is None
+                or str(metadata["project_uuid"])
+                != str(assignment["project_id"])
+                or str(metadata["stream_uuid"])
+                != str(stream_mapping["workspace_uuid"])
+            ):
+                # Recanonicalization can leave historical message mappings
+                # pointing at a retired stream. The message snapshot remains
+                # the convergent read-state source; do not submit a permanently
+                # invalid read event against the retired projection.
+                continue
             key = (
                 str(metadata["project_uuid"]),
                 str(metadata["stream_uuid"]),
                 str(metadata["topic_uuid"]),
-                str(metadata["chat_key"]),
+                chat_key,
             )
             grouped.setdefault(key, []).append(mapping)
         for (project_uuid, stream_uuid, topic_uuid, chat_key), mappings in sorted(

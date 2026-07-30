@@ -117,8 +117,10 @@ UUID in durable state. Provider result responses are terminally recorded so
 conflict, rejection, not-found, and stale-lease responses cannot create an
 unbounded resend loop. A renewed lease can safely rebind the same immutable
 operation. Provider event batches are released back to the outbox on transport
-or response validation failure and are committed locally only after the backend
-accepts the full atomic batch.
+or retryable failure and are committed locally only after backend acceptance.
+Permanent record-scoped validation failures are isolated from valid siblings,
+retained as rejected reconciliation evidence, and excluded from automatic
+resubmission.
 
 The 30-day bridge client leaf is renewed with a locally generated replacement
 key during the final seven days of validity. A heartbeat can force immediate

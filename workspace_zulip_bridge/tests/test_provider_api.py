@@ -81,3 +81,20 @@ def test_provider_api_keeps_retryable_conflict_separate_from_bad_request():
         client.lease_operations(uuid.uuid4())
     with pytest.raises(httpx.HTTPStatusError):
         client.lease_operations(uuid.uuid4())
+
+
+def test_provider_event_validation_rejection_has_a_terminal_error_type():
+    client = provider_api.ProviderApiClient(
+        _settings(),
+        httpx.Client(
+            base_url="https://provider.invalid",
+            transport=httpx.MockTransport(
+                lambda _request: httpx.Response(422)
+            ),
+        ),
+    )
+
+    with pytest.raises(provider_api.ProviderEventRejectedError) as exc_info:
+        client.apply_events([{"provider_event_uuid": str(uuid.uuid4())}])
+
+    assert exc_info.value.status_code == 422

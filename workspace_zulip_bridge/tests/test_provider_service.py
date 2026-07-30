@@ -1,10 +1,11 @@
+import copy
 import uuid
 from pathlib import Path
 
 import httpx
 import pytest
 
-from workspace_zulip_bridge import service
+from workspace_zulip_bridge import provider_api, service
 
 ACCOUNT_UUID = "10000000-0000-0000-0000-000000000001"
 PROJECT_UUID = "20000000-0000-0000-0000-000000000002"
@@ -22,6 +23,7 @@ class Store:
         self.finalized = []
         self.accepted = []
         self.released = []
+        self.rejected = []
         self.health = []
 
     def workspace_mapping(self, account_uuid, kind, workspace_uuid):
@@ -86,6 +88,10 @@ class Store:
 
     def release_provider_event_submissions(self, record_uuids):
         self.released.extend(record_uuids)
+
+    def reject_provider_event_submission(self, record_uuid, error_code):
+        self.rejected.append((record_uuid, error_code))
+        return True
 
 
 class Provider:
@@ -389,6 +395,52 @@ def test_retryable_provider_event_failure_releases_idempotent_http_submission():
     with pytest.raises(httpx.ConnectError):
         instance.flush_provider_events()
     assert instance.store.released == [record["record_uuid"]]
+
+
+def test_permanent_rejection_isolates_one_record_and_commits_valid_sibling():
+    instance = _instance()
+    rejected = _inbound_record()
+    accepted = copy.deepcopy(rejected)
+    accepted["record_uuid"] = str(uuid.uuid4())
+    accepted["operation_uuid"] = str(uuid.uuid4())
+    accepted["operation"]["entity_uuid"] = str(uuid.uuid4())
+    accepted["sequence"] = 2
+    instance.store.deliveries = [rejected, accepted]
+    calls = []
+
+    def apply(events):
+        calls.append([event["provider_event_uuid"] for event in events])
+        if any(
+            event["payload"]["resource"]["uuid"] == MESSAGE_UUID
+            for event in events
+        ):
+            raise provider_api.ProviderEventRejectedError(422)
+        return {
+            "results": [
+                {
+                    "provider_event_uuid": event["provider_event_uuid"],
+                    "status": "applied",
+                }
+                for event in events
+            ]
+        }
+
+    instance.provider_api.apply_events = apply
+
+    assert instance.flush_provider_events() == 1
+    assert [len(call) for call in calls] == [2, 1, 1]
+    assert instance.store.rejected == [
+        (rejected["record_uuid"], "provider_api_http_422")
+    ]
+    assert [
+        result["in_reply_to_record_uuid"] for result in instance.store.accepted
+    ] == [
+        accepted["record_uuid"]
+    ]
+    assert instance.store.released == []
+    assert instance.store.health == [
+        ("provider_api", "degraded", "provider_event_rejected")
+    ]
 
 
 def test_unsupported_provider_mutation_is_released_not_acknowledged_as_committed():

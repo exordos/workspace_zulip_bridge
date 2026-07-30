@@ -15,6 +15,14 @@ class ProviderApiRetryableError(RuntimeError):
         self.retry_after_seconds = retry_after_seconds
 
 
+class ProviderEventRejectedError(RuntimeError):
+    """A record-scoped event request that the Provider API will not accept."""
+
+    def __init__(self, status_code: int):
+        super().__init__(f"Provider API rejected event delivery: HTTP {status_code}")
+        self.status_code = status_code
+
+
 class ProviderApiClient:
     """mTLS client for the private Workspace Provider Data API v1."""
 
@@ -117,5 +125,10 @@ class ProviderApiClient:
             f"{self.API_ROOT}/events",
             json={"events": events},
         )
-        self._raise_for_status(response)
+        try:
+            self._raise_for_status(response)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in {400, 413, 422}:
+                raise ProviderEventRejectedError(exc.response.status_code) from exc
+            raise
         return typing.cast(dict[str, object], response.json())

@@ -480,6 +480,14 @@ class RestAlchemyStore:
                         self._materialize_workspace_projection(
                             session, typing.cast(dict[str, object], body)
                         )
+                        self._wake_assignment_pending_events(
+                            session,
+                            str(
+                                typing.cast(
+                                    dict[str, object], body
+                                )["external_account_uuid"]
+                            ),
+                        )
                     elif previous is not None and previous["body"] is not None:
                         self._tombstone_workspace_projection(
                             session,
@@ -530,6 +538,10 @@ class RestAlchemyStore:
                 )
                 if resource["resource_type"] == "external_chat_assignment":
                     self._materialize_workspace_projection(session, resource)
+                    self._wake_assignment_pending_events(
+                        session,
+                        str(resource["external_account_uuid"]),
+                    )
             session.execute(
                 """
                 DELETE FROM zulip_event_cursors AS cursor
@@ -714,6 +726,23 @@ class RestAlchemyStore:
             )
 
     @staticmethod
+    def _wake_assignment_pending_events(
+        session: sessions.PgSQLSession,
+        account_uuid: str,
+    ) -> None:
+        """Wake journal events after their projection mapping arrives."""
+        session.execute(
+            """
+            UPDATE zulip_provider_events
+            SET available_at = now()
+            WHERE account_uuid = %s
+              AND processing_state = 'pending'
+              AND processing_reason = 'provider_chat_assignment_pending'
+            """,
+            (account_uuid,),
+        )
+
+    @staticmethod
     def _tombstone_workspace_projection(
         session: sessions.PgSQLSession,
         assignment: dict[str, object],
@@ -879,6 +908,30 @@ class RestAlchemyStore:
                 (account_uuid, provider_chat_key),
             ).fetchone()
             return None if row is None else typing.cast(dict[str, object], row["body"])
+
+    def reconcile_assignment_projection(
+        self, account_uuid: str, provider_chat_key: str
+    ) -> bool:
+        """Rebuild local mappings from the latest durable assignment."""
+        with self.session() as session:
+            row = session.execute(
+                """
+                SELECT body FROM desired_resources
+                WHERE resource_type = 'external_chat_assignment'
+                  AND NOT deleted
+                  AND body->>'external_account_uuid' = %s
+                  AND body->'provider_chat'->>'provider_chat_key' = %s
+                LIMIT 1
+                """,
+                (account_uuid, provider_chat_key),
+            ).fetchone()
+            if row is None:
+                return False
+            self._materialize_workspace_projection(
+                session, typing.cast(dict[str, object], row["body"])
+            )
+            self._wake_assignment_pending_events(session, account_uuid)
+            return True
 
     def assignments_needing_live_report(
         self, account_uuid: str
@@ -3126,6 +3179,39 @@ class RestAlchemyStore:
                 """,
                 (record_uuids,),
             )
+
+    def reject_provider_event_submission(
+        self,
+        record_uuid: str,
+        error_code: str,
+    ) -> bool:
+        """Quarantine one permanent Provider API rejection for reconciliation."""
+        with self.session() as session:
+            row = session.execute(
+                """
+                WITH rejected AS (
+                    UPDATE workspace_delivery_outbox
+                    SET submission_state = 'rejected',
+                        submission_error_code = %s
+                    WHERE record_uuid = %s
+                      AND submission_state = 'submitting'
+                      AND sent_at IS NULL
+                    RETURNING account_uuid, provider_queue_id, provider_event_id
+                ), marked AS (
+                    UPDATE zulip_provider_events AS event
+                    SET processing_reason = 'workspace_delivery_rejected'
+                    FROM rejected
+                    WHERE event.account_uuid = rejected.account_uuid
+                      AND event.queue_id = rejected.provider_queue_id
+                      AND event.event_id = rejected.provider_event_id
+                      AND event.processing_state = 'delivering'
+                    RETURNING event.event_id
+                )
+                SELECT EXISTS (SELECT 1 FROM rejected) AS rejected
+                """,
+                (error_code[:128], record_uuid),
+            ).fetchone()
+            return bool(row["rejected"])
 
     @staticmethod
     def _queued_operation(row: dict[str, object]) -> QueuedOperation:

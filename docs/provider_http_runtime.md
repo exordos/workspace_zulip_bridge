@@ -46,8 +46,11 @@ POST /api/workspace-provider/v1/events
 
 The backend applies each batch atomically. The bridge validates response order,
 event UUIDs, and `applied` status before committing its local outbox. Transport
-errors and invalid or non-applied responses release every claimed submission so
-the idempotent event UUIDs can be retried.
+errors and retryable responses release claimed submissions so the idempotent
+event UUIDs can be retried. A record-scoped permanent rejection is isolated by
+ordered batch bisection. Valid siblings still commit; the rejected record is
+retained in the durable outbox with `submission_state = 'rejected'` and a safe
+status code, and is not automatically resubmitted.
 
 ### Staged synchronization
 
@@ -71,6 +74,11 @@ Zulip topics are discovered from messages. The durable provider mapping table
 is the local processed-topic cache: a missing topic queues an idempotent catalog
 report, message delivery waits for the resulting Workspace topic mapping, and
 then an idempotent `topic.upsert` precedes `message.create`.
+If an assignment exists but its local stream or topic mapping was lost, the
+bridge rematerializes that mapping from the durable assignment and immediately
+wakes assignment-blocked journal events. Read-state events whose historical
+message mappings point at a retired stream are omitted; message snapshots remain
+the convergent read-state source for those retired projections.
 
 If Zulip rejects a persisted queue, the bridge records a catch-up boundary,
 invalidates only that queue cursor, and opens a replacement queue. Selected
