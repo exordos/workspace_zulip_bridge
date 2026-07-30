@@ -873,6 +873,62 @@ def test_message_mutations_and_topic_rename_reuse_stable_mappings():
     assert "through_message_uuid" not in read[0]["payload"]
 
 
+def test_read_state_drops_retired_stream_mapping_after_recanonicalization():
+    store = FakeStore()
+    first_event = {
+        "id": 10,
+        "type": "message",
+        "message": _stream_message(601, "Topic"),
+    }
+    first_records = converter.event_records(
+        store, ACCOUNT_UUID, "queue", first_event
+    )
+    first_message = next(
+        operation
+        for operation in _operations(first_records)
+        if operation["kind"] == "message.create"
+    )
+    stream_mapping = store.mappings[("stream", "channel:42")]
+    stream_mapping["workspace_uuid"] = str(uuid.uuid4())
+
+    second_event = {
+        "id": 11,
+        "type": "message",
+        "message": _stream_message(602, "Topic"),
+    }
+    second_records = converter.event_records(
+        store, ACCOUNT_UUID, "queue", second_event
+    )
+    second_message = next(
+        operation
+        for operation in _operations(second_records)
+        if operation["kind"] == "message.create"
+    )
+
+    read = _operations(
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "queue",
+            {
+                "id": 12,
+                "type": "update_message_flags",
+                "flag": "read",
+                "op": "add",
+                "messages": [601, 602],
+            },
+        )
+    )
+
+    assert len(read) == 1
+    assert read[0]["kind"] == "read_state.set"
+    assert read[0]["payload"]["stream_uuid"] == stream_mapping["workspace_uuid"]
+    assert read[0]["payload"]["message_uuids"] == [
+        second_message["entity_uuid"]
+    ]
+    assert first_message["entity_uuid"] not in read[0]["payload"]["message_uuids"]
+
+
 def test_message_snapshot_and_live_events_project_reactions_with_stable_identity():
     store = FakeStore()
     message = _stream_message()

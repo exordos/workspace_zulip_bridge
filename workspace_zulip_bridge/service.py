@@ -1985,29 +1985,14 @@ class BridgeService:
                 else:
                     event_records.append((record, event))
             if event_records:
-                response = self.provider_api.apply_events(
-                    [event for _record, event in event_records]
-                )
-                results = typing.cast(list[dict[str, object]], response["results"])
-                expected = [
-                    str(event["provider_event_uuid"])
-                    for _record, event in event_records
-                ]
-                actual = [str(result["provider_event_uuid"]) for result in results]
-                if actual != expected:
-                    raise ValueError(
-                        "Provider event response does not match request order"
-                    )
-                if any(result["status"] != "applied" for result in results):
-                    raise ValueError("Provider event batch was not applied atomically")
+                committed = self._apply_provider_event_records(event_records)
+            else:
+                committed = 0
         except Exception:
             if hasattr(self.store, "release_provider_event_submissions"):
                 self.store.release_provider_event_submissions(submitting_record_uuids)
             raise
-        for record in [
-            *completed_without_event,
-            *(record for record, _event in event_records),
-        ]:
+        for record in completed_without_event:
             result = scheduler.result_record(
                 record,
                 "committed",
@@ -2017,7 +2002,57 @@ class BridgeService:
             self.store.accept_result(result)
         if hasattr(self.store, "finalize_ready_provider_events"):
             self.store.finalize_ready_provider_events()
-        return len(completed_without_event) + len(event_records)
+        return len(completed_without_event) + committed
+
+    def _apply_provider_event_records(
+        self,
+        event_records: list[tuple[dict[str, object], dict[str, object]]],
+    ) -> int:
+        """Apply in order, isolating only permanently rejected records."""
+        try:
+            response = self.provider_api.apply_events(
+                [event for _record, event in event_records]
+            )
+        except provider_api.ProviderEventRejectedError as exc:
+            if len(event_records) > 1:
+                midpoint = len(event_records) // 2
+                return self._apply_provider_event_records(
+                    event_records[:midpoint]
+                ) + self._apply_provider_event_records(event_records[midpoint:])
+            record, _event = event_records[0]
+            error_code = f"provider_api_http_{exc.status_code}"
+            rejected = self.store.reject_provider_event_submission(
+                str(record["record_uuid"]),
+                error_code,
+            )
+            if not rejected:
+                raise RuntimeError(
+                    "Provider event rejection could not be quarantined"
+                ) from exc
+            self.store.mark_health(
+                "provider_api",
+                "degraded",
+                "provider_event_rejected",
+            )
+            return 0
+        results = typing.cast(list[dict[str, object]], response["results"])
+        expected = [
+            str(event["provider_event_uuid"]) for _record, event in event_records
+        ]
+        actual = [str(result["provider_event_uuid"]) for result in results]
+        if actual != expected:
+            raise ValueError("Provider event response does not match request order")
+        if any(result["status"] != "applied" for result in results):
+            raise ValueError("Provider event batch was not applied atomically")
+        for record, _event in event_records:
+            result = scheduler.result_record(
+                record,
+                "committed",
+                scheduler.TargetCommit(None, None),
+                None,
+            )
+            self.store.accept_result(result)
+        return len(event_records)
 
     def tick(self) -> bool:
         now = time.monotonic()

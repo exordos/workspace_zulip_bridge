@@ -67,11 +67,12 @@ def test_migrations_have_one_versioned_dependency_chain():
         "0008-refresh-Zulip-reaction-queues-c511aa.py",
         "0009-index-observed-reports-d6d013.py",
         "0010-prepare-provider-event-records-f970c8.py",
+        "0011-quarantine-rejected-provider-events-f1169c.py",
     ]
     assert engine.get_latest_migration() == (
-        "0010-prepare-provider-event-records-f970c8.py"
+        "0011-quarantine-rejected-provider-events-f1169c.py"
     )
-    assert len({step["uuid"] for step in all_migrations.values()}) == 11
+    assert len({step["uuid"] for step in all_migrations.values()}) == 12
     assert all_migrations[
         "0001-add-Zulip-provider-scheduler-state-143113.py"
     ]["depends"] == ["0000-initialize-bridge-operational-state-18f707.py"]
@@ -118,6 +119,11 @@ def test_migrations_have_one_versioned_dependency_chain():
     ]["depends"] == [
         "0009-index-observed-reports-d6d013.py"
     ]
+    assert all_migrations[
+        "0011-quarantine-rejected-provider-events-f1169c.py"
+    ]["depends"] == [
+        "0010-prepare-provider-event-records-f970c8.py"
+    ]
 
 
 def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
@@ -151,7 +157,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                 ORDER BY indexname
                 """
             ).fetchall()
-            assert applied["count"] == 11
+            assert applied["count"] == 12
             assert [row["indexname"] for row in indexes] == [
                 "observed_report_outbox_pending_order_idx",
                 "observed_report_outbox_resource_latest_idx",
@@ -182,7 +188,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
             provider_cursor_count = session.execute(
                 "SELECT count(*) AS count FROM zulip_event_cursors"
             ).fetchone()
-            assert applied["count"] == 11
+            assert applied["count"] == 12
             assert cursor["control_cursor"] == "preserved"
             assert provider_cursor_count["count"] == 0
     finally:
