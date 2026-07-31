@@ -246,6 +246,12 @@ class OfficialZulipAdapter:
                 )
             except PROVIDER_NETWORK_ERRORS as exc:
                 raise ZulipOperationError("provider_unavailable", True) from exc
+            except AssertionError as exc:
+                # The official client asserts that the server-settings response
+                # contains a Zulip version. Treat a malformed/transient response
+                # as an account-scoped provider failure instead of terminating the
+                # bridge process and disrupting every other account.
+                raise ZulipOperationError("provider_unavailable", True) from exc
         self.client = client
         self.credentials = credentials
         self.routing = routing

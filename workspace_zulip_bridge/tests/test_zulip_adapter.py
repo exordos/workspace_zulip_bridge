@@ -1437,6 +1437,24 @@ def test_official_client_disables_inline_retries(monkeypatch):
     ]
 
 
+def test_invalid_server_settings_are_retryable_and_account_scoped(monkeypatch):
+    def invalid_client(**kwargs):
+        raise AssertionError("zulip_version is missing")
+
+    monkeypatch.setattr(zulip_adapter.zulip, "Client", invalid_client)
+    credentials = zulip_adapter.ZulipCredentials(
+        site="https://zulip.example.invalid",
+        email="owner@example.invalid",
+        api_key="secret",
+    )
+
+    with pytest.raises(zulip_adapter.ZulipOperationError) as error:
+        zulip_adapter.OfficialZulipAdapter(credentials=credentials)
+
+    assert error.value.code == "provider_unavailable"
+    assert error.value.retryable is True
+
+
 def test_registration_requests_and_retains_catalog_snapshot_fields():
     client = FakeClient()
     adapter = zulip_adapter.OfficialZulipAdapter(client=client)

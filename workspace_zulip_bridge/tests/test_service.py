@@ -699,6 +699,42 @@ class DeliveryStore:
         self.invalid.append((account_uuid, queue_id, event_id, reason))
 
 
+def test_inactive_account_event_is_terminalized_without_provider_access():
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+
+    class Store(DeliveryStore):
+        def __init__(self):
+            super().__init__(
+                [
+                    {
+                        "account_uuid": account_uuid,
+                        "queue_id": "retired-queue",
+                        "event_id": 7,
+                        "body": {"id": 7, "type": "message"},
+                    }
+                ]
+            )
+            self.ignored = []
+
+        def account_is_active(self, requested):
+            return False
+
+        def ignore_provider_event_for_inactive_account(
+            self, requested, queue_id, event_id
+        ):
+            self.ignored.append((requested, queue_id, event_id))
+            return True
+
+    store = Store()
+    instance = _delivery_service(store)
+    instance.provider_adapters = lambda requested: pytest.fail(
+        "inactive accounts must not instantiate a Zulip client"
+    )
+
+    assert instance.process_provider_journal() == 1
+    assert store.ignored == [(account_uuid, "retired-queue", 7)]
+
+
 class ProviderAdapter:
     server_url = "https://zulip.example.invalid"
 

@@ -475,6 +475,9 @@ def test_workspace_delivery_outbox_orders_live_before_backfill():
     assert "jsonb_array_elements_text" in statement
     assert "workspace_delivery_state" in statement
     assert "provider_mappings AS message_mapping" in statement
+    assert "message_mapping.workspace_uuid::text" not in statement
+    assert "read_message.message_uuid::uuid" in statement
+    assert ")::uuid" in statement
     assert "'reaction.upsert', 'reaction.delete'" in statement
     assert "ORDER BY priority, created_at" in statement
 
@@ -591,6 +594,38 @@ def test_initial_backfill_gate_ignores_delivery_outcomes_from_older_generation()
     assert "participant_sync.state = 'ready'" in normalized
     assert "account.resource_uuid = delivery.account_uuid" in normalized
     assert "delivery.account_generation = account.generation" in normalized
+    assert "participant_sync.account_uuid::text" not in normalized
+    assert "job.account_uuid::text" not in normalized
+    assert "delivery.account_uuid::text" not in normalized
+
+
+def test_catalog_readiness_queries_use_native_uuid_index_expressions():
+    session = Session(({"accepted": True, "count": 0},))
+    store = _store_with_session(session)
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+
+    assert store.catalog_reports_accepted(account_uuid, 3)
+    report_query = " ".join(session.statements[0][0].split())
+    assert "external_account_uuid" in report_query
+    assert ")::uuid = %s" in report_query
+    assert "resource_uuid')::uuid" in report_query
+
+
+def test_inactive_provider_event_terminalization_preserves_audit_rows():
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+    session = Session(({"account_uuid": account_uuid},))
+    store = _store_with_session(session)
+
+    assert store.ignore_provider_event_for_inactive_account(
+        account_uuid, "retired-queue", 7
+    )
+    ignored = " ".join(session.statements[0][0].split())
+    cancelled = " ".join(session.statements[1][0].split())
+    assert "processing_state = 'ignored'" in ignored
+    assert "processing_reason = 'account_inactive'" in ignored
+    assert "synchronization_enabled" in ignored
+    assert "submission_state = 'cancelled'" in cancelled
+    assert "submission_error_code = 'account_inactive'" in cancelled
 
 
 def test_backfill_claim_requires_ready_participants_for_current_assignment():
