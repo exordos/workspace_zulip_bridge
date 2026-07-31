@@ -563,15 +563,54 @@ def _trim_bare_url(value: str) -> tuple[str, str]:
     return url, suffix
 
 
+def _reply_provider_id(link: markdown_conversion.MarkdownLink) -> str | None:
+    target = urllib.parse.urlsplit(link.destination)
+    if target.scheme and target.scheme.casefold() not in {"http", "https"}:
+        return None
+    match = REPLY_FRAGMENT_RE.fullmatch(target.fragment)
+    return match.group("id") if match is not None else None
+
+
 def _semantic_reply_provider_id(content: str) -> str | None:
     for link in markdown_conversion.semantic_quote_links(content):
-        target = urllib.parse.urlsplit(link.destination)
-        if target.scheme and target.scheme.casefold() not in {"http", "https"}:
-            continue
-        match = REPLY_FRAGMENT_RE.fullmatch(target.fragment)
-        if match is not None:
-            return match.group("id")
+        provider_id = _reply_provider_id(link)
+        if provider_id is not None:
+            return provider_id
     return None
+
+
+def _canonicalize_semantic_quotes(
+    content: str,
+    store: ConversionStore,
+    account_uuid: str,
+) -> str:
+    def canonical_quote(
+        link: markdown_conversion.MarkdownLink,
+        _quoted_content: str,
+    ) -> str | None:
+        provider_id = _reply_provider_id(link)
+        if provider_id is None:
+            return None
+        message = store.provider_mapping(account_uuid, "message", provider_id)
+        if message is None:
+            return None
+        metadata = message.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        author_uuid = metadata.get("author_uuid")
+        author = (
+            store.workspace_mapping(account_uuid, "identity", str(author_uuid))
+            if author_uuid is not None
+            else None
+        )
+        author_metadata = author.get("metadata") if author is not None else None
+        author_metadata = (
+            author_metadata if isinstance(author_metadata, dict) else {}
+        )
+        display_name = str(author_metadata.get("display_name", "Quoted message"))
+        label = display_name.replace("\\", "\\\\").replace("]", "\\]")
+        return f"[{label}](urn:quote:{message['workspace_uuid']})"
+
+    return markdown_conversion.transform_semantic_quotes(content, canonical_quote)
 
 
 def _convert_zulip_links(
@@ -1207,14 +1246,20 @@ def message_event_records(
         if provider_site
         else f"#narrow/near/{provider_message_id}"
     )
+    provider_content = str(message["content"])
+    reply_provider_id = _semantic_reply_provider_id(provider_content)
+    canonical_content = _canonicalize_semantic_quotes(
+        provider_content,
+        store,
+        account_uuid,
+    )
     markdown, lossy = convert_markdown(
-        str(message["content"]),
+        canonical_content,
         mention_uuids,
         message_url,
         file_resolver,
         ZulipLinkResolver(store, account_uuid, owner_uuid),
     )
-    reply_provider_id = _semantic_reply_provider_id(str(message["content"]))
     reply_mapping = (
         store.provider_mapping(account_uuid, "message", reply_provider_id)
         if reply_provider_id is not None
@@ -1225,7 +1270,7 @@ def message_event_records(
     )
     content_sha256 = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
     provider_content_sha256 = hashlib.sha256(
-        str(message["content"]).encode("utf-8")
+        provider_content.encode("utf-8")
     ).hexdigest()
     channel_subject = channel_topic_name(str(message.get("subject", "")))
     topic_provider_id = (

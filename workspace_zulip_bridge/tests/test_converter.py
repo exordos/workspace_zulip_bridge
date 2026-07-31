@@ -1260,6 +1260,9 @@ def test_inbound_zulip_reply_resolves_provider_target_to_workspace_message():
     )
 
     assert message["payload"]["reply_to_message_uuid"] == original["workspace_uuid"]
+    assert message["payload"]["payload"]["content"] == (
+        f"[Other User](urn:quote:{original['workspace_uuid']})\n\nreply"
+    )
     assert message["extensions"]["unresolved_reply_provider_id"] is None
 
 
@@ -1292,6 +1295,9 @@ def test_inbound_zulip_reply_accepts_localized_quote_link_label():
     )
 
     assert message["payload"]["reply_to_message_uuid"] == original["workspace_uuid"]
+    assert message["payload"]["payload"]["content"] == (
+        f"[Other User](urn:quote:{original['workspace_uuid']})\n\nreply"
+    )
     assert message["extensions"]["unresolved_reply_provider_id"] is None
 
 
@@ -1337,6 +1343,9 @@ def test_inbound_zulip_reply_resolves_within_each_account_projection():
         )
 
         assert message["payload"]["reply_to_message_uuid"] == source["workspace_uuid"]
+        assert message["payload"]["payload"]["content"] == (
+            f"[Other User](urn:quote:{source['workspace_uuid']})\n\nreply"
+        )
         assert message["extensions"]["unresolved_reply_provider_id"] is None
 
     assert source_uuids[0] != source_uuids[1]

@@ -33,6 +33,7 @@ class MarkdownLink:
 TextTransform = typing.Callable[[str], str]
 LinkTransform = typing.Callable[[MarkdownLink], str]
 StandaloneLinkTransform = typing.Callable[[MarkdownLink], str | None]
+SemanticQuoteTransform = typing.Callable[[MarkdownLink, str], str | None]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -481,6 +482,64 @@ def semantic_quote_links(content: str) -> tuple[MarkdownLink, ...]:
                     break
             break
     return tuple(links)
+
+
+def transform_semantic_quotes(
+    content: str,
+    transform: SemanticQuoteTransform,
+) -> str:
+    """Replace complete Zulip reply quote blocks while preserving other source."""
+    tokens, _environment, source = _parse(content)
+    edits: list[_Edit] = []
+    for fence_index, fence in enumerate(tokens):
+        if not _quote_fence(fence) or fence.map is None:
+            continue
+        for candidate in reversed(tokens[:fence_index]):
+            if candidate.type != "inline" or candidate.map is None:
+                continue
+            if candidate.map[1] != fence.map[0]:
+                break
+            if candidate.level != fence.level + 1:
+                continue
+            candidate_links = _inline_links(candidate, source)
+            for _token, link, span in reversed(candidate_links):
+                if link.image:
+                    continue
+                fence_start, fence_end = source.line_range(fence.map)
+                if source.content[span[1] : fence_start].strip() != ":":
+                    continue
+                replacement = transform(
+                    link,
+                    _without_final_line_ending(fence.content),
+                )
+                if replacement is not None:
+                    header_start, _header_end = source.line_range(candidate.map)
+                    closing_ending = _split_line_ending(
+                        source.lines[fence.map[1] - 1]
+                    )[1]
+                    edits.append(
+                        _Edit(
+                            header_start,
+                            fence_end,
+                            replacement + closing_ending,
+                            120,
+                        )
+                    )
+                break
+            break
+
+    transformed: list[str] = []
+    cursor = 0
+    for edit in _select_edits(edits):
+        transformed.append(content[cursor : edit.start])
+        transformed.append(
+            content[edit.start : edit.end]
+            if edit.replacement is None
+            else edit.replacement
+        )
+        cursor = edit.end
+    transformed.append(content[cursor:])
+    return "".join(transformed)
 
 
 def _literal_reference_labels(

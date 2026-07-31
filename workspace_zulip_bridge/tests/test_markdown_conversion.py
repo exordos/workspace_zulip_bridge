@@ -76,3 +76,36 @@ def test_semantic_quote_link_label_may_be_localized():
     assert [link.destination for link in links] == [
         "https://zulip.example.invalid/#narrow/near/601"
     ]
+
+
+def test_semantic_quote_transform_replaces_header_and_body_but_preserves_reply():
+    reply = (
+        "@_**Other User|2** "
+        "[said](https://zulip.example.invalid/#narrow/near/601):\n"
+        "```quote\noriginal\n```\n\nreply"
+    )
+
+    converted = markdown_conversion.transform_semantic_quotes(
+        reply,
+        lambda _link, body: f"[Other User](urn:quote:message-uuid?text={body})",
+    )
+
+    assert converted == (
+        "[Other User](urn:quote:message-uuid?text=original)\n\nreply"
+    )
+
+
+def test_semantic_quote_transform_preserves_literal_example_fence():
+    literal = (
+        "````markdown\n"
+        "[said](https://zulip.example.invalid/#narrow/near/999):\n"
+        "```quote\nliteral\n```\n"
+        "````\n"
+    )
+
+    converted = markdown_conversion.transform_semantic_quotes(
+        literal,
+        lambda _link, _body: "replacement",
+    )
+
+    assert converted == literal
