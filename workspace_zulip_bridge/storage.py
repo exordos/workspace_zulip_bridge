@@ -1428,6 +1428,52 @@ class RestAlchemyStore:
                 ),
             )
 
+    def ignore_provider_event_for_inactive_account(
+        self, account_uuid: str, queue_id: str, event_id: int
+    ) -> bool:
+        """Terminalize stale work only when its account is explicitly inactive."""
+        with self.session() as session:
+            ignored = session.execute(
+                """
+                UPDATE zulip_provider_events AS event
+                SET processing_state = 'ignored',
+                    processing_reason = 'account_inactive',
+                    prepared_records = NULL
+                WHERE event.account_uuid = %s
+                  AND event.queue_id = %s
+                  AND event.event_id = %s
+                  AND event.processing_state IN ('pending', 'delivering')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM desired_resources AS account
+                      WHERE account.resource_type = 'external_account'
+                        AND account.resource_uuid = event.account_uuid
+                        AND NOT account.deleted
+                        AND COALESCE(
+                            (account.body->>'synchronization_enabled')::boolean,
+                            false
+                        )
+                  )
+                RETURNING event.account_uuid
+                """,
+                (account_uuid, queue_id, event_id),
+            ).fetchone()
+            if ignored is None:
+                return False
+            session.execute(
+                """
+                UPDATE workspace_delivery_outbox
+                SET submission_state = 'cancelled',
+                    submission_error_code = 'account_inactive'
+                WHERE account_uuid = %s
+                  AND provider_queue_id = %s
+                  AND provider_event_id = %s
+                  AND sent_at IS NULL
+                  AND submission_state NOT IN ('cancelled', 'rejected', 'sent')
+                """,
+                (account_uuid, queue_id, event_id),
+            )
+            return True
+
     def producer_lane_position(
         self, operation_uuid: str, origin: str, causal_lane: str
     ) -> tuple[int, str | None]:
@@ -1924,8 +1970,8 @@ class RestAlchemyStore:
                                   WHERE message_mapping.account_uuid =
                                       delivery.account_uuid
                                     AND message_mapping.entity_kind = 'message'
-                                    AND message_mapping.workspace_uuid::text =
-                                        read_message.message_uuid
+                                    AND message_mapping.workspace_uuid =
+                                        read_message.message_uuid::uuid
                                     AND NOT message_mapping.deleted
                                     AND message_mapping.metadata
                                             ->>'workspace_delivery_state' =
@@ -1970,9 +2016,11 @@ class RestAlchemyStore:
                               WHERE message_mapping.account_uuid =
                                   delivery.account_uuid
                                 AND message_mapping.entity_kind = 'message'
-                                AND message_mapping.workspace_uuid::text =
-                                    delivery.record->'operation'->'payload'
-                                        ->>'message_uuid'
+                                AND message_mapping.workspace_uuid =
+                                    (
+                                        delivery.record->'operation'->'payload'
+                                            ->>'message_uuid'
+                                    )::uuid
                                 AND NOT message_mapping.deleted
                                 AND message_mapping.metadata
                                         ->>'workspace_delivery_state' =
@@ -2778,12 +2826,16 @@ class RestAlchemyStore:
             row = session.execute(
                 """
                 WITH latest AS (
-                    SELECT DISTINCT ON (body->>'resource_uuid') result_status
+                    SELECT DISTINCT ON (
+                        (body->>'resource_uuid')::uuid
+                    ) result_status
                     FROM observed_report_outbox
                     WHERE body->>'resource_type' = 'external_chat_catalog'
-                      AND body->'catalog'->>'external_account_uuid' = %s
+                      AND (
+                          body->'catalog'->>'external_account_uuid'
+                      )::uuid = %s
                       AND (body->>'observed_generation')::bigint = %s
-                    ORDER BY body->>'resource_uuid', created_at DESC
+                    ORDER BY (body->>'resource_uuid')::uuid, created_at DESC
                 )
                 SELECT NOT EXISTS (
                     SELECT 1 FROM latest
@@ -2815,12 +2867,16 @@ class RestAlchemyStore:
             catalog_count = session.execute(
                 """
                 WITH latest AS (
-                    SELECT DISTINCT ON (body->>'resource_uuid') body, result_status
+                    SELECT DISTINCT ON (
+                        (body->>'resource_uuid')::uuid
+                    ) body, result_status
                     FROM observed_report_outbox
                     WHERE body->>'resource_type' = 'external_chat_catalog'
-                      AND body->'catalog'->>'external_account_uuid' = %s
+                      AND (
+                          body->'catalog'->>'external_account_uuid'
+                      )::uuid = %s
                       AND (body->>'observed_generation')::bigint = %s
-                    ORDER BY body->>'resource_uuid', created_at DESC
+                    ORDER BY (body->>'resource_uuid')::uuid, created_at DESC
                 )
                 SELECT COUNT(*) AS count FROM latest
                 WHERE body->'catalog'->>'operation' = 'upsert'
@@ -2833,7 +2889,7 @@ class RestAlchemyStore:
                 SELECT COUNT(*) AS count FROM desired_resources
                 WHERE resource_type = 'external_chat_assignment'
                   AND NOT deleted
-                  AND body->>'external_account_uuid' = %s
+                  AND (body->>'external_account_uuid')::uuid = %s
                   AND COALESCE((body->>'selected')::boolean, true)
                 """,
                 (account_uuid,),
@@ -2849,14 +2905,16 @@ class RestAlchemyStore:
                         SELECT 1 FROM desired_resources AS assignment
                         WHERE assignment.resource_type = 'external_chat_assignment'
                           AND NOT assignment.deleted
-                          AND assignment.body->>'external_account_uuid' = %s
+                          AND (
+                              assignment.body->>'external_account_uuid'
+                          )::uuid = %s
                           AND COALESCE(
                               (assignment.body->>'selected')::boolean, true
                           )
                           AND NOT EXISTS (
                               SELECT 1 FROM zulip_participant_sync
                                   AS participant_sync
-                              WHERE participant_sync.account_uuid::text = %s
+                              WHERE participant_sync.account_uuid = %s
                                 AND participant_sync.provider_chat_key =
                                     assignment.body->'provider_chat'
                                         ->>'provider_chat_key'
@@ -2870,13 +2928,15 @@ class RestAlchemyStore:
                         WHERE assignment.resource_type =
                               'external_chat_assignment'
                           AND NOT assignment.deleted
-                          AND assignment.body->>'external_account_uuid' = %s
+                          AND (
+                              assignment.body->>'external_account_uuid'
+                          )::uuid = %s
                           AND COALESCE(
                               (assignment.body->>'selected')::boolean, true
                           )
                           AND NOT EXISTS (
                               SELECT 1 FROM zulip_backfill_jobs AS job
-                              WHERE job.account_uuid::text = %s
+                              WHERE job.account_uuid = %s
                                 AND job.provider_chat_key =
                                     assignment.body->'provider_chat'->>'provider_chat_key'
                                 AND job.state = 'complete'
@@ -2890,7 +2950,7 @@ class RestAlchemyStore:
                          AND NOT account.deleted
                         LEFT JOIN operation_idempotency AS operation
                           ON operation.operation_uuid = delivery.operation_uuid
-                        WHERE delivery.account_uuid::text = %s
+                        WHERE delivery.account_uuid = %s
                           AND delivery.priority = 2
                           AND delivery.account_generation = account.generation
                           AND operation.terminal_outcome IS DISTINCT FROM 'committed'

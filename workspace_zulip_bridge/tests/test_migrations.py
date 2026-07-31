@@ -68,11 +68,12 @@ def test_migrations_have_one_versioned_dependency_chain():
         "0009-index-observed-reports-d6d013.py",
         "0010-prepare-provider-event-records-f970c8.py",
         "0011-quarantine-rejected-provider-events-f1169c.py",
+        "0012-optimize-bridge-load-and-reconcile-stale-queues-6c9ddc.py",
     ]
     assert engine.get_latest_migration() == (
-        "0011-quarantine-rejected-provider-events-f1169c.py"
+        "0012-optimize-bridge-load-and-reconcile-stale-queues-6c9ddc.py"
     )
-    assert len({step["uuid"] for step in all_migrations.values()}) == 12
+    assert len({step["uuid"] for step in all_migrations.values()}) == 13
     assert all_migrations[
         "0001-add-Zulip-provider-scheduler-state-143113.py"
     ]["depends"] == ["0000-initialize-bridge-operational-state-18f707.py"]
@@ -124,6 +125,11 @@ def test_migrations_have_one_versioned_dependency_chain():
     ]["depends"] == [
         "0010-prepare-provider-event-records-f970c8.py"
     ]
+    assert all_migrations[
+        "0012-optimize-bridge-load-and-reconcile-stale-queues-6c9ddc.py"
+    ]["depends"] == [
+        "0011-quarantine-rejected-provider-events-f1169c.py"
+    ]
 
 
 def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
@@ -152,17 +158,27 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                       'workspace_delivery_outbox_pending_order_idx',
                       'workspace_delivery_outbox_pending_dependency_idx',
                       'observed_report_outbox_resource_latest_idx',
-                      'observed_report_outbox_pending_order_idx'
+                      'observed_report_outbox_pending_order_idx',
+                      'observed_report_outbox_catalog_readiness_idx',
+                      'desired_resources_selected_assignment_account_idx',
+                      'workspace_delivery_outbox_initial_backfill_idx',
+                      'zulip_provider_events_pending_order_idx',
+                      'workspace_delivery_outbox_provider_event_pending_idx'
                   )
                 ORDER BY indexname
                 """
             ).fetchall()
-            assert applied["count"] == 12
+            assert applied["count"] == 13
             assert [row["indexname"] for row in indexes] == [
+                "desired_resources_selected_assignment_account_idx",
+                "observed_report_outbox_catalog_readiness_idx",
                 "observed_report_outbox_pending_order_idx",
                 "observed_report_outbox_resource_latest_idx",
+                "workspace_delivery_outbox_initial_backfill_idx",
                 "workspace_delivery_outbox_pending_dependency_idx",
                 "workspace_delivery_outbox_pending_order_idx",
+                "workspace_delivery_outbox_provider_event_pending_idx",
+                "zulip_provider_events_pending_order_idx",
             ]
             session.execute("UPDATE bridge_metadata SET control_cursor = 'preserved'")
             session.execute(
@@ -188,9 +204,134 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
             provider_cursor_count = session.execute(
                 "SELECT count(*) AS count FROM zulip_event_cursors"
             ).fetchone()
-            assert applied["count"] == 12
+            assert applied["count"] == 13
             assert cursor["control_cursor"] == "preserved"
             assert provider_cursor_count["count"] == 0
+    finally:
+        with admin_store.session() as session:
+            session.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+
+def test_load_optimization_migration_reconciles_stale_queues_idempotently(tmp_path):
+    connection_url = os.environ.get("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN")
+    if not connection_url:
+        pytest.skip("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN is not configured")
+    schema = f"bridge_load_optimization_{uuid.uuid4().hex}"
+    scoped_url = _schema_connection_url(connection_url, schema)
+    config_path = tmp_path / "bridge.conf"
+    admin_store = storage.RestAlchemyStore(connection_url)
+    scoped_store = storage.RestAlchemyStore(scoped_url)
+    migration_path = (
+        MIGRATIONS
+        / "0012-optimize-bridge-load-and-reconcile-stale-queues-6c9ddc.py"
+    )
+    spec = importlib.util.spec_from_file_location("load_optimization", migration_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    with admin_store.session() as session:
+        session.execute(f'CREATE SCHEMA "{schema}"')
+    try:
+        _apply_migrations(scoped_url, config_path)
+        active_account_uuid = str(uuid.uuid4())
+        inactive_account_uuid = str(uuid.uuid4())
+        active_operation_uuid = str(uuid.uuid4())
+        inactive_operation_uuid = str(uuid.uuid4())
+        with scoped_store.session() as session:
+            session.execute(
+                """
+                INSERT INTO desired_resources (
+                    resource_type, resource_uuid, generation, body
+                ) VALUES (
+                    'external_account', %s, 1,
+                    jsonb_build_object('synchronization_enabled', true)
+                )
+                """,
+                (active_account_uuid,),
+            )
+            session.execute(
+                """
+                INSERT INTO workspace_delivery_outbox (
+                    record_uuid, operation_uuid, account_uuid,
+                    account_generation, submission_state,
+                    next_submission_at, priority, record
+                ) VALUES (
+                    %s, %s, %s, 1, 'awaiting_result',
+                    TIMESTAMPTZ '2126-01-01 00:00:00+00', 0, '{}'::jsonb
+                )
+                """,
+                (str(uuid.uuid4()), active_operation_uuid, active_account_uuid),
+            )
+            session.execute(
+                """
+                INSERT INTO zulip_provider_events (
+                    account_uuid, queue_id, event_id, event_type, body,
+                    processing_state, prepared_records
+                ) VALUES (
+                    %s, 'retired-queue', 7, 'message', '{}'::jsonb,
+                    'delivering', '[]'::jsonb
+                )
+                """,
+                (inactive_account_uuid,),
+            )
+            session.execute(
+                """
+                INSERT INTO workspace_delivery_outbox (
+                    record_uuid, operation_uuid, account_uuid,
+                    account_generation, provider_queue_id, provider_event_id,
+                    submission_state, priority, record
+                ) VALUES (
+                    %s, %s, %s, 1, 'retired-queue', 7,
+                    'ambiguous', 0, '{}'::jsonb
+                )
+                """,
+                (
+                    str(uuid.uuid4()),
+                    inactive_operation_uuid,
+                    inactive_account_uuid,
+                ),
+            )
+
+            module.migration_step.upgrade(session)
+            module.migration_step.upgrade(session)
+
+            active_delivery = session.execute(
+                """
+                SELECT submission_state, next_submission_at <= now() AS due
+                FROM workspace_delivery_outbox
+                WHERE operation_uuid = %s
+                """,
+                (active_operation_uuid,),
+            ).fetchone()
+            inactive_delivery = session.execute(
+                """
+                SELECT submission_state, submission_error_code
+                FROM workspace_delivery_outbox
+                WHERE operation_uuid = %s
+                """,
+                (inactive_operation_uuid,),
+            ).fetchone()
+            inactive_event = session.execute(
+                """
+                SELECT processing_state, processing_reason, prepared_records
+                FROM zulip_provider_events
+                WHERE account_uuid = %s AND queue_id = 'retired-queue'
+                  AND event_id = 7
+                """,
+                (inactive_account_uuid,),
+            ).fetchone()
+
+        assert active_delivery == {"submission_state": "ambiguous", "due": True}
+        assert inactive_delivery == {
+            "submission_state": "cancelled",
+            "submission_error_code": "account_inactive",
+        }
+        assert inactive_event == {
+            "processing_state": "ignored",
+            "processing_reason": "account_inactive",
+            "prepared_records": None,
+        }
     finally:
         with admin_store.session() as session:
             session.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')

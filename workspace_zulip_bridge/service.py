@@ -1562,6 +1562,15 @@ class BridgeService:
             event_id = int(row["event_id"])
             event = typing.cast(dict[str, object], row["body"])
             if not self.store.account_is_active(account_uuid):
+                ignore_inactive = getattr(
+                    self.store,
+                    "ignore_provider_event_for_inactive_account",
+                    None,
+                )
+                if callable(ignore_inactive) and ignore_inactive(
+                    account_uuid, queue_id, event_id
+                ):
+                    processed += 1
                 continue
             try:
                 adapter = self.provider_adapters(account_uuid)

@@ -633,6 +633,7 @@ def test_pending_observed_reports_supersede_older_unsent_resource_states(
 
 def test_observed_report_hot_queries_use_migration_indexes(postgres_store):
     resource_uuid = str(uuid.uuid4())
+    catalog_account_uuid = str(uuid.uuid4())
     report = {
         "report_uuid": str(uuid.uuid4()),
         "resource_type": "external_account",
@@ -660,6 +661,34 @@ def test_observed_report_hot_queries_use_migration_indexes(postgres_store):
             FROM generate_series(1, 1000) AS sample
             ON CONFLICT (report_uuid) DO NOTHING
             """
+        )
+        session.execute(
+            """
+            INSERT INTO observed_report_outbox (
+                report_uuid, body, result_status, completed_at
+            )
+            SELECT
+                md5('catalog-readiness-report-' || sample::text)::uuid,
+                jsonb_build_object(
+                    'resource_type', 'external_chat_catalog',
+                    'resource_uuid',
+                    md5('catalog-resource-' || sample::text)::uuid::text,
+                    'observed_generation', 3,
+                    'catalog', jsonb_build_object(
+                        'external_account_uuid', CASE
+                            WHEN sample %% 20 = 0 THEN %s::text
+                            ELSE md5(
+                                'catalog-account-' || (sample %% 20)::text
+                            )::uuid::text
+                        END,
+                        'operation', 'upsert'
+                    )
+                ),
+                'applied', now()
+            FROM generate_series(1, 2000) AS sample
+            ON CONFLICT (report_uuid) DO NOTHING
+            """,
+            (catalog_account_uuid,),
         )
         session.execute("ANALYZE observed_report_outbox")
         dedup_plan = _explain_text(
@@ -694,10 +723,26 @@ def test_observed_report_hot_queries_use_migration_indexes(postgres_store):
             ORDER BY created_at LIMIT 500
             """,
         )
+        catalog_readiness_plan = _explain_text(
+            session,
+            """
+            SELECT DISTINCT ON ((body->>'resource_uuid')::uuid) result_status
+            FROM observed_report_outbox
+            WHERE body->>'resource_type' = 'external_chat_catalog'
+              AND (body->'catalog'->>'external_account_uuid')::uuid = %s
+              AND (body->>'observed_generation')::bigint = 3
+            ORDER BY (body->>'resource_uuid')::uuid, created_at DESC
+            """,
+            (catalog_account_uuid,),
+        )
 
     assert "observed_report_outbox_resource_latest_idx" in dedup_plan
     assert "observed_report_outbox_pending_order_idx" in pending_rank_plan
     assert "observed_report_outbox_pending_order_idx" in pending_order_plan
+    assert (
+        "observed_report_outbox_catalog_readiness_idx"
+        in catalog_readiness_plan
+    )
 
 
 def _provider_record(
@@ -1121,6 +1166,61 @@ def test_provider_result_acknowledgement_types_nullable_sql_parameters(
     assert row["last_error_code"] == expected_code
     assert row["manual_reconciliation_required"] is expected_manual
     assert row["reconciliation_evidence"] == expected_evidence
+
+
+def test_initial_backfill_gate_uses_account_priority_index(postgres_store):
+    account_uuid, _ = _insert_account_and_assignment(postgres_store)
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            INSERT INTO operation_idempotency (
+                operation_uuid, operation_sha256, terminal_outcome
+            )
+            SELECT md5('readiness-operation-' || sample::text)::uuid,
+                   repeat('a', 64), 'committed'
+            FROM generate_series(1, 5000) AS sample
+            """
+        )
+        session.execute(
+            """
+            INSERT INTO workspace_delivery_outbox (
+                record_uuid, operation_uuid, account_uuid,
+                account_generation, priority, record
+            )
+            SELECT md5('readiness-record-' || sample::text)::uuid,
+                   md5('readiness-operation-' || sample::text)::uuid,
+                   CASE
+                       WHEN sample %% 20 = 0 THEN %s::uuid
+                       ELSE md5(
+                           'readiness-account-' || (sample %% 20)::text
+                       )::uuid
+                   END,
+                   1, 2, '{}'::jsonb
+            FROM generate_series(1, 5000) AS sample
+            """,
+            (account_uuid,),
+        )
+        session.execute("ANALYZE workspace_delivery_outbox")
+        plan = _explain_text(
+            session,
+            """
+            SELECT 1
+            FROM workspace_delivery_outbox AS delivery
+            JOIN desired_resources AS account
+              ON account.resource_type = 'external_account'
+             AND account.resource_uuid = delivery.account_uuid
+             AND NOT account.deleted
+            LEFT JOIN operation_idempotency AS operation
+              ON operation.operation_uuid = delivery.operation_uuid
+            WHERE delivery.account_uuid = %s
+              AND delivery.priority = 2
+              AND delivery.account_generation = account.generation
+              AND operation.terminal_outcome IS DISTINCT FROM 'committed'
+            """,
+            (account_uuid,),
+        )
+
+    assert "workspace_delivery_outbox_initial_backfill_idx" in plan
 
 
 def test_reconcile_backfill_jobs_casts_json_account_uuid(postgres_store):
@@ -2524,6 +2624,74 @@ def test_submitted_delivery_survives_assignment_change_as_ambiguous(postgres_sto
         ).fetchone()
     assert resolved["submission_state"] == "sent"
     assert resolved["sent_at"] is not None
+
+
+def test_inactive_account_event_and_delivery_are_terminalized_without_deletion(
+    postgres_store,
+):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    queue_id = "retired-queue"
+    event_id = 11
+    record = _provider_record(account_uuid, project_uuid)
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            INSERT INTO zulip_provider_events (
+                account_uuid, queue_id, event_id, event_type, body
+            ) VALUES (%s, %s, %s, 'message', '{}'::jsonb)
+            """,
+            (account_uuid, queue_id, event_id),
+        )
+    assert postgres_store.enqueue_workspace_delivery(
+        record, 0, queue_id, event_id
+    )
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE desired_resources
+            SET body = jsonb_set(
+                body, '{synchronization_enabled}', 'false'::jsonb
+            )
+            WHERE resource_type = 'external_account'
+              AND resource_uuid = %s
+            """,
+            (account_uuid,),
+        )
+
+    assert postgres_store.ignore_provider_event_for_inactive_account(
+        account_uuid, queue_id, event_id
+    )
+    assert not postgres_store.ignore_provider_event_for_inactive_account(
+        account_uuid, queue_id, event_id
+    )
+
+    with postgres_store.session() as session:
+        event = session.execute(
+            """
+            SELECT processing_state, processing_reason, prepared_records
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
+            """,
+            (account_uuid, queue_id, event_id),
+        ).fetchone()
+        delivery = session.execute(
+            """
+            SELECT submission_state, submission_error_code, sent_at
+            FROM workspace_delivery_outbox
+            WHERE record_uuid = %s
+            """,
+            (record["record_uuid"],),
+        ).fetchone()
+    assert event == {
+        "processing_state": "ignored",
+        "processing_reason": "account_inactive",
+        "prepared_records": None,
+    }
+    assert delivery == {
+        "submission_state": "cancelled",
+        "submission_error_code": "account_inactive",
+        "sent_at": None,
+    }
 
 
 def test_permanent_provider_rejection_is_quarantined_with_safe_evidence(
