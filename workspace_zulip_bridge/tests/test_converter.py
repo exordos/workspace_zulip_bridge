@@ -743,6 +743,18 @@ def test_empty_channel_topic_uses_backend_owned_default_topic(subject):
             "default_topic_uuid": default_topic_uuid,
         },
     )
+    store.remember_provider_mapping(
+        ACCOUNT_UUID,
+        "topic",
+        "42:general chat",
+        default_topic_uuid,
+        {
+            "stream_uuid": stream_uuid,
+            "chat_key": "channel:42",
+            "name": "general chat",
+            "is_default": True,
+        },
+    )
 
     records = converter.event_records(
         store,
@@ -771,6 +783,7 @@ def test_empty_channel_topic_uses_backend_owned_default_topic(subject):
 def test_empty_channel_topic_waits_for_backend_default_topic_assignment():
     store = FakeStore(auto_materialize=False)
     stream_uuid = str(uuid.uuid4())
+    topic_uuid = str(uuid.uuid4())
     store.remember_provider_mapping(
         ACCOUNT_UUID,
         "stream",
@@ -786,6 +799,18 @@ def test_empty_channel_topic_waits_for_backend_default_topic_assignment():
             "default_topic_uuid": None,
         },
     )
+    store.remember_provider_mapping(
+        ACCOUNT_UUID,
+        "topic",
+        "42:general chat",
+        topic_uuid,
+        {
+            "stream_uuid": stream_uuid,
+            "chat_key": "channel:42",
+            "name": "general chat",
+            "is_default": True,
+        },
+    )
 
     with pytest.raises(ValueError, match="provider_chat_assignment_pending"):
         converter.event_records(
@@ -794,6 +819,108 @@ def test_empty_channel_topic_waits_for_backend_default_topic_assignment():
             "queue",
             {"id": 10, "type": "message", "message": _stream_message(subject="")},
         )
+
+
+def test_empty_channel_topic_waits_when_provider_mapping_disagrees_with_default():
+    store = FakeStore(auto_materialize=False)
+    stream_uuid = str(uuid.uuid4())
+    stale_default_topic_uuid = str(uuid.uuid4())
+    provider_topic_uuid = str(uuid.uuid4())
+    store.remember_provider_mapping(
+        ACCOUNT_UUID,
+        "stream",
+        "channel:42",
+        stream_uuid,
+        {
+            "chat_type": "channel",
+            "project_uuid": PROJECT_UUID,
+            "participants": [OWNER_UUID],
+            "name": "Engineering",
+            "description": "",
+            "private": False,
+            "default_topic_uuid": stale_default_topic_uuid,
+        },
+    )
+    store.remember_provider_mapping(
+        ACCOUNT_UUID,
+        "topic",
+        "42:general chat",
+        provider_topic_uuid,
+        {
+            "stream_uuid": stream_uuid,
+            "chat_key": "channel:42",
+            "name": "general chat",
+            "is_default": True,
+        },
+    )
+
+    with pytest.raises(ValueError, match="provider_chat_assignment_pending"):
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "queue",
+            {"id": 10, "type": "message", "message": _stream_message(subject="")},
+        )
+
+
+def test_empty_channel_topic_reconciles_disagreeing_projection():
+    provider_topic_uuid = str(uuid.uuid4())
+
+    class ReconcilingStore(FakeStore):
+        def __init__(self):
+            super().__init__(auto_materialize=False)
+            self.reconciled = 0
+
+        def reconcile_assignment_projection(self, account_uuid, provider_chat_key):
+            assert account_uuid == ACCOUNT_UUID
+            assert provider_chat_key == "channel:42"
+            self.reconciled += 1
+            stream = self.mappings[("stream", provider_chat_key)]
+            stream["metadata"]["default_topic_uuid"] = provider_topic_uuid
+            return True
+
+    store = ReconcilingStore()
+    stream_uuid = str(uuid.uuid4())
+    store.remember_provider_mapping(
+        ACCOUNT_UUID,
+        "stream",
+        "channel:42",
+        stream_uuid,
+        {
+            "chat_type": "channel",
+            "project_uuid": PROJECT_UUID,
+            "participants": [OWNER_UUID],
+            "name": "Engineering",
+            "description": "",
+            "private": False,
+            "default_topic_uuid": str(uuid.uuid4()),
+        },
+    )
+    store.remember_provider_mapping(
+        ACCOUNT_UUID,
+        "topic",
+        "42:general chat",
+        provider_topic_uuid,
+        {
+            "stream_uuid": stream_uuid,
+            "chat_key": "channel:42",
+            "name": "general chat",
+            "is_default": True,
+        },
+    )
+
+    operations = _operations(
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "queue",
+            {"id": 10, "type": "message", "message": _stream_message(subject="")},
+        )
+    )
+
+    topic = next(value for value in operations if value["kind"] == "topic.upsert")
+    assert store.reconciled == 1
+    assert topic["entity_uuid"] == provider_topic_uuid
 
 
 def test_message_mutations_and_topic_rename_reuse_stable_mappings():

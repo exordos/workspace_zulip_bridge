@@ -1058,25 +1058,36 @@ def _message_context(
     stream_metadata = typing.cast(
         dict[str, object], stream_mapping.get("metadata", {})
     )
-    if chat_type == "channel" and is_empty_channel_topic(subject):
-        default_topic_uuid = stream_metadata.get("default_topic_uuid")
-        if default_topic_uuid is None:
-            raise ValueError("provider_chat_assignment_pending")
-        return (
-            chat_type,
-            chat_key,
-            project_uuid,
-            stream_uuid,
-            str(default_topic_uuid),
-        )
     topic_mapping = store.provider_mapping(account_uuid, "topic", topic_provider_id)
-    if topic_mapping is None and _reconcile_assignment_projection(
-        store, account_uuid, chat_key
+    empty_channel_topic = chat_type == "channel" and is_empty_channel_topic(subject)
+    default_topic_uuid = stream_metadata.get("default_topic_uuid")
+    # Empty topics carry both a provider mapping and the backend-owned default.
+    # Never let stale stream metadata redirect a topic upsert to another UUID.
+    projection_inconsistent = empty_channel_topic and (
+        default_topic_uuid is None
+        or topic_mapping is None
+        or str(topic_mapping["workspace_uuid"]) != str(default_topic_uuid)
+    )
+    if (topic_mapping is None or projection_inconsistent) and (
+        _reconcile_assignment_projection(store, account_uuid, chat_key)
     ):
+        stream_mapping = store.provider_mapping(account_uuid, "stream", chat_key)
         topic_mapping = store.provider_mapping(
             account_uuid, "topic", topic_provider_id
         )
-    if topic_mapping is None:
+        if stream_mapping is not None:
+            stream_uuid = str(stream_mapping["workspace_uuid"])
+            stream_metadata = typing.cast(
+                dict[str, object], stream_mapping.get("metadata", {})
+            )
+            default_topic_uuid = stream_metadata.get("default_topic_uuid")
+    if topic_mapping is None or (
+        empty_channel_topic
+        and (
+            default_topic_uuid is None
+            or str(topic_mapping["workspace_uuid"]) != str(default_topic_uuid)
+        )
+    ):
         raise ValueError("provider_chat_assignment_pending")
     topic_uuid = str(topic_mapping["workspace_uuid"])
     return chat_type, chat_key, project_uuid, stream_uuid, topic_uuid
