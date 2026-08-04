@@ -15,6 +15,10 @@ from workspace_zulip_bridge import canonical, control
 PARTICIPANT_RECHECK_INTERVAL_SECONDS = 30
 
 
+def backfill_health_component(account_uuid: str, provider_chat_key: str) -> str:
+    return f"provider:{account_uuid}:{provider_chat_key}"
+
+
 def _same_provider_identity_replay(
     accepted: dict[str, object],
     current: dict[str, object],
@@ -2790,6 +2794,11 @@ class RestAlchemyStore:
                 WHERE job.state <> 'cancelled'
                   AND NOT EXISTS (
                     SELECT 1 FROM desired_resources AS assignment
+                    JOIN desired_resources AS account
+                      ON account.resource_type = 'external_account'
+                     AND account.resource_uuid::text =
+                         assignment.body->>'external_account_uuid'
+                     AND NOT account.deleted
                     WHERE assignment.resource_type = 'external_chat_assignment'
                       AND NOT assignment.deleted
                       AND assignment.body->>'external_account_uuid' =
@@ -2800,6 +2809,16 @@ class RestAlchemyStore:
                           (assignment.body->>'selected')::boolean, true
                       )
                 )
+                """
+            )
+            session.execute(
+                """
+                DELETE FROM bridge_health AS health
+                USING zulip_backfill_jobs AS job
+                WHERE job.state <> 'failed'
+                  AND health.component =
+                      'provider:' || job.account_uuid::text || ':' ||
+                      job.provider_chat_key
                 """
             )
             session.execute(
@@ -3031,6 +3050,10 @@ class RestAlchemyStore:
                     account_uuid,
                     provider_chat_key,
                 ),
+            )
+            session.execute(
+                "DELETE FROM bridge_health WHERE component = %s",
+                (backfill_health_component(account_uuid, provider_chat_key),),
             )
 
     def release_backfill_job(self, account_uuid: str, provider_chat_key: str) -> None:

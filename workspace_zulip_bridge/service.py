@@ -1876,7 +1876,9 @@ class BridgeService:
                     exc.code,
                 )
                 self.store.mark_health(
-                    f"provider:{account_uuid}:{provider_chat_key}",
+                    storage.backfill_health_component(
+                        account_uuid, provider_chat_key
+                    ),
                     "degraded",
                     exc.code,
                 )
@@ -1918,7 +1920,9 @@ class BridgeService:
                     exc.code,
                 )
                 self.store.mark_health(
-                    f"provider:{account_uuid}:{provider_chat_key}",
+                    storage.backfill_health_component(
+                        account_uuid, provider_chat_key
+                    ),
                     "degraded",
                     exc.code,
                 )
