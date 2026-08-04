@@ -65,7 +65,8 @@ def postgres_store(migrated_postgres_dsn):
                      operation_idempotency, producer_lane_counters,
                      producer_operations, causal_lane_state, bridge_operations,
                      scheduler_accounts, observed_report_outbox,
-                     zulip_provider_events, zulip_event_cursors CASCADE
+                     zulip_provider_events, zulip_event_cursors,
+                     bridge_health CASCADE
             """
         )
     return store
@@ -2837,6 +2838,7 @@ def test_pre_provider_result_crash_retries_same_immutable_record_until_result(
 
 def test_reselected_chat_restarts_cancelled_backfill(postgres_store):
     account_uuid, _ = _insert_account_and_assignment(postgres_store)
+    component = storage.backfill_health_component(account_uuid, "channel:42")
     with postgres_store.session() as session:
         session.execute(
             """
@@ -2846,6 +2848,7 @@ def test_reselected_chat_restarts_cancelled_backfill(postgres_store):
             """,
             (account_uuid,),
         )
+    postgres_store.mark_health(component, "degraded", "provider_forbidden")
 
     postgres_store.reconcile_backfill_jobs()
 
@@ -2853,7 +2856,76 @@ def test_reselected_chat_restarts_cancelled_backfill(postgres_store):
         state = session.execute("SELECT state FROM zulip_backfill_jobs").fetchone()[
             "state"
         ]
+        health = session.execute(
+            "SELECT component FROM bridge_health WHERE component = %s",
+            (component,),
+        ).fetchone()
     assert state == "pending"
+    assert health is None
+
+
+def test_inactive_account_cancels_backfill_and_clears_only_its_health(
+    postgres_store,
+):
+    account_uuid, _ = _insert_account_and_assignment(postgres_store)
+    postgres_store.reconcile_backfill_jobs()
+    component = storage.backfill_health_component(account_uuid, "channel:42")
+    unrelated = storage.backfill_health_component(account_uuid, "channel:99")
+    postgres_store.mark_health(component, "degraded", "provider_forbidden")
+    postgres_store.mark_health(unrelated, "degraded", "provider_forbidden")
+    postgres_store.mark_health("provider", "healthy")
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE desired_resources SET deleted = true
+            WHERE resource_type = 'external_account'
+              AND resource_uuid = %s
+            """,
+            (account_uuid,),
+        )
+
+    postgres_store.reconcile_backfill_jobs()
+
+    with postgres_store.session() as session:
+        state = session.execute(
+            """
+            SELECT state FROM zulip_backfill_jobs
+            WHERE account_uuid = %s AND provider_chat_key = 'channel:42'
+            """,
+            (account_uuid,),
+        ).fetchone()["state"]
+        components = {
+            row["component"]
+            for row in session.execute(
+                "SELECT component FROM bridge_health"
+            ).fetchall()
+        }
+    assert state == "cancelled"
+    assert components == {"provider", unrelated}
+
+
+def test_successful_backfill_progress_clears_prior_chat_health(postgres_store):
+    account_uuid, _ = _insert_account_and_assignment(postgres_store)
+    postgres_store.reconcile_backfill_jobs()
+    component = storage.backfill_health_component(account_uuid, "channel:42")
+    postgres_store.mark_health(component, "degraded", "provider_forbidden")
+
+    postgres_store.advance_backfill_job(account_uuid, "channel:42", 41, False)
+
+    with postgres_store.session() as session:
+        job = session.execute(
+            """
+            SELECT state, next_anchor FROM zulip_backfill_jobs
+            WHERE account_uuid = %s AND provider_chat_key = 'channel:42'
+            """,
+            (account_uuid,),
+        ).fetchone()
+        health = session.execute(
+            "SELECT component FROM bridge_health WHERE component = %s",
+            (component,),
+        ).fetchone()
+    assert job == {"state": "pending", "next_anchor": 41}
+    assert health is None
 
 
 def test_changed_history_depth_restarts_backfill_from_newest(postgres_store):
@@ -2932,6 +3004,7 @@ def test_non_retryable_backfill_failure_is_terminal_for_only_that_job(
     postgres_store,
 ):
     account_uuid, _ = _insert_account_and_assignment(postgres_store)
+    component = storage.backfill_health_component(account_uuid, "channel:42")
     postgres_store.reconcile_backfill_jobs()
     assert postgres_store.claim_backfill_job() is not None
 
@@ -2940,6 +3013,8 @@ def test_non_retryable_backfill_failure_is_terminal_for_only_that_job(
         "channel:42",
         "provider_forbidden",
     )
+    postgres_store.mark_health(component, "degraded", "provider_forbidden")
+    postgres_store.reconcile_backfill_jobs()
 
     assert postgres_store.claim_backfill_job() is None
     with postgres_store.session() as session:
@@ -2951,9 +3026,20 @@ def test_non_retryable_backfill_failure_is_terminal_for_only_that_job(
             """,
             (account_uuid,),
         ).fetchone()
+        health = session.execute(
+            """
+            SELECT status, safe_error_code FROM bridge_health
+            WHERE component = %s
+            """,
+            (component,),
+        ).fetchone()
     assert failed["state"] == "failed"
     assert failed["last_error_code"] == "provider_forbidden"
     assert failed["lease_until"] is None
+    assert health == {
+        "status": "degraded",
+        "safe_error_code": "provider_forbidden",
+    }
 
 
 def test_explicit_manual_retry_remains_claimable_after_lane_advanced(postgres_store):

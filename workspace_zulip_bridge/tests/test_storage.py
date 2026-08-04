@@ -1087,6 +1087,36 @@ def test_backfill_depth_is_assignment_owned():
     assert "account.body->'settings'->>'history_depth'" not in statement
 
 
+def test_backfill_reconcile_cancels_inactive_accounts_and_clears_stale_health():
+    session = Session()
+    store = _store_with_session(session)
+
+    store.reconcile_backfill_jobs()
+
+    cancellation = " ".join(session.statements[1][0].split())
+    cleanup = " ".join(session.statements[2][0].split())
+    assert "JOIN desired_resources AS account" in cancellation
+    assert "AND NOT account.deleted" in cancellation
+    assert "DELETE FROM bridge_health AS health" in cleanup
+    assert "job.state <> 'failed'" in cleanup
+    assert "job.account_uuid::text" in cleanup
+
+
+def test_advance_backfill_job_clears_its_health_component():
+    session = Session()
+    store = _store_with_session(session)
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+
+    store.advance_backfill_job(account_uuid, "direct:100,200", None, True)
+
+    assert len(session.statements) == 2
+    cleanup, parameters = session.statements[1]
+    assert "DELETE FROM bridge_health" in cleanup
+    assert parameters == (
+        storage.backfill_health_component(account_uuid, "direct:100,200"),
+    )
+
+
 def test_committed_message_mapping_preserves_workspace_alias():
     session = Session()
     record = {
