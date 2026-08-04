@@ -1478,6 +1478,107 @@ class RestAlchemyStore:
             )
             return True
 
+    def ignore_provider_reaction_outside_history_window(
+        self,
+        account_uuid: str,
+        provider_chat_key: str,
+        provider_message_id: str,
+        provider_message_time: datetime.datetime,
+        queue_id: str,
+        event_id: int,
+    ) -> bool:
+        """Terminalize a reaction only when its message cannot be backfilled."""
+        with self.session() as session:
+            ignored = session.execute(
+                """
+                UPDATE zulip_provider_events AS event
+                SET processing_state = 'ignored',
+                    processing_reason = 'provider_message_outside_history',
+                    prepared_records = NULL
+                WHERE event.account_uuid = %s
+                  AND event.queue_id = %s
+                  AND event.event_id = %s
+                  AND event.processing_state = 'pending'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM provider_mappings AS mapping
+                      WHERE mapping.account_uuid = event.account_uuid
+                        AND mapping.entity_kind = 'message'
+                        AND mapping.provider_id = %s
+                        AND NOT mapping.deleted
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM zulip_provider_events AS source_event
+                      WHERE source_event.account_uuid = event.account_uuid
+                        AND source_event.event_type = 'message'
+                        AND source_event.processing_state IN (
+                            'pending', 'delivering'
+                        )
+                        AND source_event.body->'message'->>'id' = %s
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM zulip_provider_events AS echo_event
+                      JOIN bridge_operations AS operation
+                        ON operation.account_uuid = echo_event.account_uuid
+                       AND operation.provider_queue_id = echo_event.queue_id
+                       AND operation.provider_local_id =
+                           echo_event.body->>'local_message_id'
+                       AND operation.provider_local_id IS NOT NULL
+                       AND operation.state IN (
+                           'pending', 'running', 'uncertain'
+                       )
+                       AND operation.record->'operation'->>'kind' =
+                           'message.create'
+                      WHERE echo_event.account_uuid = event.account_uuid
+                        AND echo_event.event_type = 'message'
+                        AND echo_event.body ? 'local_message_id'
+                        AND echo_event.body->'message'->>'id' = %s
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM zulip_queue_catchup_jobs AS catchup
+                      WHERE catchup.account_uuid = event.account_uuid
+                        AND catchup.provider_chat_key = %s
+                        AND catchup.state <> 'complete'
+                  )
+                  AND EXISTS (
+                      SELECT 1
+                      FROM zulip_backfill_jobs AS job
+                      JOIN desired_resources AS assignment
+                        ON assignment.resource_type =
+                           'external_chat_assignment'
+                       AND NOT assignment.deleted
+                       AND assignment.body->>'external_account_uuid' =
+                           job.account_uuid::text
+                       AND assignment.body->'provider_chat'
+                               ->>'provider_chat_key' =
+                           job.provider_chat_key
+                       AND COALESCE(
+                           (assignment.body->>'selected')::boolean, true
+                       )
+                       AND assignment.body->>'history_depth' =
+                           job.history_depth
+                      WHERE job.account_uuid = event.account_uuid
+                        AND job.provider_chat_key = %s
+                        AND job.state = 'complete'
+                        AND job.cutoff_at IS NOT NULL
+                        AND %s < job.cutoff_at
+                  )
+                RETURNING event.account_uuid
+                """,
+                (
+                    account_uuid,
+                    queue_id,
+                    event_id,
+                    provider_message_id,
+                    provider_message_id,
+                    provider_message_id,
+                    provider_chat_key,
+                    provider_chat_key,
+                    provider_message_time,
+                ),
+            ).fetchone()
+            return ignored is not None
+
     def producer_lane_position(
         self, operation_uuid: str, origin: str, causal_lane: str
     ) -> tuple[int, str | None]:
@@ -2740,6 +2841,7 @@ class RestAlchemyStore:
                     assignment.body->'provider_chat'->>'provider_chat_key',
                     assignment.body->>'history_depth',
                     CASE assignment.body->>'history_depth'
+                        WHEN 'new' THEN assignment.updated_at
                         WHEN '7_days' THEN now() - interval '7 days'
                         WHEN '30_days' THEN now() - interval '30 days'
                         WHEN '90_days' THEN now() - interval '90 days'
@@ -2771,7 +2873,10 @@ class RestAlchemyStore:
                         WHEN zulip_backfill_jobs.state <> 'cancelled'
                          AND zulip_backfill_jobs.history_depth =
                              EXCLUDED.history_depth
-                        THEN zulip_backfill_jobs.cutoff_at
+                        THEN COALESCE(
+                            zulip_backfill_jobs.cutoff_at,
+                            zulip_backfill_jobs.updated_at
+                        )
                         ELSE EXCLUDED.cutoff_at
                     END,
                     state = CASE
@@ -2785,6 +2890,10 @@ class RestAlchemyStore:
                 WHERE zulip_backfill_jobs.state = 'cancelled'
                    OR zulip_backfill_jobs.history_depth IS DISTINCT FROM
                           EXCLUDED.history_depth
+                   OR (
+                       zulip_backfill_jobs.history_depth = 'new'
+                       AND zulip_backfill_jobs.cutoff_at IS NULL
+                   )
                 """
             )
             session.execute(

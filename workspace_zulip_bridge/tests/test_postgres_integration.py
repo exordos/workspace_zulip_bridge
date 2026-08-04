@@ -12,8 +12,10 @@ from workspace_zulip_bridge import (
     canonical,
     converter,
     provider_protocol,
+    scheduler,
     service,
     storage,
+    zulip_adapter,
 )
 
 ROOT = pathlib.Path(__file__).parents[2]
@@ -2693,6 +2695,635 @@ def test_inactive_account_event_and_delivery_are_terminalized_without_deletion(
         "submission_error_code": "account_inactive",
         "sent_at": None,
     }
+
+
+def test_reaction_is_ignored_only_outside_completed_history_window(postgres_store):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    postgres_store.reconcile_backfill_jobs()
+    cutoff = datetime.datetime(2026, 7, 1, tzinfo=datetime.UTC)
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_backfill_jobs
+            SET state = 'pending', cutoff_at = %s
+            WHERE account_uuid = %s AND provider_chat_key = 'channel:42'
+            """,
+            (cutoff, account_uuid),
+        )
+        session.execute(
+            """
+            INSERT INTO zulip_provider_events (
+                account_uuid, queue_id, event_id, event_type, body
+            )
+            SELECT %s, 'queue', event_id, 'reaction', '{}'::jsonb
+            FROM generate_series(1, 5) AS event_id
+            """,
+            (account_uuid,),
+        )
+
+    old_message_time = datetime.datetime(2026, 6, 1, tzinfo=datetime.UTC)
+    assert not postgres_store.ignore_provider_reaction_outside_history_window(
+        account_uuid,
+        "channel:42",
+        "601",
+        old_message_time,
+        "queue",
+        1,
+    )
+
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_backfill_jobs
+            SET state = 'complete'
+            WHERE account_uuid = %s AND provider_chat_key = 'channel:42'
+            """,
+            (account_uuid,),
+        )
+    assert not postgres_store.ignore_provider_reaction_outside_history_window(
+        account_uuid,
+        "channel:42",
+        "602",
+        datetime.datetime(2026, 7, 2, tzinfo=datetime.UTC),
+        "queue",
+        2,
+    )
+
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_backfill_jobs
+            SET cutoff_at = NULL
+            WHERE account_uuid = %s AND provider_chat_key = 'channel:42'
+            """,
+            (account_uuid,),
+        )
+    assert not postgres_store.ignore_provider_reaction_outside_history_window(
+        account_uuid,
+        "channel:42",
+        "603",
+        old_message_time,
+        "queue",
+        3,
+    )
+
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_backfill_jobs
+            SET cutoff_at = %s
+            WHERE account_uuid = %s AND provider_chat_key = 'channel:42'
+            """,
+            (cutoff, account_uuid),
+        )
+        session.execute(
+            """
+            INSERT INTO provider_mappings (
+                account_uuid, entity_kind, workspace_uuid, provider_id, metadata
+            ) VALUES (%s, 'message', %s, '604', %s)
+            """,
+            (
+                account_uuid,
+                str(uuid.uuid4()),
+                json.dumps(
+                    {
+                        "chat_key": "channel:42",
+                        "project_uuid": project_uuid,
+                    }
+                ),
+            ),
+        )
+    assert not postgres_store.ignore_provider_reaction_outside_history_window(
+        account_uuid,
+        "channel:42",
+        "604",
+        old_message_time,
+        "queue",
+        4,
+    )
+    assert postgres_store.ignore_provider_reaction_outside_history_window(
+        account_uuid,
+        "channel:42",
+        "605",
+        old_message_time,
+        "queue",
+        5,
+    )
+    assert not postgres_store.ignore_provider_reaction_outside_history_window(
+        account_uuid,
+        "channel:42",
+        "605",
+        old_message_time,
+        "queue",
+        5,
+    )
+
+    with postgres_store.session() as session:
+        events = session.execute(
+            """
+            SELECT event_id, processing_state, processing_reason
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = 'queue'
+            ORDER BY event_id
+            """,
+            (account_uuid,),
+        ).fetchall()
+    assert events == [
+        {"event_id": 1, "processing_state": "pending", "processing_reason": None},
+        {"event_id": 2, "processing_state": "pending", "processing_reason": None},
+        {"event_id": 3, "processing_state": "pending", "processing_reason": None},
+        {"event_id": 4, "processing_state": "pending", "processing_reason": None},
+        {
+            "event_id": 5,
+            "processing_state": "ignored",
+            "processing_reason": "provider_message_outside_history",
+        },
+    ]
+
+
+def test_reaction_waits_for_other_recoverable_mapping_sources(postgres_store):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    postgres_store.reconcile_backfill_jobs()
+    cutoff = datetime.datetime(2026, 7, 1, tzinfo=datetime.UTC)
+    message_time = datetime.datetime(2026, 6, 1, tzinfo=datetime.UTC)
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_backfill_jobs
+            SET state = 'complete', cutoff_at = %s
+            WHERE account_uuid = %s AND provider_chat_key = 'channel:42'
+            """,
+            (cutoff, account_uuid),
+        )
+        session.execute(
+            """
+            INSERT INTO zulip_provider_events (
+                account_uuid, queue_id, event_id, event_type, body
+            ) VALUES
+                (%s, 'reaction-queue', 1, 'reaction', '{}'::jsonb),
+                (%s, 'reaction-queue', 2, 'reaction', '{}'::jsonb),
+                (%s, 'reaction-queue', 3, 'reaction', '{}'::jsonb),
+                (
+                    %s, 'message-queue', 99, 'message',
+                    '{"type":"message","message":{"id":606}}'::jsonb
+                )
+            """,
+            (account_uuid, account_uuid, account_uuid, account_uuid),
+        )
+        session.execute(
+            """
+            INSERT INTO zulip_queue_catchup_jobs (
+                account_uuid, provider_chat_key, state
+            ) VALUES (%s, 'channel:42', 'manual')
+            """,
+            (account_uuid,),
+        )
+
+    assert not postgres_store.ignore_provider_reaction_outside_history_window(
+        account_uuid,
+        "channel:42",
+        "606",
+        message_time,
+        "reaction-queue",
+        1,
+    )
+    assert not postgres_store.ignore_provider_reaction_outside_history_window(
+        account_uuid,
+        "channel:42",
+        "607",
+        message_time,
+        "reaction-queue",
+        2,
+    )
+    assert not postgres_store.ignore_provider_reaction_outside_history_window(
+        account_uuid,
+        "channel:42",
+        "608",
+        message_time,
+        "reaction-queue",
+        3,
+    )
+
+    postgres_store.begin_provider_queue_catchup(account_uuid)
+    with postgres_store.session() as session:
+        catchup = session.execute(
+            """
+            SELECT state FROM zulip_queue_catchup_jobs
+            WHERE account_uuid = %s AND provider_chat_key = 'channel:42'
+            """,
+            (account_uuid,),
+        ).fetchone()
+        session.execute(
+            """
+            UPDATE zulip_backfill_jobs
+            SET state = 'complete', cutoff_at = %s
+            WHERE account_uuid = %s AND provider_chat_key = 'channel:42'
+            """,
+            (cutoff, account_uuid),
+        )
+    assert catchup["state"] == "pending"
+    assert not postgres_store.ignore_provider_reaction_outside_history_window(
+        account_uuid,
+        "channel:42",
+        "608",
+        message_time,
+        "reaction-queue",
+        3,
+    )
+
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "message",
+        "606",
+        str(uuid.uuid4()),
+        {"chat_key": "channel:42", "project_uuid": project_uuid},
+    )
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "message",
+        "608",
+        str(uuid.uuid4()),
+        {"chat_key": "channel:42", "project_uuid": project_uuid},
+    )
+    postgres_store.mark_provider_event_processed(
+        account_uuid,
+        "message-queue",
+        99,
+        True,
+    )
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_queue_catchup_jobs
+            SET state = 'complete'
+            WHERE account_uuid = %s AND provider_chat_key = 'channel:42'
+            """,
+            (account_uuid,),
+        )
+
+    assert not postgres_store.ignore_provider_reaction_outside_history_window(
+        account_uuid,
+        "channel:42",
+        "606",
+        message_time,
+        "reaction-queue",
+        1,
+    )
+    assert not postgres_store.ignore_provider_reaction_outside_history_window(
+        account_uuid,
+        "channel:42",
+        "608",
+        message_time,
+        "reaction-queue",
+        3,
+    )
+    assert postgres_store.ignore_provider_reaction_outside_history_window(
+        account_uuid,
+        "channel:42",
+        "607",
+        message_time,
+        "reaction-queue",
+        2,
+    )
+    with postgres_store.session() as session:
+        reactions = session.execute(
+            """
+            SELECT event_id, processing_state
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = 'reaction-queue'
+            ORDER BY event_id
+            """,
+            (account_uuid,),
+        ).fetchall()
+    assert reactions == [
+        {"event_id": 1, "processing_state": "pending"},
+        {"event_id": 2, "processing_state": "ignored"},
+        {"event_id": 3, "processing_state": "pending"},
+    ]
+
+
+def test_reaction_waits_for_processed_local_echo_operation(postgres_store):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    postgres_store.reconcile_backfill_jobs()
+    cutoff = datetime.datetime(2026, 7, 1, tzinfo=datetime.UTC)
+    message_time = datetime.datetime(2026, 6, 1, tzinfo=datetime.UTC)
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_backfill_jobs
+            SET state = 'complete', cutoff_at = %s
+            WHERE account_uuid = %s AND provider_chat_key = 'channel:42'
+            """,
+            (cutoff, account_uuid),
+        )
+        session.execute(
+            """
+            INSERT INTO zulip_provider_events (
+                account_uuid, queue_id, event_id, event_type, body,
+                processing_state
+            ) VALUES
+                (%s, 'reaction-queue', 1, 'reaction', '{}'::jsonb, 'pending'),
+                (
+                    %s, 'message-queue', 99, 'message',
+                    '{
+                        "type":"message",
+                        "local_message_id":"local-606",
+                        "message":{"id":606}
+                    }'::jsonb,
+                    'processed'
+                )
+            """,
+            (account_uuid, account_uuid),
+        )
+
+    record = _provider_record(account_uuid, project_uuid)
+    assert postgres_store.enqueue(record, 0)
+    item = postgres_store.claim("worker")
+    assert item is not None
+    postgres_store.record_provider_attempt(
+        item,
+        "message-queue",
+        "local-606",
+        99,
+        "hello",
+    )
+    postgres_store.mark_uncertain(item, "ambiguous_provider_outcome")
+
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            INSERT INTO zulip_provider_events (
+                account_uuid, queue_id, event_id, event_type, body,
+                processing_state
+            )
+            SELECT
+                %s, 'retained-message-journal', sample, 'message',
+                jsonb_build_object(
+                    'type', 'message',
+                    'message', jsonb_build_object('id', 100000 + sample)
+                ),
+                'processed'
+            FROM generate_series(1, 10000) AS sample
+            """,
+            (account_uuid,),
+        )
+        session.execute("ANALYZE zulip_provider_events")
+        session.execute("ANALYZE bridge_operations")
+        local_echo_plan = _explain_text(
+            session,
+            """
+            SELECT 1
+            FROM zulip_provider_events AS echo_event
+            JOIN bridge_operations AS operation
+              ON operation.account_uuid = echo_event.account_uuid
+             AND operation.provider_queue_id = echo_event.queue_id
+             AND operation.provider_local_id =
+                 echo_event.body->>'local_message_id'
+             AND operation.provider_local_id IS NOT NULL
+             AND operation.state IN ('pending', 'running', 'uncertain')
+             AND operation.record->'operation'->>'kind' = 'message.create'
+            WHERE echo_event.account_uuid = %s
+              AND echo_event.event_type = 'message'
+              AND echo_event.body ? 'local_message_id'
+              AND echo_event.body->'message'->>'id' = %s
+            """,
+            (account_uuid, "606"),
+        )
+    assert "zulip_provider_message_events_local_echo_idx" in local_echo_plan
+    assert "Seq Scan on zulip_provider_events" not in local_echo_plan
+
+    assert not postgres_store.ignore_provider_reaction_outside_history_window(
+        account_uuid,
+        "channel:42",
+        "606",
+        message_time,
+        "reaction-queue",
+        1,
+    )
+
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE bridge_operations
+            SET reconciliation_after = now()
+            WHERE record_uuid = %s
+            """,
+            (str(item.record_uuid),),
+        )
+
+    class MatchingAdapter:
+        def reconcile_message(
+            self,
+            operation,
+            attempted_at,
+            provider_rendered_content=None,
+        ):
+            return zulip_adapter.ReconciliationEvidence(
+                "now",
+                ("606",),
+                1,
+                "606",
+            )
+
+    reconciler = scheduler.Scheduler(
+        postgres_store,
+        lambda _: MatchingAdapter(),
+        "reconciler",
+    )
+    assert reconciler.reconcile_once()
+    mapping = postgres_store.provider_mapping(account_uuid, "message", "606")
+    assert mapping is not None
+    assert not postgres_store.ignore_provider_reaction_outside_history_window(
+        account_uuid,
+        "channel:42",
+        "606",
+        message_time,
+        "reaction-queue",
+        1,
+    )
+    with postgres_store.session() as session:
+        reaction = session.execute(
+            """
+            SELECT processing_state, processing_reason
+            FROM zulip_provider_events
+            WHERE account_uuid = %s
+              AND queue_id = 'reaction-queue' AND event_id = 1
+            """,
+            (account_uuid,),
+        ).fetchone()
+    assert reaction == {
+        "processing_state": "pending",
+        "processing_reason": None,
+    }
+
+
+def test_terminal_local_echo_operation_no_longer_blocks_reaction(postgres_store):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    postgres_store.reconcile_backfill_jobs()
+    cutoff = datetime.datetime(2026, 7, 1, tzinfo=datetime.UTC)
+    message_time = datetime.datetime(2026, 6, 1, tzinfo=datetime.UTC)
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_backfill_jobs
+            SET state = 'complete', cutoff_at = %s
+            WHERE account_uuid = %s AND provider_chat_key = 'channel:42'
+            """,
+            (cutoff, account_uuid),
+        )
+        session.execute(
+            """
+            INSERT INTO zulip_provider_events (
+                account_uuid, queue_id, event_id, event_type, body,
+                processing_state
+            ) VALUES
+                (%s, 'reaction-queue', 1, 'reaction', '{}'::jsonb, 'pending'),
+                (
+                    %s, 'message-queue', 99, 'message',
+                    '{
+                        "type":"message",
+                        "local_message_id":"local-607",
+                        "message":{"id":607}
+                    }'::jsonb,
+                    'processed'
+                )
+            """,
+            (account_uuid, account_uuid),
+        )
+
+    record = _provider_record(account_uuid, project_uuid)
+    assert postgres_store.enqueue(record, 0)
+    item = postgres_store.claim("worker")
+    assert item is not None
+    postgres_store.record_provider_attempt(
+        item,
+        "message-queue",
+        "local-607",
+        99,
+        "hello",
+    )
+    postgres_store.mark_uncertain(item, "ambiguous_provider_outcome")
+
+    assert not postgres_store.ignore_provider_reaction_outside_history_window(
+        account_uuid,
+        "channel:42",
+        "607",
+        message_time,
+        "reaction-queue",
+        1,
+    )
+    postgres_store.require_operation_manual_reconciliation(
+        item,
+        "unsafe_provider_state",
+        {"match_count": None},
+    )
+    assert postgres_store.ignore_provider_reaction_outside_history_window(
+        account_uuid,
+        "channel:42",
+        "607",
+        message_time,
+        "reaction-queue",
+        1,
+    )
+
+
+def test_new_history_persists_cutoff_without_bounding_all(postgres_store):
+    new_account_uuid, _ = _insert_account_and_assignment(postgres_store, "new")
+    all_account_uuid, _ = _insert_account_and_assignment(postgres_store, "all")
+    selection_time = datetime.datetime(2026, 6, 1, tzinfo=datetime.UTC)
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE desired_resources
+            SET updated_at = %s
+            WHERE resource_type = 'external_chat_assignment'
+              AND body->>'external_account_uuid' = %s
+            """,
+            (selection_time, new_account_uuid),
+        )
+
+    postgres_store.reconcile_backfill_jobs()
+
+    with postgres_store.session() as session:
+        initial = session.execute(
+            """
+            SELECT account_uuid, history_depth, state, cutoff_at
+            FROM zulip_backfill_jobs
+            ORDER BY history_depth
+            """
+        ).fetchall()
+    assert initial == [
+        {
+            "account_uuid": uuid.UUID(all_account_uuid),
+            "history_depth": "all",
+            "state": "pending",
+            "cutoff_at": None,
+        },
+        {
+            "account_uuid": uuid.UUID(new_account_uuid),
+            "history_depth": "new",
+            "state": "complete",
+            "cutoff_at": selection_time,
+        },
+    ]
+
+    repaired_cutoff = datetime.datetime(2026, 5, 1, tzinfo=datetime.UTC)
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_backfill_jobs
+            SET cutoff_at = NULL, updated_at = %s
+            WHERE account_uuid = %s AND history_depth = 'new'
+            """,
+            (repaired_cutoff, new_account_uuid),
+        )
+        session.execute(
+            """
+            UPDATE zulip_backfill_jobs
+            SET state = 'complete'
+            WHERE account_uuid = %s AND history_depth = 'all'
+            """,
+            (all_account_uuid,),
+        )
+        session.execute(
+            """
+            INSERT INTO zulip_provider_events (
+                account_uuid, queue_id, event_id, event_type, body
+            ) VALUES (%s, 'queue', 1, 'reaction', '{}'::jsonb),
+                     (%s, 'queue', 1, 'reaction', '{}'::jsonb)
+            """,
+            (new_account_uuid, all_account_uuid),
+        )
+
+    postgres_store.reconcile_backfill_jobs()
+
+    with postgres_store.session() as session:
+        repaired = session.execute(
+            """
+            SELECT cutoff_at FROM zulip_backfill_jobs
+            WHERE account_uuid = %s AND history_depth = 'new'
+            """,
+            (new_account_uuid,),
+        ).fetchone()
+    assert repaired["cutoff_at"] == repaired_cutoff
+
+    old_message_time = datetime.datetime(2026, 4, 1, tzinfo=datetime.UTC)
+    assert postgres_store.ignore_provider_reaction_outside_history_window(
+        new_account_uuid,
+        "channel:42",
+        "608",
+        old_message_time,
+        "queue",
+        1,
+    )
+    assert not postgres_store.ignore_provider_reaction_outside_history_window(
+        all_account_uuid,
+        "channel:42",
+        "608",
+        old_message_time,
+        "queue",
+        1,
+    )
 
 
 def test_permanent_provider_rejection_is_quarantined_with_safe_evidence(

@@ -1641,6 +1641,35 @@ class BridgeService:
                         converter.provider_chat_assignment(
                             self.store, account_uuid, chat_key
                         )
+                        provider_timestamp = provider_message.get("timestamp")
+                        provider_message_time = None
+                        if not isinstance(provider_timestamp, bool):
+                            try:
+                                provider_message_time = datetime.datetime.fromtimestamp(
+                                    float(typing.cast(object, provider_timestamp)),
+                                    datetime.UTC,
+                                )
+                            except (TypeError, ValueError, OverflowError):
+                                pass
+                        ignore_outside_history = getattr(
+                            self.store,
+                            "ignore_provider_reaction_outside_history_window",
+                            None,
+                        )
+                        if (
+                            provider_message_time is not None
+                            and callable(ignore_outside_history)
+                            and ignore_outside_history(
+                                account_uuid,
+                                chat_key,
+                                str(provider_message_id),
+                                provider_message_time,
+                                queue_id,
+                                event_id,
+                            )
+                        ):
+                            processed += 1
+                            continue
                         external_chat_uuid = uuid.UUID(
                             converter.stable_entity_uuid(
                                 account_uuid, "external_chat", chat_key

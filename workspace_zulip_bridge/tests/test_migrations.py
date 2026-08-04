@@ -69,11 +69,12 @@ def test_migrations_have_one_versioned_dependency_chain():
         "0010-prepare-provider-event-records-f970c8.py",
         "0011-quarantine-rejected-provider-events-f1169c.py",
         "0012-optimize-bridge-load-and-reconcile-stale-queues-6c9ddc.py",
+        "0013-bound-reaction-history-window-5edf75.py",
     ]
     assert engine.get_latest_migration() == (
-        "0012-optimize-bridge-load-and-reconcile-stale-queues-6c9ddc.py"
+        "0013-bound-reaction-history-window-5edf75.py"
     )
-    assert len({step["uuid"] for step in all_migrations.values()}) == 13
+    assert len({step["uuid"] for step in all_migrations.values()}) == 14
     assert all_migrations[
         "0001-add-Zulip-provider-scheduler-state-143113.py"
     ]["depends"] == ["0000-initialize-bridge-operational-state-18f707.py"]
@@ -130,6 +131,11 @@ def test_migrations_have_one_versioned_dependency_chain():
     ]["depends"] == [
         "0011-quarantine-rejected-provider-events-f1169c.py"
     ]
+    assert all_migrations[
+        "0013-bound-reaction-history-window-5edf75.py"
+    ]["depends"] == [
+        "0012-optimize-bridge-load-and-reconcile-stale-queues-6c9ddc.py"
+    ]
 
 
 def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
@@ -163,13 +169,17 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                       'desired_resources_selected_assignment_account_idx',
                       'workspace_delivery_outbox_initial_backfill_idx',
                       'zulip_provider_events_pending_order_idx',
-                      'workspace_delivery_outbox_provider_event_pending_idx'
+                      'workspace_delivery_outbox_provider_event_pending_idx',
+                      'zulip_provider_message_events_inflight_idx',
+                      'zulip_provider_message_events_local_echo_idx',
+                      'bridge_operations_active_local_echo_idx'
                   )
                 ORDER BY indexname
                 """
             ).fetchall()
-            assert applied["count"] == 13
+            assert applied["count"] == 14
             assert [row["indexname"] for row in indexes] == [
+                "bridge_operations_active_local_echo_idx",
                 "desired_resources_selected_assignment_account_idx",
                 "observed_report_outbox_catalog_readiness_idx",
                 "observed_report_outbox_pending_order_idx",
@@ -179,6 +189,8 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                 "workspace_delivery_outbox_pending_order_idx",
                 "workspace_delivery_outbox_provider_event_pending_idx",
                 "zulip_provider_events_pending_order_idx",
+                "zulip_provider_message_events_inflight_idx",
+                "zulip_provider_message_events_local_echo_idx",
             ]
             session.execute("UPDATE bridge_metadata SET control_cursor = 'preserved'")
             session.execute(
@@ -204,9 +216,107 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
             provider_cursor_count = session.execute(
                 "SELECT count(*) AS count FROM zulip_event_cursors"
             ).fetchone()
-            assert applied["count"] == 13
+            assert applied["count"] == 14
             assert cursor["control_cursor"] == "preserved"
             assert provider_cursor_count["count"] == 0
+    finally:
+        with admin_store.session() as session:
+            session.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+
+def test_reaction_history_migration_repairs_new_cutoff_idempotently(tmp_path):
+    connection_url = os.environ.get("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN")
+    if not connection_url:
+        pytest.skip("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN is not configured")
+    schema = f"bridge_reaction_history_{uuid.uuid4().hex}"
+    scoped_url = _schema_connection_url(connection_url, schema)
+    config_path = tmp_path / "bridge.conf"
+    admin_store = storage.RestAlchemyStore(connection_url)
+    scoped_store = storage.RestAlchemyStore(scoped_url)
+    migration_path = (
+        MIGRATIONS / "0013-bound-reaction-history-window-5edf75.py"
+    )
+    spec = importlib.util.spec_from_file_location("reaction_history", migration_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    account_uuid = str(uuid.uuid4())
+    legacy_boundary = "2026-05-01 00:00:00+00"
+
+    with admin_store.session() as session:
+        session.execute(f'CREATE SCHEMA "{schema}"')
+    try:
+        _apply_migrations(scoped_url, config_path)
+        with scoped_store.session() as session:
+            session.execute("DROP INDEX bridge_operations_active_local_echo_idx")
+            session.execute(
+                "DROP INDEX zulip_provider_message_events_local_echo_idx"
+            )
+            session.execute(
+                "DROP INDEX zulip_provider_message_events_inflight_idx"
+            )
+            session.execute(
+                """
+                INSERT INTO zulip_backfill_jobs (
+                    account_uuid, provider_chat_key, history_depth,
+                    cutoff_at, state, updated_at
+                ) VALUES (
+                    %s, 'channel:42', 'new', NULL, 'complete', %s
+                )
+                """,
+                (account_uuid, legacy_boundary),
+            )
+
+            module.migration_step.upgrade(session)
+            module.migration_step.upgrade(session)
+
+            repaired = session.execute(
+                """
+                SELECT cutoff_at, updated_at FROM zulip_backfill_jobs
+                WHERE account_uuid = %s AND provider_chat_key = 'channel:42'
+                """,
+                (account_uuid,),
+            ).fetchone()
+            indexes = session.execute(
+                """
+                SELECT indexname FROM pg_indexes
+                WHERE schemaname = current_schema()
+                  AND indexname IN (
+                      'zulip_provider_message_events_inflight_idx',
+                      'zulip_provider_message_events_local_echo_idx',
+                      'bridge_operations_active_local_echo_idx'
+                  )
+                ORDER BY indexname
+                """
+            ).fetchall()
+            assert repaired["cutoff_at"] == repaired["updated_at"]
+            assert [row["indexname"] for row in indexes] == [
+                "bridge_operations_active_local_echo_idx",
+                "zulip_provider_message_events_inflight_idx",
+                "zulip_provider_message_events_local_echo_idx",
+            ]
+
+            module.migration_step.downgrade(session)
+            downgraded = session.execute(
+                """
+                SELECT cutoff_at FROM zulip_backfill_jobs
+                WHERE account_uuid = %s AND provider_chat_key = 'channel:42'
+                """,
+                (account_uuid,),
+            ).fetchone()
+            dropped = session.execute(
+                """
+                SELECT indexname FROM pg_indexes
+                WHERE schemaname = current_schema()
+                  AND indexname IN (
+                      'zulip_provider_message_events_inflight_idx',
+                      'zulip_provider_message_events_local_echo_idx',
+                      'bridge_operations_active_local_echo_idx'
+                  )
+                """
+            ).fetchall()
+            assert downgraded["cutoff_at"] is None
+            assert dropped == []
     finally:
         with admin_store.session() as session:
             session.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')

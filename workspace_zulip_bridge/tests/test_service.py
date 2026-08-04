@@ -1,3 +1,4 @@
+import datetime
 import pathlib
 import threading
 import time
@@ -986,6 +987,10 @@ def test_reaction_event_for_selected_chat_waits_for_message_mapping():
     }
 
     class Store(DeliveryStore):
+        def __init__(self, events):
+            super().__init__(events)
+            self.outside_history_checks = []
+
         def account_resource(self, requested):
             assert requested == account_uuid
             return {
@@ -1010,6 +1015,27 @@ def test_reaction_event_for_selected_chat_waits_for_message_mapping():
                 "selected": True,
             }
 
+        def ignore_provider_reaction_outside_history_window(
+            self,
+            requested,
+            provider_chat_key,
+            provider_message_id,
+            provider_message_time,
+            queue_id,
+            event_id,
+        ):
+            self.outside_history_checks.append(
+                (
+                    requested,
+                    provider_chat_key,
+                    provider_message_id,
+                    provider_message_time,
+                    queue_id,
+                    event_id,
+                )
+            )
+            return False
+
     store = Store(
         [
             {
@@ -1030,6 +1056,7 @@ def test_reaction_event_for_selected_chat_waits_for_message_mapping():
                 "type": "stream",
                 "stream_id": 42,
                 "display_recipient": "Engineering",
+                "timestamp": 1_800_000_000,
             }
 
     instance.provider_adapters = lambda _account_uuid: Adapter()
@@ -1037,12 +1064,129 @@ def test_reaction_event_for_selected_chat_waits_for_message_mapping():
     assert instance.process_provider_journal() == 0
     assert store.enqueued == []
     assert store.processed == []
+    assert store.outside_history_checks == [
+        (
+            account_uuid,
+            "channel:42",
+            "601",
+            datetime.datetime.fromtimestamp(1_800_000_000, datetime.UTC),
+            "queue",
+            7,
+        )
+    ]
     assert store.retried == [
         (
             account_uuid,
             "queue",
             7,
             "provider_chat_assignment_pending",
+        )
+    ]
+
+
+def test_reaction_event_outside_completed_history_window_is_terminal():
+    account_uuid = "00000000-0000-0000-0000-000000000001"
+    reaction = {
+        "id": 7,
+        "type": "reaction",
+        "op": "add",
+        "message_id": 601,
+        "user_id": 3,
+        "emoji_name": "thumbs_up",
+        "emoji_code": "1f44d",
+        "reaction_type": "unicode_emoji",
+    }
+
+    class Store(DeliveryStore):
+        def __init__(self, events):
+            super().__init__(events)
+            self.ignored = []
+
+        def account_resource(self, requested):
+            assert requested == account_uuid
+            return {
+                "owner_user_uuid": "00000000-0000-0000-0000-000000000010",
+                "generation": 1,
+                "settings": {
+                    "default_project_id": "00000000-0000-0000-0000-000000000020"
+                },
+            }
+
+        def provider_mapping(self, requested, entity_kind, provider_id):
+            assert requested == account_uuid
+            assert entity_kind == "message"
+            assert provider_id == "601"
+            return None
+
+        def assignment_for_provider_chat(self, requested, provider_chat_key):
+            assert requested == account_uuid
+            assert provider_chat_key == "channel:42"
+            return {
+                "project_id": "00000000-0000-0000-0000-000000000020",
+                "selected": True,
+            }
+
+        def ignore_provider_reaction_outside_history_window(
+            self,
+            requested,
+            provider_chat_key,
+            provider_message_id,
+            provider_message_time,
+            queue_id,
+            event_id,
+        ):
+            self.ignored.append(
+                (
+                    requested,
+                    provider_chat_key,
+                    provider_message_id,
+                    provider_message_time,
+                    queue_id,
+                    event_id,
+                )
+            )
+            return True
+
+    store = Store(
+        [
+            {
+                "account_uuid": account_uuid,
+                "queue_id": "queue",
+                "event_id": 7,
+                "body": reaction,
+            }
+        ]
+    )
+    instance = _delivery_service(store)
+
+    class Adapter(ProviderAdapter):
+        def message_by_id(self, provider_message_id):
+            assert provider_message_id == 601
+            return {
+                "id": 601,
+                "type": "stream",
+                "stream_id": 42,
+                "display_recipient": "Engineering",
+                "timestamp": 1_700_000_000,
+            }
+
+    instance.provider_adapters = lambda _account_uuid: Adapter()
+    instance._event_records_with_file_fallback = lambda *_args: pytest.fail(
+        "ignored reactions must not reach conversion"
+    )
+
+    assert instance.process_provider_journal() == 1
+    assert store.enqueued == []
+    assert store.retried == []
+    assert store.processed == []
+    assert store.ignored == [
+        (
+            account_uuid,
+            "channel:42",
+            "601",
+            datetime.datetime.fromtimestamp(1_700_000_000, datetime.UTC),
+            "queue",
+            7,
         )
     ]
 
