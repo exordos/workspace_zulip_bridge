@@ -1,4 +1,5 @@
 import contextlib
+import datetime
 import json
 import pathlib
 import uuid
@@ -626,6 +627,62 @@ def test_inactive_provider_event_terminalization_preserves_audit_rows():
     assert "synchronization_enabled" in ignored
     assert "submission_state = 'cancelled'" in cancelled
     assert "submission_error_code = 'account_inactive'" in cancelled
+
+
+def test_outside_history_reaction_terminalization_is_policy_guarded():
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+    session = Session(({"account_uuid": account_uuid},))
+    store = _store_with_session(session)
+    message_time = datetime.datetime(2026, 6, 1, tzinfo=datetime.UTC)
+
+    assert store.ignore_provider_reaction_outside_history_window(
+        account_uuid,
+        "channel:42",
+        "601",
+        message_time,
+        "queue",
+        7,
+    )
+    statement, parameters = session.statements[0]
+    normalized = " ".join(statement.split())
+    assert "processing_state = 'ignored'" in normalized
+    assert "processing_reason = 'provider_message_outside_history'" in normalized
+    assert "job.state = 'complete'" in normalized
+    assert "job.cutoff_at IS NOT NULL" in normalized
+    assert "%s < job.cutoff_at" in normalized
+    assert "assignment.body->>'history_depth' = job.history_depth" in normalized
+    assert "NOT EXISTS ( SELECT 1 FROM provider_mappings" in normalized
+    assert "FROM zulip_provider_events AS source_event" in normalized
+    assert "source_event.event_type = 'message'" in normalized
+    assert (
+        "source_event.processing_state IN ( 'pending', 'delivering' )"
+        in normalized
+    )
+    assert "source_event.body->'message'->>'id' = %s" in normalized
+    assert "FROM zulip_provider_events AS echo_event" in normalized
+    assert "JOIN bridge_operations AS operation" in normalized
+    assert (
+        "operation.provider_local_id = echo_event.body->>'local_message_id'"
+        in normalized
+    )
+    assert "operation.provider_local_id IS NOT NULL" in normalized
+    assert "operation.state IN ( 'pending', 'running', 'uncertain' )" in normalized
+    assert "operation.record->'operation'->>'kind' = 'message.create'" in normalized
+    assert "echo_event.body ? 'local_message_id'" in normalized
+    assert "echo_event.body->'message'->>'id' = %s" in normalized
+    assert "FROM zulip_queue_catchup_jobs AS catchup" in normalized
+    assert "catchup.state <> 'complete'" in normalized
+    assert parameters == (
+        account_uuid,
+        "queue",
+        7,
+        "601",
+        "601",
+        "601",
+        "channel:42",
+        "channel:42",
+        message_time,
+    )
 
 
 def test_backfill_claim_requires_ready_participants_for_current_assignment():
