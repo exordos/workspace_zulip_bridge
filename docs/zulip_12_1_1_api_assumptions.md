@@ -21,6 +21,9 @@ that branch's `zerver/openapi/python_examples.py` and generated OpenAPI:
 - reactions use `add_reaction` and `remove_reaction` with the provider message
   ID and emoji name; live `reaction` events carry `op=add/remove`,
   `message_id`, `user_id`, `emoji_name`, `emoji_code`, and `reaction_type`;
+  Unicode reactions use the normalized `reaction_type`/`emoji_code` pair as
+  their stable provider identity and project the decoded Unicode glyph into
+  Workspace, while retaining the Zulip emoji name in provider metadata;
 - files use `upload_file` with an opened binary file object and the returned URL
   is embedded only after Workspace file-plane authorization/copy.
 
