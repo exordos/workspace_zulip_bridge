@@ -1615,6 +1615,19 @@ def test_outbound_reaction_echo_reuses_workspace_identity(postgres_store):
         if record["operation"]["kind"] == "reaction.upsert"
     )
     assert reaction["operation"]["entity_uuid"] == workspace_reaction_uuid
+    assert reaction["operation"]["payload"]["emoji_name"] == "👍"
+    assert str(
+        postgres_store.provider_mapping(
+            account_uuid,
+            "reaction",
+            "601:2:unicode_emoji:1f44d",
+        )["workspace_uuid"]
+    ) == workspace_reaction_uuid
+    assert postgres_store.provider_mapping(
+        account_uuid,
+        "reaction",
+        "601:2:thumbs_up",
+    ) is None
 
 
 def test_provider_mapping_written_before_event_delivery_recovers_same_message(
