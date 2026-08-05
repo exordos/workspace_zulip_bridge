@@ -12,7 +12,7 @@ import uuid
 import requests
 import zulip
 
-from workspace_zulip_bridge import file_api, markdown_conversion
+from workspace_zulip_bridge import emoji, file_api, markdown_conversion
 
 MAX_PROVIDER_FILE_BYTES = 52_428_800
 PROVIDER_QUEUE_IDLE_TIMEOUT_SECONDS = 43_200
@@ -170,14 +170,6 @@ def _successful(result: dict[str, object]) -> dict[str, object]:
         "provider_error",
     }
     raise ZulipOperationError(code, retryable)
-
-
-def _unicode_emoji_code(emoji: str) -> str:
-    return "-".join(
-        f"{ord(character):04x}"
-        for character in emoji
-        if character not in {"\ufe0e", "\ufe0f"}
-    )
 
 
 @functools.lru_cache(maxsize=32)
@@ -1158,7 +1150,10 @@ class OfficialZulipAdapter:
         value = str(emoji_name)
         if value.isascii():
             return value, None, None
-        emoji_code = _unicode_emoji_code(value)
+        try:
+            emoji_code = emoji.unicode_emoji_code(value)
+        except ValueError as exc:
+            raise ZulipOperationError("invalid_record", False) from exc
         if not emoji_code:
             raise ZulipOperationError("invalid_record", False)
         names = _zulip_unicode_emoji_names(
@@ -1221,11 +1216,22 @@ class OfficialZulipAdapter:
         )
         if identity is None:
             raise ZulipOperationError("not_found", False)
+        emoji_code = request.get("emoji_code")
+        reaction_type = request.get("reaction_type")
+        if isinstance(emoji_code, str) and isinstance(reaction_type, str):
+            if reaction_type == "unicode_emoji":
+                try:
+                    emoji_code = emoji.canonical_unicode_emoji_code(emoji_code)
+                except ValueError as exc:
+                    raise ZulipOperationError("invalid_record", False) from exc
+            reaction_identity = (reaction_type, emoji_code)
+        else:
+            reaction_identity = (str(request["emoji_name"]),)
         return ":".join(
             (
                 str(int(str(request["message_id"]))),
                 str(int(str(identity["provider_id"]))),
-                str(request["emoji_name"]),
+                *reaction_identity,
             )
         )
 

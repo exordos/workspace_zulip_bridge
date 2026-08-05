@@ -70,11 +70,12 @@ def test_migrations_have_one_versioned_dependency_chain():
         "0011-quarantine-rejected-provider-events-f1169c.py",
         "0012-optimize-bridge-load-and-reconcile-stale-queues-6c9ddc.py",
         "0013-bound-reaction-history-window-5edf75.py",
+        "0014-refresh-Zulip-reactions-by-emoji-code-e76ed0.py",
     ]
     assert engine.get_latest_migration() == (
-        "0013-bound-reaction-history-window-5edf75.py"
+        "0014-refresh-Zulip-reactions-by-emoji-code-e76ed0.py"
     )
-    assert len({step["uuid"] for step in all_migrations.values()}) == 14
+    assert len({step["uuid"] for step in all_migrations.values()}) == 15
     assert all_migrations[
         "0001-add-Zulip-provider-scheduler-state-143113.py"
     ]["depends"] == ["0000-initialize-bridge-operational-state-18f707.py"]
@@ -136,6 +137,36 @@ def test_migrations_have_one_versioned_dependency_chain():
     ]["depends"] == [
         "0012-optimize-bridge-load-and-reconcile-stale-queues-6c9ddc.py"
     ]
+    assert all_migrations[
+        "0014-refresh-Zulip-reactions-by-emoji-code-e76ed0.py"
+    ]["depends"] == ["0013-bound-reaction-history-window-5edf75.py"]
+
+
+def test_reaction_emoji_migration_requeues_configured_history():
+    migration_path = (
+        MIGRATIONS / "0014-refresh-Zulip-reactions-by-emoji-code-e76ed0.py"
+    )
+    spec = importlib.util.spec_from_file_location("reaction_emoji", migration_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class Session:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, statement):
+            self.statements.append(statement)
+
+    session = Session()
+    module.migration_step.upgrade(session)
+
+    assert len(session.statements) == 1
+    statement = session.statements[0]
+    assert "UPDATE zulip_backfill_jobs" in statement
+    assert "WHEN history_depth = 'new' THEN 'complete'" in statement
+    assert "ELSE 'pending'" in statement
+    assert "retry_count = 0" in statement
 
 
 def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
@@ -177,7 +208,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                 ORDER BY indexname
                 """
             ).fetchall()
-            assert applied["count"] == 14
+            assert applied["count"] == 15
             assert [row["indexname"] for row in indexes] == [
                 "bridge_operations_active_local_echo_idx",
                 "desired_resources_selected_assignment_account_idx",
@@ -216,7 +247,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
             provider_cursor_count = session.execute(
                 "SELECT count(*) AS count FROM zulip_event_cursors"
             ).fetchone()
-            assert applied["count"] == 14
+            assert applied["count"] == 15
             assert cursor["control_cursor"] == "preserved"
             assert provider_cursor_count["count"] == 0
     finally:

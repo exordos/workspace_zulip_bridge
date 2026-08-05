@@ -1045,8 +1045,8 @@ def test_workspace_unicode_reaction_uses_zulip_server_emoji_identity(monkeypatch
         },
     }
 
-    assert adapter.apply(create) == ("99:1:+1", None)
-    assert adapter.apply(delete) == ("99:1:+1", None)
+    assert adapter.apply(create) == ("99:1:unicode_emoji:1f44d", None)
+    assert adapter.apply(delete) == ("99:1:unicode_emoji:1f44d", None)
     assert client.added_reactions[-1] == {
         "message_id": 99,
         "emoji_name": "+1",

@@ -6,7 +6,7 @@ import typing
 import urllib.parse
 import uuid
 
-from workspace_zulip_bridge import canonical, markdown_conversion
+from workspace_zulip_bridge import canonical, emoji, markdown_conversion
 
 OPERATION_NAMESPACE = uuid.UUID("9d8b6952-b2de-4c80-a9c7-9619aaf5f35d")
 ENTITY_NAMESPACE = uuid.UUID("9a1d0e75-50a5-413c-b3e8-d070232ef57f")
@@ -29,6 +29,9 @@ ZULIP_DIRECT_TOPIC_NAME = "Zulip"
 # Keep provider message projections within Workspace MarkdownPayload.content.
 WORKSPACE_MARKDOWN_MAX_LENGTH = 40_000
 WORKSPACE_MARKDOWN_TRUNCATION_MARKER = "\n\n[Message truncated]"
+# Version only reaction snapshots when their persisted Workspace projection
+# changes. Other backfill operations retain their established idempotency keys.
+REACTION_PROJECTION_VERSION = 2
 
 
 def is_empty_channel_topic(subject: str) -> bool:
@@ -754,6 +757,25 @@ def _provider(
 def _reaction_provider_id(
     provider_message_id: object,
     provider_user_id: object,
+    reaction_type: object,
+    emoji_code: object,
+) -> str:
+    normalized_code = str(emoji_code)
+    if str(reaction_type) == "unicode_emoji":
+        normalized_code = emoji.canonical_unicode_emoji_code(normalized_code)
+    return ":".join(
+        (
+            str(int(str(provider_message_id))),
+            str(int(str(provider_user_id))),
+            str(reaction_type),
+            normalized_code,
+        )
+    )
+
+
+def _legacy_reaction_provider_id(
+    provider_message_id: object,
+    provider_user_id: object,
     emoji_name: object,
 ) -> str:
     return ":".join(
@@ -783,6 +805,11 @@ def _reaction_operations(
     emoji_name = str(reaction["emoji_name"])
     emoji_code = str(reaction["emoji_code"])
     reaction_type = str(reaction["reaction_type"])
+    workspace_emoji_name = (
+        emoji.unicode_emoji_from_code(emoji_code)
+        if reaction_type == "unicode_emoji"
+        else emoji_name
+    )
     identity = store.provider_mapping(
         account_uuid,
         "identity",
@@ -824,17 +851,8 @@ def _reaction_operations(
     provider_reaction_id = _reaction_provider_id(
         provider_message_id,
         provider_user_id,
-        emoji_name,
-    )
-    existing = store.provider_mapping(
-        account_uuid,
-        "reaction",
-        provider_reaction_id,
-    )
-    reaction_uuid = (
-        str(existing["workspace_uuid"])
-        if existing is not None
-        else stable_entity_uuid(account_uuid, "reaction", provider_reaction_id)
+        reaction_type,
+        emoji_code,
     )
     reaction_metadata = {
         "project_uuid": project_uuid,
@@ -843,10 +861,41 @@ def _reaction_operations(
         "message_uuid": message_uuid,
         "user_uuid": identity_uuid,
         "chat_key": chat_key,
-        "emoji_name": emoji_name,
+        "emoji_name": workspace_emoji_name,
+        "provider_emoji_name": emoji_name,
         "emoji_code": emoji_code,
         "reaction_type": reaction_type,
     }
+    existing = store.provider_mapping(
+        account_uuid,
+        "reaction",
+        provider_reaction_id,
+    )
+    if existing is None:
+        legacy_provider_reaction_id = _legacy_reaction_provider_id(
+            provider_message_id,
+            provider_user_id,
+            emoji_name,
+        )
+        if legacy_provider_reaction_id != provider_reaction_id:
+            legacy = store.provider_mapping(
+                account_uuid,
+                "reaction",
+                legacy_provider_reaction_id,
+            )
+            if legacy is not None:
+                existing = store.rename_provider_mapping(
+                    account_uuid,
+                    "reaction",
+                    legacy_provider_reaction_id,
+                    provider_reaction_id,
+                    reaction_metadata,
+                )
+    reaction_uuid = (
+        str(existing["workspace_uuid"])
+        if existing is not None
+        else stable_entity_uuid(account_uuid, "reaction", provider_reaction_id)
+    )
     store.remember_provider_mapping(
         account_uuid,
         "reaction",
@@ -866,10 +915,11 @@ def _reaction_operations(
                 "topic_uuid": topic_uuid,
                 "message_uuid": message_uuid,
                 "user_uuid": identity_uuid,
-                "emoji_name": emoji_name,
+                "emoji_name": workspace_emoji_name,
             },
             "extensions": {
                 "provider_badge": "zulip",
+                "emoji_name": emoji_name,
                 "emoji_code": emoji_code,
                 "reaction_type": reaction_type,
             },
@@ -1478,6 +1528,14 @@ def message_event_records(
         )
     records = []
     for index, operation in enumerate(operations):
+        operation_record_source = record_source
+        if delivery_class == "backfill" and str(operation["kind"]).startswith(
+            "reaction."
+        ):
+            operation_record_source = (
+                f"{record_source}:reaction-projection:"
+                f"{REACTION_PROJECTION_VERSION}"
+            )
         operation_lane = (
             f"identity:{account_uuid}:{operation['entity_uuid']}"
             if operation["kind"] == "identity.upsert"
@@ -1488,7 +1546,7 @@ def message_event_records(
                 store,
                 account_uuid,
                 project_uuid,
-                record_source,
+                operation_record_source,
                 int(event["id"]),
                 index,
                 operation,
