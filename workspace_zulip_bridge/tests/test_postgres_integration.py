@@ -1482,6 +1482,73 @@ def test_outbound_commit_suppresses_queue_loss_history_duplicate(postgres_store)
     assert duplicate == []
 
 
+def test_content_only_update_preserves_workspace_origin_topic_mapping(postgres_store):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    stream_uuid, topic_uuid, author_uuid = _materialize_channel_projection(
+        postgres_store, account_uuid, project_uuid
+    )
+    message_uuid = str(uuid.uuid4())
+    outbound = _provider_record(account_uuid, project_uuid)
+    outbound["origin"] = "workspace"
+    outbound["operation"]["entity_uuid"] = message_uuid
+    outbound["operation"]["payload"].update(
+        {
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "author_uuid": author_uuid,
+        }
+    )
+    outbound["operation_sha256"] = canonical.operation_digest(outbound)
+    with postgres_store.session() as session:
+        postgres_store._persist_committed_mapping(session, outbound, "601", None)
+
+    mapping = postgres_store.provider_mapping(account_uuid, "message", "601")
+    assert "subject" not in mapping["metadata"]
+
+    records = converter.event_records(
+        postgres_store,
+        account_uuid,
+        "provider-message-update:601",
+        {
+            "id": 700,
+            "type": "update_message",
+            "message_id": 601,
+            "message_ids": [601],
+            "stream_id": 42,
+            "content": "edited",
+            "edit_timestamp": 1_700_000_010,
+        },
+    )
+
+    assert [record["operation"]["kind"] for record in records] == [
+        "message.update"
+    ]
+    update = records[0]
+    assert update["operation"]["entity_uuid"] == message_uuid
+    assert update["operation"]["payload"]["topic_uuid"] == topic_uuid
+    assert "subject" not in update["operation"]["extensions"]
+
+    with postgres_store.session() as session:
+        postgres_store._persist_committed_mapping(session, update, None, "1")
+
+    persisted = postgres_store.provider_mapping(account_uuid, "message", "601")
+    assert "subject" not in persisted["metadata"]
+    assert (
+        str(
+            postgres_store.provider_mapping(account_uuid, "topic", "42:Topic")[
+                "workspace_uuid"
+            ]
+        )
+        == topic_uuid
+    )
+    assert (
+        postgres_store.provider_mapping(
+            account_uuid, "topic", "42:general chat"
+        )
+        is None
+    )
+
+
 def test_outbound_reaction_echo_reuses_workspace_identity(postgres_store):
     account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
     stream_uuid, topic_uuid, author_uuid = _materialize_channel_projection(
