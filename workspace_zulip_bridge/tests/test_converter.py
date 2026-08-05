@@ -1000,6 +1000,52 @@ def test_message_mutations_and_topic_rename_reuse_stable_mappings():
     assert "through_message_uuid" not in read[0]["payload"]
 
 
+def test_content_only_message_update_does_not_infer_a_topic_name():
+    store = FakeStore(auto_materialize=False)
+    stream_uuid = str(uuid.uuid4())
+    topic_uuid = str(uuid.uuid4())
+    author_uuid = str(uuid.uuid4())
+    message_uuid = str(uuid.uuid4())
+    store.remember_provider_mapping(
+        ACCOUNT_UUID,
+        "message",
+        "601",
+        message_uuid,
+        {
+            "project_uuid": PROJECT_UUID,
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "author_uuid": author_uuid,
+            "chat_key": "channel:42",
+            "mapping_origin": "workspace",
+            "workspace_delivery_state": "committed",
+        },
+    )
+
+    updated = _operations(
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "queue",
+            {
+                "id": 11,
+                "type": "update_message",
+                "message_id": 601,
+                "message_ids": [601],
+                "stream_id": 42,
+                "content": "edited",
+                "edit_timestamp": 1_700_000_010,
+            },
+        )
+    )
+
+    assert [operation["kind"] for operation in updated] == ["message.update"]
+    assert updated[0]["entity_uuid"] == message_uuid
+    assert updated[0]["payload"]["topic_uuid"] == topic_uuid
+    assert "subject" not in updated[0]["extensions"]
+    assert ("topic", "42:general chat") not in store.mappings
+
+
 def test_read_state_drops_retired_stream_mapping_after_recanonicalization():
     store = FakeStore()
     first_event = {
@@ -1341,14 +1387,11 @@ def test_message_create_and_update_mentions_use_provider_identity_ids_and_urns()
     update_identity = next(
         operation for operation in updated if operation["kind"] == "identity.upsert"
     )
-    updated_topic = next(
-        operation for operation in updated if operation["kind"] == "topic.upsert"
-    )
     updated_message = next(
         operation for operation in updated if operation["kind"] == "message.update"
     )
-    assert updated.index(updated_topic) < updated.index(updated_message)
-    assert updated_topic["entity_uuid"] == created_message["payload"]["topic_uuid"]
+    assert not any(operation["kind"] == "topic.upsert" for operation in updated)
+    assert updated_message["extensions"]["subject"] == "Topic"
     assert update_identity["provider"]["entity_id"] == "4"
     assert (
         "[Another User](urn:user:" in updated_message["payload"]["payload"]["content"]

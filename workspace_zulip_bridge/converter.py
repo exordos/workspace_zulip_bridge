@@ -1797,22 +1797,40 @@ def _mapped_event_records(
                 file_resolver,
                 ZulipLinkResolver(store, account_uuid, owner_uuid),
             )
-            topic_name = str(event.get("subject", metadata.get("subject", "")))
-            if chat_key.startswith("channel:"):
-                topic_name = channel_topic_name(topic_name)
-            else:
-                topic_name = ZULIP_DIRECT_TOPIC_NAME
-            topic_provider_id = (
-                channel_topic_provider_id(
-                    chat_key.removeprefix("channel:"), topic_name
+            event_subject = event.get("subject")
+            mapped_subject = metadata.get("subject")
+            is_channel = chat_key.startswith("channel:")
+            if is_channel:
+                event_topic_name = (
+                    channel_topic_name(str(event_subject))
+                    if event_subject is not None
+                    else None
                 )
-                if chat_key.startswith("channel:")
-                else f"{chat_key}:default"
-            )
-            if not any(
-                record["operation"]["kind"] == "topic.upsert"
-                and record["operation"]["entity_uuid"] == topic_uuid
-                for record in records
+                message_subject = event_topic_name
+                if message_subject is None and mapped_subject is not None:
+                    message_subject = channel_topic_name(str(mapped_subject))
+            else:
+                event_topic_name = (
+                    ZULIP_DIRECT_TOPIC_NAME if event_subject is not None else None
+                )
+                message_subject = ""
+            topic_provider_id = None
+            if event_topic_name is not None:
+                topic_provider_id = (
+                    channel_topic_provider_id(
+                        chat_key.removeprefix("channel:"), event_topic_name
+                    )
+                    if is_channel
+                    else f"{chat_key}:default"
+                )
+            if (
+                event_topic_name is not None
+                and topic_provider_id is not None
+                and not any(
+                    record["operation"]["kind"] == "topic.upsert"
+                    and record["operation"]["entity_uuid"] == topic_uuid
+                    for record in records
+                )
             ):
                 topic_operation = {
                     "kind": "topic.upsert",
@@ -1826,7 +1844,7 @@ def _mapped_event_records(
                     ),
                     "payload": {
                         "stream_uuid": stream_uuid,
-                        "name": topic_name,
+                        "name": event_topic_name,
                     },
                     "extensions": {"provider_badge": "zulip"},
                 }
@@ -1867,7 +1885,11 @@ def _mapped_event_records(
                         markdown.encode("utf-8")
                     ).hexdigest(),
                     "provider_content_sha256": provider_content_sha256,
-                    "subject": (topic_name if chat_key.startswith("channel:") else ""),
+                    **(
+                        {"subject": message_subject}
+                        if message_subject is not None
+                        else {}
+                    ),
                 },
             }
         else:
