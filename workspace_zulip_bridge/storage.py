@@ -577,6 +577,7 @@ class RestAlchemyStore:
         workspace_uuid: str,
         provider_id: str,
         metadata: dict[str, object],
+        authoritative_workspace_uuids: list[str] | None = None,
     ) -> None:
         session.execute(
             """
@@ -587,6 +588,24 @@ class RestAlchemyStore:
             (account_uuid, entity_kind, workspace_uuid, provider_id),
         )
         if entity_kind == "topic":
+            authoritative_workspace_uuids = list(
+                dict.fromkeys(
+                    [*(authoritative_workspace_uuids or []), workspace_uuid]
+                )
+            )
+            # An alias only represents a displaced Workspace UUID. Once that
+            # UUID appears in the current projection it is authoritative again,
+            # so an older redirect must not continue to override its mapping.
+            session.execute(
+                """
+                UPDATE provider_mapping_aliases
+                SET deleted = true, updated_at = now()
+                WHERE account_uuid = %s AND entity_kind = %s
+                  AND workspace_uuid = %s AND provider_id <> %s
+                  AND NOT deleted
+                """,
+                (account_uuid, entity_kind, workspace_uuid, provider_id),
+            )
             # A provider rename can make the backend recanonicalize the same
             # provider topic under a new Workspace UUID. Keep the displaced
             # UUID routable instead of silently orphaning its existing topic.
@@ -596,6 +615,7 @@ class RestAlchemyStore:
                 SET metadata = %s, deleted = false, updated_at = now()
                 WHERE account_uuid = %s AND entity_kind = %s
                   AND provider_id = %s AND workspace_uuid <> %s
+                  AND NOT (workspace_uuid = ANY(%s))
                 """,
                 (
                     json.dumps(metadata),
@@ -603,6 +623,7 @@ class RestAlchemyStore:
                     entity_kind,
                     provider_id,
                     workspace_uuid,
+                    authoritative_workspace_uuids,
                 ),
             )
             session.execute(
@@ -618,6 +639,7 @@ class RestAlchemyStore:
                   AND mapping.entity_kind = %s
                   AND mapping.provider_id = %s
                   AND mapping.workspace_uuid <> %s
+                  AND NOT (mapping.workspace_uuid = ANY(%s))
                 ON CONFLICT (
                     account_uuid, entity_kind, workspace_uuid
                 ) DO UPDATE SET
@@ -632,6 +654,7 @@ class RestAlchemyStore:
                     entity_kind,
                     provider_id,
                     workspace_uuid,
+                    authoritative_workspace_uuids,
                 ),
             )
         session.execute(
@@ -712,6 +735,11 @@ class RestAlchemyStore:
                 "default_topic_uuid": stream.get("default_topic_uuid"),
             },
         )
+        authoritative_topic_uuids = [
+            str(raw_topic["topic_uuid"])
+            for raw_topic in topics
+            if isinstance(raw_topic, dict)
+        ]
         for raw_topic in topics:
             if not isinstance(raw_topic, dict):
                 raise ValueError("Invalid workspace projection topic")
@@ -727,6 +755,7 @@ class RestAlchemyStore:
                     "name": raw_topic["name"],
                     "is_default": raw_topic["is_default"],
                 },
+                authoritative_topic_uuids,
             )
 
     @staticmethod

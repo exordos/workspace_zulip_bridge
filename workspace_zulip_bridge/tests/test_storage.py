@@ -871,13 +871,22 @@ def test_topic_projection_replacement_preserves_displaced_workspace_alias():
         {"name": "new topic"},
     )
 
-    assert len(session.statements) == 4
+    assert len(session.statements) == 5
     delete_statement, delete_parameters = session.statements[0]
-    restore_statement, restore_parameters = session.statements[1]
-    alias_statement, alias_parameters = session.statements[2]
-    insert_statement, insert_parameters = session.statements[3]
+    deactivate_statement, deactivate_parameters = session.statements[1]
+    restore_statement, restore_parameters = session.statements[2]
+    alias_statement, alias_parameters = session.statements[3]
+    insert_statement, insert_parameters = session.statements[4]
     assert "DELETE FROM provider_mappings" in delete_statement
     assert delete_parameters == (
+        account_uuid,
+        "topic",
+        workspace_uuid,
+        "42:new-topic",
+    )
+    assert "UPDATE provider_mapping_aliases" in deactivate_statement
+    assert "workspace_uuid = %s AND provider_id <> %s" in deactivate_statement
+    assert deactivate_parameters == (
         account_uuid,
         "topic",
         workspace_uuid,
@@ -886,15 +895,18 @@ def test_topic_projection_replacement_preserves_displaced_workspace_alias():
     assert "UPDATE provider_mapping_aliases" in restore_statement
     assert "provider_id = %s" in restore_statement
     assert "workspace_uuid <> %s" in restore_statement
+    assert "workspace_uuid = ANY(%s)" in restore_statement
     assert restore_parameters == (
         json.dumps({"name": "new topic"}),
         account_uuid,
         "topic",
         "42:new-topic",
         workspace_uuid,
+        [workspace_uuid],
     )
     assert "INSERT INTO provider_mapping_aliases" in alias_statement
     assert "mapping.workspace_uuid <> %s" in alias_statement
+    assert "mapping.workspace_uuid = ANY(%s)" in alias_statement
     assert alias_parameters == (
         "42:new-topic",
         json.dumps({"name": "new topic"}),
@@ -902,6 +914,7 @@ def test_topic_projection_replacement_preserves_displaced_workspace_alias():
         "topic",
         "42:new-topic",
         workspace_uuid,
+        [workspace_uuid],
     )
     assert "INSERT INTO provider_mappings" in insert_statement
     assert "WITH removed_stale_workspace_mapping" not in insert_statement
@@ -1012,7 +1025,7 @@ def test_workspace_projection_contract_materializes_first_outbound_mappings():
 
     storage.RestAlchemyStore._materialize_workspace_projection(session, assignment)
 
-    assert len(session.statements) == 10
+    assert len(session.statements) == 11
     inserts = [
         parameters
         for statement, parameters in session.statements
@@ -1054,7 +1067,7 @@ def test_exact_backend_assignment_fixture_materializes_owned_topology():
     )
     session = Session()
     storage.RestAlchemyStore._materialize_workspace_projection(session, fixture)
-    assert len(session.statements) == 14
+    assert len(session.statements) == 16
     materialized = []
     for statement, parameters in session.statements:
         if "INSERT INTO provider_mappings" not in statement:
