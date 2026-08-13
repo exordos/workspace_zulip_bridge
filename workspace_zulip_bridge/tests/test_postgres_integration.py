@@ -543,11 +543,18 @@ def test_topic_recanonicalization_keeps_previous_workspace_route(postgres_store)
     )
     postgres_store.apply_desired_changes([mixed_projection], "cursor-5")
 
-    for topic_uuid in (original_topic_uuid, canonical_topic_uuid):
-        route = postgres_store.workspace_mapping(account_uuid, "topic", topic_uuid)
-        assert route is not None
-        assert route["provider_id"] == "42:renamed again"
-        assert route["metadata"]["name"] == "renamed again"
+    original_route = postgres_store.workspace_mapping(
+        account_uuid, "topic", original_topic_uuid
+    )
+    assert original_route is not None
+    assert original_route["provider_id"] == "42:resolved topic"
+    assert original_route["metadata"]["name"] == "resolved topic"
+    canonical_route = postgres_store.workspace_mapping(
+        account_uuid, "topic", canonical_topic_uuid
+    )
+    assert canonical_route is not None
+    assert canonical_route["provider_id"] == "42:renamed again"
+    assert canonical_route["metadata"]["name"] == "renamed again"
 
 
 def test_observed_report_state_can_recover_to_a_previous_value(postgres_store):
