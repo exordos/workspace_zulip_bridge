@@ -146,6 +146,36 @@ def _insert_account_and_assignment(
     return account_uuid, project_uuid
 
 
+def _insert_channel_assignment(
+    store: storage.RestAlchemyStore,
+    account_uuid: str,
+    project_uuid: str,
+    channel_id: int,
+    history_depth: str = "all",
+) -> None:
+    assignment = {
+        "uuid": str(uuid.uuid4()),
+        "generation": 1,
+        "external_account_uuid": account_uuid,
+        "project_id": project_uuid,
+        "selected": True,
+        "history_depth": history_depth,
+        "provider_chat": {
+            "provider_chat_key": f"channel:{channel_id}",
+            "chat_type": "channel",
+        },
+    }
+    with store.session() as session:
+        session.execute(
+            """
+            INSERT INTO desired_resources (
+                resource_type, resource_uuid, generation, body, deleted
+            ) VALUES ('external_chat_assignment', %s, 1, %s, false)
+            """,
+            (assignment["uuid"], json.dumps(assignment)),
+        )
+
+
 def _materialize_channel_projection(
     store: storage.RestAlchemyStore, account_uuid: str, project_uuid: str
 ) -> tuple[str, str, str]:
@@ -271,12 +301,10 @@ def test_desired_assignment_can_replace_provider_id_for_workspace_uuid(
         "cursor-2",
     )
 
-    assert postgres_store.provider_mapping(
-        account_uuid, "topic", "42:old-topic"
-    ) is None
-    replacement = postgres_store.provider_mapping(
-        account_uuid, "topic", "42:new-topic"
+    assert (
+        postgres_store.provider_mapping(account_uuid, "topic", "42:old-topic") is None
     )
+    replacement = postgres_store.provider_mapping(account_uuid, "topic", "42:new-topic")
     assert replacement is not None
     assert str(replacement["workspace_uuid"]) == topic_uuid
     assert replacement["metadata"]["name"] == "new topic"
@@ -360,12 +388,8 @@ def test_assignment_projection_repair_restores_mapping_and_wakes_event(
             (account_uuid, queue_id, event_id),
         )
 
-    assert postgres_store.reconcile_assignment_projection(
-        account_uuid, "channel:42"
-    )
-    topic = postgres_store.provider_mapping(
-        account_uuid, "topic", "42:Topic"
-    )
+    assert postgres_store.reconcile_assignment_projection(account_uuid, "channel:42")
+    topic = postgres_store.provider_mapping(account_uuid, "topic", "42:Topic")
     assert topic is not None
     assert str(topic["workspace_uuid"]) == topic_uuid
     with postgres_store.session() as session:
@@ -641,6 +665,80 @@ def test_pending_observed_reports_supersede_older_unsent_resource_states(
     ]
 
 
+def test_pending_observed_reports_round_robin_catalog_accounts(postgres_store):
+    first_account_uuid = str(uuid.uuid4())
+    second_account_uuid = str(uuid.uuid4())
+
+    for account_uuid, chat_ids in (
+        (first_account_uuid, (1, 2, 3)),
+        (second_account_uuid, (4,)),
+    ):
+        for chat_id in chat_ids:
+            report = {
+                "report_uuid": str(uuid.uuid4()),
+                "resource_type": "external_chat_catalog",
+                "resource_uuid": str(uuid.uuid4()),
+                "observed_generation": 1,
+                "status": "ready",
+                "observed_at": datetime.datetime.now(datetime.UTC).isoformat(),
+                "catalog": {
+                    "external_account_uuid": account_uuid,
+                    "provider_chat_key": f"channel:{chat_id}",
+                },
+            }
+            assert postgres_store.enqueue_observed_report(report)
+
+    pending = postgres_store.pending_observed_reports(limit=2)
+
+    assert {report["catalog"]["external_account_uuid"] for report in pending} == {
+        first_account_uuid,
+        second_account_uuid,
+    }
+
+
+def test_pending_observed_reports_prioritize_live_message_dependency(postgres_store):
+    account_uuid = str(uuid.uuid4())
+    queue_id = "live-priority"
+    for chat_id in (2, 1):
+        report = {
+            "report_uuid": str(uuid.uuid4()),
+            "resource_type": "external_chat_catalog",
+            "resource_uuid": str(uuid.uuid4()),
+            "observed_generation": 1,
+            "status": "ready",
+            "observed_at": datetime.datetime.now(datetime.UTC).isoformat(),
+            "catalog": {
+                "external_account_uuid": account_uuid,
+                "source": {"provider_chat_key": f"channel:{chat_id}"},
+            },
+        }
+        assert postgres_store.enqueue_observed_report(report)
+
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            INSERT INTO zulip_provider_events (
+                account_uuid, queue_id, event_id, event_type, body
+            ) VALUES (%s, %s, 1, 'message', %s::jsonb)
+            """,
+            (
+                account_uuid,
+                queue_id,
+                json.dumps(
+                    {
+                        "id": 1,
+                        "type": "message",
+                        "message": {"id": 1, "stream_id": 1},
+                    }
+                ),
+            ),
+        )
+
+    pending = postgres_store.pending_observed_reports(limit=1)
+
+    assert pending[0]["catalog"]["source"]["provider_chat_key"] == "channel:1"
+
+
 def test_observed_report_hot_queries_use_migration_indexes(postgres_store):
     resource_uuid = str(uuid.uuid4())
     catalog_account_uuid = str(uuid.uuid4())
@@ -749,10 +847,7 @@ def test_observed_report_hot_queries_use_migration_indexes(postgres_store):
     assert "observed_report_outbox_resource_latest_idx" in dedup_plan
     assert "observed_report_outbox_pending_order_idx" in pending_rank_plan
     assert "observed_report_outbox_pending_order_idx" in pending_order_plan
-    assert (
-        "observed_report_outbox_catalog_readiness_idx"
-        in catalog_readiness_plan
-    )
+    assert "observed_report_outbox_catalog_readiness_idx" in catalog_readiness_plan
 
 
 def _provider_record(
@@ -863,14 +958,10 @@ def test_message_delivery_waits_for_one_durable_topic_projection(postgres_store)
             )
         )
     topic_records = [
-        record
-        for record in records
-        if record["operation"]["kind"] == "topic.upsert"
+        record for record in records if record["operation"]["kind"] == "topic.upsert"
     ]
     message_records = [
-        record
-        for record in records
-        if record["operation"]["kind"] == "message.create"
+        record for record in records if record["operation"]["kind"] == "message.create"
     ]
     update_records = converter.event_records(
         postgres_store,
@@ -918,9 +1009,12 @@ def test_message_delivery_waits_for_one_durable_topic_projection(postgres_store)
 
     postgres_store.accept_result(_committed_result(topic_records[0]))
 
-    assert postgres_store.pending_workspace_deliveries(
-        minimum_priority=0, maximum_priority=0
-    ) == message_records
+    assert (
+        postgres_store.pending_workspace_deliveries(
+            minimum_priority=0, maximum_priority=0
+        )
+        == message_records
+    )
 
     postgres_store.accept_result(
         _committed_result(message_records[0], provider_entity_id="101")
@@ -1114,6 +1208,82 @@ def test_ready_channel_participants_are_rechecked_after_bounded_interval(
     assert str(claimed["account_uuid"]) == account_uuid
     assert claimed["provider_chat_key"] == "channel:42"
     assert claimed["assignment_generation"] == 1
+
+
+def test_participant_and_backfill_claims_rotate_between_accounts(postgres_store):
+    first_account_uuid, first_project_uuid = _insert_account_and_assignment(
+        postgres_store, "all"
+    )
+    second_account_uuid, second_project_uuid = _insert_account_and_assignment(
+        postgres_store, "all"
+    )
+    _insert_channel_assignment(
+        postgres_store, first_account_uuid, first_project_uuid, 43
+    )
+    _insert_channel_assignment(
+        postgres_store, first_account_uuid, first_project_uuid, 44
+    )
+    _insert_channel_assignment(
+        postgres_store, second_account_uuid, second_project_uuid, 43
+    )
+    postgres_store.reconcile_participant_sync()
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_participant_sync
+            SET updated_at = CASE
+                WHEN account_uuid = %s THEN now() - interval '2 minutes'
+                ELSE now() - interval '1 minute'
+            END
+            WHERE state = 'pending'
+            """,
+            (first_account_uuid,),
+        )
+
+    first_participant = postgres_store.claim_participant_sync()
+    assert str(first_participant["account_uuid"]) == first_account_uuid
+    postgres_store.complete_participant_sync(
+        first_account_uuid,
+        str(first_participant["provider_chat_key"]),
+        1,
+        [],
+        True,
+    )
+    second_participant = postgres_store.claim_participant_sync()
+    assert str(second_participant["account_uuid"]) == second_account_uuid
+
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_participant_sync
+            SET state = 'ready', lease_until = NULL
+            WHERE state IN ('pending', 'running')
+            """
+        )
+    postgres_store.reconcile_backfill_jobs()
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_backfill_jobs
+            SET updated_at = CASE
+                WHEN account_uuid = %s THEN now() - interval '2 minutes'
+                ELSE now() - interval '1 minute'
+            END
+            WHERE state = 'pending'
+            """,
+            (first_account_uuid,),
+        )
+
+    first_backfill = postgres_store.claim_backfill_job()
+    assert str(first_backfill["account_uuid"]) == first_account_uuid
+    postgres_store.advance_backfill_job(
+        first_account_uuid,
+        str(first_backfill["provider_chat_key"]),
+        100,
+        False,
+    )
+    second_backfill = postgres_store.claim_backfill_job()
+    assert str(second_backfill["account_uuid"]) == second_account_uuid
 
 
 @pytest.mark.parametrize(
@@ -1418,12 +1588,9 @@ def test_provider_identity_replay_keeps_first_accepted_record(postgres_store):
     canonical_replay = json.loads(json.dumps(record))
     canonical_replay["operation"]["entity_uuid"] = str(uuid.uuid4())
     canonical_replay["causal_lane"] = (
-        f"identity:{account_uuid}:"
-        f"{canonical_replay['operation']['entity_uuid']}"
+        f"identity:{account_uuid}:{canonical_replay['operation']['entity_uuid']}"
     )
-    canonical_replay["operation_sha256"] = canonical.operation_digest(
-        canonical_replay
-    )
+    canonical_replay["operation_sha256"] = canonical.operation_digest(canonical_replay)
 
     assert not postgres_store.enqueue_workspace_delivery(
         canonical_replay, 0, "queue", 7
@@ -1527,9 +1694,7 @@ def test_content_only_update_preserves_workspace_origin_topic_mapping(postgres_s
         },
     )
 
-    assert [record["operation"]["kind"] for record in records] == [
-        "message.update"
-    ]
+    assert [record["operation"]["kind"] for record in records] == ["message.update"]
     update = records[0]
     assert update["operation"]["entity_uuid"] == message_uuid
     assert update["operation"]["payload"]["topic_uuid"] == topic_uuid
@@ -1549,9 +1714,7 @@ def test_content_only_update_preserves_workspace_origin_topic_mapping(postgres_s
         == topic_uuid
     )
     assert (
-        postgres_store.provider_mapping(
-            account_uuid, "topic", "42:general chat"
-        )
+        postgres_store.provider_mapping(account_uuid, "topic", "42:general chat")
         is None
     )
 
@@ -1617,9 +1780,7 @@ def test_outbound_reaction_echo_reuses_workspace_identity(postgres_store):
     )
 
     reaction = next(
-        record
-        for record in records
-        if record["operation"]["kind"] == "reaction.upsert"
+        record for record in records if record["operation"]["kind"] == "reaction.upsert"
     )
     assert reaction["operation"]["entity_uuid"] == workspace_reaction_uuid
 
@@ -1677,9 +1838,7 @@ def test_live_message_replay_reuses_accepted_link_after_topic_recanonicalization
     )
     message = _provider_history_message(602)
     message["subject"] = "✔ resolved topic"
-    message["content"] = (
-        "#**Engineering>✔ resolved topic** @**Mentioned user|99**"
-    )
+    message["content"] = "#**Engineering>✔ resolved topic** @**Mentioned user|99**"
     message["flags"] = ["read"]
     queue_id = "provider-message:602"
     event_id = 17
@@ -1694,15 +1853,11 @@ def test_live_message_replay_reuses_accepted_link_after_topic_recanonicalization
     accepted = postgres_store.prepare_provider_event_records(
         account_uuid, queue_id, event_id, accepted
     )
-    assert accepted[-1]["operation"]["kind"] == "read_state.set"
+    assert accepted[-1]["operation"]["kind"] == "message.create"
     for record in accepted[:-1]:
-        assert postgres_store.enqueue_workspace_delivery(
-            record, 0, queue_id, event_id
-        )
+        assert postgres_store.enqueue_workspace_delivery(record, 0, queue_id, event_id)
     accepted_message = next(
-        record
-        for record in accepted
-        if record["operation"]["kind"] == "message.create"
+        record for record in accepted if record["operation"]["kind"] == "message.create"
     )
     assert any(
         record["operation"]["kind"] == "identity.upsert"
@@ -1776,16 +1931,12 @@ def test_live_message_replay_reuses_accepted_link_after_topic_recanonicalization
                 (account_uuid, queue_id, event_id),
             ).fetchall()
         ]
-    assert stored_kinds == [
-        record["operation"]["kind"] for record in accepted
-    ]
+    assert stored_kinds == [record["operation"]["kind"] for record in accepted]
 
     # A sent prefix can survive an assignment replacement while an unsent tail
     # is discarded as stale. Keep the prepared snapshot through delivering so
     # the event can requeue the missing tail under the new generation.
-    postgres_store.mark_provider_event_delivering(
-        account_uuid, queue_id, event_id
-    )
+    postgres_store.mark_provider_event_delivering(account_uuid, queue_id, event_id)
     with postgres_store.session() as session:
         session.execute(
             """
@@ -1793,7 +1944,7 @@ def test_live_message_replay_reuses_accepted_link_after_topic_recanonicalization
             SET submission_state = 'sent', sent_at = now()
             WHERE account_uuid = %s AND provider_queue_id = %s
               AND provider_event_id = %s
-              AND record->'operation'->>'kind' != 'read_state.set'
+              AND record->'operation'->>'kind' != 'message.create'
             """,
             (account_uuid, queue_id, event_id),
         )
@@ -1852,11 +2003,9 @@ def test_live_message_replay_reuses_accepted_link_after_topic_recanonicalization
     assert restored == {
         "total": len(accepted),
         "messages": 1,
-        "read_states": 1,
+        "read_states": 0,
     }
-    postgres_store.mark_provider_event_delivering(
-        account_uuid, queue_id, event_id
-    )
+    postgres_store.mark_provider_event_delivering(account_uuid, queue_id, event_id)
     with postgres_store.session() as session:
         session.execute(
             """
@@ -1906,12 +2055,8 @@ def test_partial_live_event_finishes_when_assignment_target_is_removed(
         account_uuid, queue_id, event_id, prepared
     )
     for record in prepared:
-        assert postgres_store.enqueue_workspace_delivery(
-            record, 0, queue_id, event_id
-        )
-    postgres_store.mark_provider_event_delivering(
-        account_uuid, queue_id, event_id
-    )
+        assert postgres_store.enqueue_workspace_delivery(record, 0, queue_id, event_id)
+    postgres_store.mark_provider_event_delivering(account_uuid, queue_id, event_id)
     with postgres_store.session() as session:
         session.execute(
             """
@@ -1919,7 +2064,7 @@ def test_partial_live_event_finishes_when_assignment_target_is_removed(
             SET submission_state = 'sent', sent_at = now()
             WHERE account_uuid = %s AND provider_queue_id = %s
               AND provider_event_id = %s
-              AND record->'operation'->>'kind' != 'read_state.set'
+              AND record->'operation'->>'kind' != 'message.create'
             """,
             (account_uuid, queue_id, event_id),
         )
@@ -1981,18 +2126,112 @@ def test_partial_live_event_finishes_when_assignment_target_is_removed(
             """,
             (account_uuid, queue_id, event_id),
         ).fetchone()
+    expected_state = "pending" if assignment_change == "project" else "processed"
     assert provider_event == {
-        "processing_state": "processed",
+        "processing_state": expected_state,
         "processing_reason": "assignment_changed",
         "prepared_records": None,
     }
     assert deliveries == {
         "total": len(prepared) - 1,
         "unsent": 0,
-        "messages": 1,
+        "messages": 0,
         "read_states": 0,
     }
-    assert postgres_store.pending_provider_events() == []
+    pending = postgres_store.pending_provider_events()
+    if assignment_change == "project":
+        assert [row["event_id"] for row in pending] == [event_id]
+    else:
+        assert pending == []
+
+
+def test_terminal_delivery_state_is_pruned_by_priority_and_age(postgres_store):
+    account_uuid = str(uuid.uuid4())
+    history_record_uuid = str(uuid.uuid4())
+    live_record_uuid = str(uuid.uuid4())
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            INSERT INTO zulip_provider_events (
+                account_uuid, queue_id, event_id, event_type, body,
+                processing_state, created_at
+            ) VALUES
+                (%s, 'history', 1, 'message', '{}'::jsonb, 'processed',
+                 now() - interval '20 minutes'),
+                (%s, 'live', 2, 'message', '{}'::jsonb, 'processed',
+                 now() - interval '20 minutes'),
+                (%s, 'invalid', 3, 'message', '{}'::jsonb, 'invalid',
+                 now() - interval '20 minutes'),
+                (%s, 'pending', 4, 'message', '{}'::jsonb, 'pending',
+                 now() - interval '20 minutes')
+            """,
+            (account_uuid, account_uuid, account_uuid, account_uuid),
+        )
+        session.execute(
+            """
+            INSERT INTO workspace_delivery_outbox (
+                record_uuid, operation_uuid, account_uuid, provider_queue_id,
+                provider_event_id, submission_state,
+                priority, record, sent_at, created_at
+            ) VALUES
+                (%s, %s, %s, 'history', 1, 'sent', 2, '{}'::jsonb,
+                 now() - interval '2 minutes', now() - interval '20 minutes'),
+                (%s, %s, %s, 'live', 2, 'sent', 0, '{}'::jsonb,
+                 now() - interval '2 minutes', now() - interval '20 minutes')
+            """,
+            (
+                history_record_uuid,
+                str(uuid.uuid4()),
+                account_uuid,
+                live_record_uuid,
+                str(uuid.uuid4()),
+                account_uuid,
+            ),
+        )
+
+    assert postgres_store.prune_terminal_delivery_state() == (1, 2)
+
+    with postgres_store.session() as session:
+        deliveries = session.execute(
+            "SELECT provider_queue_id FROM workspace_delivery_outbox"
+        ).fetchall()
+        events = session.execute(
+            "SELECT queue_id FROM zulip_provider_events ORDER BY queue_id"
+        ).fetchall()
+    assert deliveries == [{"provider_queue_id": "live"}]
+    assert events == [{"queue_id": "live"}, {"queue_id": "pending"}]
+
+
+def test_pending_provider_probe_waits_for_each_accounts_head(postgres_store):
+    account_uuid = str(uuid.uuid4())
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            INSERT INTO zulip_provider_events (
+                account_uuid, queue_id, event_id, event_type, body,
+                processing_state, available_at, created_at
+            ) VALUES
+                (%s, 'queue', 1, 'message', '{}'::jsonb, 'pending',
+                 now() + interval '5 minutes', now() - interval '1 minute'),
+                (%s, 'queue', 2, 'message', '{}'::jsonb, 'pending',
+                 now(), now())
+            """,
+            (account_uuid, account_uuid),
+        )
+
+    assert not postgres_store.has_pending_provider_events()
+
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_provider_events
+            SET available_at = now()
+            WHERE account_uuid = %s AND queue_id = 'queue' AND event_id = 1
+            """,
+            (account_uuid,),
+        )
+
+    assert postgres_store.has_pending_provider_events()
 
 
 def test_enqueue_assignment_change_race_requeues_unsubmitted_prefix(postgres_store):
@@ -2008,9 +2247,7 @@ def test_enqueue_assignment_change_race_requeues_unsubmitted_prefix(postgres_sto
     records = postgres_store.prepare_provider_event_records(
         account_uuid, queue_id, event_id, records
     )
-    assert postgres_store.enqueue_workspace_delivery(
-        records[0], 0, queue_id, event_id
-    )
+    assert postgres_store.enqueue_workspace_delivery(records[0], 0, queue_id, event_id)
     with postgres_store.session() as session:
         session.execute(
             """
@@ -2026,9 +2263,7 @@ def test_enqueue_assignment_change_race_requeues_unsubmitted_prefix(postgres_sto
             (str(uuid.uuid4()),),
         )
     with pytest.raises(ValueError, match="provider_chat_assignment_pending"):
-        postgres_store.enqueue_workspace_delivery(
-            records[1], 0, queue_id, event_id
-        )
+        postgres_store.enqueue_workspace_delivery(records[1], 0, queue_id, event_id)
 
     assert (
         postgres_store.finalize_provider_event_assignment_changed(
@@ -2141,9 +2376,7 @@ def test_assignment_move_before_message_enqueue_replays_create_and_update(
         assert postgres_store.mark_workspace_delivery_submitting(
             topic_record["record_uuid"]
         )
-        postgres_store.mark_workspace_delivery_submitted(
-            topic_record["record_uuid"]
-        )
+        postgres_store.mark_workspace_delivery_submitted(topic_record["record_uuid"])
 
     pending_mapping = postgres_store.provider_mapping(
         account_uuid,
@@ -2224,9 +2457,7 @@ def test_assignment_move_before_message_enqueue_replays_create_and_update(
         replay,
     )
     assert {record["project_uuid"] for record in replay} == {new_project_uuid}
-    assert {
-        record["operation_uuid"] for record in replay
-    }.isdisjoint(
+    assert {record["operation_uuid"] for record in replay}.isdisjoint(
         record["operation_uuid"] for record in prepared
     )
     replay_results = [
@@ -2281,12 +2512,9 @@ def test_assignment_move_before_message_enqueue_replays_create_and_update(
         update_event_id,
         update_records,
     )
-    assert {record["project_uuid"] for record in update_records} == {
-        new_project_uuid
-    }
+    assert {record["project_uuid"] for record in update_records} == {new_project_uuid}
     assert any(
-        record["operation"]["kind"] == "message.update"
-        for record in update_records
+        record["operation"]["kind"] == "message.update" for record in update_records
     )
     update_enqueue_results = [
         postgres_store.enqueue_workspace_delivery(
@@ -2703,6 +2931,41 @@ def test_submitted_delivery_survives_assignment_change_as_ambiguous(postgres_sto
     assert resolved["sent_at"] is not None
 
 
+def test_replayed_committed_result_repairs_dangling_delivery(postgres_store):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    record = _provider_record(account_uuid, project_uuid)
+    assert postgres_store.enqueue_workspace_delivery(record, 2)
+    postgres_store.accept_result(_committed_result(record))
+
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE workspace_delivery_outbox
+            SET sent_at = NULL, submission_state = 'pending'
+            WHERE operation_uuid = %s
+            """,
+            (record["operation_uuid"],),
+        )
+
+    postgres_store.accept_result(_committed_result(record))
+
+    with postgres_store.session() as session:
+        delivery = session.execute(
+            """
+            SELECT sent_at, submission_state FROM workspace_delivery_outbox
+            WHERE operation_uuid = %s
+            """,
+            (record["operation_uuid"],),
+        ).fetchone()
+        session.execute(
+            "DELETE FROM workspace_delivery_outbox WHERE operation_uuid = %s",
+            (record["operation_uuid"],),
+        )
+    assert delivery["sent_at"] is not None
+    assert delivery["submission_state"] == "sent"
+    assert not postgres_store.enqueue_workspace_delivery(record, 2)
+
+
 def test_inactive_account_event_and_delivery_are_terminalized_without_deletion(
     postgres_store,
 ):
@@ -2719,9 +2982,7 @@ def test_inactive_account_event_and_delivery_are_terminalized_without_deletion(
             """,
             (account_uuid, queue_id, event_id),
         )
-    assert postgres_store.enqueue_workspace_delivery(
-        record, 0, queue_id, event_id
-    )
+    assert postgres_store.enqueue_workspace_delivery(record, 0, queue_id, event_id)
     with postgres_store.session() as session:
         session.execute(
             """
@@ -3417,13 +3678,13 @@ def test_permanent_provider_rejection_is_quarantined_with_safe_evidence(
             (account_uuid, queue_id, event_id),
         )
     record = _provider_record(account_uuid, project_uuid)
-    assert postgres_store.enqueue_workspace_delivery(
-        record, 0, queue_id, event_id
-    )
-    assert postgres_store.mark_workspace_delivery_submitting(
-        record["record_uuid"]
-    )
+    assert postgres_store.enqueue_workspace_delivery(record, 0, queue_id, event_id)
+    assert postgres_store.mark_workspace_delivery_submitting(record["record_uuid"])
 
+    assert postgres_store.reject_provider_event_submission(
+        record["record_uuid"],
+        "provider_api_http_422",
+    )
     assert postgres_store.reject_provider_event_submission(
         record["record_uuid"],
         "provider_api_http_422",
@@ -3601,9 +3862,7 @@ def test_inactive_account_cancels_backfill_and_clears_only_its_health(
         ).fetchone()["state"]
         components = {
             row["component"]
-            for row in session.execute(
-                "SELECT component FROM bridge_health"
-            ).fetchall()
+            for row in session.execute("SELECT component FROM bridge_health").fetchall()
         }
     assert state == "cancelled"
     assert components == {"provider", unrelated}

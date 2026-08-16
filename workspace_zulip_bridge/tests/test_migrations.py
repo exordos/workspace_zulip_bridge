@@ -19,9 +19,7 @@ def _schema_connection_url(connection_url: str, schema: str) -> str:
     base_url, _, raw_query = connection_url.partition("?")
     query = [
         (key, value)
-        for key, value in urllib.parse.parse_qsl(
-            raw_query, keep_blank_values=True
-        )
+        for key, value in urllib.parse.parse_qsl(raw_query, keep_blank_values=True)
         if key != "options"
     ]
     query.append(("options", f"-csearch_path={schema}"))
@@ -70,72 +68,54 @@ def test_migrations_have_one_versioned_dependency_chain():
         "0011-quarantine-rejected-provider-events-f1169c.py",
         "0012-optimize-bridge-load-and-reconcile-stale-queues-6c9ddc.py",
         "0013-bound-reaction-history-window-5edf75.py",
+        "0014-bound-terminal-delivery-retention-4c61bd.py",
     ]
     assert engine.get_latest_migration() == (
-        "0013-bound-reaction-history-window-5edf75.py"
+        "0014-bound-terminal-delivery-retention-4c61bd.py"
     )
-    assert len({step["uuid"] for step in all_migrations.values()}) == 14
-    assert all_migrations[
-        "0001-add-Zulip-provider-scheduler-state-143113.py"
-    ]["depends"] == ["0000-initialize-bridge-operational-state-18f707.py"]
-    assert all_migrations[
-        "0002-remove-legacy-message-projection-deliveries-e1636f.py"
-    ]["depends"] == ["0001-add-Zulip-provider-scheduler-state-143113.py"]
-    assert all_migrations[
-        "0003-requeue-message-missing-topic-projection-ed8a5e.py"
-    ]["depends"] == [
-        "0002-remove-legacy-message-projection-deliveries-e1636f.py"
-    ]
-    assert all_migrations[
-        "0004-gate-selected-chat-messages-on-participants-23f11f.py"
-    ]["depends"] == [
-        "0003-requeue-message-missing-topic-projection-ed8a5e.py"
-    ]
-    assert all_migrations[
-        "0005-rebuild-message-topic-dependencies-7c52a1.py"
-    ]["depends"] == [
-        "0004-gate-selected-chat-messages-on-participants-23f11f.py"
-    ]
-    assert all_migrations[
-        "0006-index-pending-Workspace-deliveries-c143b4.py"
-    ]["depends"] == [
-        "0005-rebuild-message-topic-dependencies-7c52a1.py"
-    ]
-    assert all_migrations[
-        "0007-persist-Zulip-provider-identity-c721d9.py"
-    ]["depends"] == [
-        "0006-index-pending-Workspace-deliveries-c143b4.py"
-    ]
-    assert all_migrations[
-        "0008-refresh-Zulip-reaction-queues-c511aa.py"
-    ]["depends"] == [
-        "0007-persist-Zulip-provider-identity-c721d9.py"
-    ]
-    assert all_migrations[
-        "0009-index-observed-reports-d6d013.py"
-    ]["depends"] == [
+    assert len({step["uuid"] for step in all_migrations.values()}) == 15
+    assert all_migrations["0001-add-Zulip-provider-scheduler-state-143113.py"][
+        "depends"
+    ] == ["0000-initialize-bridge-operational-state-18f707.py"]
+    assert all_migrations["0002-remove-legacy-message-projection-deliveries-e1636f.py"][
+        "depends"
+    ] == ["0001-add-Zulip-provider-scheduler-state-143113.py"]
+    assert all_migrations["0003-requeue-message-missing-topic-projection-ed8a5e.py"][
+        "depends"
+    ] == ["0002-remove-legacy-message-projection-deliveries-e1636f.py"]
+    assert all_migrations["0004-gate-selected-chat-messages-on-participants-23f11f.py"][
+        "depends"
+    ] == ["0003-requeue-message-missing-topic-projection-ed8a5e.py"]
+    assert all_migrations["0005-rebuild-message-topic-dependencies-7c52a1.py"][
+        "depends"
+    ] == ["0004-gate-selected-chat-messages-on-participants-23f11f.py"]
+    assert all_migrations["0006-index-pending-Workspace-deliveries-c143b4.py"][
+        "depends"
+    ] == ["0005-rebuild-message-topic-dependencies-7c52a1.py"]
+    assert all_migrations["0007-persist-Zulip-provider-identity-c721d9.py"][
+        "depends"
+    ] == ["0006-index-pending-Workspace-deliveries-c143b4.py"]
+    assert all_migrations["0008-refresh-Zulip-reaction-queues-c511aa.py"][
+        "depends"
+    ] == ["0007-persist-Zulip-provider-identity-c721d9.py"]
+    assert all_migrations["0009-index-observed-reports-d6d013.py"]["depends"] == [
         "0008-refresh-Zulip-reaction-queues-c511aa.py"
     ]
-    assert all_migrations[
-        "0010-prepare-provider-event-records-f970c8.py"
-    ]["depends"] == [
-        "0009-index-observed-reports-d6d013.py"
-    ]
-    assert all_migrations[
-        "0011-quarantine-rejected-provider-events-f1169c.py"
-    ]["depends"] == [
-        "0010-prepare-provider-event-records-f970c8.py"
-    ]
+    assert all_migrations["0010-prepare-provider-event-records-f970c8.py"][
+        "depends"
+    ] == ["0009-index-observed-reports-d6d013.py"]
+    assert all_migrations["0011-quarantine-rejected-provider-events-f1169c.py"][
+        "depends"
+    ] == ["0010-prepare-provider-event-records-f970c8.py"]
     assert all_migrations[
         "0012-optimize-bridge-load-and-reconcile-stale-queues-6c9ddc.py"
-    ]["depends"] == [
-        "0011-quarantine-rejected-provider-events-f1169c.py"
-    ]
-    assert all_migrations[
-        "0013-bound-reaction-history-window-5edf75.py"
-    ]["depends"] == [
-        "0012-optimize-bridge-load-and-reconcile-stale-queues-6c9ddc.py"
-    ]
+    ]["depends"] == ["0011-quarantine-rejected-provider-events-f1169c.py"]
+    assert all_migrations["0013-bound-reaction-history-window-5edf75.py"][
+        "depends"
+    ] == ["0012-optimize-bridge-load-and-reconcile-stale-queues-6c9ddc.py"]
+    assert all_migrations["0014-bound-terminal-delivery-retention-4c61bd.py"][
+        "depends"
+    ] == ["0013-bound-reaction-history-window-5edf75.py"]
 
 
 def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
@@ -172,12 +152,14 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                       'workspace_delivery_outbox_provider_event_pending_idx',
                       'zulip_provider_message_events_inflight_idx',
                       'zulip_provider_message_events_local_echo_idx',
-                      'bridge_operations_active_local_echo_idx'
+                      'bridge_operations_active_local_echo_idx',
+                      'workspace_delivery_outbox_sent_at_idx',
+                      'zulip_provider_events_terminal_created_idx'
                   )
                 ORDER BY indexname
                 """
             ).fetchall()
-            assert applied["count"] == 14
+            assert applied["count"] == 15
             assert [row["indexname"] for row in indexes] == [
                 "bridge_operations_active_local_echo_idx",
                 "desired_resources_selected_assignment_account_idx",
@@ -188,7 +170,9 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                 "workspace_delivery_outbox_pending_dependency_idx",
                 "workspace_delivery_outbox_pending_order_idx",
                 "workspace_delivery_outbox_provider_event_pending_idx",
+                "workspace_delivery_outbox_sent_at_idx",
                 "zulip_provider_events_pending_order_idx",
+                "zulip_provider_events_terminal_created_idx",
                 "zulip_provider_message_events_inflight_idx",
                 "zulip_provider_message_events_local_echo_idx",
             ]
@@ -216,7 +200,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
             provider_cursor_count = session.execute(
                 "SELECT count(*) AS count FROM zulip_event_cursors"
             ).fetchone()
-            assert applied["count"] == 14
+            assert applied["count"] == 15
             assert cursor["control_cursor"] == "preserved"
             assert provider_cursor_count["count"] == 0
     finally:
@@ -233,9 +217,7 @@ def test_reaction_history_migration_repairs_new_cutoff_idempotently(tmp_path):
     config_path = tmp_path / "bridge.conf"
     admin_store = storage.RestAlchemyStore(connection_url)
     scoped_store = storage.RestAlchemyStore(scoped_url)
-    migration_path = (
-        MIGRATIONS / "0013-bound-reaction-history-window-5edf75.py"
-    )
+    migration_path = MIGRATIONS / "0013-bound-reaction-history-window-5edf75.py"
     spec = importlib.util.spec_from_file_location("reaction_history", migration_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -249,12 +231,8 @@ def test_reaction_history_migration_repairs_new_cutoff_idempotently(tmp_path):
         _apply_migrations(scoped_url, config_path)
         with scoped_store.session() as session:
             session.execute("DROP INDEX bridge_operations_active_local_echo_idx")
-            session.execute(
-                "DROP INDEX zulip_provider_message_events_local_echo_idx"
-            )
-            session.execute(
-                "DROP INDEX zulip_provider_message_events_inflight_idx"
-            )
+            session.execute("DROP INDEX zulip_provider_message_events_local_echo_idx")
+            session.execute("DROP INDEX zulip_provider_message_events_inflight_idx")
             session.execute(
                 """
                 INSERT INTO zulip_backfill_jobs (
@@ -332,8 +310,7 @@ def test_load_optimization_migration_reconciles_stale_queues_idempotently(tmp_pa
     admin_store = storage.RestAlchemyStore(connection_url)
     scoped_store = storage.RestAlchemyStore(scoped_url)
     migration_path = (
-        MIGRATIONS
-        / "0012-optimize-bridge-load-and-reconcile-stale-queues-6c9ddc.py"
+        MIGRATIONS / "0012-optimize-bridge-load-and-reconcile-stale-queues-6c9ddc.py"
     )
     spec = importlib.util.spec_from_file_location("load_optimization", migration_path)
     assert spec is not None and spec.loader is not None

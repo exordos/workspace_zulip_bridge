@@ -41,6 +41,56 @@ def _store_with_session(session):
     return store
 
 
+def test_transaction_reuses_one_session_for_nested_store_calls(monkeypatch):
+    supplied = Session()
+
+    class Engine:
+        def __init__(self):
+            self.opens = 0
+
+        @contextlib.contextmanager
+        def session_manager(self):
+            self.opens += 1
+            yield supplied
+
+    engine = Engine()
+    monkeypatch.setattr(storage, "_engine_for", lambda _connection_url: engine)
+    store = storage.RestAlchemyStore("postgresql://unused")
+
+    with store.transaction() as outer:
+        with store.session() as nested:
+            assert nested is outer
+
+    assert engine.opens == 1
+
+
+def test_pending_provider_event_probe_checks_only_ready_live_journal_rows():
+    session = Session(({"pending": True},))
+    store = _store_with_session(session)
+
+    assert store.has_pending_provider_events()
+    statement, parameters = session.statements[0]
+    assert "processing_state = 'pending'" in statement
+    assert "PARTITION BY account_uuid" in statement
+    assert "position = 1 AND available_at <= now()" in statement
+    assert parameters is None
+
+
+def test_pending_workspace_delivery_probe_requires_current_account_and_assignment():
+    session = Session(({"pending": True},))
+    store = _store_with_session(session)
+
+    assert store.has_pending_workspace_deliveries(0, 0)
+    statement, parameters = session.statements[0]
+    assert "SELECT EXISTS" in statement
+    assert "workspace_delivery_outbox" in statement
+    assert "JOIN desired_resources AS account" in statement
+    assert "LEFT JOIN desired_resources AS assignment" in statement
+    assert "delivery.assignment_uuid IS NULL" in statement
+    assert "OR assignment.resource_uuid IS NOT NULL" in statement
+    assert parameters == (0, 0)
+
+
 def _desired_change():
     resource_uuid = str(uuid.uuid4())
     return {
@@ -93,9 +143,7 @@ def test_workspace_mapping_prefers_active_alias_over_stale_primary_mapping():
     account_uuid = str(uuid.uuid4())
     workspace_uuid = str(alias_row["workspace_uuid"])
 
-    assert (
-        store.workspace_mapping(account_uuid, "topic", workspace_uuid) == alias_row
-    )
+    assert store.workspace_mapping(account_uuid, "topic", workspace_uuid) == alias_row
     statement, parameters = session.statements[0]
     assert "alias.metadata, 0 AS source_order" in statement
     assert "1 AS source_order" in statement
@@ -139,8 +187,7 @@ def test_accepted_provider_message_context_uses_immutable_delivery_record():
     queue_id = str(uuid.uuid4())
 
     assert (
-        store.accepted_provider_message_context(account_uuid, queue_id, 17)
-        == context
+        store.accepted_provider_message_context(account_uuid, queue_id, 17) == context
     )
     statement, parameters = session.statements[0]
     assert "WITH provider_event AS" in statement
@@ -465,6 +512,15 @@ def test_workspace_delivery_outbox_orders_live_before_backfill():
     assert "SET priority = reaction_delivery.priority" in reaction_promotion
     assert "'reaction.upsert', 'reaction.delete'" in reaction_promotion
     assert "SET priority = message_delivery.priority" in topic_promotion
+    assert "AND %s = 0" in read_promotion
+    assert "AND %s = 0" in reaction_promotion
+    assert "AND %s = 0" in topic_promotion
+    assert "read_delivery.priority BETWEEN %s AND %s" in read_promotion
+    assert "reaction_delivery.priority BETWEEN %s AND %s" in reaction_promotion
+    assert "message_delivery.priority BETWEEN %s AND %s" in topic_promotion
+    assert session.statements[0][1] == (2, 2, 2)
+    assert session.statements[1][1] == (2, 2, 2)
+    assert session.statements[2][1] == (2, 2, 2)
     assert "submission_state IN ('pending', 'ambiguous')" in statement
     assert "submission_state = 'awaiting_result'" in statement
     assert "next_submission_at <= now()" in statement
@@ -483,16 +539,38 @@ def test_workspace_delivery_outbox_orders_live_before_backfill():
     assert "ORDER BY priority, created_at" in statement
 
 
+def test_live_dependency_promotion_scans_only_live_source_rows():
+    session = Session()
+    store = _store_with_session(session)
+
+    assert (
+        store.pending_workspace_deliveries(
+            minimum_priority=0,
+            maximum_priority=0,
+            limit=20,
+        )
+        == []
+    )
+    assert [parameters for _statement, parameters in session.statements[:3]] == [
+        (0, 0, 0),
+        (0, 0, 0),
+        (0, 0, 0),
+    ]
+
+
 class SharedDeliverySession:
     def __init__(self):
         self.operations = {}
         self.deliveries = {}
+        self.mapping_updates = []
 
     def execute(self, statement, parameters=None):
         normalized = " ".join(statement.split())
         if normalized.startswith("SELECT generation FROM desired_resources"):
             return Result(({"generation": 1},))
-        if normalized.startswith("SELECT operation_sha256 FROM operation_idempotency"):
+        if normalized.startswith(
+            "SELECT operation_sha256, terminal_outcome FROM operation_idempotency"
+        ):
             operation = self.operations.get(parameters[0])
             return Result(() if operation is None else ({**operation},))
         if normalized.startswith("INSERT INTO operation_idempotency"):
@@ -523,6 +601,9 @@ class SharedDeliverySession:
             operation["result_record_uuid"] = parameters[1]
             return Result()
         if normalized.startswith("UPDATE workspace_delivery_outbox"):
+            return Result()
+        if normalized.startswith("UPDATE provider_mappings"):
+            self.mapping_updates.append((normalized, parameters))
             return Result()
         raise AssertionError(normalized)
 
@@ -580,6 +661,71 @@ def test_workspace_delivery_result_survives_store_restart_round_trip():
     )
 
 
+def test_committed_inbound_topic_result_marks_projection_durable():
+    session = SharedDeliverySession()
+    store = _store_with_session(session)
+    operation_uuid = str(uuid.uuid4())
+    account_uuid = str(uuid.uuid4())
+    topic_uuid = str(uuid.uuid4())
+    record = {
+        "record_uuid": str(uuid.uuid4()),
+        "operation_uuid": operation_uuid,
+        "operation_sha256": "c" * 64,
+        "account_uuid": account_uuid,
+        "project_uuid": str(uuid.uuid4()),
+        "attempt": 1,
+        "origin": "zulip",
+        "causal_lane": "chat:topic",
+        "sequence": 1,
+        "predecessor_operation_uuid": None,
+        "operation": {
+            "kind": "topic.upsert",
+            "entity_uuid": topic_uuid,
+            "provider": {"entity_id": "42:Topic"},
+        },
+    }
+    session.operations[operation_uuid] = {
+        "operation_sha256": record["operation_sha256"],
+        "terminal_outcome": None,
+        "result_record_uuid": None,
+        "target_entity_id": None,
+        "target_revision": None,
+        "manual_retry_allowed": False,
+    }
+    session.deliveries[operation_uuid] = record
+    store.accept_result(
+        {
+            "record_uuid": str(uuid.uuid4()),
+            "operation_uuid": operation_uuid,
+            "operation_sha256": "c" * 64,
+            "in_reply_to_record_uuid": record["record_uuid"],
+            **{
+                field: record[field]
+                for field in (
+                    "account_uuid",
+                    "project_uuid",
+                    "attempt",
+                    "origin",
+                    "causal_lane",
+                    "sequence",
+                    "predecessor_operation_uuid",
+                )
+            },
+            "result": {
+                "outcome": "committed",
+                "provider_entity_id": "42:Topic",
+                "provider_revision": None,
+                "manual_retry_allowed": False,
+            },
+        }
+    )
+
+    assert len(session.mapping_updates) == 1
+    statement, parameters = session.mapping_updates[0]
+    assert "workspace_delivery_state" in statement
+    assert parameters == (account_uuid, "topic", "42:Topic", topic_uuid)
+
+
 def test_initial_backfill_gate_ignores_delivery_outcomes_from_older_generation():
     session = Session(({"ready": True},))
     store = _store_with_session(session)
@@ -589,8 +735,7 @@ def test_initial_backfill_gate_ignores_delivery_outcomes_from_older_generation()
     normalized = " ".join(statement.split())
     assert "zulip_participant_sync" in normalized
     assert (
-        "participant_sync.assignment_generation = assignment.generation"
-        in normalized
+        "participant_sync.assignment_generation = assignment.generation" in normalized
     )
     assert "participant_sync.state = 'ready'" in normalized
     assert "account.resource_uuid = delivery.account_uuid" in normalized
@@ -654,10 +799,7 @@ def test_outside_history_reaction_terminalization_is_policy_guarded():
     assert "NOT EXISTS ( SELECT 1 FROM provider_mappings" in normalized
     assert "FROM zulip_provider_events AS source_event" in normalized
     assert "source_event.event_type = 'message'" in normalized
-    assert (
-        "source_event.processing_state IN ( 'pending', 'delivering' )"
-        in normalized
-    )
+    assert "source_event.processing_state IN ( 'pending', 'delivering' )" in normalized
     assert "source_event.body->'message'->>'id' = %s" in normalized
     assert "FROM zulip_provider_events AS echo_event" in normalized
     assert "JOIN bridge_operations AS operation" in normalized
@@ -712,6 +854,7 @@ def test_participant_claim_only_refreshes_channels():
     assert "make_interval(secs => %s)" in statement
     assert session.statements[0][1] == (
         storage.PARTICIPANT_RECHECK_INTERVAL_SECONDS,
+        storage.PARTICIPANT_RECHECK_INTERVAL_SECONDS,
     )
 
 
@@ -719,9 +862,7 @@ def test_dead_queue_restarts_participants_and_configured_history():
     session = Session()
     store = _store_with_session(session)
 
-    store.begin_provider_queue_catchup(
-        "00000000-0000-4000-8000-000000000001"
-    )
+    store.begin_provider_queue_catchup("00000000-0000-4000-8000-000000000001")
 
     assert len(session.statements) == 3
     participant_reset = session.statements[1][0]
@@ -939,14 +1080,17 @@ def test_provider_topic_rename_moves_workspace_aliases_to_current_provider_id():
     session = Session((row,))
     store = _store_with_session(session)
 
-    assert store.rename_provider_mapping(
-        account_uuid,
-        "topic",
-        "42:old",
-        "42:renamed",
-        {"name": "renamed"},
-        "2",
-    ) == row
+    assert (
+        store.rename_provider_mapping(
+            account_uuid,
+            "topic",
+            "42:old",
+            "42:renamed",
+            {"name": "renamed"},
+            "2",
+        )
+        == row
+    )
 
     assert len(session.statements) == 2
     primary_statement, primary_parameters = session.statements[0]
