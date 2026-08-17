@@ -1070,6 +1070,61 @@ class BridgeService:
             "is_owner": is_owner,
         }
 
+    def _catalog_participants_with_owner(
+        self,
+        account_uuid: str,
+        participants: list[dict[str, object]],
+        provider_owner_user_id: str,
+    ) -> list[dict[str, object]]:
+        normalized: list[dict[str, object]] = []
+        owner_present = False
+        for participant in participants:
+            value = dict(participant)
+            is_owner = (
+                str(value.get("provider_user_id")) == provider_owner_user_id
+            )
+            value["is_owner"] = is_owner
+            owner_present |= is_owner
+            normalized.append(value)
+        if owner_present or not normalized:
+            return normalized
+
+        metadata: dict[str, object] = {}
+        mapping_loader = getattr(self.store, "provider_mapping", None)
+        if callable(mapping_loader):
+            mapping = mapping_loader(
+                account_uuid,
+                "identity",
+                provider_owner_user_id,
+            )
+            if isinstance(mapping, dict) and isinstance(
+                mapping.get("metadata"), dict
+            ):
+                metadata = typing.cast(dict[str, object], mapping["metadata"])
+        display_name = metadata.get("display_name")
+        normalized.append(
+            {
+                "provider_user_id": provider_owner_user_id,
+                "display_name": (
+                    display_name
+                    if isinstance(display_name, str) and display_name.strip()
+                    else provider_owner_user_id
+                ),
+                "email": (
+                    metadata.get("email")
+                    if isinstance(metadata.get("email"), str)
+                    else None
+                ),
+                "avatar_urn": (
+                    metadata.get("avatar_urn")
+                    if isinstance(metadata.get("avatar_urn"), str)
+                    else None
+                ),
+                "is_owner": True,
+            }
+        )
+        return normalized
+
     def _queue_catalog_report(
         self,
         account_uuid: str,
@@ -1108,6 +1163,25 @@ class BridgeService:
                 participants or [],
                 topics or [],
                 authoritative_participants=authoritative_participants,
+            )
+            normalized_participants = self._catalog_participants_with_owner(
+                account_uuid,
+                participants,
+                provider_owner_user_id,
+            )
+            if normalized_participants != participants:
+                participants, topics = self.store.merge_catalog_topology(
+                    account_uuid,
+                    chat_key,
+                    normalized_participants,
+                    topics,
+                    authoritative_participants=authoritative_participants,
+                )
+        elif operation == "upsert":
+            participants = self._catalog_participants_with_owner(
+                account_uuid,
+                participants or [],
+                provider_owner_user_id,
             )
         elif operation == "delete" and hasattr(self.store, "delete_catalog_topology"):
             self.store.delete_catalog_topology(account_uuid, chat_key)
