@@ -12,7 +12,7 @@ from restalchemy.storage.sql import engines, sessions
 
 from workspace_zulip_bridge import canonical, control, emoji
 
-PARTICIPANT_RECHECK_INTERVAL_SECONDS = 30
+PARTICIPANT_RECHECK_INTERVAL_SECONDS = 3600
 
 
 def backfill_health_component(account_uuid: str, provider_chat_key: str) -> str:
@@ -2990,7 +2990,7 @@ class RestAlchemyStore:
                 """
                 DELETE FROM workspace_delivery_outbox AS delivery
                 WHERE delivery.sent_at IS NULL
-                  AND delivery.submission_state = 'pending' AND (
+                  AND delivery.submission_state IN ('pending', 'rejected') AND (
                     (
                         delivery.assignment_uuid IS NOT NULL AND NOT EXISTS (
                             SELECT 1 FROM desired_resources AS assignment
@@ -3486,6 +3486,23 @@ class RestAlchemyStore:
                       )
                 )
                 """
+            )
+
+    def invalidate_participant_sync(
+        self, account_uuid: str, provider_chat_keys: list[str]
+    ) -> None:
+        """Schedule prompt refreshes for channels changed by provider events."""
+        if not provider_chat_keys:
+            return
+        with self.session() as session:
+            session.execute(
+                """
+                UPDATE zulip_participant_sync
+                SET state = 'pending', lease_until = NULL, updated_at = now()
+                WHERE account_uuid = %s
+                  AND provider_chat_key = ANY(%s)
+                """,
+                (account_uuid, sorted(set(provider_chat_keys))),
             )
 
     def claim_participant_sync_batch(
@@ -5768,7 +5785,9 @@ class RestAlchemyStore:
                       AND report.available_at <= now()
                 )
                 SELECT body FROM pending
-                ORDER BY account_position, live_dependency DESC,
+                ORDER BY
+                         (body->>'resource_type' = 'external_account') DESC,
+                         account_position, live_dependency DESC,
                          created_at, report_uuid
                 LIMIT %s
                 """,

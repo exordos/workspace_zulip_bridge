@@ -568,7 +568,7 @@ class BridgeService:
         account_uuid: str,
         adapter: zulip_adapter.OfficialZulipAdapter | None = None,
     ) -> tuple[int, zulip_adapter.ZulipOperationError | None]:
-        """Perform one queue long-poll using an account-thread-owned adapter."""
+        """Perform one bounded queue poll using an account-thread-owned adapter."""
         try:
             if adapter is None:
                 adapter = self.provider_adapters(account_uuid)
@@ -669,7 +669,7 @@ class BridgeService:
         if not hasattr(self, "provider_successful_accounts"):
             self.provider_successful_accounts = set()
 
-    def _run_provider_account_longpoll(
+    def _run_provider_account_poll(
         self,
         account_uuid: str,
         stop: threading.Event,
@@ -681,6 +681,13 @@ class BridgeService:
                 processed, error = self._poll_provider_account(account_uuid, adapter)
                 self.provider_poll_results.put((account_uuid, processed, error))
                 if error is not None:
+                    return
+                poll_interval = getattr(
+                    self,
+                    "provider_poll_interval_seconds",
+                    self.PROVIDER_POLL_INTERVAL_SECONDS,
+                )
+                if stop.wait(max(0.1, poll_interval)):
                     return
         except zulip_adapter.ZulipOperationError as exc:
             self.provider_poll_results.put((account_uuid, 0, exc))
@@ -744,7 +751,7 @@ class BridgeService:
                 continue
             stop = threading.Event()
             thread = threading.Thread(
-                target=self._run_provider_account_longpoll,
+                target=self._run_provider_account_poll,
                 args=(account_uuid, stop),
                 name=f"zulip-live-{account_uuid[:8]}-{account_uuid[-4:]}",
                 daemon=True,
@@ -1410,6 +1417,22 @@ class BridgeService:
         if event_type != "subscription":
             return
         operation = str(event.get("op"))
+        if operation in {"peer_add", "peer_remove"}:
+            stream_ids = event.get("stream_ids")
+            if isinstance(stream_ids, list):
+                invalidator = getattr(
+                    self.store, "invalidate_participant_sync", None
+                )
+                if callable(invalidator):
+                    invalidator(
+                        account_uuid,
+                        [
+                            f"channel:{stream_id}"
+                            for stream_id in stream_ids
+                            if isinstance(stream_id, int)
+                        ],
+                    )
+            return
         subscriptions: list[dict[str, object]] = []
         if operation in {"add", "remove"}:
             subscriptions = typing.cast(
@@ -1456,7 +1479,6 @@ class BridgeService:
             self.store.provider_catchup_ready(account_uuid)
             and self.store.catalog_reports_accepted(account_uuid, generation)
             and self.store.catalog_assignments_ready(account_uuid, generation)
-            and self.store.initial_backfill_ready(account_uuid)
         )
 
     def flush_observed_reports(self) -> int:

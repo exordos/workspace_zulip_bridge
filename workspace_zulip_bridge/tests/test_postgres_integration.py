@@ -738,6 +738,33 @@ def test_pending_observed_reports_round_robin_catalog_accounts(postgres_store):
     }
 
 
+def test_pending_observed_reports_prioritize_account_control_state(postgres_store):
+    catalog_report = {
+        "report_uuid": str(uuid.uuid4()),
+        "resource_type": "external_chat_catalog",
+        "resource_uuid": str(uuid.uuid4()),
+        "observed_generation": 1,
+        "status": "ready",
+        "observed_at": datetime.datetime.now(datetime.UTC).isoformat(),
+        "catalog": {
+            "external_account_uuid": str(uuid.uuid4()),
+            "provider_chat_key": "channel:1",
+        },
+    }
+    account_report = {
+        "report_uuid": str(uuid.uuid4()),
+        "resource_type": "external_account",
+        "resource_uuid": str(uuid.uuid4()),
+        "observed_generation": 1,
+        "status": "live_ready",
+        "observed_at": datetime.datetime.now(datetime.UTC).isoformat(),
+    }
+    assert postgres_store.enqueue_observed_report(catalog_report)
+    assert postgres_store.enqueue_observed_report(account_report)
+
+    assert postgres_store.pending_observed_reports(limit=1) == [account_report]
+
+
 def test_pending_observed_reports_prioritize_live_message_dependency(postgres_store):
     account_uuid = str(uuid.uuid4())
     queue_id = "live-priority"
@@ -1250,6 +1277,17 @@ def test_ready_channel_participants_are_rechecked_after_bounded_interval(
     assert str(claimed["account_uuid"]) == account_uuid
     assert claimed["provider_chat_key"] == "channel:42"
     assert claimed["assignment_generation"] == 1
+
+
+def test_subscription_event_immediately_invalidates_ready_participants(postgres_store):
+    account_uuid, _project_uuid = _insert_account_and_assignment(postgres_store)
+
+    postgres_store.invalidate_participant_sync(account_uuid, ["channel:42"])
+
+    claimed = postgres_store.claim_participant_sync()
+    assert claimed is not None
+    assert str(claimed["account_uuid"]) == account_uuid
+    assert claimed["provider_chat_key"] == "channel:42"
 
 
 def test_participant_and_backfill_claims_rotate_between_accounts(postgres_store):
@@ -3245,6 +3283,108 @@ def test_stale_reset_replays_message_when_project_moves_before_submission(
         event_id,
         True,
     )
+
+
+def test_stale_reset_replays_message_after_permanent_setup_rejection(
+    postgres_store,
+):
+    account_uuid, old_project_uuid = _insert_account_and_assignment(postgres_store)
+    _materialize_channel_projection(
+        postgres_store,
+        account_uuid,
+        old_project_uuid,
+    )
+    message = _provider_history_message(607)
+    queue_id = "provider-message:607"
+    event_id = 23
+    event = {"id": event_id, "type": "message", "message": message}
+    assert postgres_store.record_provider_event(account_uuid, queue_id, event)
+    prepared = converter.event_records(
+        postgres_store,
+        account_uuid,
+        queue_id,
+        event,
+    )
+    prepared = postgres_store.prepare_provider_event_records(
+        account_uuid,
+        queue_id,
+        event_id,
+        prepared,
+    )
+    for record in prepared:
+        assert postgres_store.enqueue_workspace_delivery(
+            record,
+            0,
+            queue_id,
+            event_id,
+        )
+    postgres_store.mark_provider_event_delivering(
+        account_uuid,
+        queue_id,
+        event_id,
+    )
+    rejected = next(
+        record
+        for record in prepared
+        if record["operation"]["kind"] != "message.create"
+    )
+    assert postgres_store.mark_workspace_delivery_submitting(
+        rejected["record_uuid"]
+    )
+    assert postgres_store.reject_provider_event_submission(
+        rejected["record_uuid"],
+        "provider_api_http_422",
+    )
+
+    new_project_uuid = str(uuid.uuid4())
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE desired_resources
+            SET generation = generation + 1,
+                body = jsonb_set(
+                    body,
+                    '{project_id}',
+                    to_jsonb(%s::text)
+                )
+            WHERE resource_type = 'external_chat_assignment'
+            """,
+            (new_project_uuid,),
+        )
+
+    assert postgres_store.reset_stale_workspace_deliveries() == len(prepared)
+    with postgres_store.session() as session:
+        provider_event = session.execute(
+            """
+            SELECT processing_state, processing_reason, prepared_records
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
+            """,
+            (account_uuid, queue_id, event_id),
+        ).fetchone()
+        remaining_deliveries = session.execute(
+            """
+            SELECT count(*) AS count
+            FROM workspace_delivery_outbox
+            WHERE account_uuid = %s AND provider_queue_id = %s
+              AND provider_event_id = %s
+            """,
+            (account_uuid, queue_id, event_id),
+        ).fetchone()["count"]
+    assert provider_event == {
+        "processing_state": "pending",
+        "processing_reason": "assignment_changed",
+        "prepared_records": None,
+    }
+    assert remaining_deliveries == 0
+
+    replay = converter.event_records(
+        postgres_store,
+        account_uuid,
+        queue_id,
+        event,
+    )
+    assert {record["project_uuid"] for record in replay} == {new_project_uuid}
 
 
 def test_lane_allocation_is_atomic_with_durable_outbox(postgres_store):

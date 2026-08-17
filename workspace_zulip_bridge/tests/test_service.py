@@ -465,6 +465,7 @@ def test_empty_successful_longpoll_recovers_health():
     instance.provider_random = type(
         "Random", (), {"uniform": lambda self, lower, upper: lower}
     )()
+    instance.provider_poll_interval_seconds = 0.01
 
     assert instance.poll_provider_events() == 0
     assert first_returned.wait(timeout=1)
@@ -478,6 +479,57 @@ def test_empty_successful_longpoll_recovers_health():
     instance.provider_poll_stops[account_uuid].set()
     stop_release.set()
     instance.provider_poll_threads[account_uuid].join(timeout=1)
+
+
+def test_account_provider_poll_is_throttled_between_empty_responses():
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+    first_returned = threading.Event()
+    second_started = threading.Event()
+
+    class Store:
+        def provider_event_cursor(self, requested):
+            assert requested == account_uuid
+            return {"queue_id": "queue", "last_event_id": 4}
+
+        def account_resource(self, requested):
+            return None
+
+    class Adapter:
+        def __init__(self):
+            self.calls = 0
+
+        def restore_queue(self, queue_id, last_event_id):
+            return None
+
+        def events(self, queue_id, last_event_id):
+            self.calls += 1
+            if self.calls == 1:
+                first_returned.set()
+            else:
+                second_started.set()
+            return []
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance.provider_adapters = lambda requested: Adapter()
+    instance.scheduler = type(
+        "Scheduler", (), {"reconcile_local_echo": lambda *args: None}
+    )()
+    instance.provider_poll_results = service.queue.SimpleQueue()
+    instance.provider_poll_interval_seconds = 0.1
+    stop = threading.Event()
+    thread = threading.Thread(
+        target=instance._run_provider_account_poll,
+        args=(account_uuid, stop),
+    )
+    thread.start()
+
+    assert first_returned.wait(timeout=1)
+    assert not second_started.wait(timeout=0.03)
+    assert second_started.wait(timeout=0.2)
+    stop.set()
+    thread.join(timeout=1)
+    assert not thread.is_alive()
 
 
 def test_live_event_is_persisted_before_incomplete_queue_catchup():
@@ -2050,6 +2102,47 @@ def test_selected_channel_participants_are_refreshed_in_one_account_batch():
     assert all(update["ready"] for update in instance.store.completed)
 
 
+def test_subscription_peer_event_invalidates_only_affected_channels():
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+
+    class Store:
+        def __init__(self):
+            self.invalidations = []
+
+        def account_resource(self, requested):
+            assert requested == account_uuid
+            return {
+                "generation": 1,
+                "owner_user_uuid": "00000000-0000-4000-8000-000000000002",
+                "settings": {
+                    "default_project_id": (
+                        "00000000-0000-4000-8000-000000000003"
+                    )
+                },
+            }
+
+        def invalidate_participant_sync(self, requested, chat_keys):
+            self.invalidations.append((requested, chat_keys))
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+
+    instance._queue_event_catalog(
+        account_uuid,
+        {
+            "type": "subscription",
+            "op": "peer_add",
+            "stream_ids": [42, "invalid", 43],
+            "user_ids": [7],
+        },
+        "https://zulip.example.invalid",
+    )
+
+    assert instance.store.invalidations == [
+        (account_uuid, ["channel:42", "channel:43"])
+    ]
+
+
 def test_live_message_does_not_wait_for_full_participant_projection(monkeypatch):
     account_uuid = "00000000-0000-4000-8000-000000000001"
 
@@ -2538,7 +2631,7 @@ def test_first_provider_poll_processes_registration_and_reports_live_ready():
     assert assignment_report["progress"]["phase"] == "live"
 
 
-def test_live_ready_requires_catalog_assignment_and_initial_backfill_gates():
+def test_live_ready_requires_catalog_assignment_but_not_initial_backfill():
     account_uuid = "00000000-0000-4000-8000-000000000001"
 
     class Store:
@@ -2587,7 +2680,7 @@ def test_live_ready_requires_catalog_assignment_and_initial_backfill_gates():
     instance.store.ready["catalog"] = True
     assert not instance._initial_sync_ready(account_uuid)
     instance.store.ready["assignment"] = True
-    assert not instance._initial_sync_ready(account_uuid)
+    assert instance._initial_sync_ready(account_uuid)
     instance.store.ready["backfill"] = True
     assert instance._initial_sync_ready(account_uuid)
 

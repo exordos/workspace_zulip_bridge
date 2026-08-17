@@ -859,6 +859,22 @@ def test_participant_claim_only_refreshes_channels():
     )
 
 
+def test_provider_event_invalidates_only_selected_participant_channels():
+    session = Session()
+    store = _store_with_session(session)
+    account_uuid = str(uuid.uuid4())
+
+    store.invalidate_participant_sync(
+        account_uuid, ["channel:43", "channel:42", "channel:43"]
+    )
+
+    statement, parameters = session.statements[0]
+    assert "UPDATE zulip_participant_sync" in statement
+    assert "state = 'pending'" in statement
+    assert "provider_chat_key = ANY(%s)" in statement
+    assert parameters == (account_uuid, ["channel:42", "channel:43"])
+
+
 def test_dead_queue_restarts_participants_and_configured_history():
     session = Session()
     store = _store_with_session(session)

@@ -60,9 +60,11 @@ only. Once Workspace selects a channel, the bridge fetches the authoritative
 Zulip subscriber list and reports it before admitting live messages or
 starting the configured history backfill. The participant gate opens only when
 the current Workspace assignment projection contains the same provider user
-IDs. A ready selected channel becomes eligible for another subscriber check
-after 30 seconds, so add/remove changes made by another Zulip administrator
-return through the same catalog and desired-state handshake.
+IDs. Zulip `subscription` peer add/remove events immediately invalidate only
+the affected selected channels, so administrator changes return through the
+same catalog and desired-state handshake without a full account rescan. A
+ready channel becomes eligible for a full subscriber check after one hour as a
+safety net for a missed or unavailable subscription event.
 
 Provider-backed Workspace binding changes arrive as durable `membership.add`
 and `membership.remove` operations gated by `messenger.membership.write`. The
