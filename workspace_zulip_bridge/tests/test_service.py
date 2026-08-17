@@ -1980,6 +1980,68 @@ def test_catalog_reports_accumulate_full_replacement_topology():
     }
 
 
+def test_catalog_report_repairs_authenticated_owner_in_persisted_topology():
+    class Store:
+        def __init__(self):
+            self.participants = []
+            self.reports = []
+
+        def merge_catalog_topology(
+            self,
+            _account,
+            _chat,
+            participants,
+            topics,
+            *,
+            authoritative_participants=False,
+        ):
+            self.participants = participants
+            return participants, topics
+
+        def enqueue_observed_report(self, report):
+            self.reports.append(report)
+            return True
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance._queue_catalog_report(
+        "10000000-0000-4000-8000-000000000001",
+        "10000000-0000-4000-8000-000000000002",
+        "10000000-0000-4000-8000-000000000003",
+        1,
+        "direct:9,14",
+        "direct",
+        "Direct chat",
+        "https://zulip.example.invalid",
+        participants=[
+            {
+                "provider_user_id": "9",
+                "display_name": "Owner",
+                "is_owner": False,
+            },
+            {
+                "provider_user_id": "14",
+                "display_name": "Peer",
+                "is_owner": False,
+            },
+        ],
+        topics=[
+            {
+                "provider_topic_id": "direct:9,14:default",
+                "name": "Zulip",
+                "is_default": True,
+            }
+        ],
+        provider_realm_uuid="10000000-0000-4000-8000-000000000004",
+        provider_owner_user_id="9",
+    )
+
+    participants = instance.store.participants
+    assert [value["provider_user_id"] for value in participants] == ["9", "14"]
+    assert [value["is_owner"] for value in participants] == [True, False]
+    assert instance.store.reports[0]["catalog"]["participants"] == participants
+
+
 @pytest.mark.parametrize(
     ("subject", "expected_topic"),
     [
