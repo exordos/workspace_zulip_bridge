@@ -1431,12 +1431,14 @@ def test_message_by_id_preserves_retryable_provider_failures():
     assert error.value.retryable is True
 
 
-def test_provider_event_poll_uses_official_longpoll_boundary():
+def test_provider_event_poll_uses_bounded_nonblocking_boundary():
     client = FakeClient()
     adapter = zulip_adapter.OfficialZulipAdapter(client=client)
 
     assert adapter.events("queue-1", 7) == []
-    assert client.event_requests == [{"queue_id": "queue-1", "last_event_id": 7}]
+    assert client.event_requests == [
+        {"queue_id": "queue-1", "last_event_id": 7, "dont_block": True}
+    ]
     assert client.endpoint_requests == [
         {
             "url": "events",
@@ -1444,8 +1446,9 @@ def test_provider_event_poll_uses_official_longpoll_boundary():
             "request": {
                 "queue_id": "queue-1",
                 "last_event_id": 7,
+                "dont_block": True,
             },
-            "longpolling": True,
+            "longpolling": False,
             "timeout": None,
         }
     ]
@@ -1564,6 +1567,26 @@ def test_registration_hydrates_referenced_user_missing_from_bulk_directory():
 
     assert snapshot is not None
     assert [user["user_id"] for user in snapshot["realm_users"]] == [1, 2, 3]
+    assert client.user_requests == [(3, {})]
+
+
+def test_registration_skips_referenced_user_absent_from_provider_directory():
+    client = FakeClient()
+    original_get_subscriptions = client.get_subscriptions
+
+    def get_subscriptions(request=None):
+        result = original_get_subscriptions(request)
+        result["subscriptions"][0]["subscribers"].append(3)
+        return result
+
+    client.get_subscriptions = get_subscriptions
+    adapter = zulip_adapter.OfficialZulipAdapter(client=client)
+
+    assert adapter.ensure_queue() == ("queue-1", 7)
+    snapshot = adapter.take_registration_snapshot()
+
+    assert snapshot is not None
+    assert [user["user_id"] for user in snapshot["realm_users"]] == [1, 2]
     assert client.user_requests == [(3, {})]
 
 
