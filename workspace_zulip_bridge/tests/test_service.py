@@ -760,8 +760,58 @@ def test_run_recovers_interrupted_deliveries_before_starting_workers(monkeypatch
     with pytest.raises(StopRun):
         instance.run()
 
-    assert len(started) == 4
+    assert len(started) == 5
+    assert "workspace-zulip-heartbeat" in started
     assert len([name for name in started if "live-delivery" in name]) == 1
+
+
+def test_background_heartbeat_lane_surfaces_unexpected_failure(monkeypatch):
+    class StopHeartbeat(Exception):
+        pass
+
+    instance = object.__new__(service.BridgeService)
+    instance._run_heartbeat = lambda _now: (_ for _ in ()).throw(StopHeartbeat())
+    monkeypatch.setattr(
+        service.time,
+        "sleep",
+        lambda _seconds: (_ for _ in ()).throw(
+            AssertionError("failed heartbeat must stop its lane")
+        ),
+    )
+
+    instance._run_background_heartbeat_lane()
+
+    assert isinstance(instance.background_heartbeat_error, StopHeartbeat)
+
+
+def test_tick_skips_heartbeat_owned_by_background_lane(tmp_path, monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+
+    instance = object.__new__(service.BridgeService)
+    instance.background_heartbeat_enabled = True
+    instance.background_heartbeat_error = None
+    instance.background_live_enabled = True
+    instance.background_live_delivery_enabled = True
+    instance.background_history_enabled = True
+    instance.last_certificate_check = now[0]
+    instance.last_control_state_reconcile = now[0]
+    instance.control_state_dirty = False
+    instance.last_provider_poll = now[0]
+    instance.last_terminal_state_prune = now[0]
+    instance.health_file = tmp_path / "progress"
+    instance.certificate_renewer = None
+    instance._run_heartbeat = lambda _now: (_ for _ in ()).throw(
+        AssertionError("main tick must not share the heartbeat client lane")
+    )
+    instance._run_control_poll = lambda _now: False
+    instance.poll_provider_events = lambda: 0
+    instance._flush_observed_reports = lambda _now: 0
+    instance.refresh_selected_participants_once = lambda: False
+    instance.store = object()
+
+    assert not instance.tick()
+    assert instance.health_file.is_file()
 
 
 def test_inactive_account_event_is_terminalized_without_provider_access():

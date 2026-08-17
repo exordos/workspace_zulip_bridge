@@ -397,6 +397,69 @@ def test_retryable_provider_event_failure_releases_idempotent_http_submission():
     assert instance.store.released == [record["record_uuid"]]
 
 
+def test_retryable_provider_event_failure_uses_shared_bounded_backoff(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(service.time, "monotonic", lambda: now[0])
+
+    class Random:
+        def uniform(self, lower, upper):
+            return upper
+
+    instance = _instance()
+    record = _inbound_record()
+    instance.store.deliveries = [record]
+    instance.provider_delivery_random = Random()
+    calls = []
+
+    def fail(events):
+        calls.append(events)
+        raise provider_api.ProviderApiRetryableError(409)
+
+    instance.provider_api.apply_events = fail
+
+    with pytest.raises(provider_api.ProviderApiRetryableError):
+        instance.flush_provider_events()
+    assert len(calls) == 1
+    assert instance.provider_delivery_retry_attempts == 1
+    assert instance.provider_delivery_retry_after == 101.0
+
+    assert instance.flush_provider_events() == 0
+    assert len(calls) == 1
+
+    now[0] = 101.0
+    with pytest.raises(provider_api.ProviderApiRetryableError):
+        instance.flush_provider_events()
+    assert len(calls) == 2
+    assert instance.provider_delivery_retry_attempts == 2
+    assert instance.provider_delivery_retry_after == 103.0
+
+    instance.provider_api.apply_events = Provider().apply_events
+    now[0] = 103.0
+    assert instance.flush_provider_events() == 1
+    assert instance.provider_delivery_retry_attempts == 0
+    assert instance.provider_delivery_retry_after == 0.0
+
+
+def test_provider_event_backoff_honors_retry_after_header(monkeypatch):
+    monkeypatch.setattr(service.time, "monotonic", lambda: 200.0)
+
+    class Random:
+        def uniform(self, lower, upper):
+            return lower
+
+    instance = _instance()
+    instance.store.deliveries = [_inbound_record()]
+    instance.provider_delivery_random = Random()
+    instance.provider_api.apply_events = lambda _events: (_ for _ in ()).throw(
+        provider_api.ProviderApiRetryableError(503, 17.0)
+    )
+
+    with pytest.raises(provider_api.ProviderApiRetryableError):
+        instance.flush_provider_events()
+
+    assert instance.provider_delivery_retry_after == 217.0
+
+
 def test_permanent_rejection_isolates_one_record_and_commits_valid_sibling():
     instance = _instance()
     rejected = _inbound_record()
