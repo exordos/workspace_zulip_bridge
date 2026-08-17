@@ -4994,11 +4994,16 @@ class RestAlchemyStore:
         with self.session() as session:
             previous = session.execute(
                 """
-                SELECT body FROM observed_report_outbox
-                WHERE body->>'resource_type' = %s
-                  AND body->>'resource_uuid' = %s
-                ORDER BY created_at DESC
-                LIMIT 1
+                SELECT body FROM (
+                    SELECT body, result_status, completed_at
+                    FROM observed_report_outbox
+                    WHERE body->>'resource_type' = %s
+                      AND body->>'resource_uuid' = %s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                ) AS latest
+                WHERE result_status IS DISTINCT FROM 'rejected'
+                   OR completed_at > clock_timestamp() - interval '5 minutes'
                 """,
                 (str(report["resource_type"]), str(report["resource_uuid"])),
             ).fetchone()

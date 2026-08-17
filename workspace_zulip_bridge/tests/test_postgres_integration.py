@@ -623,6 +623,48 @@ def test_observed_report_state_can_recover_to_a_previous_value(postgres_store):
     assert len({row["report_uuid"] for row in rows}) == 3
 
 
+def test_rejected_observed_report_retries_after_cooldown(postgres_store):
+    resource_uuid = str(uuid.uuid4())
+    observed_at = datetime.datetime.now(datetime.UTC).isoformat()
+    report = {
+        "report_uuid": str(uuid.uuid4()),
+        "resource_type": "external_chat_catalog",
+        "resource_uuid": resource_uuid,
+        "observed_generation": 1,
+        "status": "ready",
+        "observed_at": observed_at,
+    }
+    assert postgres_store.enqueue_observed_report(report)
+    postgres_store.apply_observed_report_results(
+        [
+            {
+                "report_uuid": report["report_uuid"],
+                "status": "rejected",
+                "safe_error": {"retryable": False},
+            }
+        ]
+    )
+    retry = {
+        **report,
+        "report_uuid": str(uuid.uuid4()),
+        "observed_at": datetime.datetime.now(datetime.UTC).isoformat(),
+    }
+    assert not postgres_store.enqueue_observed_report(retry)
+
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE observed_report_outbox
+            SET completed_at = clock_timestamp() - interval '5 minutes 1 second'
+            WHERE report_uuid = %s
+            """,
+            (report["report_uuid"],),
+        )
+
+    assert postgres_store.enqueue_observed_report(retry)
+    assert postgres_store.pending_observed_reports() == [retry]
+
+
 def test_pending_observed_reports_supersede_older_unsent_resource_states(
     postgres_store,
 ):
