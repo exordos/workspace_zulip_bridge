@@ -173,6 +173,71 @@ class FakeStore:
         self.mappings[(entity_kind, new_provider_id)] = mapping
         return mapping
 
+    def plan_reaction_mapping(
+        self,
+        account_uuid,
+        provider_message_id,
+        provider_user_id,
+        provider_id,
+        legacy_provider_id,
+        workspace_uuid,
+        metadata,
+        create_if_missing=True,
+    ):
+        prefix = f"{provider_message_id}:{provider_user_id}:"
+        reaction_type = str(metadata["reaction_type"])
+        emoji_code = str(metadata["emoji_code"]).lower()
+        if reaction_type == "unicode_emoji":
+            emoji_code = converter.emoji.canonical_unicode_emoji_code(emoji_code)
+
+        def same_reaction(item):
+            (entity_kind, current_provider_id), mapping = item
+            if entity_kind != "reaction" or not current_provider_id.startswith(prefix):
+                return False
+            if current_provider_id in {provider_id, legacy_provider_id}:
+                return True
+            current_metadata = mapping["metadata"]
+            if str(current_metadata.get("reaction_type")) != reaction_type:
+                return False
+            current_code = str(current_metadata.get("emoji_code", "")).lower()
+            if reaction_type == "unicode_emoji":
+                try:
+                    current_code = converter.emoji.canonical_unicode_emoji_code(
+                        current_code
+                    )
+                except ValueError:
+                    return False
+            return current_code == emoji_code
+
+        candidates = [item for item in self.mappings.items() if same_reaction(item)]
+        active = [item for item in candidates if not item[1].get("deleted", False)]
+        survivor_item = next(
+            (item for item in active if item[0][1] == provider_id),
+            active[0] if active else None,
+        )
+        if survivor_item is None and create_if_missing:
+            survivor_item = next(
+                (item for item in candidates if item[0][1] == provider_id),
+                candidates[0] if candidates else None,
+            )
+        displaced = []
+        if survivor_item is None:
+            if not create_if_missing:
+                return None, []
+            survivor = {
+                "workspace_uuid": workspace_uuid,
+                "provider_id": provider_id,
+                "provider_revision": None,
+                "metadata": metadata,
+                "convergent_alias": False,
+            }
+        else:
+            survivor = survivor_item[1]
+            for _key, mapping in candidates:
+                if mapping["workspace_uuid"] != survivor["workspace_uuid"]:
+                    displaced.append(mapping)
+        return survivor, displaced
+
     def mark_provider_mapping_deleted(self, account_uuid, entity_kind, provider_id):
         self.mappings.pop((entity_kind, provider_id), None)
 
@@ -1091,7 +1156,7 @@ def test_read_state_drops_retired_stream_mapping_after_recanonicalization():
     assert first_message["entity_uuid"] not in read[0]["payload"]["message_uuids"]
 
 
-def test_message_snapshot_and_live_events_project_reactions_with_stable_identity():
+def test_message_snapshot_and_live_events_project_unicode_reaction_code():
     store = FakeStore()
     message = _stream_message()
     message["reactions"] = [
@@ -1123,14 +1188,30 @@ def test_message_snapshot_and_live_events_project_reactions_with_stable_identity
         "topic_uuid": message_operation["payload"]["topic_uuid"],
         "message_uuid": message_operation["entity_uuid"],
         "user_uuid": converter.stable_entity_uuid(ACCOUNT_UUID, "identity", "3"),
-        "emoji_name": "thumbs_up",
+        "emoji_name": "👍",
     }
+    assert snapshot_reaction["provider"]["entity_id"] == (
+        "601:3:unicode_emoji:1f44d"
+    )
     assert snapshot_reaction["extensions"] == {
         "provider_badge": "zulip",
+        "emoji_name": "thumbs_up",
         "emoji_code": "1f44d",
         "reaction_type": "unicode_emoji",
         "delivery_class": "live",
     }
+    store.remember_provider_mapping(
+        ACCOUNT_UUID,
+        "reaction",
+        "601:3:unicode_emoji:1f44d",
+        snapshot_reaction["entity_uuid"],
+        {
+            "emoji_name": "👍",
+            "provider_emoji_name": "thumbs_up",
+            "emoji_code": "1f44d",
+            "reaction_type": "unicode_emoji",
+        },
+    )
 
     removed = _operations(
         converter.event_records(
@@ -1155,6 +1236,313 @@ def test_message_snapshot_and_live_events_project_reactions_with_stable_identity
 
     assert removed_reaction["entity_uuid"] == snapshot_reaction["entity_uuid"]
     assert removed_reaction["payload"] == snapshot_reaction["payload"]
+
+
+def test_remove_reaction_without_active_mapping_is_ignored():
+    store = FakeStore()
+    converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {"id": 10, "type": "message", "message": _stream_message()},
+    )
+
+    records = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {
+            "id": 11,
+            "type": "reaction",
+            "op": "remove",
+            "message_id": 601,
+            "user_id": 3,
+            "emoji_name": "writing",
+            "emoji_code": "270d",
+            "reaction_type": "unicode_emoji",
+        },
+    )
+
+    assert records == []
+    assert store.provider_mapping(
+        ACCOUNT_UUID,
+        "reaction",
+        "601:3:unicode_emoji:270d",
+    ) is None
+
+
+def test_reaction_aliases_for_one_unicode_code_share_workspace_identity():
+    store = FakeStore()
+    converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {"id": 10, "type": "message", "message": _stream_message()},
+    )
+
+    first = _operations(
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "queue",
+            {
+                "id": 11,
+                "type": "reaction",
+                "op": "add",
+                "message_id": 601,
+                "user_id": 3,
+                "emoji_name": "+1",
+                "emoji_code": "1f44d",
+                "reaction_type": "unicode_emoji",
+            },
+        )
+    )
+    second = _operations(
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "queue",
+            {
+                "id": 12,
+                "type": "reaction",
+                "op": "add",
+                "message_id": 601,
+                "user_id": 3,
+                "emoji_name": "thumbs_up",
+                "emoji_code": "1F44D-FE0F",
+                "reaction_type": "unicode_emoji",
+            },
+        )
+    )
+
+    first_reaction = next(
+        operation for operation in first if operation["kind"] == "reaction.upsert"
+    )
+    second_reaction = next(
+        operation for operation in second if operation["kind"] == "reaction.upsert"
+    )
+    assert second_reaction["entity_uuid"] == first_reaction["entity_uuid"]
+    assert second_reaction["provider"]["entity_id"] == (
+        "601:3:unicode_emoji:1f44d"
+    )
+    assert second_reaction["payload"]["emoji_name"] == "👍"
+    assert second_reaction["extensions"]["emoji_name"] == "thumbs_up"
+
+
+def test_legacy_reaction_mapping_cleanup_is_planned_without_early_mutation():
+    store = FakeStore()
+    converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {"id": 10, "type": "message", "message": _stream_message()},
+    )
+    legacy_uuid = str(uuid.uuid4())
+    store.remember_provider_mapping(
+        ACCOUNT_UUID,
+        "reaction",
+        "601:3:writing",
+        legacy_uuid,
+        {"emoji_name": "writing"},
+    )
+
+    records = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {
+            "id": 11,
+            "type": "reaction",
+            "op": "add",
+            "message_id": 601,
+            "user_id": 3,
+            "emoji_name": "writing",
+            "emoji_code": "270d",
+            "reaction_type": "unicode_emoji",
+        },
+    )
+    operations = _operations(records)
+
+    reaction = next(
+        operation for operation in operations if operation["kind"] == "reaction.upsert"
+    )
+    assert reaction["entity_uuid"] == legacy_uuid
+    assert reaction["payload"]["emoji_name"] == "✍"
+    assert store.provider_mapping(
+        ACCOUNT_UUID, "reaction", "601:3:writing"
+    ) is not None
+    assert store.provider_mapping(
+        ACCOUNT_UUID, "reaction", "601:3:unicode_emoji:270d"
+    ) is None
+    reaction_record = next(
+        record
+        for record in records
+        if record["operation"]["kind"] == "reaction.upsert"
+    )
+    plan = reaction_record["transport"]["reaction_mapping"]
+    assert plan["workspace_uuid"] == legacy_uuid
+    assert plan["provider_id"] == "601:3:unicode_emoji:270d"
+
+
+def test_partial_reaction_migration_merges_aliases_by_type_and_code():
+    store = FakeStore()
+    converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {"id": 10, "type": "message", "message": _stream_message()},
+    )
+    canonical_uuid = str(uuid.uuid4())
+    stale_uuid = str(uuid.uuid4())
+    store.remember_provider_mapping(
+        ACCOUNT_UUID,
+        "reaction",
+        "601:3:unicode_emoji:270d",
+        canonical_uuid,
+        {
+            "emoji_name": "✍",
+            "provider_emoji_name": "writing",
+            "emoji_code": "270d",
+            "reaction_type": "unicode_emoji",
+        },
+    )
+    store.remember_provider_mapping(
+        ACCOUNT_UUID,
+        "reaction",
+        "601:3:writing_hand",
+        stale_uuid,
+        {
+            "emoji_name": "writing_hand",
+            "emoji_code": "270D-FE0F",
+            "reaction_type": "unicode_emoji",
+        },
+    )
+
+    records = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {
+            "id": 11,
+            "type": "reaction",
+            "op": "add",
+            "message_id": 601,
+            "user_id": 3,
+            "emoji_name": "writing",
+            "emoji_code": "270d",
+            "reaction_type": "unicode_emoji",
+        },
+    )
+    operations = _operations(records)
+
+    assert [operation["kind"] for operation in operations] == [
+        "reaction.delete",
+        "reaction.upsert",
+    ]
+    assert operations[0]["entity_uuid"] == stale_uuid
+    assert operations[0]["payload"]["emoji_name"] == "writing_hand"
+    assert operations[1]["entity_uuid"] == canonical_uuid
+    assert operations[1]["payload"]["emoji_name"] == "✍"
+    assert store.provider_mapping(
+        ACCOUNT_UUID, "reaction", "601:3:writing_hand"
+    ) is not None
+    reaction_record = next(
+        record
+        for record in records
+        if record["operation"]["kind"] == "reaction.upsert"
+    )
+    plan = reaction_record["transport"]["reaction_mapping"]
+    assert plan["workspace_uuid"] == canonical_uuid
+    assert plan["displaced"] == [
+        {
+            "workspace_uuid": stale_uuid,
+            "provider_id": "601:3:writing_hand",
+        }
+    ]
+
+
+def test_custom_reaction_keeps_provider_name_and_uses_typed_code_identity():
+    store = FakeStore()
+    message = _stream_message()
+    message["reactions"] = [
+        {
+            "user_id": 3,
+            "emoji_name": "party_parrot",
+            "emoji_code": "17",
+            "reaction_type": "realm_emoji",
+        }
+    ]
+
+    operations = _operations(
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "queue",
+            {"id": 10, "type": "message", "message": message},
+        )
+    )
+
+    reaction = next(
+        operation for operation in operations if operation["kind"] == "reaction.upsert"
+    )
+    assert reaction["provider"]["entity_id"] == "601:3:realm_emoji:17"
+    assert reaction["payload"]["emoji_name"] == "party_parrot"
+    assert reaction["extensions"] == {
+        "provider_badge": "zulip",
+        "emoji_name": "party_parrot",
+        "emoji_code": "17",
+        "reaction_type": "realm_emoji",
+        "delivery_class": "live",
+    }
+
+
+def test_backfill_reaction_uses_versioned_projection_operation_identity():
+    store = FakeStore()
+    message = _stream_message()
+    message["reactions"] = [
+        {
+            "user_id": 3,
+            "emoji_name": "writing",
+            "emoji_code": "270d",
+            "reaction_type": "unicode_emoji",
+        }
+    ]
+
+    records = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "history",
+        {"id": 601, "type": "message", "message": message},
+        "backfill",
+    )
+
+    reaction = next(
+        record
+        for record in records
+        if record["operation"]["kind"] == "reaction.upsert"
+    )
+    reaction_index = records.index(reaction)
+    source = (
+        "provider-message:601:reconcile-generation:1:"
+        f"reaction-projection:{converter.REACTION_PROJECTION_VERSION}"
+    )
+    assert reaction["operation_uuid"] == converter.operation_uuid_for(
+        ACCOUNT_UUID,
+        source,
+        601,
+        reaction_index,
+    )
+    message_record = next(
+        record
+        for record in records
+        if record["operation"]["kind"] == "message.create"
+    )
+    assert message_record["operation_uuid"] == converter.operation_uuid_for(
+        ACCOUNT_UUID,
+        "provider-message:601:reconcile-generation:1",
+        601,
+        records.index(message_record),
+    )
 
 
 def test_reaction_event_rejects_unknown_operation():

@@ -1904,6 +1904,7 @@ class BridgeService:
                     "provider_chat_assignment_pending",
                     "provider_chat_participants_pending",
                     "provider_event_replay_incomplete",
+                    "reaction_mapping_plan_changed",
                 }:
                     self.store.retry_provider_event(
                         account_uuid,

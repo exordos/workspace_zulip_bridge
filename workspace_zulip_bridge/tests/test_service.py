@@ -1408,6 +1408,38 @@ def test_provider_journal_waits_for_assignment_bound_delivery(monkeypatch):
     assert store.processed == []
 
 
+def test_provider_journal_retries_changed_reaction_mapping_plan(monkeypatch):
+    class Store(DeliveryStore):
+        def prepare_provider_event_records(
+            self, account_uuid, queue_id, event_id, records
+        ):
+            raise ValueError("reaction_mapping_plan_changed")
+
+    account_uuid = "00000000-0000-0000-0000-000000000001"
+    store = Store(
+        [
+            {
+                "account_uuid": account_uuid,
+                "queue_id": "queue",
+                "event_id": 7,
+                "body": {"id": 7, "type": "realm_user", "person": {}},
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        converter,
+        "event_records",
+        lambda *args, **kwargs: [{"record_uuid": "record"}],
+    )
+
+    assert _delivery_service(store).process_provider_journal() == 0
+    assert store.retried == [
+        (account_uuid, "queue", 7, "reaction_mapping_plan_changed")
+    ]
+    assert store.enqueued == []
+    assert store.invalid == []
+
+
 def test_provider_journal_finishes_assignment_change_during_enqueue(monkeypatch):
     class Store(DeliveryStore):
         def __init__(self, events):

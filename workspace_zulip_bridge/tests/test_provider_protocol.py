@@ -271,9 +271,10 @@ def test_provider_reaction_event_includes_actor_identity_and_delete_selector():
                 "topic_uuid": TOPIC_UUID,
                 "message_uuid": MESSAGE_UUID,
                 "user_uuid": ACCOUNT_UUID,
-                "emoji_name": "thumbs_up",
+                "emoji_name": "👍",
             },
             "extensions": {
+                "emoji_name": "thumbs_up",
                 "emoji_code": "1f44d",
                 "reaction_type": "unicode_emoji",
             },
@@ -287,7 +288,8 @@ def test_provider_reaction_event_includes_actor_identity_and_delete_selector():
     assert resource["uuid"] == REACTION_UUID
     assert resource["message_uuid"] == MESSAGE_UUID
     assert resource["user_uuid"] == ACCOUNT_UUID
-    assert resource["emoji_name"] == "thumbs_up"
+    assert resource["emoji_name"] == "👍"
+    assert resource["provider_metadata"]["emoji_name"] == "thumbs_up"
     assert resource["provider_metadata"]["emoji_code"] == "1f44d"
     assert resource["user_identity"]["provider_external_id"] == "42"
 

@@ -10,7 +10,7 @@ import uuid
 
 from restalchemy.storage.sql import engines, sessions
 
-from workspace_zulip_bridge import canonical, control
+from workspace_zulip_bridge import canonical, control, emoji
 
 PARTICIPANT_RECHECK_INTERVAL_SECONDS = 30
 
@@ -1401,6 +1401,234 @@ class RestAlchemyStore:
                 )
             return row
 
+    @staticmethod
+    def _select_reaction_mappings(
+        rows: list[dict[str, object]],
+        provider_id: str,
+        legacy_provider_id: str,
+        metadata: dict[str, object],
+        create_if_missing: bool = True,
+    ) -> tuple[dict[str, object] | None, list[dict[str, object]]]:
+        reaction_type = str(metadata["reaction_type"])
+        emoji_code = str(metadata["emoji_code"])
+        if reaction_type == "unicode_emoji":
+            emoji_code = emoji.canonical_unicode_emoji_code(emoji_code)
+
+        def same_reaction(row: dict[str, object]) -> bool:
+            row_provider_id = str(row["provider_id"])
+            if row_provider_id in {provider_id, legacy_provider_id}:
+                return True
+            row_metadata = typing.cast(dict[str, object], row["metadata"])
+            if str(row_metadata.get("reaction_type")) != reaction_type:
+                return False
+            row_code = str(row_metadata.get("emoji_code", ""))
+            if reaction_type == "unicode_emoji":
+                try:
+                    row_code = emoji.canonical_unicode_emoji_code(row_code)
+                except ValueError:
+                    return False
+            return row_code == emoji_code
+
+        candidates = [row for row in rows if same_reaction(row)]
+        active = [row for row in candidates if not bool(row["deleted"])]
+        survivor = next(
+            (row for row in active if str(row["provider_id"]) == provider_id),
+            active[0] if active else None,
+        )
+        if survivor is None and create_if_missing:
+            survivor = next(
+                (
+                    row
+                    for row in candidates
+                    if str(row["provider_id"]) == provider_id
+                ),
+                candidates[0] if candidates else None,
+            )
+        displaced = [
+            {
+                "workspace_uuid": row["workspace_uuid"],
+                "provider_id": row["provider_id"],
+                "provider_revision": row["provider_revision"],
+                "metadata": row["metadata"],
+            }
+            for row in active
+            if survivor is not None
+            and row["workspace_uuid"] != survivor["workspace_uuid"]
+        ]
+        return survivor, displaced
+
+    def plan_reaction_mapping(
+        self,
+        account_uuid: str,
+        provider_message_id: str,
+        provider_user_id: str,
+        provider_id: str,
+        legacy_provider_id: str,
+        workspace_uuid: str,
+        metadata: dict[str, object],
+        create_if_missing: bool = True,
+    ) -> tuple[dict[str, object] | None, list[dict[str, object]]]:
+        """Plan convergence without hiding mappings before cleanup is accepted."""
+
+        provider_prefix = f"{provider_message_id}:{provider_user_id}:%"
+        with self.session() as session:
+            rows = list(
+                session.execute(
+                    """
+                    SELECT workspace_uuid, provider_id, provider_revision,
+                           metadata, deleted, updated_at
+                    FROM provider_mappings
+                    WHERE account_uuid = %s AND entity_kind = 'reaction'
+                      AND provider_id LIKE %s
+                    ORDER BY deleted, updated_at, workspace_uuid
+                    """,
+                    (account_uuid, provider_prefix),
+                ).fetchall()
+            )
+            survivor, displaced = self._select_reaction_mappings(
+                rows,
+                provider_id,
+                legacy_provider_id,
+                metadata,
+                create_if_missing,
+            )
+            mapping = (
+                {
+                    "workspace_uuid": workspace_uuid,
+                    "provider_id": provider_id,
+                    "provider_revision": None,
+                    "metadata": metadata,
+                }
+                if survivor is None and create_if_missing
+                else survivor
+            )
+            return mapping, displaced
+
+    def _converge_reaction_mapping(
+        self,
+        session: sessions.PgSQLSession,
+        account_uuid: str,
+        provider_message_id: str,
+        provider_user_id: str,
+        provider_id: str,
+        legacy_provider_id: str,
+        workspace_uuid: str,
+        metadata: dict[str, object],
+        create_if_missing: bool = True,
+    ) -> tuple[dict[str, object] | None, list[dict[str, object]]]:
+        lock_key = ":".join(
+            (account_uuid, "reaction", provider_message_id, provider_user_id)
+        )
+        provider_prefix = f"{provider_message_id}:{provider_user_id}:%"
+        session.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (lock_key,),
+        )
+        rows = list(
+            session.execute(
+                """
+                SELECT workspace_uuid, provider_id, provider_revision,
+                       metadata, deleted, updated_at
+                FROM provider_mappings
+                WHERE account_uuid = %s AND entity_kind = 'reaction'
+                  AND provider_id LIKE %s
+                ORDER BY deleted, updated_at, workspace_uuid
+                FOR UPDATE
+                """,
+                (account_uuid, provider_prefix),
+            ).fetchall()
+        )
+        survivor, displaced = self._select_reaction_mappings(
+            rows,
+            provider_id,
+            legacy_provider_id,
+            metadata,
+            create_if_missing,
+        )
+        if survivor is not None:
+            # A deleted canonical row can block renaming the active legacy
+            # survivor. It is safe to remove because it has no live
+            # Workspace projection. Active displaced rows stay recoverable
+            # until their individual cleanup operations are accepted.
+            if str(survivor["provider_id"]) != provider_id:
+                session.execute(
+                    """
+                    DELETE FROM provider_mappings
+                    WHERE account_uuid = %s AND entity_kind = 'reaction'
+                      AND provider_id = %s AND deleted
+                    """,
+                    (account_uuid, provider_id),
+                )
+            mapping = session.execute(
+                """
+                UPDATE provider_mappings
+                SET provider_id = %s, metadata = %s,
+                    deleted = false, updated_at = now()
+                WHERE account_uuid = %s AND entity_kind = 'reaction'
+                  AND workspace_uuid = %s AND provider_id = %s
+                RETURNING workspace_uuid, provider_id, provider_revision,
+                          metadata
+                """,
+                (
+                    provider_id,
+                    json.dumps(metadata),
+                    account_uuid,
+                    survivor["workspace_uuid"],
+                    survivor["provider_id"],
+                ),
+            ).fetchone()
+        elif create_if_missing:
+            mapping = session.execute(
+                """
+                INSERT INTO provider_mappings (
+                    account_uuid, entity_kind, workspace_uuid, provider_id,
+                    metadata, deleted
+                ) VALUES (%s, 'reaction', %s, %s, %s, false)
+                ON CONFLICT (account_uuid, entity_kind, provider_id)
+                DO UPDATE SET metadata = EXCLUDED.metadata,
+                              deleted = false, updated_at = now()
+                RETURNING workspace_uuid, provider_id, provider_revision,
+                          metadata
+                """,
+                (
+                    account_uuid,
+                    workspace_uuid,
+                    provider_id,
+                    json.dumps(metadata),
+                ),
+            ).fetchone()
+        else:
+            mapping = None
+        if mapping is None and not create_if_missing:
+            return None, displaced
+        if mapping is None:
+            raise ValueError("Reaction mapping convergence failed")
+        return mapping, displaced
+
+    def converge_reaction_mapping(
+        self,
+        account_uuid: str,
+        provider_message_id: str,
+        provider_user_id: str,
+        provider_id: str,
+        legacy_provider_id: str,
+        workspace_uuid: str,
+        metadata: dict[str, object],
+    ) -> tuple[dict[str, object], list[dict[str, object]]]:
+        """Canonicalize one survivor; accepted cleanup tombstones aliases."""
+
+        with self.session() as session:
+            return self._converge_reaction_mapping(
+                session,
+                account_uuid,
+                provider_message_id,
+                provider_user_id,
+                provider_id,
+                legacy_provider_id,
+                workspace_uuid,
+                metadata,
+            )
+
     def mark_provider_mapping_deleted(
         self, account_uuid: str, entity_kind: str, provider_id: str
     ) -> None:
@@ -1837,6 +2065,7 @@ class RestAlchemyStore:
             prepared = copy.deepcopy(records)
             for record in prepared:
                 self._allocate_producer_lane(session, record)
+            self._validate_reaction_mapping_plans(session, prepared)
             session.execute(
                 """
                 UPDATE zulip_provider_events
@@ -1847,6 +2076,237 @@ class RestAlchemyStore:
                 (json.dumps(prepared), account_uuid, queue_id, event_id),
             )
             return prepared
+
+    def _validate_reaction_mapping_plans(
+        self,
+        session: sessions.PgSQLSession,
+        records: list[dict[str, object]],
+    ) -> None:
+        for record in records:
+            transport = record.get("transport")
+            if not isinstance(transport, dict):
+                continue
+            plan = transport.get("reaction_mapping")
+            if plan is None:
+                continue
+            if not isinstance(plan, dict):
+                raise ValueError("invalid_reaction_mapping_plan")
+            metadata = plan.get("metadata")
+            displaced_plan = plan.get("displaced")
+            create_if_missing = plan.get("create_if_missing")
+            if not isinstance(metadata, dict) or not isinstance(
+                displaced_plan, list
+            ) or not isinstance(create_if_missing, bool):
+                raise ValueError("invalid_reaction_mapping_plan")
+            operation = record.get("operation")
+            if not isinstance(operation, dict) or operation.get("kind") not in {
+                "reaction.upsert",
+                "reaction.delete",
+            }:
+                raise ValueError("invalid_reaction_mapping_operation")
+            if create_if_missing != (operation["kind"] == "reaction.upsert"):
+                raise ValueError("invalid_reaction_mapping_plan")
+            expected_displaced = {
+                (str(item["workspace_uuid"]), str(item["provider_id"]))
+                for item in displaced_plan
+                if isinstance(item, dict)
+                and item.get("workspace_uuid") is not None
+                and item.get("provider_id") is not None
+            }
+            if len(expected_displaced) != len(displaced_plan):
+                raise ValueError("invalid_reaction_mapping_plan")
+            account_uuid = str(record["account_uuid"])
+            provider_message_id = str(plan["provider_message_id"])
+            provider_user_id = str(plan["provider_user_id"])
+            provider_id = str(plan["provider_id"])
+            legacy_provider_id = str(plan["legacy_provider_id"])
+            lock_key = ":".join(
+                (
+                    account_uuid,
+                    "reaction",
+                    provider_message_id,
+                    provider_user_id,
+                )
+            )
+            session.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (lock_key,),
+            )
+            rows = list(
+                session.execute(
+                    """
+                    SELECT workspace_uuid, provider_id, provider_revision,
+                           metadata, deleted, updated_at
+                    FROM provider_mappings
+                    WHERE account_uuid = %s AND entity_kind = 'reaction'
+                      AND provider_id LIKE %s
+                    ORDER BY deleted, updated_at, workspace_uuid
+                    FOR UPDATE
+                    """,
+                    (
+                        account_uuid,
+                        f"{provider_message_id}:{provider_user_id}:%",
+                    ),
+                ).fetchall()
+            )
+            survivor, displaced = self._select_reaction_mappings(
+                rows,
+                provider_id,
+                legacy_provider_id,
+                typing.cast(dict[str, object], metadata),
+                create_if_missing,
+            )
+            planned_workspace_uuid = str(plan["workspace_uuid"])
+            actual_workspace_uuid = (
+                planned_workspace_uuid
+                if survivor is None and create_if_missing
+                else None if survivor is None else str(survivor["workspace_uuid"])
+            )
+            if actual_workspace_uuid != planned_workspace_uuid:
+                raise ValueError("reaction_mapping_plan_changed")
+            actual_displaced = {
+                (str(item["workspace_uuid"]), str(item["provider_id"]))
+                for item in displaced
+            }
+            if not actual_displaced.issubset(expected_displaced):
+                raise ValueError("reaction_mapping_plan_changed")
+
+    def _commit_reaction_mapping_transition(
+        self,
+        session: sessions.PgSQLSession,
+        record: dict[str, object],
+    ) -> None:
+        """Publish reaction mapping changes only after Workspace acceptance."""
+        transport = record.get("transport")
+        if not isinstance(transport, dict):
+            return
+        account_uuid = str(record["account_uuid"])
+        delete_target = transport.get("reaction_mapping_delete")
+        if delete_target is not None and not isinstance(delete_target, dict):
+            raise ValueError("invalid_reaction_mapping_delete")
+        if isinstance(delete_target, dict):
+            workspace_uuid = delete_target.get("workspace_uuid")
+            provider_id = delete_target.get("provider_id")
+            if workspace_uuid is None or provider_id is None:
+                raise ValueError("invalid_reaction_mapping_delete")
+            session.execute(
+                """
+                UPDATE provider_mappings
+                SET deleted = true, updated_at = now()
+                WHERE account_uuid = %s AND entity_kind = 'reaction'
+                  AND workspace_uuid = %s AND provider_id = %s
+                  AND NOT deleted
+                """,
+                (account_uuid, str(workspace_uuid), str(provider_id)),
+            )
+        plan = transport.get("reaction_mapping")
+        if plan is None:
+            return
+        if not isinstance(plan, dict):
+            raise ValueError("invalid_reaction_mapping_plan")
+        metadata = plan.get("metadata")
+        create_if_missing = plan.get("create_if_missing")
+        if not isinstance(metadata, dict) or not isinstance(
+            create_if_missing, bool
+        ):
+            raise ValueError("invalid_reaction_mapping_plan")
+        operation = record.get("operation")
+        if not isinstance(operation, dict) or operation.get("kind") not in {
+            "reaction.upsert",
+            "reaction.delete",
+        }:
+            raise ValueError("invalid_reaction_mapping_operation")
+        if create_if_missing != (operation["kind"] == "reaction.upsert"):
+            raise ValueError("invalid_reaction_mapping_plan")
+        mapping, _displaced = self._converge_reaction_mapping(
+            session,
+            account_uuid,
+            str(plan["provider_message_id"]),
+            str(plan["provider_user_id"]),
+            str(plan["provider_id"]),
+            str(plan["legacy_provider_id"]),
+            str(plan["workspace_uuid"]),
+            typing.cast(dict[str, object], metadata),
+            True,
+        )
+        if mapping is None or str(mapping["workspace_uuid"]) != str(
+            plan["workspace_uuid"]
+        ):
+            raise ValueError("reaction_mapping_plan_changed")
+        if operation["kind"] == "reaction.delete":
+            session.execute(
+                """
+                UPDATE provider_mappings
+                SET deleted = true, updated_at = now()
+                WHERE account_uuid = %s AND entity_kind = 'reaction'
+                  AND workspace_uuid = %s AND provider_id = %s
+                """,
+                (
+                    account_uuid,
+                    str(plan["workspace_uuid"]),
+                    str(plan["provider_id"]),
+                ),
+            )
+
+    @staticmethod
+    def _requeue_rejected_reaction_cleanup(
+        session: sessions.PgSQLSession,
+        record: dict[str, object],
+        priority: int,
+        assignment: dict[str, object],
+    ) -> bool:
+        """Retry an identical history cleanup after Provider API rejection."""
+        operation = record.get("operation")
+        transport = record.get("transport")
+        if (
+            not isinstance(operation, dict)
+            or operation.get("kind") != "reaction.delete"
+            or not isinstance(transport, dict)
+        ):
+            return False
+        delete_target = transport.get("reaction_mapping_delete")
+        if not isinstance(delete_target, dict):
+            return False
+        if not all(
+            isinstance(delete_target.get(field), str)
+            for field in ("workspace_uuid", "provider_id")
+        ):
+            return False
+        requeued = session.execute(
+            """
+            UPDATE workspace_delivery_outbox
+            SET submission_state = 'pending',
+                submission_error_code = NULL,
+                next_submission_at = now(),
+                priority = LEAST(priority, %s),
+                assignment_uuid = %s,
+                assignment_generation = %s,
+                assignment_project_uuid = %s
+            WHERE operation_uuid = %s
+              AND account_uuid = %s
+              AND sent_at IS NULL
+              AND submission_state = 'rejected'
+              AND provider_queue_id IS NULL
+              AND provider_event_id IS NULL
+              AND record->>'operation_sha256' = %s
+              AND record->'operation'->>'kind' = 'reaction.delete'
+              AND record->'operation'->>'entity_uuid' = %s
+              AND record->'transport'->'reaction_mapping_delete' = %s::jsonb
+            RETURNING record_uuid
+            """,
+            (
+                priority,
+                str(assignment["resource_uuid"]),
+                int(assignment["generation"]),
+                str(assignment["project_uuid"]),
+                str(record["operation_uuid"]),
+                str(record["account_uuid"]),
+                str(record["operation_sha256"]),
+                str(operation["entity_uuid"]),
+                json.dumps(delete_target),
+            ),
+        ).fetchone()
+        return requeued is not None
 
     def enqueue_workspace_delivery(
         self,
@@ -1958,6 +2418,19 @@ class RestAlchemyStore:
                 ).fetchone()
                 if assignment is None:
                     raise ValueError("provider_chat_assignment_pending")
+            if (
+                existing is not None
+                and provider_queue_id is None
+                and provider_event_id is None
+                and assignment is not None
+                and self._requeue_rejected_reaction_cleanup(
+                    session,
+                    record,
+                    priority,
+                    assignment,
+                )
+            ):
+                return True
             if operation.get("kind") == "topic.upsert" and assignment is not None:
                 payload = typing.cast(dict[str, object], operation["payload"])
                 duplicate_topic = session.execute(
@@ -2017,6 +2490,12 @@ class RestAlchemyStore:
                     json.dumps(record),
                 ),
             ).fetchone()
+            if (
+                result is not None
+                and provider_queue_id is None
+                and provider_event_id is None
+            ):
+                self._validate_reaction_mapping_plans(session, [record])
             return result is not None
 
     def pending_workspace_deliveries(
@@ -5149,7 +5628,12 @@ class RestAlchemyStore:
             ):
                 provider = typing.cast(dict[str, object], operation["provider"])
                 kind = operation.get("kind")
-                if kind in {"message.create", "topic.upsert"}:
+                if kind in {"reaction.upsert", "reaction.delete"}:
+                    self._commit_reaction_mapping_transition(
+                        session,
+                        operation_record,
+                    )
+                elif kind in {"message.create", "topic.upsert"}:
                     entity_kind = kind.partition(".")[0]
                     session.execute(
                         """

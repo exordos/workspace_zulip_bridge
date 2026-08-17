@@ -70,11 +70,12 @@ def test_migrations_have_one_versioned_dependency_chain():
         "0013-bound-reaction-history-window-5edf75.py",
         "0014-bound-terminal-delivery-retention-4c61bd.py",
         "0015-scale-large-synchronizations-ad12e8.py",
+        "0016-refresh-Zulip-reactions-by-emoji-code-e76ed0.py",
     ]
     assert engine.get_latest_migration() == (
-        "0015-scale-large-synchronizations-ad12e8.py"
+        "0016-refresh-Zulip-reactions-by-emoji-code-e76ed0.py"
     )
-    assert len({step["uuid"] for step in all_migrations.values()}) == 16
+    assert len({step["uuid"] for step in all_migrations.values()}) == 17
     assert all_migrations["0001-add-Zulip-provider-scheduler-state-143113.py"][
         "depends"
     ] == ["0000-initialize-bridge-operational-state-18f707.py"]
@@ -120,6 +121,114 @@ def test_migrations_have_one_versioned_dependency_chain():
     assert all_migrations["0015-scale-large-synchronizations-ad12e8.py"][
         "depends"
     ] == ["0014-bound-terminal-delivery-retention-4c61bd.py"]
+    assert all_migrations[
+        "0016-refresh-Zulip-reactions-by-emoji-code-e76ed0.py"
+    ]["depends"] == ["0015-scale-large-synchronizations-ad12e8.py"]
+
+
+def test_reaction_emoji_migration_requeues_configured_history():
+    migration_path = (
+        MIGRATIONS / "0016-refresh-Zulip-reactions-by-emoji-code-e76ed0.py"
+    )
+    spec = importlib.util.spec_from_file_location("reaction_emoji", migration_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class Session:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, statement):
+            self.statements.append(statement)
+
+    session = Session()
+    module.migration_step.upgrade(session)
+
+    assert len(session.statements) == 1
+    statement = session.statements[0]
+    assert "UPDATE zulip_backfill_jobs" in statement
+    assert "state = 'pending'" in statement
+    assert "THEN COALESCE(job.cutoff_at, assignment.updated_at)" in statement
+    assert "retry_count = 0" in statement
+
+
+def test_reaction_emoji_migration_replays_new_history_to_original_cutoff(tmp_path):
+    connection_url = os.environ.get("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN")
+    if not connection_url:
+        pytest.skip("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN is not configured")
+    schema = f"bridge_reaction_emoji_{uuid.uuid4().hex}"
+    scoped_url = _schema_connection_url(connection_url, schema)
+    config_path = tmp_path / "bridge.conf"
+    admin_store = storage.RestAlchemyStore(connection_url)
+    scoped_store = storage.RestAlchemyStore(scoped_url)
+    migration_path = (
+        MIGRATIONS / "0016-refresh-Zulip-reactions-by-emoji-code-e76ed0.py"
+    )
+    spec = importlib.util.spec_from_file_location("reaction_emoji", migration_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    account_uuid = str(uuid.uuid4())
+    assignment_uuid = str(uuid.uuid4())
+
+    with admin_store.session() as session:
+        session.execute(f'CREATE SCHEMA "{schema}"')
+    try:
+        _apply_migrations(scoped_url, config_path)
+        with scoped_store.session() as session:
+            session.execute(
+                """
+                INSERT INTO desired_resources (
+                    resource_type, resource_uuid, generation, body, deleted
+                ) VALUES (
+                    'external_account', %s, 1,
+                    jsonb_build_object('uuid', %s::text), false
+                ), (
+                    'external_chat_assignment', %s, 1,
+                    jsonb_build_object(
+                        'external_account_uuid', %s::text,
+                        'selected', true,
+                        'provider_chat', jsonb_build_object(
+                            'provider_chat_key', 'channel:42'
+                        )
+                    ), false
+                )
+                """,
+                (account_uuid, account_uuid, assignment_uuid, account_uuid),
+            )
+            assignment = session.execute(
+                """
+                SELECT updated_at FROM desired_resources
+                WHERE resource_uuid = %s
+                """,
+                (assignment_uuid,),
+            ).fetchone()
+            session.execute(
+                """
+                INSERT INTO zulip_backfill_jobs (
+                    account_uuid, provider_chat_key, history_depth, state,
+                    next_anchor, cutoff_at
+                ) VALUES (%s, 'channel:42', 'new', 'complete', 99, NULL)
+                """,
+                (account_uuid,),
+            )
+            module.migration_step.upgrade(session)
+            job = session.execute(
+                """
+                SELECT state, next_anchor, cutoff_at
+                FROM zulip_backfill_jobs
+                WHERE account_uuid = %s AND provider_chat_key = 'channel:42'
+                """,
+                (account_uuid,),
+            ).fetchone()
+
+        assert job["state"] == "pending"
+        assert job["next_anchor"] is None
+        assert job["cutoff_at"] == assignment["updated_at"]
+    finally:
+        with admin_store.session() as session:
+            session.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
 
 
 def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
@@ -166,7 +275,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                 ORDER BY indexname
                 """
             ).fetchall()
-            assert applied["count"] == 16
+            assert applied["count"] == 17
             assert [row["indexname"] for row in indexes] == [
                 "bridge_operations_active_local_echo_idx",
                 "desired_resources_assignment_chat_idx",
@@ -210,7 +319,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
             provider_cursor_count = session.execute(
                 "SELECT count(*) AS count FROM zulip_event_cursors"
             ).fetchone()
-            assert applied["count"] == 16
+            assert applied["count"] == 17
             assert cursor["control_cursor"] == "preserved"
             assert provider_cursor_count["count"] == 0
     finally:

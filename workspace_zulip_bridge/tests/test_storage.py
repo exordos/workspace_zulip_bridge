@@ -1390,6 +1390,62 @@ def test_committed_reaction_mapping_preserves_workspace_identity():
     )
 
 
+def test_reaction_convergence_drops_deleted_canonical_even_for_same_uuid():
+    account_uuid = str(uuid.uuid4())
+    reaction_uuid = str(uuid.uuid4())
+    canonical_provider_id = "601:2:unicode_emoji:270d"
+    legacy_provider_id = "601:2:writing"
+    metadata = {
+        "emoji_name": "✍",
+        "provider_emoji_name": "writing",
+        "emoji_code": "270d",
+        "reaction_type": "unicode_emoji",
+    }
+    session = Session(
+        (
+            {
+                "workspace_uuid": reaction_uuid,
+                "provider_id": legacy_provider_id,
+                "provider_revision": None,
+                "metadata": metadata,
+                "deleted": False,
+                "updated_at": datetime.datetime.now(datetime.UTC),
+            },
+            {
+                "workspace_uuid": reaction_uuid,
+                "provider_id": canonical_provider_id,
+                "provider_revision": None,
+                "metadata": metadata,
+                "deleted": True,
+                "updated_at": datetime.datetime.now(datetime.UTC),
+            },
+        )
+    )
+    store = _store_with_session(session)
+
+    mapping, displaced = store._converge_reaction_mapping(
+        session,
+        account_uuid,
+        "601",
+        "2",
+        canonical_provider_id,
+        legacy_provider_id,
+        reaction_uuid,
+        metadata,
+    )
+
+    assert mapping is not None
+    assert str(mapping["workspace_uuid"]) == reaction_uuid
+    assert displaced == []
+    delete_statement, delete_parameters = session.statements[2]
+    assert "provider_id = %s AND deleted" in delete_statement
+    assert "workspace_uuid <>" not in delete_statement
+    assert delete_parameters == (account_uuid, canonical_provider_id)
+    update_statement, update_parameters = session.statements[3]
+    assert "workspace_uuid = %s AND provider_id = %s" in update_statement
+    assert update_parameters[-2:] == (reaction_uuid, legacy_provider_id)
+
+
 def test_stale_assignment_delivery_is_removed_and_provider_event_replayed():
     session = Session()
     store = _store_with_session(session)

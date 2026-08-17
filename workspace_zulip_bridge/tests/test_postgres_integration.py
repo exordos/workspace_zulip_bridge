@@ -1887,6 +1887,505 @@ def test_outbound_reaction_echo_reuses_workspace_identity(postgres_store):
         record for record in records if record["operation"]["kind"] == "reaction.upsert"
     )
     assert reaction["operation"]["entity_uuid"] == workspace_reaction_uuid
+    assert reaction["operation"]["payload"]["emoji_name"] == "👍"
+    assert postgres_store.enqueue_workspace_delivery(reaction, 0)
+    postgres_store.accept_result(_committed_result(reaction))
+    assert str(
+        postgres_store.provider_mapping(
+            account_uuid,
+            "reaction",
+            "601:2:unicode_emoji:1f44d",
+        )["workspace_uuid"]
+    ) == workspace_reaction_uuid
+    assert postgres_store.provider_mapping(
+        account_uuid,
+        "reaction",
+        "601:2:thumbs_up",
+    ) is None
+
+
+def test_reaction_mapping_convergence_keeps_displaced_mapping_until_cleanup(
+    postgres_store,
+):
+    account_uuid = str(uuid.uuid4())
+    canonical_uuid = str(uuid.uuid4())
+    stale_uuid = str(uuid.uuid4())
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "reaction",
+        "601:2:unicode_emoji:270d",
+        canonical_uuid,
+        {
+            "emoji_name": "✍",
+            "provider_emoji_name": "writing",
+            "emoji_code": "270d",
+            "reaction_type": "unicode_emoji",
+        },
+    )
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "reaction",
+        "601:2:writing_hand",
+        stale_uuid,
+        {
+            "emoji_name": "writing_hand",
+            "emoji_code": "270D-FE0F",
+            "reaction_type": "unicode_emoji",
+        },
+    )
+
+    mapping, displaced = postgres_store.converge_reaction_mapping(
+        account_uuid,
+        "601",
+        "2",
+        "601:2:unicode_emoji:270d",
+        "601:2:writing",
+        str(uuid.uuid4()),
+        {
+            "emoji_name": "✍",
+            "provider_emoji_name": "writing",
+            "emoji_code": "270d",
+            "reaction_type": "unicode_emoji",
+        },
+    )
+
+    assert str(mapping["workspace_uuid"]) == canonical_uuid
+    assert [str(row["workspace_uuid"]) for row in displaced] == [stale_uuid]
+    stale = postgres_store.provider_mapping(
+        account_uuid, "reaction", "601:2:writing_hand"
+    )
+    assert str(stale["workspace_uuid"]) == stale_uuid
+    canonical = postgres_store.provider_mapping(
+        account_uuid, "reaction", "601:2:unicode_emoji:270d"
+    )
+    assert canonical is not None
+    assert str(canonical["workspace_uuid"]) == canonical_uuid
+
+
+def test_reaction_mapping_convergence_replaces_same_uuid_deleted_canonical(
+    postgres_store,
+):
+    account_uuid = str(uuid.uuid4())
+    reaction_uuid = str(uuid.uuid4())
+    canonical_provider_id = "601:2:unicode_emoji:270d"
+    legacy_provider_id = "601:2:writing"
+    metadata = {
+        "emoji_name": "✍",
+        "provider_emoji_name": "writing",
+        "emoji_code": "270d",
+        "reaction_type": "unicode_emoji",
+    }
+    with pytest.raises(RuntimeError, match="rollback test schema"):
+        with postgres_store.transaction() as session:
+            # Recreate the legacy state called out by the review. The current
+            # schema's workspace-UUID primary key prevents new duplicates, so
+            # the constraint change and fixture rows are rolled back together.
+            session.execute(
+                """
+                ALTER TABLE provider_mappings
+                DROP CONSTRAINT provider_mappings_pkey
+                """
+            )
+            session.execute(
+                """
+                INSERT INTO provider_mappings (
+                    account_uuid, entity_kind, workspace_uuid, provider_id,
+                    metadata, deleted
+                ) VALUES
+                    (%s, 'reaction', %s, %s, %s, true),
+                    (%s, 'reaction', %s, %s, %s, false)
+                """,
+                (
+                    account_uuid,
+                    reaction_uuid,
+                    canonical_provider_id,
+                    json.dumps(metadata),
+                    account_uuid,
+                    reaction_uuid,
+                    legacy_provider_id,
+                    json.dumps(metadata),
+                ),
+            )
+
+            mapping, displaced = postgres_store.converge_reaction_mapping(
+                account_uuid,
+                "601",
+                "2",
+                canonical_provider_id,
+                legacy_provider_id,
+                reaction_uuid,
+                metadata,
+            )
+
+            assert str(mapping["workspace_uuid"]) == reaction_uuid
+            assert displaced == []
+            rows = session.execute(
+                """
+                SELECT workspace_uuid, provider_id, deleted
+                FROM provider_mappings
+                WHERE account_uuid = %s AND entity_kind = 'reaction'
+                """,
+                (account_uuid,),
+            ).fetchall()
+            assert rows == [
+                {
+                    "workspace_uuid": uuid.UUID(reaction_uuid),
+                    "provider_id": canonical_provider_id,
+                    "deleted": False,
+                }
+            ]
+            raise RuntimeError("rollback test schema")
+
+
+def _reaction_mapping_recovery_case(postgres_store):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    stream_uuid, topic_uuid, author_uuid = _materialize_channel_projection(
+        postgres_store, account_uuid, project_uuid
+    )
+    message_uuid = str(uuid.uuid4())
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "message",
+        "601",
+        message_uuid,
+        {
+            "project_uuid": project_uuid,
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "author_uuid": author_uuid,
+            "chat_key": "channel:42",
+            "workspace_delivery_state": "committed",
+        },
+    )
+    canonical_uuid = str(uuid.uuid4())
+    stale_uuid = str(uuid.uuid4())
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "reaction",
+        "601:2:unicode_emoji:270d",
+        canonical_uuid,
+        {
+            "emoji_name": "✍",
+            "provider_emoji_name": "writing",
+            "emoji_code": "270d",
+            "reaction_type": "unicode_emoji",
+        },
+    )
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "reaction",
+        "601:2:writing_hand",
+        stale_uuid,
+        {
+            "emoji_name": "writing_hand",
+            "emoji_code": "270D-FE0F",
+            "reaction_type": "unicode_emoji",
+        },
+    )
+    queue_id = "reaction-recovery"
+    event = {
+        "id": 700,
+        "type": "reaction",
+        "op": "add",
+        "message_id": 601,
+        "user_id": 2,
+        "emoji_name": "writing",
+        "emoji_code": "270d",
+        "reaction_type": "unicode_emoji",
+    }
+    assert postgres_store.record_provider_event(account_uuid, queue_id, event)
+    records = converter.event_records(
+        postgres_store,
+        account_uuid,
+        queue_id,
+        event,
+    )
+    return account_uuid, queue_id, canonical_uuid, stale_uuid, records
+
+
+def test_reaction_mapping_cleanup_rolls_back_with_uncommitted_journal(
+    postgres_store,
+):
+    account_uuid, queue_id, canonical_uuid, stale_uuid, records = (
+        _reaction_mapping_recovery_case(postgres_store)
+    )
+    assert [record["operation"]["kind"] for record in records] == [
+        "reaction.delete",
+        "reaction.upsert",
+    ]
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        with postgres_store.transaction():
+            postgres_store.prepare_provider_event_records(
+                account_uuid, queue_id, 700, records
+            )
+            raise RuntimeError("simulated crash")
+
+    assert postgres_store.provider_mapping(
+        account_uuid, "reaction", "601:2:writing_hand"
+    ) is not None
+    canonical = postgres_store.provider_mapping(
+        account_uuid, "reaction", "601:2:unicode_emoji:270d"
+    )
+    assert str(canonical["workspace_uuid"]) == canonical_uuid
+    with postgres_store.session() as session:
+        event = session.execute(
+            """
+            SELECT prepared_records FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = %s AND event_id = 700
+            """,
+            (account_uuid, queue_id),
+        ).fetchone()
+    assert event["prepared_records"] is None
+
+    prepared = postgres_store.prepare_provider_event_records(
+        account_uuid, queue_id, 700, records
+    )
+    assert [record["operation"] for record in prepared] == [
+        record["operation"] for record in records
+    ]
+    assert prepared[-1]["transport"] == records[-1]["transport"]
+    assert prepared[0]["transport"]["reaction_mapping_delete"] == {
+        "workspace_uuid": stale_uuid,
+        "provider_id": "601:2:writing_hand",
+    }
+    assert postgres_store.provider_mapping(
+        account_uuid, "reaction", "601:2:writing_hand"
+    ) is not None
+    canonical = postgres_store.provider_mapping(
+        account_uuid, "reaction", "601:2:unicode_emoji:270d"
+    )
+    assert str(canonical["workspace_uuid"]) == canonical_uuid
+    assert any(
+        record["operation"]["entity_uuid"] == stale_uuid
+        and record["operation"]["kind"] == "reaction.delete"
+        for record in prepared
+    )
+
+    for record in prepared:
+        assert postgres_store.enqueue_workspace_delivery(
+            record,
+            0,
+            queue_id,
+            700,
+        )
+    postgres_store.accept_result(_committed_result(prepared[0]))
+    assert postgres_store.provider_mapping(
+        account_uuid, "reaction", "601:2:writing_hand"
+    ) is None
+    postgres_store.accept_result(_committed_result(prepared[-1]))
+    canonical = postgres_store.provider_mapping(
+        account_uuid, "reaction", "601:2:unicode_emoji:270d"
+    )
+    assert str(canonical["workspace_uuid"]) == canonical_uuid
+
+
+def test_rejected_backfill_reaction_cleanup_is_requeued_on_replay(
+    postgres_store,
+):
+    account_uuid, _queue_id, canonical_uuid, stale_uuid, _records = (
+        _reaction_mapping_recovery_case(postgres_store)
+    )
+    message = _provider_history_message(601)
+    message["reactions"] = [
+        {
+            "user_id": 2,
+            "emoji_name": "writing",
+            "emoji_code": "270d",
+            "reaction_type": "unicode_emoji",
+        }
+    ]
+    event = {"id": 601, "type": "message", "message": message}
+    records = converter.event_records(
+        postgres_store,
+        account_uuid,
+        "history",
+        event,
+        "backfill",
+    )
+    cleanup = next(
+        record
+        for record in records
+        if record.get("transport", {}).get("reaction_mapping_delete")
+    )
+    assert postgres_store.enqueue_workspace_delivery(cleanup, 2)
+    assert postgres_store.mark_workspace_delivery_submitting(
+        cleanup["record_uuid"]
+    )
+    assert postgres_store.reject_provider_event_submission(
+        cleanup["record_uuid"],
+        "provider_api_http_422",
+    )
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE desired_resources
+            SET generation = 2,
+                body = jsonb_set(body, '{generation}', '2'::jsonb)
+            WHERE resource_type = 'external_chat_assignment'
+              AND body->>'external_account_uuid' = %s
+            """,
+            (account_uuid,),
+        )
+
+    stale = postgres_store.provider_mapping(
+        account_uuid, "reaction", "601:2:writing_hand"
+    )
+    canonical = postgres_store.provider_mapping(
+        account_uuid, "reaction", "601:2:unicode_emoji:270d"
+    )
+    assert str(stale["workspace_uuid"]) == stale_uuid
+    assert str(canonical["workspace_uuid"]) == canonical_uuid
+    replay_records = converter.event_records(
+        postgres_store,
+        account_uuid,
+        "history-replay",
+        event,
+        "backfill",
+    )
+    replay_cleanup = next(
+        record
+        for record in replay_records
+        if record.get("transport", {}).get("reaction_mapping_delete")
+    )
+    assert replay_cleanup["operation_uuid"] == cleanup["operation_uuid"]
+    assert replay_cleanup["operation_sha256"] == cleanup["operation_sha256"]
+    assert postgres_store.enqueue_workspace_delivery(replay_cleanup, 2)
+    assert postgres_store.pending_workspace_deliveries(2, 2) == [cleanup]
+    with postgres_store.session() as session:
+        delivery = session.execute(
+            """
+            SELECT assignment_generation, submission_state,
+                   submission_error_code
+            FROM workspace_delivery_outbox
+            WHERE operation_uuid = %s
+            """,
+            (cleanup["operation_uuid"],),
+        ).fetchone()
+    assert delivery == {
+        "assignment_generation": 2,
+        "submission_state": "pending",
+        "submission_error_code": None,
+    }
+    assert postgres_store.mark_workspace_delivery_submitting(
+        cleanup["record_uuid"]
+    )
+    postgres_store.accept_result(_committed_result(cleanup))
+    assert postgres_store.provider_mapping(
+        account_uuid, "reaction", "601:2:writing_hand"
+    ) is None
+
+
+def test_remove_reaction_tombstones_existing_mapping_only_after_acceptance(
+    postgres_store,
+):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    stream_uuid, topic_uuid, author_uuid = _materialize_channel_projection(
+        postgres_store, account_uuid, project_uuid
+    )
+    message_uuid = str(uuid.uuid4())
+    reaction_uuid = str(uuid.uuid4())
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "message",
+        "601",
+        message_uuid,
+        {
+            "project_uuid": project_uuid,
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "author_uuid": author_uuid,
+            "chat_key": "channel:42",
+        },
+    )
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "reaction",
+        "601:2:writing",
+        reaction_uuid,
+        {
+            "emoji_name": "writing",
+            "emoji_code": "270d",
+            "reaction_type": "unicode_emoji",
+        },
+    )
+    queue_id = "reaction-remove"
+    event = {
+        "id": 701,
+        "type": "reaction",
+        "op": "remove",
+        "message_id": 601,
+        "user_id": 2,
+        "emoji_name": "writing",
+        "emoji_code": "270d",
+        "reaction_type": "unicode_emoji",
+    }
+    assert postgres_store.record_provider_event(account_uuid, queue_id, event)
+    records = converter.event_records(postgres_store, account_uuid, queue_id, event)
+    assert [record["operation"]["kind"] for record in records] == [
+        "reaction.delete"
+    ]
+    assert records[0]["transport"]["reaction_mapping"]["create_if_missing"] is False
+    prepared = postgres_store.prepare_provider_event_records(
+        account_uuid, queue_id, 701, records
+    )
+    assert postgres_store.provider_mapping(
+        account_uuid, "reaction", "601:2:writing"
+    ) is not None
+    assert postgres_store.enqueue_workspace_delivery(
+        prepared[0], 0, queue_id, 701
+    )
+    postgres_store.accept_result(_committed_result(prepared[0]))
+
+    assert postgres_store.provider_mapping(
+        account_uuid, "reaction", "601:2:writing"
+    ) is None
+    assert postgres_store.provider_mapping(
+        account_uuid, "reaction", "601:2:unicode_emoji:270d"
+    ) is None
+    with postgres_store.session() as session:
+        tombstone = session.execute(
+            """
+            SELECT workspace_uuid, deleted FROM provider_mappings
+            WHERE account_uuid = %s AND entity_kind = 'reaction'
+              AND provider_id = '601:2:unicode_emoji:270d'
+            """,
+            (account_uuid,),
+        ).fetchone()
+    assert str(tombstone["workspace_uuid"]) == reaction_uuid
+    assert tombstone["deleted"] is True
+
+
+def test_existing_prepared_reaction_event_does_not_apply_new_mapping_plan(
+    postgres_store,
+):
+    account_uuid, queue_id, canonical_uuid, _stale_uuid, records = (
+        _reaction_mapping_recovery_case(postgres_store)
+    )
+    old_prepared = json.loads(json.dumps([records[-1]]))
+    old_prepared[0].pop("transport", None)
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_provider_events
+            SET prepared_records = %s
+            WHERE account_uuid = %s AND queue_id = %s AND event_id = 700
+            """,
+            (json.dumps(old_prepared), account_uuid, queue_id),
+        )
+
+    replay = postgres_store.prepare_provider_event_records(
+        account_uuid, queue_id, 700, records
+    )
+
+    assert replay == old_prepared
+    assert postgres_store.provider_mapping(
+        account_uuid, "reaction", "601:2:writing_hand"
+    ) is not None
+    canonical = postgres_store.provider_mapping(
+        account_uuid, "reaction", "601:2:unicode_emoji:270d"
+    )
+    assert str(canonical["workspace_uuid"]) == canonical_uuid
 
 
 def test_provider_mapping_written_before_event_delivery_recovers_same_message(
@@ -3793,6 +4292,7 @@ def test_permanent_provider_rejection_is_quarantined_with_safe_evidence(
         record["record_uuid"],
         "provider_api_http_422",
     )
+    assert not postgres_store.enqueue_workspace_delivery(record, 0)
     assert postgres_store.pending_workspace_deliveries() == []
     postgres_store.release_provider_event_submissions([record["record_uuid"]])
 
