@@ -665,7 +665,16 @@ class OfficialZulipAdapter:
         )
 
     def channel_catalog(self, provider_chat_key: str) -> dict[str, object]:
-        stream_id = self._channel_id(provider_chat_key)
+        return self.channel_catalogs([provider_chat_key])
+
+    def channel_catalogs(
+        self, provider_chat_keys: list[str]
+    ) -> dict[str, object]:
+        if not provider_chat_keys:
+            raise ZulipOperationError("invalid_record", False)
+        stream_ids = [self._channel_id(chat_key) for chat_key in provider_chat_keys]
+        if len(set(stream_ids)) != len(stream_ids):
+            raise ZulipOperationError("invalid_record", False)
         try:
             subscriptions = _successful(
                 self.client.get_subscriptions({"include_subscribers": True})
@@ -686,28 +695,29 @@ class OfficialZulipAdapter:
             or not isinstance(profile.get("user_id"), int)
         ):
             raise ZulipOperationError("invalid_record", False)
-        subscription = next(
-            (
-                item
-                for item in subscriptions
-                if isinstance(item, dict) and item.get("stream_id") == stream_id
-            ),
-            None,
-        )
-        if (
-            subscription is None
-            or not isinstance(subscription.get("name"), str)
-            or not isinstance(subscription.get("subscribers"), list)
-            or not all(
-                isinstance(user_id, int)
-                for user_id in typing.cast(
-                    list[object], subscription.get("subscribers")
+        subscriptions_by_id = {
+            int(item["stream_id"]): item
+            for item in subscriptions
+            if isinstance(item, dict) and isinstance(item.get("stream_id"), int)
+        }
+        selected_subscriptions = []
+        for stream_id in stream_ids:
+            subscription = subscriptions_by_id.get(stream_id)
+            if (
+                subscription is None
+                or not isinstance(subscription.get("name"), str)
+                or not isinstance(subscription.get("subscribers"), list)
+                or not all(
+                    isinstance(user_id, int)
+                    for user_id in typing.cast(
+                        list[object], subscription.get("subscribers")
+                    )
                 )
-            )
-        ):
-            raise ZulipOperationError("invalid_record", False)
+            ):
+                raise ZulipOperationError("invalid_record", False)
+            selected_subscriptions.append(subscription)
         return {
-            "subscriptions": [subscription],
+            "subscriptions": selected_subscriptions,
             "realm_users": members,
             "user_id": profile["user_id"],
         }

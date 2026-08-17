@@ -2912,6 +2912,22 @@ class RestAlchemyStore:
         with self.session() as session:
             session.execute(
                 """
+                INSERT INTO scheduler_accounts (account_uuid)
+                SELECT DISTINCT
+                    (assignment.body->>'external_account_uuid')::uuid
+                FROM desired_resources AS assignment
+                WHERE assignment.resource_type = 'external_chat_assignment'
+                  AND NOT assignment.deleted
+                  AND COALESCE(
+                      (assignment.body->>'selected')::boolean, true
+                  )
+                ORDER BY
+                    (assignment.body->>'external_account_uuid')::uuid
+                ON CONFLICT (account_uuid) DO NOTHING
+                """
+            )
+            session.execute(
+                """
                 INSERT INTO zulip_participant_sync (
                     account_uuid, provider_chat_key, assignment_generation, state
                 )
@@ -2931,6 +2947,9 @@ class RestAlchemyStore:
                   AND COALESCE(
                       (assignment.body->>'selected')::boolean, true
                   )
+                ORDER BY
+                    (assignment.body->>'external_account_uuid')::uuid,
+                    assignment.body->'provider_chat'->>'provider_chat_key'
                 ON CONFLICT (account_uuid, provider_chat_key) DO UPDATE SET
                     assignment_generation = EXCLUDED.assignment_generation,
                     state = CASE
@@ -2990,14 +3009,69 @@ class RestAlchemyStore:
                 """
             )
 
-    def claim_participant_sync(self) -> dict[str, object] | None:
+    def claim_participant_sync_batch(
+        self, limit: int = 50
+    ) -> list[dict[str, object]]:
+        if limit < 1:
+            raise ValueError("Participant sync claim limit must be positive")
         with self.session() as session:
-            return session.execute(
+            rows = session.execute(
                 """
-                WITH candidate AS (
+                WITH candidate_account AS MATERIALIZED (
+                    SELECT scheduler.account_uuid
+                    FROM scheduler_accounts AS scheduler
+                    JOIN LATERAL (
+                        SELECT participant_sync.updated_at
+                        FROM zulip_participant_sync AS participant_sync
+                        JOIN desired_resources AS assignment
+                          ON assignment.resource_type =
+                             'external_chat_assignment'
+                         AND NOT assignment.deleted
+                         AND assignment.generation =
+                             participant_sync.assignment_generation
+                         AND assignment.body->>'external_account_uuid' =
+                             participant_sync.account_uuid::text
+                         AND assignment.body->'provider_chat'
+                                 ->>'provider_chat_key' =
+                             participant_sync.provider_chat_key
+                         AND assignment.body->'provider_chat'->>'chat_type' =
+                             'channel'
+                        WHERE participant_sync.account_uuid =
+                              scheduler.account_uuid
+                          AND (
+                              participant_sync.state = 'pending'
+                              OR (
+                                  participant_sync.state = 'running'
+                                  AND participant_sync.lease_until < now()
+                              )
+                              OR (
+                                  participant_sync.state = 'reported'
+                                  AND participant_sync.updated_at <
+                                      now() - interval '30 seconds'
+                              )
+                              OR (
+                                  participant_sync.state = 'ready'
+                                  AND participant_sync.updated_at <
+                                      now() - make_interval(secs => %s)
+                              )
+                          )
+                        ORDER BY participant_sync.updated_at,
+                                 participant_sync.provider_chat_key
+                        LIMIT 1
+                    ) AS oldest ON true
+                    ORDER BY scheduler.last_participant_sync_at NULLS FIRST,
+                             oldest.updated_at,
+                             scheduler.account_uuid
+                    FOR UPDATE OF scheduler SKIP LOCKED
+                    LIMIT 1
+                ), candidates AS MATERIALIZED (
                     SELECT participant_sync.account_uuid,
-                           participant_sync.provider_chat_key
+                           participant_sync.provider_chat_key,
+                           participant_sync.assignment_generation,
+                           assignment.body AS assignment
                     FROM zulip_participant_sync AS participant_sync
+                    JOIN candidate_account AS account
+                      ON account.account_uuid = participant_sync.account_uuid
                     JOIN desired_resources AS assignment
                       ON assignment.resource_type =
                          'external_chat_assignment'
@@ -3028,51 +3102,47 @@ class RestAlchemyStore:
                        )
                     ORDER BY participant_sync.updated_at,
                              participant_sync.provider_chat_key
-                    FOR UPDATE SKIP LOCKED
-                    LIMIT 1
-                ), rotated AS (
-                    UPDATE zulip_participant_sync AS sibling
-                    SET updated_at = now()
-                    FROM candidate
-                    WHERE sibling.account_uuid = candidate.account_uuid
-                      AND sibling.provider_chat_key <>
-                          candidate.provider_chat_key
-                      AND (
-                          sibling.state = 'pending'
-                          OR (
-                              sibling.state = 'running'
-                              AND sibling.lease_until < now()
-                          )
-                          OR (
-                              sibling.state = 'reported'
-                              AND sibling.updated_at <
-                                  now() - interval '30 seconds'
-                          )
-                          OR (
-                              sibling.state = 'ready'
-                              AND sibling.updated_at <
-                                  now() - make_interval(secs => %s)
-                          )
-                      )
-                    RETURNING sibling.account_uuid
-                )
+                    FOR UPDATE OF participant_sync SKIP LOCKED
+                    LIMIT %s
+                ), claimed AS (
                 UPDATE zulip_participant_sync AS participant_sync
                 SET state = 'running',
                     lease_until = now() + interval '60 seconds',
                     updated_at = now()
-                FROM candidate
-                WHERE participant_sync.account_uuid = candidate.account_uuid
+                FROM candidates
+                WHERE participant_sync.account_uuid = candidates.account_uuid
                   AND participant_sync.provider_chat_key =
-                      candidate.provider_chat_key
+                      candidates.provider_chat_key
                 RETURNING participant_sync.account_uuid,
                           participant_sync.provider_chat_key,
-                          participant_sync.assignment_generation
+                          participant_sync.assignment_generation,
+                          candidates.assignment
+                ), dispatched AS (
+                    UPDATE scheduler_accounts AS scheduler
+                    SET last_participant_sync_at = now()
+                    FROM candidate_account AS account
+                    WHERE scheduler.account_uuid = account.account_uuid
+                    RETURNING scheduler.account_uuid
+                )
+                SELECT claimed.account_uuid,
+                       claimed.provider_chat_key,
+                       claimed.assignment_generation,
+                       claimed.assignment
+                FROM claimed
+                JOIN dispatched USING (account_uuid)
+                ORDER BY claimed.provider_chat_key
                 """,
                 (
                     PARTICIPANT_RECHECK_INTERVAL_SECONDS,
                     PARTICIPANT_RECHECK_INTERVAL_SECONDS,
+                    limit,
                 ),
-            ).fetchone()
+            ).fetchall()
+            return typing.cast(list[dict[str, object]], rows)
+
+    def claim_participant_sync(self) -> dict[str, object] | None:
+        rows = self.claim_participant_sync_batch(1)
+        return None if not rows else rows[0]
 
     def complete_participant_sync(
         self,
@@ -3082,23 +3152,62 @@ class RestAlchemyStore:
         provider_user_ids: list[int],
         ready: bool,
     ) -> None:
+        self.complete_participant_sync_batch(
+            [
+                {
+                    "account_uuid": account_uuid,
+                    "provider_chat_key": provider_chat_key,
+                    "assignment_generation": assignment_generation,
+                    "provider_user_ids": provider_user_ids,
+                    "ready": ready,
+                }
+            ]
+        )
+
+    def complete_participant_sync_batch(
+        self, updates: list[dict[str, object]]
+    ) -> None:
+        if not updates:
+            return
+        normalized = [
+            {
+                "account_uuid": str(update["account_uuid"]),
+                "provider_chat_key": str(update["provider_chat_key"]),
+                "assignment_generation": int(update["assignment_generation"]),
+                "provider_user_ids": sorted(
+                    {int(value) for value in update["provider_user_ids"]}
+                ),
+                "ready": bool(update["ready"]),
+            }
+            for update in updates
+        ]
         with self.session() as session:
             session.execute(
                 """
-                UPDATE zulip_participant_sync
-                SET state = %s, lease_until = NULL,
-                    provider_user_ids = %s::jsonb, updated_at = now()
-                WHERE account_uuid = %s AND provider_chat_key = %s
-                  AND assignment_generation = %s
-                  AND state = 'running'
+                WITH updates AS (
+                    SELECT
+                        (value->>'account_uuid')::uuid AS account_uuid,
+                        value->>'provider_chat_key' AS provider_chat_key,
+                        (value->>'assignment_generation')::bigint
+                            AS assignment_generation,
+                        value->'provider_user_ids' AS provider_user_ids,
+                        (value->>'ready')::boolean AS ready
+                    FROM jsonb_array_elements(%s::jsonb) AS value
+                )
+                UPDATE zulip_participant_sync AS participant_sync
+                SET state = CASE WHEN updates.ready THEN 'ready' ELSE 'reported' END,
+                    lease_until = NULL,
+                    provider_user_ids = updates.provider_user_ids,
+                    updated_at = now()
+                FROM updates
+                WHERE participant_sync.account_uuid = updates.account_uuid
+                  AND participant_sync.provider_chat_key =
+                      updates.provider_chat_key
+                  AND participant_sync.assignment_generation =
+                      updates.assignment_generation
+                  AND participant_sync.state = 'running'
                 """,
-                (
-                    "ready" if ready else "reported",
-                    json.dumps(sorted(set(provider_user_ids))),
-                    account_uuid,
-                    provider_chat_key,
-                    assignment_generation,
-                ),
+                (json.dumps(normalized),),
             )
 
     def release_participant_sync(
@@ -3107,16 +3216,50 @@ class RestAlchemyStore:
         provider_chat_key: str,
         assignment_generation: int,
     ) -> None:
+        self.release_participant_sync_batch(
+            [
+                {
+                    "account_uuid": account_uuid,
+                    "provider_chat_key": provider_chat_key,
+                    "assignment_generation": assignment_generation,
+                }
+            ]
+        )
+
+    def release_participant_sync_batch(
+        self, jobs: list[dict[str, object]]
+    ) -> None:
+        if not jobs:
+            return
+        normalized = [
+            {
+                "account_uuid": str(job["account_uuid"]),
+                "provider_chat_key": str(job["provider_chat_key"]),
+                "assignment_generation": int(job["assignment_generation"]),
+            }
+            for job in jobs
+        ]
         with self.session() as session:
             session.execute(
                 """
-                UPDATE zulip_participant_sync
+                WITH jobs AS (
+                    SELECT
+                        (value->>'account_uuid')::uuid AS account_uuid,
+                        value->>'provider_chat_key' AS provider_chat_key,
+                        (value->>'assignment_generation')::bigint
+                            AS assignment_generation
+                    FROM jsonb_array_elements(%s::jsonb) AS value
+                )
+                UPDATE zulip_participant_sync AS participant_sync
                 SET state = 'pending', lease_until = NULL, updated_at = now()
-                WHERE account_uuid = %s AND provider_chat_key = %s
-                  AND assignment_generation = %s
-                  AND state = 'running'
+                FROM jobs
+                WHERE participant_sync.account_uuid = jobs.account_uuid
+                  AND participant_sync.provider_chat_key = jobs.provider_chat_key
+                  AND participant_sync.assignment_generation =
+                      jobs.assignment_generation
+                  AND participant_sync.state = 'running'
                 """,
-                (account_uuid, provider_chat_key, assignment_generation),
+                (json.dumps(normalized),),
             )
 
     def assignment_participants_ready(
@@ -3168,6 +3311,9 @@ class RestAlchemyStore:
                 WHERE assignment.resource_type = 'external_chat_assignment'
                   AND NOT assignment.deleted
                   AND COALESCE((assignment.body->>'selected')::boolean, true)
+                ORDER BY
+                    (assignment.body->>'external_account_uuid')::uuid,
+                    assignment.body->'provider_chat'->>'provider_chat_key'
                 ON CONFLICT (account_uuid, provider_chat_key) DO UPDATE SET
                     next_anchor = CASE
                         WHEN zulip_backfill_jobs.state <> 'cancelled'
@@ -3406,9 +3552,51 @@ class RestAlchemyStore:
         with self.session() as session:
             return session.execute(
                 """
-                WITH candidate AS (
+                WITH candidate_account AS MATERIALIZED (
+                    SELECT scheduler.account_uuid
+                    FROM scheduler_accounts AS scheduler
+                    JOIN LATERAL (
+                        SELECT job.updated_at
+                        FROM zulip_backfill_jobs AS job
+                        JOIN desired_resources AS assignment
+                          ON assignment.resource_type =
+                             'external_chat_assignment'
+                         AND NOT assignment.deleted
+                         AND assignment.body->>'external_account_uuid' =
+                             job.account_uuid::text
+                         AND assignment.body->'provider_chat'
+                                 ->>'provider_chat_key' =
+                             job.provider_chat_key
+                        JOIN zulip_participant_sync AS participant_sync
+                          ON participant_sync.account_uuid = job.account_uuid
+                         AND participant_sync.provider_chat_key =
+                             job.provider_chat_key
+                         AND participant_sync.assignment_generation =
+                             assignment.generation
+                         AND participant_sync.state = 'ready'
+                        WHERE job.account_uuid = scheduler.account_uuid
+                          AND (
+                              (
+                                  job.state = 'pending'
+                                  AND job.available_at <= now()
+                              ) OR (
+                                  job.state = 'running'
+                                  AND job.lease_until < now()
+                              )
+                          )
+                        ORDER BY job.updated_at, job.provider_chat_key
+                        LIMIT 1
+                    ) AS oldest ON true
+                    ORDER BY scheduler.last_backfill_at NULLS FIRST,
+                             oldest.updated_at,
+                             scheduler.account_uuid
+                    FOR UPDATE OF scheduler SKIP LOCKED
+                    LIMIT 1
+                ), candidate AS MATERIALIZED (
                     SELECT job.account_uuid, job.provider_chat_key
                     FROM zulip_backfill_jobs AS job
+                    JOIN candidate_account AS account
+                      ON account.account_uuid = job.account_uuid
                     JOIN desired_resources AS assignment
                       ON assignment.resource_type =
                          'external_chat_assignment'
@@ -3430,26 +3618,9 @@ class RestAlchemyStore:
                     ) OR (
                         job.state = 'running' AND job.lease_until < now()
                     )
-                    ORDER BY job.updated_at
-                    FOR UPDATE SKIP LOCKED LIMIT 1
-                ), rotated AS (
-                    UPDATE zulip_backfill_jobs AS sibling
-                    SET updated_at = now()
-                    FROM candidate
-                    WHERE sibling.account_uuid = candidate.account_uuid
-                      AND sibling.provider_chat_key <>
-                          candidate.provider_chat_key
-                      AND (
-                          (
-                              sibling.state = 'pending'
-                              AND sibling.available_at <= now()
-                          ) OR (
-                              sibling.state = 'running'
-                              AND sibling.lease_until < now()
-                          )
-                      )
-                    RETURNING sibling.account_uuid
-                )
+                    ORDER BY job.updated_at, job.provider_chat_key
+                    FOR UPDATE OF job SKIP LOCKED LIMIT 1
+                ), claimed AS (
                 UPDATE zulip_backfill_jobs AS job
                 SET state = 'running', lease_until = now() + interval '60 seconds',
                     updated_at = now()
@@ -3459,6 +3630,18 @@ class RestAlchemyStore:
                 RETURNING job.account_uuid, job.provider_chat_key,
                           job.history_depth, job.next_anchor, job.cutoff_at,
                           job.retry_count
+                ), dispatched AS (
+                    UPDATE scheduler_accounts AS scheduler
+                    SET last_backfill_at = now()
+                    FROM candidate_account AS account
+                    WHERE scheduler.account_uuid = account.account_uuid
+                    RETURNING scheduler.account_uuid
+                )
+                SELECT claimed.account_uuid, claimed.provider_chat_key,
+                       claimed.history_depth, claimed.next_anchor,
+                       claimed.cutoff_at, claimed.retry_count
+                FROM claimed
+                JOIN dispatched USING (account_uuid)
                 """
             ).fetchone()
 

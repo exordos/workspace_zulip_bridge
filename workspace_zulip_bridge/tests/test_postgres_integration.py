@@ -1328,6 +1328,68 @@ def test_participant_and_backfill_claims_rotate_between_accounts(postgres_store)
     assert str(second_backfill["account_uuid"]) == second_account_uuid
 
 
+def test_participant_batch_reuses_one_fair_account_claim(postgres_store):
+    first_account_uuid, first_project_uuid = _insert_account_and_assignment(
+        postgres_store, "all"
+    )
+    second_account_uuid, second_project_uuid = _insert_account_and_assignment(
+        postgres_store, "all"
+    )
+    _insert_channel_assignment(
+        postgres_store, first_account_uuid, first_project_uuid, 43
+    )
+    _insert_channel_assignment(
+        postgres_store, first_account_uuid, first_project_uuid, 44
+    )
+    _insert_channel_assignment(
+        postgres_store, second_account_uuid, second_project_uuid, 43
+    )
+    postgres_store.reconcile_participant_sync()
+    with postgres_store.session() as session:
+        session.execute(
+            "UPDATE scheduler_accounts SET last_participant_sync_at = NULL"
+        )
+        session.execute(
+            """
+            UPDATE zulip_participant_sync
+            SET updated_at = CASE
+                WHEN account_uuid = %s THEN now() - interval '2 minutes'
+                ELSE now() - interval '1 minute'
+            END
+            WHERE state = 'pending'
+            """,
+            (first_account_uuid,),
+        )
+
+    first_batch = postgres_store.claim_participant_sync_batch(10)
+
+    assert len(first_batch) == 2
+    assert {str(job["account_uuid"]) for job in first_batch} == {
+        first_account_uuid
+    }
+    assert {job["provider_chat_key"] for job in first_batch} == {
+        "channel:43",
+        "channel:44",
+    }
+    assert all(isinstance(job["assignment"], dict) for job in first_batch)
+    postgres_store.complete_participant_sync_batch(
+        [
+            {
+                **job,
+                "provider_user_ids": [],
+                "ready": True,
+            }
+            for job in first_batch
+        ]
+    )
+
+    second_batch = postgres_store.claim_participant_sync_batch(10)
+
+    assert len(second_batch) == 1
+    assert str(second_batch[0]["account_uuid"]) == second_account_uuid
+    assert second_batch[0]["provider_chat_key"] == "channel:43"
+
+
 @pytest.mark.parametrize(
     ("status", "expected_code", "expected_manual", "expected_evidence"),
     [

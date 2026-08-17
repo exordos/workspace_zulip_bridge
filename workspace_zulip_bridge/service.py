@@ -192,12 +192,15 @@ class BridgeService:
     BACKGROUND_LIVE_DELIVERY_WORKERS = 1
     LIVE_DELIVERY_BATCH_SIZE = 20
     PROVIDER_JOURNAL_QUANTUM = 20
+    PARTICIPANT_SYNC_BATCH_SIZE = 50
     # History conversion touches shared stream/topic/identity mappings. Commit
     # each message so live events never wait behind a multi-message lock set.
     BACKFILL_ENQUEUE_TRANSACTION_MESSAGES = 1
     RETRYABLE_DATABASE_CONFLICT_CODES = frozenset({"40001", "40P01"})
     PROVIDER_POLL_INTERVAL_SECONDS = 2.0
-    CONTROL_STATE_RECONCILE_INTERVAL_SECONDS = 2.0
+    # Desired-state changes reconcile immediately. This slower sweep is only a
+    # recovery guard for state left behind by a prior process interruption.
+    CONTROL_STATE_RECONCILE_INTERVAL_SECONDS = 60.0
     HISTORY_QUANTUM_INTERVAL_SECONDS = 1.0
     HISTORY_PROGRESS_DELAY_SECONDS = 2.0
     TERMINAL_STATE_PRUNE_INTERVAL_SECONDS = 10.0
@@ -245,6 +248,7 @@ class BridgeService:
         self.last_certificate_check = 0.0
         self.last_provider_poll = 0.0
         self.last_control_state_reconcile = 0.0
+        self.control_state_dirty = True
         self.last_history_quantum = time.monotonic()
         self.history_quantum_lock = threading.Lock()
         self.history_delivery_lock = threading.Lock()
@@ -285,11 +289,9 @@ class BridgeService:
         except control.ControlCursorExpired:
             self._install_control_snapshot()
             return True
+        changes = typing.cast(list[dict[str, object]], batch["changes"])
         try:
-            self.store.apply_desired_changes(
-                typing.cast(list[dict[str, object]], batch["changes"]),
-                str(batch["next_cursor"]),
-            )
+            self.store.apply_desired_changes(changes, str(batch["next_cursor"]))
         except (KeyError, TypeError, ValueError):
             self.store.set_blocked_batch(
                 cursor,
@@ -299,6 +301,8 @@ class BridgeService:
             self.store.mark_health("control", "degraded", "unsupported_desired_batch")
             return False
         self.store.clear_blocked_batch()
+        if changes:
+            self.control_state_dirty = True
         return True
 
     def _install_control_snapshot(self) -> None:
@@ -329,6 +333,7 @@ class BridgeService:
                 raise ValueError("Control snapshot page cursor repeated")
             seen_page_cursors.add(page_cursor)
         self.store.install_snapshot(resources, str(session["anchor_cursor"]))
+        self.control_state_dirty = True
 
     def heartbeat(self) -> None:
         blocked_batch = (
@@ -832,6 +837,7 @@ class BridgeService:
         account_uuid: str,
         registration: dict[str, object],
         server_url: str,
+        assignments: dict[str, dict[str, object]] | None = None,
     ) -> None:
         account = self.store.account_resource(account_uuid)
         if account is None:
@@ -885,14 +891,17 @@ class BridgeService:
             name = subscription.get("name")
             if isinstance(stream_id, int) and isinstance(name, str) and name:
                 chat_key = f"channel:{stream_id}"
-                assignment_lookup = getattr(
-                    self.store, "assignment_for_provider_chat", None
-                )
-                assignment = (
-                    assignment_lookup(account_uuid, chat_key)
-                    if assignment_lookup is not None
-                    else None
-                )
+                if assignments is not None:
+                    assignment = assignments.get(chat_key)
+                else:
+                    assignment_lookup = getattr(
+                        self.store, "assignment_for_provider_chat", None
+                    )
+                    assignment = (
+                        assignment_lookup(account_uuid, chat_key)
+                        if assignment_lookup is not None
+                        else None
+                    )
                 subscribers = subscription.get("subscribers")
                 participant_ids: set[int] = (
                     {provider_user_id} if isinstance(provider_user_id, int) else set()
@@ -1009,51 +1018,116 @@ class BridgeService:
         return bool(checker(account_uuid, chat_key, int(assignment["generation"])))
 
     def refresh_selected_participants_once(self) -> bool:
-        job = self.store.claim_participant_sync()
-        if job is None:
+        batch_claim = getattr(self.store, "claim_participant_sync_batch", None)
+        if callable(batch_claim):
+            jobs = batch_claim(self.PARTICIPANT_SYNC_BATCH_SIZE)
+        else:
+            job = self.store.claim_participant_sync()
+            jobs = [] if job is None else [job]
+        if not jobs:
             return False
-        account_uuid = str(job["account_uuid"])
-        chat_key = str(job["provider_chat_key"])
-        generation = int(job["assignment_generation"])
-        assignment = self.store.assignment_for_provider_chat(account_uuid, chat_key)
-        if (
-            assignment is None
-            or int(assignment["generation"]) != generation
-            or not bool(assignment.get("selected", True))
-            or self.store.provider_event_cursor(account_uuid) is None
-        ):
-            self.store.release_participant_sync(account_uuid, chat_key, generation)
+        account_uuid = str(jobs[0]["account_uuid"])
+        valid_jobs: list[dict[str, object]] = []
+        assignments: dict[str, dict[str, object]] = {}
+        invalid_jobs: list[dict[str, object]] = []
+        for job in jobs:
+            chat_key = str(job["provider_chat_key"])
+            generation = int(job["assignment_generation"])
+            assignment_value = job.get("assignment")
+            assignment = (
+                typing.cast(dict[str, object], assignment_value)
+                if isinstance(assignment_value, dict)
+                else self.store.assignment_for_provider_chat(account_uuid, chat_key)
+            )
+            if (
+                str(job["account_uuid"]) != account_uuid
+                or assignment is None
+                or int(assignment["generation"]) != generation
+                or not bool(assignment.get("selected", True))
+            ):
+                invalid_jobs.append(job)
+                continue
+            valid_jobs.append(job)
+            assignments[chat_key] = assignment
+        self._release_participant_jobs(invalid_jobs)
+        if not valid_jobs:
+            return False
+        if self.store.provider_event_cursor(account_uuid) is None:
+            self._release_participant_jobs(valid_jobs)
             return False
         try:
             adapter = self.provider_adapters(account_uuid)
-            registration = adapter.channel_catalog(chat_key)
+            chat_keys = [str(job["provider_chat_key"]) for job in valid_jobs]
+            batch_catalog = getattr(adapter, "channel_catalogs", None)
+            if callable(batch_catalog):
+                registration = batch_catalog(chat_keys)
+            elif len(chat_keys) == 1:
+                registration = adapter.channel_catalog(chat_keys[0])
+            else:
+                raise RuntimeError("Adapter does not support participant batches")
             self._queue_registration_reports(
                 account_uuid,
                 registration,
                 getattr(adapter, "server_url", ""),
+                assignments,
             )
         except zulip_adapter.ZulipOperationError as exc:
-            self.store.release_participant_sync(account_uuid, chat_key, generation)
+            self._release_participant_jobs(valid_jobs)
             self.store.mark_health("provider", "degraded", exc.code)
             self._queue_account_report(account_uuid, "degraded", exc.code)
             return False
-        subscription = typing.cast(
-            list[dict[str, object]], registration["subscriptions"]
-        )[0]
-        provider_user_ids = {
-            int(value)
-            for value in typing.cast(list[object], subscription["subscribers"])
+        subscriptions = {
+            f"channel:{int(subscription['stream_id'])}": subscription
+            for subscription in typing.cast(
+                list[dict[str, object]], registration["subscriptions"]
+            )
         }
-        provider_user_ids.add(int(registration["user_id"]))
-        ready = provider_user_ids == self._projection_participant_ids(assignment)
-        self.store.complete_participant_sync(
-            account_uuid,
-            chat_key,
-            generation,
-            sorted(provider_user_ids),
-            ready,
-        )
+        completions: list[dict[str, object]] = []
+        for job in valid_jobs:
+            chat_key = str(job["provider_chat_key"])
+            subscription = subscriptions[chat_key]
+            provider_user_ids = {
+                int(value)
+                for value in typing.cast(list[object], subscription["subscribers"])
+            }
+            provider_user_ids.add(int(registration["user_id"]))
+            completions.append(
+                {
+                    "account_uuid": account_uuid,
+                    "provider_chat_key": chat_key,
+                    "assignment_generation": int(job["assignment_generation"]),
+                    "provider_user_ids": sorted(provider_user_ids),
+                    "ready": provider_user_ids
+                    == self._projection_participant_ids(assignments[chat_key]),
+                }
+            )
+        batch_complete = getattr(self.store, "complete_participant_sync_batch", None)
+        if callable(batch_complete):
+            batch_complete(completions)
+        else:
+            for completion in completions:
+                self.store.complete_participant_sync(
+                    str(completion["account_uuid"]),
+                    str(completion["provider_chat_key"]),
+                    int(completion["assignment_generation"]),
+                    typing.cast(list[int], completion["provider_user_ids"]),
+                    bool(completion["ready"]),
+                )
         return True
+
+    def _release_participant_jobs(self, jobs: list[dict[str, object]]) -> None:
+        if not jobs:
+            return
+        batch_release = getattr(self.store, "release_participant_sync_batch", None)
+        if callable(batch_release):
+            batch_release(jobs)
+            return
+        for job in jobs:
+            self.store.release_participant_sync(
+                str(job["account_uuid"]),
+                str(job["provider_chat_key"]),
+                int(job["assignment_generation"]),
+            )
 
     @staticmethod
     def _catalog_participant(
@@ -2243,12 +2317,16 @@ class BridgeService:
         progressed |= self._run_control_poll(now)
         store = getattr(self, "store", None)
         last_reconcile = getattr(self, "last_control_state_reconcile", 0.0)
-        if now - last_reconcile >= self.CONTROL_STATE_RECONCILE_INTERVAL_SECONDS:
+        control_state_dirty = getattr(self, "control_state_dirty", True)
+        if control_state_dirty or (
+            now - last_reconcile >= self.CONTROL_STATE_RECONCILE_INTERVAL_SECONDS
+        ):
             if store is not None and hasattr(store, "reconcile_participant_sync"):
                 store.reconcile_participant_sync()
             if store is not None and hasattr(store, "reconcile_backfill_jobs"):
                 store.reconcile_backfill_jobs()
             self.last_control_state_reconcile = now
+            self.control_state_dirty = False
         live_progressed = False
         if not getattr(self, "background_live_enabled", False):
             live_progressed |= self._run_live_lane_once(before_provider_poll=True)
