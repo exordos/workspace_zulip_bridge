@@ -242,9 +242,7 @@ def test_dm_conversion_has_owner_membership_identity_urn_and_copied_file():
     operations = _operations(records)
     message = next(op for op in operations if op["kind"] == "message.create")
     topic = next(op for op in operations if op["kind"] == "topic.upsert")
-    participants = store.mappings[("stream", "direct:1,2")]["metadata"][
-        "participants"
-    ]
+    participants = store.mappings[("stream", "direct:1,2")]["metadata"]["participants"]
     assert len(participants) == 2
     assert OWNER_UUID in participants
     assert message["actor_uuid"] != OWNER_UUID
@@ -489,18 +487,12 @@ def test_zulip_quote_with_crlf_line_endings_is_converted():
     )
 
     assert not lossy
-    assert converted == (
-        "> [docs](urn:url:https://example.com/reference)\r\nnext"
-    )
+    assert converted == ("> [docs](urn:url:https://example.com/reference)\r\nnext")
 
 
 def test_zulip_quote_inside_outer_fence_remains_literal_code():
     content = (
-        "`````markdown\n"
-        "```quote\n"
-        "[docs](https://example.com/reference)\n"
-        "```\n"
-        "`````"
+        "`````markdown\n```quote\n[docs](https://example.com/reference)\n```\n`````"
     )
 
     converted, lossy = converter.convert_markdown(
@@ -521,18 +513,11 @@ def test_zulip_quote_preserves_list_item_indentation():
     )
 
     assert not lossy
-    assert converted == (
-        "- item\n"
-        "  > [docs](urn:url:https://example.com/reference)"
-    )
+    assert converted == ("- item\n  > [docs](urn:url:https://example.com/reference)")
 
 
 def test_four_space_indented_quote_fence_remains_literal_code():
-    content = (
-        "    ```quote\n"
-        "    [docs](https://example.com/reference)\n"
-        "    ```"
-    )
+    content = "    ```quote\n    [docs](https://example.com/reference)\n    ```"
 
     converted, lossy = converter.convert_markdown(
         content,
@@ -545,11 +530,7 @@ def test_four_space_indented_quote_fence_remains_literal_code():
 
 
 def test_four_space_indented_fence_does_not_close_top_level_quote():
-    content = (
-        "```quote\n"
-        "[docs](https://example.com/reference)\n"
-        "    ```"
-    )
+    content = "```quote\n[docs](https://example.com/reference)\n    ```"
 
     converted, lossy = converter.convert_markdown(
         content,
@@ -582,9 +563,7 @@ def test_commonmark_reference_link_becomes_inline_workspace_link():
     )
 
     assert not lossy
-    assert converted == (
-        '[docs](urn:url:https://example.com/reference "Docs")\n\n'
-    )
+    assert converted == ('[docs](urn:url:https://example.com/reference "Docs")\n\n')
 
 
 @pytest.mark.parametrize(
@@ -619,20 +598,14 @@ def test_reference_definition_is_kept_when_used_by_literal_code(
 
 def test_multiline_commonmark_link_preserves_container_prefixes():
     converted, lossy = converter.convert_markdown(
-        "> [docs](\n"
-        ">   https://example.com/reference\n"
-        '>   "Documentation"\n'
-        "> )",
+        '> [docs](\n>   https://example.com/reference\n>   "Documentation"\n> )',
         {},
         "https://chat.example.invalid/#narrow/near/602",
     )
 
     assert not lossy
     assert converted == (
-        "> [docs](\n"
-        ">   urn:url:https://example.com/reference\n"
-        '>   "Documentation"\n'
-        "> )"
+        '> [docs](\n>   urn:url:https://example.com/reference\n>   "Documentation"\n> )'
     )
 
 
@@ -723,6 +696,30 @@ def test_channel_message_waits_for_topic_and_accepts_former_author():
     assert not any(value["kind"] == "stream.upsert" for value in operations)
 
 
+def test_channel_message_skips_already_committed_topic_projection():
+    store = FakeStore()
+    first = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {"id": 10, "type": "message", "message": _stream_message(601)},
+    )
+    assert any(operation["kind"] == "topic.upsert" for operation in _operations(first))
+    store.mappings[("topic", "42:Topic")]["metadata"]["workspace_delivery_state"] = (
+        "committed"
+    )
+
+    second = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {"id": 11, "type": "message", "message": _stream_message(602)},
+    )
+    operations = _operations(second)
+
+    assert [operation["kind"] for operation in operations] == ["message.create"]
+
+
 @pytest.mark.parametrize("subject", ["", "general chat", "General Chat"])
 def test_empty_channel_topic_uses_backend_owned_default_topic(subject):
     store = FakeStore(auto_materialize=False)
@@ -775,9 +772,7 @@ def test_empty_channel_topic_uses_backend_owned_default_topic(subject):
     assert store.mappings[("topic", "42:general chat")]["workspace_uuid"] == (
         default_topic_uuid
     )
-    assert store.mappings[("message", "601")]["metadata"]["subject"] == (
-        "general chat"
-    )
+    assert store.mappings[("message", "601")]["metadata"]["subject"] == ("general chat")
 
 
 def test_empty_channel_topic_waits_for_backend_default_topic_assignment():
@@ -1053,9 +1048,7 @@ def test_read_state_drops_retired_stream_mapping_after_recanonicalization():
         "type": "message",
         "message": _stream_message(601, "Topic"),
     }
-    first_records = converter.event_records(
-        store, ACCOUNT_UUID, "queue", first_event
-    )
+    first_records = converter.event_records(store, ACCOUNT_UUID, "queue", first_event)
     first_message = next(
         operation
         for operation in _operations(first_records)
@@ -1069,9 +1062,7 @@ def test_read_state_drops_retired_stream_mapping_after_recanonicalization():
         "type": "message",
         "message": _stream_message(602, "Topic"),
     }
-    second_records = converter.event_records(
-        store, ACCOUNT_UUID, "queue", second_event
-    )
+    second_records = converter.event_records(store, ACCOUNT_UUID, "queue", second_event)
     second_message = next(
         operation
         for operation in _operations(second_records)
@@ -1096,9 +1087,7 @@ def test_read_state_drops_retired_stream_mapping_after_recanonicalization():
     assert len(read) == 1
     assert read[0]["kind"] == "read_state.set"
     assert read[0]["payload"]["stream_uuid"] == stream_mapping["workspace_uuid"]
-    assert read[0]["payload"]["message_uuids"] == [
-        second_message["entity_uuid"]
-    ]
+    assert read[0]["payload"]["message_uuids"] == [second_message["entity_uuid"]]
     assert first_message["entity_uuid"] not in read[0]["payload"]["message_uuids"]
 
 
@@ -1205,16 +1194,11 @@ def test_message_snapshot_carries_exact_owner_read_state(flags, expected_read):
         converter.event_records(store, ACCOUNT_UUID, "queue", event)
     )
 
-    read = next(operation for operation in operations if operation["kind"] == "read_state.set")
-    created = next(operation for operation in operations if operation["kind"] == "message.create")
+    created = next(
+        operation for operation in operations if operation["kind"] == "message.create"
+    )
     assert created["payload"]["read"] is expected_read
-    assert read["payload"] == {
-        "stream_uuid": created["payload"]["stream_uuid"],
-        "topic_uuid": created["payload"]["topic_uuid"],
-        "reader_uuid": OWNER_UUID,
-        "message_uuids": [created["entity_uuid"]],
-        "read": expected_read,
-    }
+    assert not any(operation["kind"] == "read_state.set" for operation in operations)
 
 
 @pytest.mark.parametrize(("flags", "expected_read"), [(["read"], True), ([], False)])
@@ -1231,15 +1215,43 @@ def test_live_message_event_carries_top_level_owner_read_state(flags, expected_r
         converter.event_records(store, ACCOUNT_UUID, "queue", event)
     )
 
-    read = next(operation for operation in operations if operation["kind"] == "read_state.set")
-    created = next(operation for operation in operations if operation["kind"] == "message.create")
+    created = next(
+        operation for operation in operations if operation["kind"] == "message.create"
+    )
     assert created["payload"]["read"] is expected_read
+    assert not any(operation["kind"] == "read_state.set" for operation in operations)
+
+
+def test_committed_live_message_uses_read_state_without_replaying_message():
+    store = FakeStore()
+    event = {
+        "id": 10,
+        "type": "message",
+        "flags": ["read"],
+        "message": _stream_message(),
+    }
+    first = _operations(converter.event_records(store, ACCOUNT_UUID, "queue", event))
+    created = next(
+        operation for operation in first if operation["kind"] == "message.create"
+    )
+    mapping = store.provider_mapping(ACCOUNT_UUID, "message", "601")
+    mapping["metadata"]["workspace_delivery_state"] = "committed"
+    event["id"] = 11
+
+    operations = _operations(
+        converter.event_records(store, ACCOUNT_UUID, "queue", event)
+    )
+
+    read = next(
+        operation for operation in operations if operation["kind"] == "read_state.set"
+    )
+    assert not any(operation["kind"] == "message.create" for operation in operations)
     assert read["payload"] == {
         "stream_uuid": created["payload"]["stream_uuid"],
         "topic_uuid": created["payload"]["topic_uuid"],
         "reader_uuid": OWNER_UUID,
         "message_uuids": [created["entity_uuid"]],
-        "read": expected_read,
+        "read": True,
     }
 
 
@@ -1284,9 +1296,7 @@ def test_channel_message_does_not_overwrite_backend_owned_stream_projection():
     assert any(operation["kind"] == "message.create" for operation in operations)
     assert any(operation["kind"] == "topic.upsert" for operation in operations)
     assert not any(operation["kind"] == "stream.upsert" for operation in operations)
-    metadata = store.provider_mapping(ACCOUNT_UUID, "stream", "channel:42")[
-        "metadata"
-    ]
+    metadata = store.provider_mapping(ACCOUNT_UUID, "stream", "channel:42")["metadata"]
     assert metadata["private"] is False
     assert metadata["name"] == "Canonical name"
     assert metadata["description"] == "Canonical description"
@@ -1666,9 +1676,7 @@ def test_live_message_replay_keeps_digest_after_topic_recanonicalization():
     message_mapping = store.mappings[("message", "601")]
     original_topic_uuid = message_mapping["metadata"]["topic_uuid"]
     accepted_message = next(
-        record
-        for record in accepted
-        if record["operation"]["kind"] == "message.create"
+        record for record in accepted if record["operation"]["kind"] == "message.create"
     )
     accepted_payload = accepted_message["operation"]["payload"]
     store.accepted_contexts[(ACCOUNT_UUID, "queue", 17)] = {
@@ -1728,11 +1736,9 @@ def test_live_message_replay_rejects_partial_accepted_sequence():
     }
     event["message"]["flags"] = ["read"]
     accepted = converter.event_records(store, ACCOUNT_UUID, "queue", event)
-    assert accepted[-1]["operation"]["kind"] == "read_state.set"
+    assert accepted[-1]["operation"]["kind"] == "message.create"
     accepted_message = next(
-        record
-        for record in accepted
-        if record["operation"]["kind"] == "message.create"
+        record for record in accepted if record["operation"]["kind"] == "message.create"
     )
     accepted_payload = accepted_message["operation"]["payload"]
     store.accepted_contexts[(ACCOUNT_UUID, "queue", 17)] = {
@@ -1789,24 +1795,27 @@ def test_live_message_replay_accepts_legacy_unscoped_operation_ids():
         )
         record["operation_sha256"] = canonical.operation_digest(record)
 
-    assert converter._accepted_live_replay_records(
-        ACCOUNT_UUID,
-        event,
-        {
-            "project_uuid": PROJECT_UUID,
-            "accepted_records": legacy,
-            "accepted_records_complete": True,
-        },
-    ) == legacy
+    assert (
+        converter._accepted_live_replay_records(
+            ACCOUNT_UUID,
+            event,
+            {
+                "project_uuid": PROJECT_UUID,
+                "accepted_records": legacy,
+                "accepted_records_complete": True,
+            },
+        )
+        == legacy
+    )
 
 
 def test_different_live_event_does_not_recreate_committed_provider_message():
     store = FakeStore()
     event = {"id": 17, "type": "message", "message": _stream_message(601)}
     converter.event_records(store, ACCOUNT_UUID, "queue", event)
-    store.mappings[("message", "601")]["metadata"][
-        "workspace_delivery_state"
-    ] = "committed"
+    store.mappings[("message", "601")]["metadata"]["workspace_delivery_state"] = (
+        "committed"
+    )
 
     repeated_event = {**event, "id": 18}
     records = converter.event_records(

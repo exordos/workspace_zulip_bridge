@@ -60,7 +60,11 @@ class ZulipClient(typing.Protocol):
         self, request: dict[str, object] | None = None
     ) -> dict[str, object]: ...
 
-    def get_users(self) -> dict[str, object]: ...
+    def get_users(
+        self, request: dict[str, object] | None = None
+    ) -> dict[str, object]: ...
+
+    def get_user_by_id(self, user_id: int, **request: object) -> dict[str, object]: ...
 
     def get_events(self, **kwargs: object) -> dict[str, object]: ...
 
@@ -459,9 +463,7 @@ class OfficialZulipAdapter:
             reverse=True,
         )
 
-    def message_by_id(
-        self, provider_message_id: int
-    ) -> dict[str, object] | None:
+    def message_by_id(self, provider_message_id: int) -> dict[str, object] | None:
         try:
             result = _successful(
                 self.client.get_messages(
@@ -470,9 +472,7 @@ class OfficialZulipAdapter:
                         "num_before": 0,
                         "num_after": 0,
                         "apply_markdown": False,
-                        "narrow": [
-                            {"operator": "id", "operand": provider_message_id}
-                        ],
+                        "narrow": [{"operator": "id", "operand": provider_message_id}],
                     }
                 )
             )
@@ -567,31 +567,95 @@ class OfficialZulipAdapter:
             # this official client forwards free-form kwargs without JSON-
             # encoding string values, while the endpoint parses this field as
             # JSON.
-            register_request["idle_queue_timeout"] = (
-                PROVIDER_QUEUE_IDLE_TIMEOUT_SECONDS
-            )
+            register_request["idle_queue_timeout"] = PROVIDER_QUEUE_IDLE_TIMEOUT_SECONDS
         try:
             result = _successful(self.client.register(**register_request))
             subscriptions = _successful(
                 self.client.get_subscriptions({"include_subscribers": True})
             ).get("subscriptions")
+            members = _successful(
+                self.client.get_users({"include_deactivated": True})
+            ).get("members")
         except PROVIDER_NETWORK_ERRORS as exc:
             raise ZulipOperationError("provider_unavailable", True) from exc
-        if not isinstance(subscriptions, list) or not all(
-            isinstance(subscription, dict)
-            and isinstance(subscription.get("stream_id"), int)
-            and isinstance(subscription.get("name"), str)
-            and isinstance(subscription.get("subscribers"), list)
-            and all(
-                isinstance(user_id, int)
-                for user_id in typing.cast(
-                    list[object], subscription.get("subscribers")
+        if (
+            not isinstance(subscriptions, list)
+            or not all(
+                isinstance(subscription, dict)
+                and isinstance(subscription.get("stream_id"), int)
+                and isinstance(subscription.get("name"), str)
+                and isinstance(subscription.get("subscribers"), list)
+                and all(
+                    isinstance(user_id, int)
+                    for user_id in typing.cast(
+                        list[object], subscription.get("subscribers")
+                    )
                 )
+                for subscription in subscriptions
             )
-            for subscription in subscriptions
+            or not isinstance(members, list)
+            or not all(
+                isinstance(member, dict)
+                and isinstance(member.get("user_id"), int)
+                and isinstance(member.get("full_name"), str)
+                for member in members
+            )
         ):
             raise ZulipOperationError("invalid_record", False)
+        realm_users = {
+            int(member["user_id"]): member
+            for member in typing.cast(list[dict[str, object]], members)
+        }
+        registered_users = result.get("realm_users", [])
+        if not isinstance(registered_users, list) or not all(
+            isinstance(member, dict)
+            and isinstance(member.get("user_id"), int)
+            and isinstance(member.get("full_name"), str)
+            for member in registered_users
+        ):
+            raise ZulipOperationError("invalid_record", False)
+        realm_users.update(
+            {
+                int(member["user_id"]): member
+                for member in typing.cast(list[dict[str, object]], registered_users)
+            }
+        )
+        referenced_user_ids = {
+            int(user_id)
+            for subscription in subscriptions
+            for user_id in typing.cast(list[int], subscription["subscribers"])
+        }
+        provider_user_id = result.get("user_id")
+        if isinstance(provider_user_id, int):
+            referenced_user_ids.add(provider_user_id)
+        for conversation in typing.cast(
+            list[object], result.get("recent_private_conversations", [])
+        ):
+            if not isinstance(conversation, dict):
+                continue
+            referenced_user_ids.update(
+                user_id
+                for user_id in typing.cast(
+                    list[object], conversation.get("user_ids", [])
+                )
+                if isinstance(user_id, int)
+            )
+        try:
+            for user_id in sorted(referenced_user_ids - set(realm_users)):
+                user = _successful(self.client.get_user_by_id(user_id)).get("user")
+                if (
+                    not isinstance(user, dict)
+                    or user.get("user_id") != user_id
+                    or not isinstance(user.get("full_name"), str)
+                ):
+                    raise ZulipOperationError("invalid_record", False)
+                realm_users[user_id] = user
+        except PROVIDER_NETWORK_ERRORS as exc:
+            raise ZulipOperationError("provider_unavailable", True) from exc
         result["subscriptions"] = subscriptions
+        result["realm_users"] = [
+            realm_users[user_id] for user_id in sorted(realm_users)
+        ]
         if result.get("user_id") is not None:
             self._user_id = int(result["user_id"])
         return (
@@ -606,7 +670,9 @@ class OfficialZulipAdapter:
             subscriptions = _successful(
                 self.client.get_subscriptions({"include_subscribers": True})
             ).get("subscriptions")
-            members = _successful(self.client.get_users()).get("members")
+            members = _successful(
+                self.client.get_users({"include_deactivated": True})
+            ).get("members")
             profile = _successful(self.client.get_profile())
         except PROVIDER_NETWORK_ERRORS as exc:
             raise ZulipOperationError("provider_unavailable", True) from exc
@@ -614,8 +680,7 @@ class OfficialZulipAdapter:
             not isinstance(subscriptions, list)
             or not isinstance(members, list)
             or not all(
-                isinstance(member, dict)
-                and isinstance(member.get("user_id"), int)
+                isinstance(member, dict) and isinstance(member.get("user_id"), int)
                 for member in members
             )
             or not isinstance(profile.get("user_id"), int)
@@ -755,9 +820,7 @@ class OfficialZulipAdapter:
             if quote_match is None:
                 return None
             message_uuid = quote_match.group("uuid")
-            selected_text = self._workspace_quote_text(
-                quote_match.group("query")
-            )
+            selected_text = self._workspace_quote_text(quote_match.group("query"))
             quote_message_uuids.add(message_uuid.casefold())
             return self._reply_quote(message_uuid, selected_text).rstrip()
 

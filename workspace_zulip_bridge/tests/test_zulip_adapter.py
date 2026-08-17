@@ -43,6 +43,8 @@ class FakeClient:
         self.uploads = []
         self.registration_request = None
         self.subscriptions_request = None
+        self.users_request = None
+        self.user_requests = []
         self.members = [
             {
                 "user_id": 1,
@@ -108,8 +110,19 @@ class FakeClient:
     def get_profile(self):
         return {"result": "success", "user_id": 1}
 
-    def get_users(self):
+    def get_users(self, request=None):
+        self.users_request = request
         return {"result": "success", "members": self.members}
+
+    def get_user_by_id(self, user_id, **request):
+        self.user_requests.append((user_id, request))
+        member = next(
+            (member for member in self.members if member["user_id"] == user_id),
+            None,
+        )
+        if member is None:
+            return {"result": "error", "code": "BAD_REQUEST"}
+        return {"result": "success", "user": member}
 
     def get_messages(self, request):
         self.last_get_messages = request
@@ -321,6 +334,7 @@ def test_selected_channel_catalog_reads_authoritative_subscribers_and_users():
     catalog = adapter.channel_catalog("channel:42")
 
     assert client.subscriptions_request == {"include_subscribers": True}
+    assert client.users_request == {"include_deactivated": True}
     assert catalog == {
         "subscriptions": [
             {
@@ -571,7 +585,10 @@ def test_canonical_quote_inside_fenced_code_remains_literal():
 
     correlation = adapter.prepare(operation, "operation-1")
 
-    assert correlation.provider_rendered_content == operation["payload"]["payload"]["content"]
+    assert (
+        correlation.provider_rendered_content
+        == operation["payload"]["payload"]["content"]
+    )
     assert not hasattr(client, "last_get_messages")
 
 
@@ -610,8 +627,9 @@ def test_workspace_links_inside_code_remain_literal():
 
     correlation = adapter.prepare(operation, "operation-1")
 
-    assert correlation.provider_rendered_content == (
-        operation["payload"]["payload"]["content"]
+    assert (
+        correlation.provider_rendered_content
+        == (operation["payload"]["payload"]["content"])
     )
 
 
@@ -637,8 +655,7 @@ def test_workspace_reference_link_uses_zulip_url_and_drops_definition():
     client = FakeClient()
     operation = _operation()
     operation["payload"]["payload"]["content"] = (
-        "[docs][reference]\n\n"
-        "[reference]: urn:url:https://example.com/reference"
+        "[docs][reference]\n\n[reference]: urn:url:https://example.com/reference"
     )
     adapter = _adapter(client)
 
@@ -691,8 +708,7 @@ def test_nested_workspace_image_and_link_destinations_are_both_converted():
     correlation = adapter.prepare(operation, "operation-1")
 
     assert correlation.provider_rendered_content == (
-        "[![diagram](https://example.com/image.png)]"
-        "(https://example.com/page)"
+        "[![diagram](https://example.com/image.png)](https://example.com/page)"
     )
     assert "urn:" not in correlation.provider_rendered_content
 
@@ -950,9 +966,7 @@ def test_reaction_create_update_and_delete_use_official_client_semantics():
     }
 
     assert adapter.apply(create) == ("99:1:thumbs_up", None)
-    assert client.added_reactions == [
-        {"message_id": 99, "emoji_name": "thumbs_up"}
-    ]
+    assert client.added_reactions == [{"message_id": 99, "emoji_name": "thumbs_up"}]
 
     update = {
         "kind": "reaction.update",
@@ -1471,6 +1485,7 @@ def test_registration_requests_and_retains_catalog_snapshot_fields():
         }
     ]
     assert client.subscriptions_request == {"include_subscribers": True}
+    assert client.users_request == {"include_deactivated": True}
     assert client.registration_request["fetch_event_types"] == [
         "message",
         "subscription",
@@ -1487,6 +1502,63 @@ def test_registration_requests_and_retains_catalog_snapshot_fields():
         zulip_adapter.PROVIDER_QUEUE_IDLE_TIMEOUT_SECONDS
     )
     assert adapter.take_registration_snapshot() is None
+
+
+def test_registration_hydrates_referenced_user_missing_from_bulk_directory():
+    client = FakeClient()
+    client.members.append(
+        {
+            "user_id": 3,
+            "full_name": "Historical User",
+            "email": "historical@example.invalid",
+        }
+    )
+    original_get_users = client.get_users
+
+    def get_users(request=None):
+        result = original_get_users(request)
+        return {**result, "members": result["members"][:2]}
+
+    client.get_users = get_users
+    original_get_subscriptions = client.get_subscriptions
+
+    def get_subscriptions(request=None):
+        result = original_get_subscriptions(request)
+        result["subscriptions"][0]["subscribers"].append(3)
+        return result
+
+    client.get_subscriptions = get_subscriptions
+    adapter = zulip_adapter.OfficialZulipAdapter(client=client)
+
+    assert adapter.ensure_queue() == ("queue-1", 7)
+    snapshot = adapter.take_registration_snapshot()
+
+    assert snapshot is not None
+    assert [user["user_id"] for user in snapshot["realm_users"]] == [1, 2, 3]
+    assert client.user_requests == [(3, {})]
+
+
+def test_registration_retries_failed_referenced_user_hydration():
+    client = FakeClient()
+    original_get_subscriptions = client.get_subscriptions
+
+    def get_subscriptions(request=None):
+        result = original_get_subscriptions(request)
+        result["subscriptions"][0]["subscribers"].append(3)
+        return result
+
+    def get_user_by_id(user_id, **request):
+        raise requests.Timeout("provider unavailable")
+
+    client.get_subscriptions = get_subscriptions
+    client.get_user_by_id = get_user_by_id
+    adapter = zulip_adapter.OfficialZulipAdapter(client=client)
+
+    with pytest.raises(zulip_adapter.ZulipOperationError) as error:
+        adapter.ensure_queue()
+
+    assert error.value.code == "provider_unavailable"
+    assert error.value.retryable
 
 
 def test_legacy_registration_omits_unsupported_idle_queue_timeout():

@@ -224,9 +224,7 @@ def _reconcile_assignment_projection(
     provider_chat_key: str,
 ) -> bool:
     reconcile = getattr(store, "reconcile_assignment_projection", None)
-    return bool(
-        callable(reconcile) and reconcile(account_uuid, provider_chat_key)
-    )
+    return bool(callable(reconcile) and reconcile(account_uuid, provider_chat_key))
 
 
 def operation_uuid_for(
@@ -250,9 +248,7 @@ def _accepted_live_replay_records(
         return None
     if accepted_context.get("accepted_records_complete") is not True:
         raise ValueError("provider_event_replay_incomplete")
-    provider_message_id = str(
-        typing.cast(dict[str, object], event["message"])["id"]
-    )
+    provider_message_id = str(typing.cast(dict[str, object], event["message"])["id"])
     records_by_uuid: dict[str, dict[str, object]] = {}
     for record in accepted_records:
         if not isinstance(record, dict):
@@ -352,9 +348,7 @@ def convert_markdown(
             )
             if len(linked_marker) < WORKSPACE_MARKDOWN_MAX_LENGTH:
                 marker = linked_marker
-        converted = (
-            converted[: WORKSPACE_MARKDOWN_MAX_LENGTH - len(marker)] + marker
-        )
+        converted = converted[: WORKSPACE_MARKDOWN_MAX_LENGTH - len(marker)] + marker
         lossy = True
     return converted, lossy
 
@@ -603,9 +597,7 @@ def _canonicalize_semantic_quotes(
             else None
         )
         author_metadata = author.get("metadata") if author is not None else None
-        author_metadata = (
-            author_metadata if isinstance(author_metadata, dict) else {}
-        )
+        author_metadata = author_metadata if isinstance(author_metadata, dict) else {}
         display_name = str(author_metadata.get("display_name", "Quoted message"))
         label = display_name.replace("\\", "\\\\").replace("]", "\\]")
         return f"[{label}](urn:quote:{message['workspace_uuid']})"
@@ -660,9 +652,7 @@ def _convert_zulip_links(
             cursor = match.end()
 
             if kind == "mention":
-                provider_user_id = (
-                    match.group("user_id") or match.group("user_id_only")
-                )
+                provider_user_id = match.group("user_id") or match.group("user_id_only")
                 name = (
                     match.group("name_with_id")
                     or match.group("name_only")
@@ -681,9 +671,7 @@ def _convert_zulip_links(
                     converted.append(f"[{name}](urn:user:{user_uuid})")
                 continue
             if kind == "native":
-                replacement, replacement_lossy = _native_zulip_link(
-                    match, resolver
-                )
+                replacement, replacement_lossy = _native_zulip_link(match, resolver)
                 lossy = lossy or replacement_lossy
                 converted.append(replacement)
                 continue
@@ -702,9 +690,7 @@ def _convert_zulip_links(
                 workspace_target = _workspace_link_target(
                     target, provider_site, resolver
                 )
-                converted.append(
-                    f"[{raw_url}]({workspace_target}){suffix}"
-                )
+                converted.append(f"[{raw_url}]({workspace_target}){suffix}")
                 continue
             raise AssertionError(f"unknown text token kind: {kind}")
         return "".join(converted)
@@ -715,19 +701,13 @@ def _convert_zulip_links(
             if file_resolver is None:
                 lossy = True
                 return link.with_destination(original_url)
-            return link.with_destination(
-                file_resolver(link.destination, link.label)
-            )
+            return link.with_destination(file_resolver(link.destination, link.label))
         target = _workspace_link_target(
             link.destination,
             provider_site,
             resolver,
         )
-        return (
-            link.raw
-            if target == link.destination
-            else link.with_destination(target)
-        )
+        return link.raw if target == link.destination else link.with_destination(target)
 
     return (
         markdown_conversion.transform_markdown(
@@ -1055,9 +1035,7 @@ def _message_context(
         if chat_type == "channel"
         else f"{chat_key}:default"
     )
-    stream_metadata = typing.cast(
-        dict[str, object], stream_mapping.get("metadata", {})
-    )
+    stream_metadata = typing.cast(dict[str, object], stream_mapping.get("metadata", {}))
     topic_mapping = store.provider_mapping(account_uuid, "topic", topic_provider_id)
     empty_channel_topic = chat_type == "channel" and is_empty_channel_topic(subject)
     default_topic_uuid = stream_metadata.get("default_topic_uuid")
@@ -1072,9 +1050,7 @@ def _message_context(
         _reconcile_assignment_projection(store, account_uuid, chat_key)
     ):
         stream_mapping = store.provider_mapping(account_uuid, "stream", chat_key)
-        topic_mapping = store.provider_mapping(
-            account_uuid, "topic", topic_provider_id
-        )
+        topic_mapping = store.provider_mapping(account_uuid, "topic", topic_provider_id)
         if stream_mapping is not None:
             stream_uuid = str(stream_mapping["workspace_uuid"])
             stream_metadata = typing.cast(
@@ -1120,18 +1096,14 @@ def message_event_records(
     )
     event_chat_type, event_chat_key = provider_chat_reference(message)
     stored_provider_event_id = existing_message_metadata.get("provider_event_id")
-    accepted_context_lookup = getattr(
-        store, "accepted_provider_message_context", None
-    )
+    accepted_context_lookup = getattr(store, "accepted_provider_message_context", None)
     accepted_context = (
         accepted_context_lookup(account_uuid, queue_id, int(event["id"]))
         if callable(accepted_context_lookup)
         else None
     )
     replay_context = (
-        accepted_context
-        if accepted_context is not None
-        else existing_message_metadata
+        accepted_context if accepted_context is not None else existing_message_metadata
     )
     same_live_event_replay = (
         delivery_class == "live"
@@ -1331,35 +1303,55 @@ def message_event_records(
         # topic mappings, so rendering them again after recanonicalization can
         # otherwise change the digest of the same deterministic operation UUID.
         message_operation = copy.deepcopy(accepted_message_operation)
-    # Control-plane assignments materialize the stream projection. Provider
-    # messages still need a topic upsert because the backend-owned topic UUID
-    # mapping can precede materialization of that topic in Messenger storage.
-    operations = [
-        *identity_operations,
-        {
-            "kind": "topic.upsert",
-            "entity_uuid": topic_uuid,
-            "actor_uuid": owner_uuid,
-            "occurred_at": occurred_at,
-            "provider": _provider(chat_key, topic_provider_id),
-            "payload": {
-                "stream_uuid": stream_uuid,
-                "name": (
-                    channel_subject
-                    if chat_type == "channel"
-                    else ZULIP_DIRECT_TOPIC_NAME
-                ),
-            },
-            "extensions": {"provider_badge": "zulip"},
-        },
-    ]
-    if (
+    # Control-plane assignments materialize the stream projection. The first
+    # provider message still confirms that the backend-owned topic exists, but
+    # repeating the same durable upsert for every later message doubles live
+    # fan-out work without changing state.
+    topic_mapping = store.provider_mapping(account_uuid, "topic", topic_provider_id)
+    topic_metadata = (
+        typing.cast(dict[str, object], topic_mapping.get("metadata", {}))
+        if topic_mapping is not None
+        else {}
+    )
+    topic_upsert_required = (
+        same_live_event_replay
+        or topic_metadata.get("workspace_delivery_state") != "committed"
+    )
+    operations = [*identity_operations]
+    if topic_upsert_required:
+        operations.append(
+            {
+                "kind": "topic.upsert",
+                "entity_uuid": topic_uuid,
+                "actor_uuid": owner_uuid,
+                "occurred_at": occurred_at,
+                "provider": _provider(chat_key, topic_provider_id),
+                "payload": {
+                    "stream_uuid": stream_uuid,
+                    "name": (
+                        channel_subject
+                        if chat_type == "channel"
+                        else ZULIP_DIRECT_TOPIC_NAME
+                    ),
+                },
+                "extensions": {"provider_badge": "zulip"},
+            }
+        )
+    message_operation_included = (
         not workspace_delivery_committed
         or delivery_class == "backfill"
         or same_live_event_replay
-    ):
+    )
+    if message_operation_included:
         operations.append(message_operation)
-    if isinstance(flags, list) and delivery_class != "backfill":
+    if (
+        isinstance(flags, list)
+        and delivery_class != "backfill"
+        and not message_operation_included
+    ):
+        # The message snapshot already carries the owner's exact read flag.
+        # Emit a separate read operation only when a previously committed
+        # message projection makes this conversion skip the message upsert.
         operations.append(
             {
                 "kind": "read_state.set",
@@ -1397,7 +1389,11 @@ def message_event_records(
         "topic",
         topic_provider_id,
         topic_uuid,
-        {"stream_uuid": stream_uuid, "chat_key": chat_key},
+        {
+            **topic_metadata,
+            "stream_uuid": stream_uuid,
+            "chat_key": chat_key,
+        },
     )
     store.remember_provider_mapping(
         account_uuid,
@@ -1589,9 +1585,7 @@ def _mapped_event_records(
     ):
         old_topic_name = channel_topic_name(str(event["orig_subject"]))
         new_topic_name = channel_topic_name(str(event["subject"]))
-        old_provider_id = channel_topic_provider_id(
-            event["stream_id"], old_topic_name
-        )
+        old_provider_id = channel_topic_provider_id(event["stream_id"], old_topic_name)
         old_topic = store.provider_mapping(account_uuid, "topic", old_provider_id)
         if old_topic is not None:
             topic_metadata = typing.cast(dict[str, object], old_topic["metadata"])
@@ -1657,12 +1651,8 @@ def _mapped_event_records(
                 continue
             metadata = typing.cast(dict[str, object], mapping["metadata"])
             chat_key = str(metadata["chat_key"])
-            assignment = store.assignment_for_provider_chat(
-                account_uuid, chat_key
-            )
-            stream_mapping = store.provider_mapping(
-                account_uuid, "stream", chat_key
-            )
+            assignment = store.assignment_for_provider_chat(account_uuid, chat_key)
+            stream_mapping = store.provider_mapping(account_uuid, "stream", chat_key)
             if stream_mapping is None and _reconcile_assignment_projection(
                 store, account_uuid, chat_key
             ):
@@ -1672,10 +1662,8 @@ def _mapped_event_records(
             if (
                 assignment is None
                 or stream_mapping is None
-                or str(metadata["project_uuid"])
-                != str(assignment["project_id"])
-                or str(metadata["stream_uuid"])
-                != str(stream_mapping["workspace_uuid"])
+                or str(metadata["project_uuid"]) != str(assignment["project_id"])
+                or str(metadata["stream_uuid"]) != str(stream_mapping["workspace_uuid"])
             ):
                 # Recanonicalization can leave historical message mappings
                 # pointing at a retired stream. The message snapshot remains

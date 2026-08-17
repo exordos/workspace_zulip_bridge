@@ -28,7 +28,10 @@ def _same_provider_identity_replay(
     normalized = []
     for record in (accepted, current):
         operation = record.get("operation")
-        if not isinstance(operation, dict) or operation.get("kind") != "identity.upsert":
+        if (
+            not isinstance(operation, dict)
+            or operation.get("kind") != "identity.upsert"
+        ):
             return False
         entity_uuid = operation.get("entity_uuid")
         account_uuid = record.get("account_uuid")
@@ -73,9 +76,7 @@ def _merge_catalog_participants(
             participants[provider_user_id] = dict(value)
             continue
         merged = dict(prior)
-        merged["is_owner"] = bool(prior.get("is_owner")) or bool(
-            value.get("is_owner")
-        )
+        merged["is_owner"] = bool(prior.get("is_owner")) or bool(value.get("is_owner"))
         for name in ("email", "avatar_urn"):
             if not merged.get(name) and value.get(name):
                 merged[name] = value[name]
@@ -263,9 +264,10 @@ _ENGINE_POOL_CONFIG = {"min_size": 1, "max_size": 20}
 
 
 def _engine_for(connection_url: str) -> engines.AbstractEngine:
-    engine_name = "workspace_zulip_bridge_" + hashlib.sha256(
-        connection_url.encode("utf-8")
-    ).hexdigest()
+    engine_name = (
+        "workspace_zulip_bridge_"
+        + hashlib.sha256(connection_url.encode("utf-8")).hexdigest()
+    )
     with _ENGINE_LOCK:
         try:
             return engines.engine_factory.get_engine(engine_name)
@@ -281,10 +283,25 @@ def _engine_for(connection_url: str) -> engines.AbstractEngine:
 class RestAlchemyStore:
     def __init__(self, connection_url: str):
         self.connection_url = connection_url
+        self._transaction_state = threading.local()
 
     @contextlib.contextmanager
     def session(self) -> typing.Iterator[sessions.PgSQLSession]:
+        current = getattr(self._transaction_state, "session", None)
+        if current is not None:
+            yield current
+            return
         with _engine_for(self.connection_url).session_manager() as session:
+            self._transaction_state.session = session
+            try:
+                yield session
+            finally:
+                del self._transaction_state.session
+
+    @contextlib.contextmanager
+    def transaction(self) -> typing.Iterator[sessions.PgSQLSession]:
+        """Reuse one database transaction for nested store operations."""
+        with self.session() as session:
             yield session
 
     def control_cursor(self) -> str:
@@ -476,7 +493,14 @@ class RestAlchemyStore:
                     )
                 if resource_type == "external_chat_assignment":
                     if operation == "upsert":
-                        if previous is not None and previous["body"] is not None:
+                        if (
+                            previous is not None
+                            and previous["body"] is not None
+                            and not self._assignment_projection_is_additive(
+                                typing.cast(dict[str, object], previous["body"]),
+                                typing.cast(dict[str, object], body),
+                            )
+                        ):
                             self._tombstone_workspace_projection(
                                 session,
                                 typing.cast(dict[str, object], previous["body"]),
@@ -487,9 +511,9 @@ class RestAlchemyStore:
                         self._wake_assignment_pending_events(
                             session,
                             str(
-                                typing.cast(
-                                    dict[str, object], body
-                                )["external_account_uuid"]
+                                typing.cast(dict[str, object], body)[
+                                    "external_account_uuid"
+                                ]
                             ),
                         )
                     elif previous is not None and previous["body"] is not None:
@@ -589,9 +613,7 @@ class RestAlchemyStore:
         )
         if entity_kind == "topic":
             authoritative_workspace_uuids = list(
-                dict.fromkeys(
-                    [*(authoritative_workspace_uuids or []), workspace_uuid]
-                )
+                dict.fromkeys([*(authoritative_workspace_uuids or []), workspace_uuid])
             )
             # An alias only represents a displaced Workspace UUID. Once that
             # UUID appears in the current projection it is authoritative again,
@@ -773,6 +795,61 @@ class RestAlchemyStore:
               AND processing_reason = 'provider_chat_assignment_pending'
             """,
             (account_uuid,),
+        )
+
+    @staticmethod
+    def _assignment_projection_keys(
+        assignment: dict[str, object],
+    ) -> tuple[tuple[str, str] | None, set[tuple[str, str]], set[tuple[str, str]]]:
+        projection = assignment.get("workspace_projection")
+        provider_chat = assignment.get("provider_chat")
+        if not isinstance(projection, dict) or not isinstance(provider_chat, dict):
+            return None, set(), set()
+        stream = projection.get("stream")
+        stream_key = (
+            None
+            if not isinstance(stream, dict)
+            or stream.get("uuid") is None
+            or provider_chat.get("provider_chat_key") is None
+            else (
+                str(stream["uuid"]),
+                str(provider_chat["provider_chat_key"]),
+            )
+        )
+        participant_keys = {
+            (str(participant["identity_uuid"]), str(participant["provider_user_id"]))
+            for participant in projection.get("participants", [])
+            if isinstance(participant, dict)
+            and participant.get("identity_uuid") is not None
+            and participant.get("provider_user_id") is not None
+        }
+        topic_keys = {
+            (str(topic["topic_uuid"]), str(topic["provider_topic_id"]))
+            for topic in projection.get("topics", [])
+            if isinstance(topic, dict)
+            and topic.get("topic_uuid") is not None
+            and topic.get("provider_topic_id") is not None
+        }
+        return stream_key, participant_keys, topic_keys
+
+    @classmethod
+    def _assignment_projection_is_additive(
+        cls,
+        previous: dict[str, object],
+        current: dict[str, object],
+    ) -> bool:
+        """Return true when materialization cannot leave stale mappings behind."""
+        previous_stream, previous_participants, previous_topics = (
+            cls._assignment_projection_keys(previous)
+        )
+        current_stream, current_participants, current_topics = (
+            cls._assignment_projection_keys(current)
+        )
+        return (
+            previous_stream is not None
+            and previous_stream == current_stream
+            and previous_participants <= current_participants
+            and previous_topics <= current_topics
         )
 
     @staticmethod
@@ -1006,10 +1083,7 @@ class RestAlchemyStore:
                 """,
                 (account_uuid,),
             ).fetchall()
-            return [
-                typing.cast(dict[str, object], row["body"])
-                for row in rows
-            ]
+            return [typing.cast(dict[str, object], row["body"]) for row in rows]
 
     def provider_mapping(
         self, account_uuid: str, entity_kind: str, provider_id: str
@@ -1345,14 +1419,47 @@ class RestAlchemyStore:
             return list(
                 session.execute(
                     """
+                    WITH account_heads AS (
+                        SELECT account_uuid, queue_id, event_id, body,
+                               created_at, available_at,
+                               row_number() OVER (
+                                   PARTITION BY account_uuid
+                                   ORDER BY created_at, event_id, queue_id
+                               ) AS position
+                        FROM zulip_provider_events
+                        WHERE processing_state = 'pending'
+                    )
                     SELECT account_uuid, queue_id, event_id, body
-                    FROM zulip_provider_events
-                    WHERE processing_state = 'pending' AND available_at <= now()
-                    ORDER BY created_at, event_id LIMIT %s
+                    FROM account_heads
+                    WHERE position = 1 AND available_at <= now()
+                    ORDER BY available_at, created_at, event_id
+                    LIMIT %s
                     """,
                     (limit,),
                 ).fetchall()
             )
+
+    def has_pending_provider_events(self) -> bool:
+        """Return whether live Zulip journal work is ready for conversion."""
+        with self.session() as session:
+            row = session.execute(
+                """
+                WITH account_heads AS (
+                    SELECT account_uuid, available_at,
+                           row_number() OVER (
+                               PARTITION BY account_uuid
+                               ORDER BY created_at, event_id, queue_id
+                           ) AS position
+                    FROM zulip_provider_events
+                    WHERE processing_state = 'pending'
+                )
+                SELECT EXISTS (
+                    SELECT 1 FROM account_heads
+                    WHERE position = 1 AND available_at <= now()
+                ) AS pending
+                """
+            ).fetchone()
+            return bool(row and row["pending"])
 
     def retry_provider_event(
         self,
@@ -1366,21 +1473,49 @@ class RestAlchemyStore:
                 """
                 UPDATE zulip_provider_events
                 SET retry_count = retry_count + 1,
-                    available_at = now() + (
-                        LEAST(300, power(2, LEAST(retry_count, 8)))
-                        * interval '1 second'
-                    ),
+                    available_at = now() + CASE
+                        WHEN %s IN (
+                            'provider_chat_assignment_pending',
+                            'provider_chat_participants_pending',
+                            'provider_event_replay_incomplete'
+                        ) THEN interval '250 milliseconds'
+                        ELSE LEAST(300, power(2, LEAST(retry_count, 8)))
+                             * interval '1 second'
+                    END,
                     processing_reason = %s
                 WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
                   AND processing_state = 'pending'
                 """,
                 (
                     reason[:128] or "provider_file_unavailable",
+                    reason[:128] or "provider_file_unavailable",
                     account_uuid,
                     queue_id,
                     event_id,
                 ),
             )
+
+    def release_dependency_gated_provider_events(self) -> int:
+        """Wake live events whose control-plane dependency may now be ready."""
+        with self.session() as session:
+            row = session.execute(
+                """
+                WITH released AS (
+                    UPDATE zulip_provider_events
+                    SET available_at = now()
+                    WHERE processing_state = 'pending'
+                      AND processing_reason IN (
+                          'provider_chat_assignment_pending',
+                          'provider_chat_participants_pending',
+                          'provider_event_replay_incomplete'
+                      )
+                      AND available_at > now()
+                    RETURNING 1
+                )
+                SELECT count(*) AS count FROM released
+                """
+            ).fetchone()
+            return int(row["count"])
 
     def mark_provider_event_processed(
         self,
@@ -1736,8 +1871,8 @@ class RestAlchemyStore:
                 raise ValueError("Unknown external account")
             account_generation = int(account["generation"])
             existing = session.execute(
-                "SELECT operation_sha256 FROM operation_idempotency "
-                "WHERE operation_uuid = %s",
+                "SELECT operation_sha256, terminal_outcome "
+                "FROM operation_idempotency WHERE operation_uuid = %s",
                 (operation_uuid,),
             ).fetchone()
             if (
@@ -1764,6 +1899,8 @@ class RestAlchemyStore:
                 ):
                     return False
                 raise ValueError("Operation UUID reused with a different digest")
+            if existing is not None and existing["terminal_outcome"] is not None:
+                return False
             session.execute(
                 """
                 INSERT INTO operation_idempotency (operation_uuid, operation_sha256)
@@ -1897,7 +2034,9 @@ class RestAlchemyStore:
                 SET priority = read_delivery.priority
                 FROM workspace_delivery_outbox AS read_delivery
                 WHERE message_delivery.sent_at IS NULL
+                  AND %s = 0
                   AND read_delivery.sent_at IS NULL
+                  AND read_delivery.priority BETWEEN %s AND %s
                   AND message_delivery.priority > read_delivery.priority
                   AND message_delivery.account_uuid =
                       read_delivery.account_uuid
@@ -1919,7 +2058,8 @@ class RestAlchemyStore:
                               ->'message_uuids'
                       )
                   )
-                """
+                """,
+                (minimum_priority, minimum_priority, maximum_priority),
             )
             session.execute(
                 """
@@ -1927,7 +2067,9 @@ class RestAlchemyStore:
                 SET priority = reaction_delivery.priority
                 FROM workspace_delivery_outbox AS reaction_delivery
                 WHERE message_delivery.sent_at IS NULL
+                  AND %s = 0
                   AND reaction_delivery.sent_at IS NULL
+                  AND reaction_delivery.priority BETWEEN %s AND %s
                   AND message_delivery.priority > reaction_delivery.priority
                   AND message_delivery.account_uuid =
                       reaction_delivery.account_uuid
@@ -1947,7 +2089,8 @@ class RestAlchemyStore:
                   AND message_delivery.record->'operation'->>'entity_uuid' =
                       reaction_delivery.record->'operation'->'payload'
                           ->>'message_uuid'
-                """
+                """,
+                (minimum_priority, minimum_priority, maximum_priority),
             )
             session.execute(
                 """
@@ -1955,7 +2098,9 @@ class RestAlchemyStore:
                 SET priority = message_delivery.priority
                 FROM workspace_delivery_outbox AS message_delivery
                 WHERE topic_delivery.sent_at IS NULL
+                  AND %s = 0
                   AND message_delivery.sent_at IS NULL
+                  AND message_delivery.priority BETWEEN %s AND %s
                   AND topic_delivery.priority > message_delivery.priority
                   AND topic_delivery.account_uuid =
                       message_delivery.account_uuid
@@ -1976,7 +2121,8 @@ class RestAlchemyStore:
                   AND topic_delivery.record->'operation'->>'entity_uuid' =
                       message_delivery.record->'operation'->'payload'
                           ->>'topic_uuid'
-                """
+                """,
+                (minimum_priority, minimum_priority, maximum_priority),
             )
             rows = session.execute(
                 """
@@ -2167,6 +2313,54 @@ class RestAlchemyStore:
             ).fetchall()
             return [typing.cast(dict[str, object], row["record"]) for row in rows]
 
+    def has_pending_workspace_deliveries(
+        self,
+        minimum_priority: int = 0,
+        maximum_priority: int = 2,
+    ) -> bool:
+        """Probe ready delivery work without running dependency projection SQL."""
+        if not 0 <= minimum_priority <= maximum_priority <= 2:
+            raise ValueError("Invalid workspace delivery priority range")
+        with self.session() as session:
+            row = session.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM workspace_delivery_outbox AS delivery
+                    JOIN desired_resources AS account
+                      ON account.resource_type = 'external_account'
+                     AND account.resource_uuid = delivery.account_uuid
+                     AND account.generation = delivery.account_generation
+                     AND NOT account.deleted
+                    LEFT JOIN desired_resources AS assignment
+                      ON assignment.resource_type = 'external_chat_assignment'
+                     AND assignment.resource_uuid = delivery.assignment_uuid
+                     AND assignment.generation = delivery.assignment_generation
+                     AND NOT assignment.deleted
+                     AND assignment.body->>'project_id' =
+                         delivery.assignment_project_uuid::text
+                     AND COALESCE(
+                         (assignment.body->>'selected')::boolean, true
+                     )
+                    WHERE delivery.sent_at IS NULL
+                      AND delivery.priority BETWEEN %s AND %s
+                      AND (
+                          delivery.assignment_uuid IS NULL
+                          OR assignment.resource_uuid IS NOT NULL
+                      )
+                      AND (
+                          delivery.submission_state IN ('pending', 'ambiguous')
+                          OR (
+                              delivery.submission_state = 'awaiting_result'
+                              AND delivery.next_submission_at <= now()
+                          )
+                      )
+                ) AS pending
+                """,
+                (minimum_priority, maximum_priority),
+            ).fetchone()
+            return bool(row and row["pending"])
+
     @staticmethod
     def _recover_provider_event_assignment_change(
         session: sessions.PgSQLSession,
@@ -2209,9 +2403,7 @@ class RestAlchemyStore:
                 continue
             message_create_operation_uuids.append(operation_uuid)
             provider_id = (
-                None
-                if not isinstance(provider, dict)
-                else provider.get("entity_id")
+                None if not isinstance(provider, dict) else provider.get("entity_id")
             )
             if provider_id is None:
                 continue
@@ -2426,11 +2618,9 @@ class RestAlchemyStore:
                         str(provider.get("chat_id", "")),
                     ),
                 ).fetchone()
-                same_project = (
-                    current_assignment is not None
-                    and str(current_assignment["project_uuid"])
-                    == str(row["assignment_project_uuid"])
-                )
+                same_project = current_assignment is not None and str(
+                    current_assignment["project_uuid"]
+                ) == str(row["assignment_project_uuid"])
                 if same_project:
                     session.execute(
                         """
@@ -2624,6 +2814,67 @@ class RestAlchemyStore:
                 )
             return len(rows)
 
+    def prune_terminal_delivery_state(
+        self,
+        limit: int = 10_000,
+    ) -> tuple[int, int]:
+        """Bound bulky terminal journals while retaining durable idempotency."""
+        with self.session() as session:
+            deleted_deliveries = session.execute(
+                """
+                WITH candidates AS (
+                    SELECT record_uuid
+                    FROM workspace_delivery_outbox
+                    WHERE submission_state = 'sent' AND sent_at IS NOT NULL
+                      AND sent_at < now() - CASE
+                          WHEN priority = 2 THEN interval '1 minute'
+                          ELSE interval '10 minutes'
+                      END
+                    ORDER BY sent_at
+                    LIMIT %s
+                    FOR UPDATE SKIP LOCKED
+                ), deleted AS (
+                    DELETE FROM workspace_delivery_outbox AS delivery
+                    USING candidates
+                    WHERE delivery.record_uuid = candidates.record_uuid
+                    RETURNING delivery.record_uuid
+                )
+                SELECT count(*) AS total FROM deleted
+                """,
+                (limit,),
+            ).fetchone()
+            deleted_events = session.execute(
+                """
+                WITH candidates AS (
+                    SELECT event.account_uuid, event.queue_id, event.event_id
+                    FROM zulip_provider_events AS event
+                    WHERE event.processing_state IN (
+                        'processed', 'unsupported', 'invalid', 'ignored'
+                    )
+                      AND event.created_at < now() - interval '10 minutes'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM workspace_delivery_outbox AS delivery
+                          WHERE delivery.account_uuid = event.account_uuid
+                            AND delivery.provider_queue_id = event.queue_id
+                            AND delivery.provider_event_id = event.event_id
+                      )
+                    ORDER BY event.created_at
+                    LIMIT %s
+                    FOR UPDATE SKIP LOCKED
+                ), deleted AS (
+                    DELETE FROM zulip_provider_events AS event
+                    USING candidates
+                    WHERE event.account_uuid = candidates.account_uuid
+                      AND event.queue_id = candidates.queue_id
+                      AND event.event_id = candidates.event_id
+                    RETURNING event.event_id
+                )
+                SELECT count(*) AS total FROM deleted
+                """,
+                (limit,),
+            ).fetchone()
+            return int(deleted_deliveries["total"]), int(deleted_events["total"])
+
     def mark_workspace_delivery_submitted(self, record_uuid: str) -> None:
         with self.session() as session:
             session.execute(
@@ -2779,6 +3030,31 @@ class RestAlchemyStore:
                              participant_sync.provider_chat_key
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
+                ), rotated AS (
+                    UPDATE zulip_participant_sync AS sibling
+                    SET updated_at = now()
+                    FROM candidate
+                    WHERE sibling.account_uuid = candidate.account_uuid
+                      AND sibling.provider_chat_key <>
+                          candidate.provider_chat_key
+                      AND (
+                          sibling.state = 'pending'
+                          OR (
+                              sibling.state = 'running'
+                              AND sibling.lease_until < now()
+                          )
+                          OR (
+                              sibling.state = 'reported'
+                              AND sibling.updated_at <
+                                  now() - interval '30 seconds'
+                          )
+                          OR (
+                              sibling.state = 'ready'
+                              AND sibling.updated_at <
+                                  now() - make_interval(secs => %s)
+                          )
+                      )
+                    RETURNING sibling.account_uuid
                 )
                 UPDATE zulip_participant_sync AS participant_sync
                 SET state = 'running',
@@ -2792,7 +3068,10 @@ class RestAlchemyStore:
                           participant_sync.provider_chat_key,
                           participant_sync.assignment_generation
                 """,
-                (PARTICIPANT_RECHECK_INTERVAL_SECONDS,),
+                (
+                    PARTICIPANT_RECHECK_INTERVAL_SECONDS,
+                    PARTICIPANT_RECHECK_INTERVAL_SECONDS,
+                ),
             ).fetchone()
 
     def complete_participant_sync(
@@ -3153,6 +3432,23 @@ class RestAlchemyStore:
                     )
                     ORDER BY job.updated_at
                     FOR UPDATE SKIP LOCKED LIMIT 1
+                ), rotated AS (
+                    UPDATE zulip_backfill_jobs AS sibling
+                    SET updated_at = now()
+                    FROM candidate
+                    WHERE sibling.account_uuid = candidate.account_uuid
+                      AND sibling.provider_chat_key <>
+                          candidate.provider_chat_key
+                      AND (
+                          (
+                              sibling.state = 'pending'
+                              AND sibling.available_at <= now()
+                          ) OR (
+                              sibling.state = 'running'
+                              AND sibling.lease_until < now()
+                          )
+                      )
+                    RETURNING sibling.account_uuid
                 )
                 UPDATE zulip_backfill_jobs AS job
                 SET state = 'running', lease_until = now() + interval '60 seconds',
@@ -3432,7 +3728,22 @@ class RestAlchemyStore:
                 """,
                 (error_code[:128], record_uuid),
             ).fetchone()
-            return bool(row["rejected"])
+            if bool(row["rejected"]):
+                return True
+            row = session.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM workspace_delivery_outbox
+                    WHERE record_uuid = %s
+                      AND (
+                          sent_at IS NOT NULL
+                          OR submission_state = 'rejected'
+                      )
+                ) AS terminal
+                """,
+                (record_uuid,),
+            ).fetchone()
+            return bool(row["terminal"])
 
     @staticmethod
     def _queued_operation(row: dict[str, object]) -> QueuedOperation:
@@ -3818,7 +4129,9 @@ class RestAlchemyStore:
             )
         elif kind in {"reaction.create", "reaction.update"}:
             if provider_entity_id is None:
-                raise ValueError("Committed reaction mutation has no provider identifier")
+                raise ValueError(
+                    "Committed reaction mutation has no provider identifier"
+                )
             metadata = {
                 "project_uuid": record["project_uuid"],
                 "message_uuid": payload["message_uuid"],
@@ -4556,7 +4869,9 @@ class RestAlchemyStore:
             row = session.execute(
                 """
                 SELECT operation.operation_sha256, operation.terminal_outcome,
-                       operation.result_record_uuid, delivery.record
+                       operation.result_record_uuid, operation.target_entity_id,
+                       operation.target_revision, operation.manual_retry_allowed,
+                       delivery.record
                 FROM operation_idempotency AS operation
                 JOIN workspace_delivery_outbox AS delivery
                   ON delivery.operation_uuid = operation.operation_uuid
@@ -4591,11 +4906,28 @@ class RestAlchemyStore:
                 raise ValueError("Result record binding mismatch")
             prior_result_uuid = row["result_record_uuid"]
             if row["terminal_outcome"] is not None:
-                if (
+                exact_result = (
                     row["terminal_outcome"] == outcome
                     and prior_result_uuid is not None
                     and str(prior_result_uuid) == str(result["record_uuid"])
-                ):
+                )
+                same_target = (
+                    row["terminal_outcome"] == outcome
+                    and row["target_entity_id"] == result_body.get("provider_entity_id")
+                    and row["target_revision"] == result_body.get("provider_revision")
+                    and row["manual_retry_allowed"]
+                    == (result_body.get("manual_retry_allowed") is True)
+                )
+                if exact_result or same_target:
+                    session.execute(
+                        """
+                        UPDATE workspace_delivery_outbox
+                        SET sent_at = COALESCE(sent_at, now()),
+                            submission_state = 'sent'
+                        WHERE operation_uuid = %s
+                        """,
+                        (str(result["operation_uuid"]),),
+                    )
                     return
                 raise ValueError("Stale result cannot replace terminal outcome")
             session.execute(
@@ -4631,29 +4963,32 @@ class RestAlchemyStore:
                 outcome == "committed"
                 and operation_record.get("origin") == "zulip"
                 and operation is not None
-                and operation.get("kind") == "message.create"
             ):
                 provider = typing.cast(dict[str, object], operation["provider"])
-                session.execute(
-                    """
-                    UPDATE provider_mappings
-                    SET metadata = jsonb_set(
-                            metadata,
-                            '{workspace_delivery_state}',
-                            '"committed"'::jsonb,
-                            true
+                kind = operation.get("kind")
+                if kind in {"message.create", "topic.upsert"}:
+                    entity_kind = kind.partition(".")[0]
+                    session.execute(
+                        """
+                        UPDATE provider_mappings
+                        SET metadata = jsonb_set(
+                                metadata,
+                                '{workspace_delivery_state}',
+                                '"committed"'::jsonb,
+                                true
+                            ),
+                            updated_at = now()
+                        WHERE account_uuid = %s AND entity_kind = %s
+                          AND provider_id = %s AND workspace_uuid = %s
+                          AND NOT deleted
+                        """,
+                        (
+                            str(operation_record["account_uuid"]),
+                            entity_kind,
+                            str(provider["entity_id"]),
+                            str(operation["entity_uuid"]),
                         ),
-                        updated_at = now()
-                    WHERE account_uuid = %s AND entity_kind = 'message'
-                      AND provider_id = %s AND workspace_uuid = %s
-                      AND NOT deleted
-                    """,
-                    (
-                        str(operation_record["account_uuid"]),
-                        str(provider["entity_id"]),
-                        str(operation["entity_uuid"]),
-                    ),
-                )
+                    )
 
     def enqueue_observed_report(self, report: dict[str, object]) -> bool:
         with self.session() as session:
@@ -4723,9 +5058,47 @@ class RestAlchemyStore:
             )
             rows = session.execute(
                 """
-                SELECT body FROM observed_report_outbox
-                WHERE completed_at IS NULL AND available_at <= now()
-                ORDER BY created_at LIMIT %s
+                WITH dependency_chats AS (
+                    SELECT DISTINCT
+                           account_uuid::text AS account_uuid,
+                           'channel:' || (body->'message'->>'stream_id')
+                               AS provider_chat_key
+                    FROM zulip_provider_events
+                    WHERE processing_state = 'pending'
+                      AND body->>'type' = 'message'
+                      AND body->'message'->>'stream_id' IS NOT NULL
+                ), pending AS (
+                    SELECT report.body, report.created_at, report.report_uuid,
+                           dependency.account_uuid IS NOT NULL
+                               AS live_dependency,
+                           row_number() OVER (
+                               PARTITION BY COALESCE(
+                                   report.body->'catalog'->>'external_account_uuid',
+                                   CASE
+                                       WHEN report.body->>'resource_type' =
+                                            'external_account'
+                                       THEN report.body->>'resource_uuid'
+                                   END,
+                                   report.body->>'resource_uuid'
+                               )
+                               ORDER BY
+                                   (dependency.account_uuid IS NOT NULL) DESC,
+                                   report.created_at,
+                                   report.report_uuid
+                           ) AS account_position
+                    FROM observed_report_outbox AS report
+                    LEFT JOIN dependency_chats AS dependency
+                      ON dependency.account_uuid =
+                           report.body->'catalog'->>'external_account_uuid'
+                     AND dependency.provider_chat_key =
+                           report.body->'catalog'->'source'->>'provider_chat_key'
+                    WHERE report.completed_at IS NULL
+                      AND report.available_at <= now()
+                )
+                SELECT body FROM pending
+                ORDER BY account_position, live_dependency DESC,
+                         created_at, report_uuid
+                LIMIT %s
                 """,
                 (limit,),
             ).fetchall()

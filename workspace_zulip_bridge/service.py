@@ -1,3 +1,4 @@
+import contextlib
 import dataclasses
 import datetime
 import hashlib
@@ -172,9 +173,34 @@ class BridgeService:
     MAX_QUEUE_CATCHUP_PAGES = 20
     MAX_CONTROL_SNAPSHOT_PAGES = 10_000
     MAX_CONTROL_SNAPSHOT_RESOURCES = 2_000_000
-    OBSERVED_REPORT_BATCH_SIZE = 1
+    # Keep each control request comfortably below the transport timeout. Large
+    # catalogs are still drained continuously, while a completed response can
+    # wake assignment-dependent live events after every small batch.
+    OBSERVED_REPORT_BATCH_SIZE = 20
+    # Amortize the dependency projection query over a bounded batch. History
+    # remains on independent workers and provider-sequence checks keep an
+    # overlapping live message authoritative.
+    HISTORY_DELIVERY_BATCH_SIZE = 20
+    BACKGROUND_HISTORY_WORKERS = 2
+    BACKGROUND_LIVE_WORKERS = 1
+    # The main live lane owns journal conversion and outbound provider work.
+    # Additional workers only submit already-durable Workspace deliveries, so
+    # per-account Zulip event ordering remains single-threaded.
+    # A single submitter preserves causal order for live records. Provider
+    # journal conversion remains concurrent with delivery and history still
+    # runs across independent workers.
+    BACKGROUND_LIVE_DELIVERY_WORKERS = 1
+    LIVE_DELIVERY_BATCH_SIZE = 20
+    PROVIDER_JOURNAL_QUANTUM = 20
+    # History conversion touches shared stream/topic/identity mappings. Commit
+    # each message so live events never wait behind a multi-message lock set.
+    BACKFILL_ENQUEUE_TRANSACTION_MESSAGES = 1
+    RETRYABLE_DATABASE_CONFLICT_CODES = frozenset({"40001", "40P01"})
     PROVIDER_POLL_INTERVAL_SECONDS = 2.0
+    CONTROL_STATE_RECONCILE_INTERVAL_SECONDS = 2.0
     HISTORY_QUANTUM_INTERVAL_SECONDS = 1.0
+    HISTORY_PROGRESS_DELAY_SECONDS = 2.0
+    TERMINAL_STATE_PRUNE_INTERVAL_SECONDS = 10.0
 
     def __init__(
         self,
@@ -218,7 +244,11 @@ class BridgeService:
         self.last_heartbeat = 0.0
         self.last_certificate_check = 0.0
         self.last_provider_poll = 0.0
+        self.last_control_state_reconcile = 0.0
         self.last_history_quantum = time.monotonic()
+        self.history_quantum_lock = threading.Lock()
+        self.history_delivery_lock = threading.Lock()
+        self.last_terminal_state_prune = time.monotonic()
         self.provider_poll_threads: dict[str, threading.Thread] = {}
         self.provider_poll_stops: dict[str, threading.Event] = {}
         self.provider_poll_results: queue.SimpleQueue[
@@ -424,6 +454,8 @@ class BridgeService:
     def _flush_observed_reports(self, now: float) -> int:
         if now < getattr(self, "control_retry_after", 0.0):
             return 0
+        if self._ready_live_workspace_delivery_pending():
+            return 0
         try:
             sent = self.flush_observed_reports()
         except (httpx.TransportError, control.ControlRetryableError) as exc:
@@ -434,6 +466,23 @@ class BridgeService:
             self._clear_control_retry("control")
             self._set_control_lane_health("control", True)
         return sent
+
+    def _live_workspace_delivery_pending(self) -> bool:
+        store = getattr(self, "store", None)
+        pending_provider_events = getattr(store, "has_pending_provider_events", None)
+        if callable(pending_provider_events) and pending_provider_events():
+            return True
+        return self._ready_live_workspace_delivery_pending()
+
+    def _ready_live_workspace_delivery_pending(self) -> bool:
+        store = getattr(self, "store", None)
+        ready_deliveries = getattr(store, "has_pending_workspace_deliveries", None)
+        if callable(ready_deliveries):
+            return bool(ready_deliveries(0, 0))
+        pending = getattr(store, "pending_workspace_deliveries", None)
+        if pending is None:
+            return False
+        return bool(pending(minimum_priority=0, maximum_priority=0, limit=1))
 
     def poll_provider_operations(self) -> int:
         """Lease Workspace-to-Zulip operations from the private HTTP data plane."""
@@ -536,9 +585,7 @@ class BridgeService:
                 if registration is not None:
                     account = self.store.account_resource(account_uuid)
                     if account is None:
-                        raise ValueError(
-                            "Zulip provider account is unavailable"
-                        )
+                        raise ValueError("Zulip provider account is unavailable")
                     provider_account_generation = int(account["generation"])
                     provider_realm_uuid = str(
                         uuid.UUID(str(registration["realm_uuid"]))
@@ -959,9 +1006,7 @@ class BridgeService:
         checker = getattr(self.store, "assignment_participants_ready", None)
         if checker is None:
             return True
-        return bool(
-            checker(account_uuid, chat_key, int(assignment["generation"]))
-        )
+        return bool(checker(account_uuid, chat_key, int(assignment["generation"])))
 
     def refresh_selected_participants_once(self) -> bool:
         job = self.store.claim_participant_sync()
@@ -977,9 +1022,7 @@ class BridgeService:
             or not bool(assignment.get("selected", True))
             or self.store.provider_event_cursor(account_uuid) is None
         ):
-            self.store.release_participant_sync(
-                account_uuid, chat_key, generation
-            )
+            self.store.release_participant_sync(account_uuid, chat_key, generation)
             return False
         try:
             adapter = self.provider_adapters(account_uuid)
@@ -990,9 +1033,7 @@ class BridgeService:
                 getattr(adapter, "server_url", ""),
             )
         except zulip_adapter.ZulipOperationError as exc:
-            self.store.release_participant_sync(
-                account_uuid, chat_key, generation
-            )
+            self.store.release_participant_sync(account_uuid, chat_key, generation)
             self.store.mark_health("provider", "degraded", exc.code)
             self._queue_account_report(account_uuid, "degraded", exc.code)
             return False
@@ -1263,9 +1304,7 @@ class BridgeService:
         )
 
     def flush_observed_reports(self) -> int:
-        reports = self.store.pending_observed_reports(
-            self.OBSERVED_REPORT_BATCH_SIZE
-        )
+        reports = self.store.pending_observed_reports(self.OBSERVED_REPORT_BATCH_SIZE)
         if not reports:
             return 0
         response = self.control.observed_reports(reports)
@@ -1325,10 +1364,7 @@ class BridgeService:
         reached_checkpoint = checkpoint is None or any(
             message_id <= checkpoint for message_id in page_ids
         )
-        complete = (
-            reached_checkpoint
-            or len(messages) < zulip_adapter.HISTORY_PAGE_SIZE
-        )
+        complete = reached_checkpoint or len(messages) < zulip_adapter.HISTORY_PAGE_SIZE
 
         unmapped_messages = []
         for message in converter.newest_first(messages):
@@ -1475,7 +1511,6 @@ class BridgeService:
         adapter: zulip_adapter.OfficialZulipAdapter,
         account_uuid: str,
         external_chat_uuid: str,
-        event_id: int,
     ) -> converter.FileResolver | None:
         if self.file_client is None:
             return None
@@ -1485,11 +1520,11 @@ class BridgeService:
             downloaded = adapter.download_file(provider_url, max_bytes=max_bytes)
             incoming_uuid = uuid.uuid5(
                 converter.ENTITY_NAMESPACE,
-                f"zulip-file:{account_uuid}:{event_id}:{provider_url}",
+                f"zulip-file:{account_uuid}:{external_chat_uuid}:{provider_url}",
             )
             transfer_operation_uuid = uuid.uuid5(
                 converter.OPERATION_NAMESPACE,
-                f"zulip-file-import:{account_uuid}:{event_id}:{provider_url}",
+                f"zulip-file-import:{account_uuid}:{external_chat_uuid}:{provider_url}",
             )
             try:
                 return self.file_client.import_file(
@@ -1498,7 +1533,10 @@ class BridgeService:
                     uuid.UUID(external_chat_uuid),
                     file_api.IncomingFile(
                         incoming_uuid,
-                        display_name or downloaded.name,
+                        # The UUID and operation UUID are URL-derived, so the
+                        # immutable descriptor must not depend on a mutable
+                        # Markdown label for that URL.
+                        downloaded.name,
                         downloaded.content_type,
                         downloaded.content,
                     ),
@@ -1537,16 +1575,22 @@ class BridgeService:
                 adapter,
                 account_uuid,
                 external_chat_uuid,
-                int(event["id"]),
             ),
         )
 
-    def process_provider_journal(self) -> int:
-        processed = 0
+    def _recover_interrupted_workspace_deliveries_once(self) -> None:
+        """Recover prior-process submissions before concurrent delivery starts."""
+        if getattr(self, "_workspace_delivery_recovery_done", False):
+            return
         if hasattr(self.store, "mark_interrupted_workspace_deliveries_ambiguous"):
             self.store.mark_interrupted_workspace_deliveries_ambiguous()
         if hasattr(self.store, "reset_stale_workspace_deliveries"):
             self.store.reset_stale_workspace_deliveries()
+        self._workspace_delivery_recovery_done = True
+
+    def process_provider_journal(self) -> int:
+        processed = 0
+        self._recover_interrupted_workspace_deliveries_once()
         supported_types = {
             "message",
             "update_message",
@@ -1556,7 +1600,7 @@ class BridgeService:
             "subscription",
             "realm_user",
         }
-        for row in self.store.pending_provider_events():
+        for row in self.store.pending_provider_events(self.PROVIDER_JOURNAL_QUANTUM):
             account_uuid = str(row["account_uuid"])
             queue_id = str(row["queue_id"])
             event_id = int(row["event_id"])
@@ -1584,18 +1628,11 @@ class BridgeService:
                 if event["type"] == "message":
                     message = typing.cast(dict[str, object], event["message"])
                     _, chat_key = converter.provider_chat_reference(message)
-                    assignment_lookup = getattr(
-                        self.store, "assignment_for_provider_chat", None
-                    )
-                    assignment = (
-                        assignment_lookup(account_uuid, chat_key)
-                        if assignment_lookup is not None
-                        else None
-                    )
-                    if assignment is not None and not self._assignment_participants_ready(
-                        account_uuid, chat_key, assignment
-                    ):
-                        raise ValueError("provider_chat_participants_pending")
+                    # A live channel message contains enough identity data to
+                    # create its author before the authoritative participant
+                    # snapshot has converged. The converter still requires the
+                    # selected stream/topic assignment and its owner; only bulk
+                    # history must wait for every participant to be projected.
                     external_chat_uuid = uuid.UUID(
                         converter.stable_entity_uuid(
                             account_uuid, "external_chat", chat_key
@@ -1819,69 +1856,78 @@ class BridgeService:
         topic_cache = getattr(self, "backfill_topic_cache", set())
         self.backfill_topic_cache = topic_cache
         ordered_messages = converter.newest_first(messages)
-        for message in ordered_messages:
-            self._queue_event_catalog(
-                account_uuid,
-                {
-                    "id": int(message["id"]),
-                    "type": "message",
-                    "message": message,
-                },
-                adapter.server_url,
-            )
-        for message in ordered_messages:
-            event = {
-                "id": int(message["id"]),
-                "type": "message",
-                "message": message,
-            }
-            _, chat_key = converter.provider_chat_reference(message)
-            external_chat_uuid = converter.stable_entity_uuid(
-                account_uuid, "external_chat", chat_key
-            )
-            records = self._event_records_with_file_fallback(
-                adapter,
-                account_uuid,
-                external_chat_uuid,
-                queue_id,
-                event,
-                "backfill",
-            )
-            for record in records:
-                operation = typing.cast(
-                    dict[str, object],
-                    record.get("operation", {}),
+        transaction = getattr(self.store, "transaction", contextlib.nullcontext)
+        with transaction():
+            for message in ordered_messages:
+                self._queue_event_catalog(
+                    account_uuid,
+                    {
+                        "id": int(message["id"]),
+                        "type": "message",
+                        "message": message,
+                    },
+                    adapter.server_url,
                 )
-                topic_cache_key = None
-                if operation.get("kind") == "topic.upsert":
-                    topic_cache_key = (
+        transaction_size = self.BACKFILL_ENQUEUE_TRANSACTION_MESSAGES
+        for offset in range(0, len(ordered_messages), transaction_size):
+            durable_topic_cache_keys = set()
+            with transaction():
+                for message in ordered_messages[offset : offset + transaction_size]:
+                    event = {
+                        "id": int(message["id"]),
+                        "type": "message",
+                        "message": message,
+                    }
+                    _, chat_key = converter.provider_chat_reference(message)
+                    external_chat_uuid = converter.stable_entity_uuid(
+                        account_uuid, "external_chat", chat_key
+                    )
+                    records = self._event_records_with_file_fallback(
+                        adapter,
                         account_uuid,
-                        str(assignment["uuid"]),
-                        int(assignment["generation"]),
-                        str(operation["entity_uuid"]),
+                        external_chat_uuid,
+                        queue_id,
+                        event,
+                        "backfill",
                     )
-                    if topic_cache_key in topic_cache:
-                        continue
-                try:
-                    enqueued += int(
-                        self.store.enqueue_workspace_delivery(record, 2)
-                    )
-                except ValueError as exc:
-                    if (
-                        str(exc)
-                        != "Operation UUID reused with a different digest"
-                    ):
-                        raise
-                    # A repeated history page can contain the current revision of
-                    # a message whose deterministic backfill operation was already
-                    # accepted from an earlier snapshot. Keep that first operation
-                    # canonical; live queue recovery carries later edits separately.
-                if topic_cache_key is not None:
-                    # Add only after the topic operation is durable (or already
-                    # present with the same deterministic UUID). A process restart
-                    # merely replays one harmless upsert; it can never skip the
-                    # first durable topic projection of an assignment generation.
-                    topic_cache.add(topic_cache_key)
+                    for record in records:
+                        operation = typing.cast(
+                            dict[str, object],
+                            record.get("operation", {}),
+                        )
+                        topic_cache_key = None
+                        if operation.get("kind") == "topic.upsert":
+                            topic_cache_key = (
+                                account_uuid,
+                                str(assignment["uuid"]),
+                                int(assignment["generation"]),
+                                str(operation["entity_uuid"]),
+                            )
+                            if (
+                                topic_cache_key in topic_cache
+                                or topic_cache_key in durable_topic_cache_keys
+                            ):
+                                continue
+                        try:
+                            enqueued += int(
+                                self.store.enqueue_workspace_delivery(record, 2)
+                            )
+                        except ValueError as exc:
+                            if (
+                                str(exc)
+                                != "Operation UUID reused with a different digest"
+                            ):
+                                raise
+                            # A repeated history page can contain the current
+                            # revision of a message whose deterministic backfill
+                            # operation was already accepted from an earlier
+                            # snapshot. Keep that first operation canonical; live
+                            # queue recovery carries later edits separately.
+                        if topic_cache_key is not None:
+                            durable_topic_cache_keys.add(topic_cache_key)
+            # Cache only keys committed by the transaction. A retry after rollback
+            # must still be able to enqueue the first durable topic projection.
+            topic_cache.update(durable_topic_cache_keys)
         return enqueued
 
     def run_backfill_once(self) -> bool:
@@ -1905,9 +1951,7 @@ class BridgeService:
                     exc.code,
                 )
                 self.store.mark_health(
-                    storage.backfill_health_component(
-                        account_uuid, provider_chat_key
-                    ),
+                    storage.backfill_health_component(account_uuid, provider_chat_key),
                     "degraded",
                     exc.code,
                 )
@@ -1920,8 +1964,7 @@ class BridgeService:
             self.store.defer_backfill_job(
                 account_uuid,
                 provider_chat_key,
-                datetime.datetime.now(datetime.UTC)
-                + datetime.timedelta(seconds=delay),
+                datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=delay),
                 exc.code,
             )
             self.store.mark_health("provider", "degraded", exc.code)
@@ -1949,9 +1992,7 @@ class BridgeService:
                     exc.code,
                 )
                 self.store.mark_health(
-                    storage.backfill_health_component(
-                        account_uuid, provider_chat_key
-                    ),
+                    storage.backfill_health_component(account_uuid, provider_chat_key),
                     "degraded",
                     exc.code,
                 )
@@ -1980,6 +2021,15 @@ class BridgeService:
             # pending until those mappings arrive instead of crashing the worker.
             self.store.release_backfill_job(account_uuid, provider_chat_key)
             return False
+        except Exception as exc:
+            if not self._is_retryable_database_conflict(exc):
+                raise
+            # Concurrent live and history projections can update the same
+            # provider mapping in opposite order. PostgreSQL rolls one whole
+            # transaction back; release the durable job so another lane can
+            # retry it instead of restarting the bridge process.
+            self.store.release_backfill_job(account_uuid, provider_chat_key)
+            return True
         complete = (
             reached_cutoff
             or len(messages) < zulip_adapter.HISTORY_PAGE_SIZE
@@ -2097,6 +2147,19 @@ class BridgeService:
         return len(event_records)
 
     def tick(self) -> bool:
+        background_error = getattr(self, "background_history_error", None)
+        if background_error is not None:
+            raise RuntimeError("Background history lane failed") from background_error
+        background_live_error = getattr(self, "background_live_error", None)
+        if background_live_error is not None:
+            raise RuntimeError("Background live lane failed") from background_live_error
+        background_live_delivery_error = getattr(
+            self, "background_live_delivery_error", None
+        )
+        if background_live_delivery_error is not None:
+            raise RuntimeError("Background live delivery lane failed") from (
+                background_live_delivery_error
+            )
         now = time.monotonic()
         progressed = False
         if now - self.last_certificate_check >= 3600.0:
@@ -2105,17 +2168,16 @@ class BridgeService:
         progressed |= self._run_heartbeat(now)
         progressed |= self._run_control_poll(now)
         store = getattr(self, "store", None)
-        if store is not None and hasattr(store, "reconcile_participant_sync"):
-            store.reconcile_participant_sync()
-        if store is not None and hasattr(store, "reconcile_backfill_jobs"):
-            store.reconcile_backfill_jobs()
+        last_reconcile = getattr(self, "last_control_state_reconcile", 0.0)
+        if now - last_reconcile >= self.CONTROL_STATE_RECONCILE_INTERVAL_SECONDS:
+            if store is not None and hasattr(store, "reconcile_participant_sync"):
+                store.reconcile_participant_sync()
+            if store is not None and hasattr(store, "reconcile_backfill_jobs"):
+                store.reconcile_backfill_jobs()
+            self.last_control_state_reconcile = now
         live_progressed = False
-        try:
-            live_progressed |= self.poll_provider_operations() > 0
-        except (httpx.TransportError, provider_api.ProviderApiRetryableError):
-            self.store.mark_health(
-                "provider_api", "degraded", "provider_api_unavailable"
-            )
+        if not getattr(self, "background_live_enabled", False):
+            live_progressed |= self._run_live_lane_once(before_provider_poll=True)
         last_provider_poll = getattr(self, "last_provider_poll", 0.0)
         provider_poll_interval = getattr(
             self,
@@ -2125,49 +2187,114 @@ class BridgeService:
         if now - last_provider_poll >= provider_poll_interval:
             live_progressed |= self.poll_provider_events() > 0
             self.last_provider_poll = now
-        if store is not None and hasattr(store, "claim_participant_sync"):
-            live_progressed |= self.refresh_selected_participants_once()
         if hasattr(self, "store"):
             live_progressed |= self._flush_observed_reports(now) > 0
-        live_progressed |= self.process_provider_journal() > 0
-        # Provider operations and their HTTP results always outrank history I/O.
-        live_progressed |= self.scheduler.reconcile_once()
-        live_progressed |= self.scheduler.run_once()
-        try:
-            live_progressed |= self.flush_provider_results() > 0
-        except (httpx.TransportError, provider_api.ProviderApiRetryableError):
-            self.store.mark_health(
-                "provider_api", "degraded", "provider_api_unavailable"
-            )
-        # Keep the live event quantum bounded so Provider HTTP cannot monopolize a tick.
-        try:
-            live_progressed |= (
-                self.flush_provider_events(
-                    minimum_priority=0, maximum_priority=0, limit=10
-                )
-                > 0
-            )
-        except (httpx.TransportError, provider_api.ProviderApiRetryableError):
-            self.store.mark_health(
-                "provider_api", "degraded", "provider_api_unavailable"
-            )
+        if store is not None and hasattr(store, "claim_participant_sync"):
+            live_progressed |= self.refresh_selected_participants_once()
+        if not getattr(self, "background_live_enabled", False):
+            live_progressed |= self._run_live_lane_once(before_provider_poll=False)
         progressed |= live_progressed
         last_history_quantum = getattr(self, "last_history_quantum", now)
         history_due = (
             now - last_history_quantum >= self.HISTORY_QUANTUM_INTERVAL_SECONDS
         )
-        if not live_progressed or history_due:
-            if history_due:
-                self.last_history_quantum = now
-            # Live work is handled first. Drain a bounded batch that is already
-            # durable before fetching another provider history page. Provider
-            # I/O may take several seconds, so fetching first would otherwise
-            # leave ready messages untouched while the bridge waits on Zulip.
-            history_delivered = 0
-            history_batch_size = max(
-                1,
-                min(int(getattr(self, "provider_batch_size", 20)), 100),
+        if not getattr(self, "background_history_enabled", False) and (
+            not live_progressed or history_due
+        ):
+            progressed |= self._run_history_lane_once()
+        if (
+            store is not None
+            and hasattr(store, "prune_terminal_delivery_state")
+            and now - self.last_terminal_state_prune
+            >= self.TERMINAL_STATE_PRUNE_INTERVAL_SECONDS
+        ):
+            deleted_deliveries, deleted_events = store.prune_terminal_delivery_state()
+            progressed |= deleted_deliveries + deleted_events > 0
+            self.last_terminal_state_prune = now
+        self.health_file.parent.mkdir(parents=True, exist_ok=True)
+        self.health_file.write_text(
+            datetime.datetime.now(datetime.UTC).isoformat(),
+            encoding="utf-8",
+        )
+        return progressed
+
+    def _run_live_lane_once(self, *, before_provider_poll: bool | None = None) -> bool:
+        """Run live provider traffic independently from catalog and history I/O."""
+        progressed = False
+        if before_provider_poll is None:
+            # The dedicated background lane must not let a slow outbound lease
+            # postpone already-journaled Zulip events. Bound the inbound quantum,
+            # then give Workspace-to-Zulip operations their turn below.
+            progressed |= self.process_provider_journal() > 0
+        if before_provider_poll is not False:
+            try:
+                progressed |= self.poll_provider_operations() > 0
+            except (httpx.TransportError, provider_api.ProviderApiRetryableError):
+                self.store.mark_health(
+                    "provider_api", "degraded", "provider_api_unavailable"
+                )
+        if before_provider_poll is True:
+            return progressed
+        if before_provider_poll is not None:
+            progressed |= self.process_provider_journal() > 0
+        # Provider operations and their HTTP results always outrank history I/O.
+        progressed |= self.scheduler.reconcile_once()
+        progressed |= self.scheduler.run_once()
+        try:
+            progressed |= self.flush_provider_results() > 0
+        except (httpx.TransportError, provider_api.ProviderApiRetryableError):
+            self.store.mark_health(
+                "provider_api", "degraded", "provider_api_unavailable"
             )
+        # Keep the live event quantum bounded so Provider HTTP cannot monopolize a tick.
+        store = getattr(self, "store", None)
+        readiness_probe = getattr(store, "has_pending_workspace_deliveries", None)
+        legacy_pending = getattr(store, "pending_workspace_deliveries", None)
+        readiness_unknown = not callable(readiness_probe) and legacy_pending is None
+        if not getattr(self, "background_live_delivery_enabled", False) and (
+            readiness_unknown or self._ready_live_workspace_delivery_pending()
+        ):
+            try:
+                progressed |= (
+                    self.flush_provider_events(
+                        minimum_priority=0,
+                        maximum_priority=0,
+                        limit=self.LIVE_DELIVERY_BATCH_SIZE,
+                    )
+                    > 0
+                )
+            except (httpx.TransportError, provider_api.ProviderApiRetryableError):
+                self.store.mark_health(
+                    "provider_api", "degraded", "provider_api_unavailable"
+                )
+        return progressed
+
+    def _run_history_lane_once(self) -> bool:
+        """Drain one durable history batch, then discover at most one page."""
+        if (
+            self._live_workspace_delivery_pending()
+            and not self._claim_history_quantum()
+        ):
+            return False
+        history_batch_size = max(
+            1,
+            min(
+                int(
+                    getattr(
+                        self,
+                        "provider_batch_size",
+                        self.HISTORY_DELIVERY_BATCH_SIZE,
+                    )
+                ),
+                self.HISTORY_DELIVERY_BATCH_SIZE,
+            ),
+        )
+        history_delivered = 0
+        history_delivery_lock = getattr(self, "history_delivery_lock", None)
+        if history_delivery_lock is None:
+            history_delivery_lock = threading.Lock()
+            self.history_delivery_lock = history_delivery_lock
+        with history_delivery_lock:
             try:
                 history_delivered = self.flush_provider_events(
                     minimum_priority=2,
@@ -2178,20 +2305,138 @@ class BridgeService:
                 self.store.mark_health(
                     "provider_api", "degraded", "provider_api_unavailable"
                 )
-            progressed |= history_delivered > 0
-            # Do not grow an already full delivery backlog. Once a bounded
-            # batch has drained, discover at most one more provider page.
-            if history_delivered < history_batch_size:
-                progressed |= self._run_history_quantum_once()
-        self.health_file.parent.mkdir(parents=True, exist_ok=True)
-        self.health_file.write_text(
-            datetime.datetime.now(datetime.UTC).isoformat(),
-            encoding="utf-8",
-        )
+        progressed = history_delivered > 0
+        if history_delivered < history_batch_size:
+            progressed |= self._run_history_quantum_once()
         return progressed
 
-    def run(self) -> None:
+    def _claim_history_quantum(self) -> bool:
+        """Let exactly one history worker progress during sustained live load."""
+        lock = getattr(self, "history_quantum_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self.history_quantum_lock = lock
+        with lock:
+            now = time.monotonic()
+            if (
+                now - getattr(self, "last_history_quantum", now)
+                < self.HISTORY_QUANTUM_INTERVAL_SECONDS
+            ):
+                return False
+            self.last_history_quantum = now
+            return True
+
+    @classmethod
+    def _is_retryable_database_conflict(cls, error: BaseException) -> bool:
+        current: BaseException | None = error
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if (
+                getattr(current, "sqlstate", None)
+                in cls.RETRYABLE_DATABASE_CONFLICT_CODES
+                or getattr(current, "code", None)
+                in cls.RETRYABLE_DATABASE_CONFLICT_CODES
+            ):
+                return True
+            current = current.__cause__ or current.__context__
+        return False
+
+    def _run_background_history_lane(self) -> None:
         while True:
-            progressed = self.tick()
+            try:
+                if self._run_history_lane_once():
+                    # Bound background SQL/HTTP pressure while retaining a much
+                    # larger history quantum than the original two-row loop.
+                    time.sleep(self.HISTORY_PROGRESS_DELAY_SECONDS)
+                else:
+                    time.sleep(0.5)
+            except Exception as error:
+                if self._is_retryable_database_conflict(error):
+                    time.sleep(random.uniform(0.05, 0.25))
+                    continue
+                self.background_history_error = error
+                return
+
+    def _run_background_live_lane(self) -> None:
+        while True:
+            try:
+                if not self._run_live_lane_once():
+                    time.sleep(0.1)
+            except Exception as error:
+                if self._is_retryable_database_conflict(error):
+                    time.sleep(random.uniform(0.05, 0.25))
+                    continue
+                self.background_live_error = error
+                return
+
+    def _run_background_live_delivery_lane(self) -> None:
+        """Submit durable live records without racing Zulip journal conversion."""
+        while True:
+            try:
+                pending = getattr(self.store, "has_pending_workspace_deliveries", None)
+                if callable(pending) and not pending(0, 0):
+                    time.sleep(0.05)
+                    continue
+                delivered = self.flush_provider_events(
+                    minimum_priority=0,
+                    maximum_priority=0,
+                    limit=self.LIVE_DELIVERY_BATCH_SIZE,
+                )
+                if not delivered:
+                    time.sleep(0.05)
+            except (httpx.TransportError, provider_api.ProviderApiRetryableError):
+                self.store.mark_health(
+                    "provider_api", "degraded", "provider_api_unavailable"
+                )
+                time.sleep(0.1)
+            except Exception as error:
+                if self._is_retryable_database_conflict(error):
+                    time.sleep(random.uniform(0.05, 0.25))
+                    continue
+                self.background_live_delivery_error = error
+                return
+
+    def run(self) -> None:
+        release_dependency_gates = getattr(
+            self.store,
+            "release_dependency_gated_provider_events",
+            None,
+        )
+        if callable(release_dependency_gates):
+            release_dependency_gates()
+        self._recover_interrupted_workspace_deliveries_once()
+        self.background_live_enabled = True
+        self.background_live_delivery_enabled = True
+        self.background_live_error = None
+        for worker_index in range(self.BACKGROUND_LIVE_WORKERS):
+            threading.Thread(
+                target=self._run_background_live_lane,
+                name=f"workspace-zulip-live-{worker_index}",
+                daemon=True,
+            ).start()
+        self.background_live_delivery_error = None
+        for worker_index in range(self.BACKGROUND_LIVE_DELIVERY_WORKERS):
+            threading.Thread(
+                target=self._run_background_live_delivery_lane,
+                name=f"workspace-zulip-live-delivery-{worker_index}",
+                daemon=True,
+            ).start()
+        self.background_history_enabled = True
+        self.background_history_error = None
+        for worker_index in range(self.BACKGROUND_HISTORY_WORKERS):
+            threading.Thread(
+                target=self._run_background_history_lane,
+                name=f"workspace-zulip-history-{worker_index}",
+                daemon=True,
+            ).start()
+        while True:
+            try:
+                progressed = self.tick()
+            except Exception as error:
+                if not self._is_retryable_database_conflict(error):
+                    raise
+                time.sleep(random.uniform(0.05, 0.25))
+                continue
             if not progressed:
                 time.sleep(0.5)
