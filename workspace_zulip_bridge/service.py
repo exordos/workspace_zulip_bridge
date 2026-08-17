@@ -204,6 +204,9 @@ class BridgeService:
     HISTORY_QUANTUM_INTERVAL_SECONDS = 1.0
     HISTORY_PROGRESS_DELAY_SECONDS = 2.0
     TERMINAL_STATE_PRUNE_INTERVAL_SECONDS = 10.0
+    PROVIDER_DELIVERY_RETRY_BASE_SECONDS = 1.0
+    PROVIDER_DELIVERY_RETRY_CAP_SECONDS = 30.0
+    PROVIDER_DELIVERY_RETRY_AFTER_CAP_SECONDS = 300.0
 
     def __init__(
         self,
@@ -268,6 +271,11 @@ class BridgeService:
         self.heartbeat_retry_attempts = 0
         self.heartbeat_retry_after = 0.0
         self.control_random = random.Random()
+        self.provider_delivery_retry_attempts = 0
+        self.provider_delivery_retry_after = 0.0
+        self.provider_delivery_random = random.Random()
+        self.provider_delivery_retry_lock = threading.Lock()
+        self.provider_delivery_lock = threading.Lock()
         self.control_lane_health: dict[str, bool | None] = {
             "heartbeat": None,
             "control": None,
@@ -2196,11 +2204,73 @@ class BridgeService:
         )
         return True
 
+    def _provider_delivery_delay(self, now: float | None = None) -> float:
+        if now is None:
+            now = time.monotonic()
+        return max(0.0, getattr(self, "provider_delivery_retry_after", 0.0) - now)
+
+    def _defer_provider_delivery(
+        self,
+        error: BaseException,
+        now: float,
+    ) -> None:
+        lock = getattr(self, "provider_delivery_retry_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self.provider_delivery_retry_lock = lock
+        with lock:
+            attempts = getattr(self, "provider_delivery_retry_attempts", 0) + 1
+            self.provider_delivery_retry_attempts = attempts
+            base = self.PROVIDER_DELIVERY_RETRY_BASE_SECONDS
+            cap = self.PROVIDER_DELIVERY_RETRY_CAP_SECONDS
+            ceiling = min(cap, base * (2 ** min(attempts - 1, 30)))
+            retry_random = getattr(self, "provider_delivery_random", random)
+            delay = retry_random.uniform(ceiling / 2, ceiling)
+            if isinstance(error, provider_api.ProviderApiRetryableError):
+                retry_after = error.retry_after_seconds
+                if retry_after is not None:
+                    delay = max(
+                        delay,
+                        min(retry_after, self.PROVIDER_DELIVERY_RETRY_AFTER_CAP_SECONDS),
+                    )
+            self.provider_delivery_retry_after = max(
+                getattr(self, "provider_delivery_retry_after", 0.0),
+                now + delay,
+            )
+
+    def _clear_provider_delivery_retry(self) -> None:
+        lock = getattr(self, "provider_delivery_retry_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self.provider_delivery_retry_lock = lock
+        with lock:
+            self.provider_delivery_retry_attempts = 0
+            self.provider_delivery_retry_after = 0.0
+
     def flush_provider_events(
         self,
         minimum_priority: int = 0,
         maximum_priority: int = 2,
         limit: int = 100,
+    ) -> int:
+        lock = getattr(self, "provider_delivery_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self.provider_delivery_lock = lock
+        with lock:
+            if self._provider_delivery_delay() > 0:
+                return 0
+            return self._flush_provider_events_locked(
+                minimum_priority=minimum_priority,
+                maximum_priority=maximum_priority,
+                limit=limit,
+            )
+
+    def _flush_provider_events_locked(
+        self,
+        minimum_priority: int,
+        maximum_priority: int,
+        limit: int,
     ) -> int:
         records = self.store.pending_workspace_deliveries(
             minimum_priority=minimum_priority,
@@ -2228,6 +2298,11 @@ class BridgeService:
                 committed = self._apply_provider_event_records(event_records)
             else:
                 committed = 0
+        except (httpx.TransportError, provider_api.ProviderApiRetryableError) as error:
+            if hasattr(self.store, "release_provider_event_submissions"):
+                self.store.release_provider_event_submissions(submitting_record_uuids)
+            self._defer_provider_delivery(error, time.monotonic())
+            raise
         except Exception:
             if hasattr(self.store, "release_provider_event_submissions"):
                 self.store.release_provider_event_submissions(submitting_record_uuids)
@@ -2242,6 +2317,7 @@ class BridgeService:
             self.store.accept_result(result)
         if hasattr(self.store, "finalize_ready_provider_events"):
             self.store.finalize_ready_provider_events()
+        self._clear_provider_delivery_retry()
         return len(completed_without_event) + committed
 
     def _apply_provider_event_records(
@@ -2295,6 +2371,13 @@ class BridgeService:
         return len(event_records)
 
     def tick(self) -> bool:
+        background_heartbeat_error = getattr(
+            self, "background_heartbeat_error", None
+        )
+        if background_heartbeat_error is not None:
+            raise RuntimeError("Background heartbeat lane failed") from (
+                background_heartbeat_error
+            )
         background_error = getattr(self, "background_history_error", None)
         if background_error is not None:
             raise RuntimeError("Background history lane failed") from background_error
@@ -2313,7 +2396,8 @@ class BridgeService:
         if now - self.last_certificate_check >= 3600.0:
             progressed |= self._renew_certificate(False)
             self.last_certificate_check = now
-        progressed |= self._run_heartbeat(now)
+        if not getattr(self, "background_heartbeat_enabled", False):
+            progressed |= self._run_heartbeat(now)
         progressed |= self._run_control_poll(now)
         store = getattr(self, "store", None)
         last_reconcile = getattr(self, "last_control_state_reconcile", 0.0)
@@ -2510,6 +2594,16 @@ class BridgeService:
                 self.background_history_error = error
                 return
 
+    def _run_background_heartbeat_lane(self) -> None:
+        """Keep provider capability leases fresh during slow catalog work."""
+        while True:
+            try:
+                self._run_heartbeat(time.monotonic())
+            except Exception as error:
+                self.background_heartbeat_error = error
+                return
+            time.sleep(0.5)
+
     def _run_background_live_lane(self) -> None:
         while True:
             try:
@@ -2526,6 +2620,10 @@ class BridgeService:
         """Submit durable live records without racing Zulip journal conversion."""
         while True:
             try:
+                retry_delay = self._provider_delivery_delay()
+                if retry_delay > 0:
+                    time.sleep(min(retry_delay, 1.0))
+                    continue
                 pending = getattr(self.store, "has_pending_workspace_deliveries", None)
                 if callable(pending) and not pending(0, 0):
                     time.sleep(0.05)
@@ -2560,6 +2658,13 @@ class BridgeService:
         self._recover_interrupted_workspace_deliveries_once()
         self.background_live_enabled = True
         self.background_live_delivery_enabled = True
+        self.background_heartbeat_enabled = True
+        self.background_heartbeat_error = None
+        threading.Thread(
+            target=self._run_background_heartbeat_lane,
+            name="workspace-zulip-heartbeat",
+            daemon=True,
+        ).start()
         self.background_live_error = None
         for worker_index in range(self.BACKGROUND_LIVE_WORKERS):
             threading.Thread(
