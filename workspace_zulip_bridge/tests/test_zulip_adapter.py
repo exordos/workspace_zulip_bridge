@@ -44,7 +44,17 @@ class FakeClient:
         self.registration_request = None
         self.subscriptions_request = None
         self.users_request = None
+        self.subscriptions_requests = 0
+        self.users_requests = 0
+        self.profile_requests = 0
         self.user_requests = []
+        self.subscriptions = [
+            {
+                "stream_id": 42,
+                "name": "Engineering",
+                "subscribers": [1, 2],
+            }
+        ]
         self.members = [
             {
                 "user_id": 1,
@@ -70,15 +80,10 @@ class FakeClient:
 
     def get_subscriptions(self, request=None):
         self.subscriptions_request = request
+        self.subscriptions_requests += 1
         return {
             "result": "success",
-            "subscriptions": [
-                {
-                    "stream_id": 42,
-                    "name": "Engineering",
-                    "subscribers": [1, 2],
-                }
-            ],
+            "subscriptions": self.subscriptions,
         }
 
     def get_events(self, **kwargs):
@@ -108,10 +113,12 @@ class FakeClient:
         return self.get_events(**request)
 
     def get_profile(self):
+        self.profile_requests += 1
         return {"result": "success", "user_id": 1}
 
     def get_users(self, request=None):
         self.users_request = request
+        self.users_requests += 1
         return {"result": "success", "members": self.members}
 
     def get_user_by_id(self, user_id, **request):
@@ -357,6 +364,28 @@ def test_selected_channel_catalog_rejects_unknown_stream():
 
     assert error.value.code == "invalid_record"
     assert not error.value.retryable
+
+
+def test_selected_channel_catalog_batches_account_snapshot_requests():
+    client = FakeClient()
+    client.subscriptions.append(
+        {
+            "stream_id": 43,
+            "name": "Operations",
+            "subscribers": [1],
+        }
+    )
+    adapter = _adapter(client)
+
+    catalog = adapter.channel_catalogs(["channel:42", "channel:43"])
+
+    assert [subscription["stream_id"] for subscription in catalog["subscriptions"]] == [
+        42,
+        43,
+    ]
+    assert client.subscriptions_requests == 1
+    assert client.users_requests == 1
+    assert client.profile_requests == 1
 
 
 @pytest.mark.parametrize("chat_kind", ["channel", "personal_dm", "group_dm"])

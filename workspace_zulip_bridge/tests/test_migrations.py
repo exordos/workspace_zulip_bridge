@@ -69,11 +69,12 @@ def test_migrations_have_one_versioned_dependency_chain():
         "0012-optimize-bridge-load-and-reconcile-stale-queues-6c9ddc.py",
         "0013-bound-reaction-history-window-5edf75.py",
         "0014-bound-terminal-delivery-retention-4c61bd.py",
+        "0015-scale-large-synchronizations-ad12e8.py",
     ]
     assert engine.get_latest_migration() == (
-        "0014-bound-terminal-delivery-retention-4c61bd.py"
+        "0015-scale-large-synchronizations-ad12e8.py"
     )
-    assert len({step["uuid"] for step in all_migrations.values()}) == 15
+    assert len({step["uuid"] for step in all_migrations.values()}) == 16
     assert all_migrations["0001-add-Zulip-provider-scheduler-state-143113.py"][
         "depends"
     ] == ["0000-initialize-bridge-operational-state-18f707.py"]
@@ -116,6 +117,9 @@ def test_migrations_have_one_versioned_dependency_chain():
     assert all_migrations["0014-bound-terminal-delivery-retention-4c61bd.py"][
         "depends"
     ] == ["0013-bound-reaction-history-window-5edf75.py"]
+    assert all_migrations["0015-scale-large-synchronizations-ad12e8.py"][
+        "depends"
+    ] == ["0014-bound-terminal-delivery-retention-4c61bd.py"]
 
 
 def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
@@ -154,14 +158,18 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                       'zulip_provider_message_events_local_echo_idx',
                       'bridge_operations_active_local_echo_idx',
                       'workspace_delivery_outbox_sent_at_idx',
-                      'zulip_provider_events_terminal_created_idx'
+                      'zulip_provider_events_terminal_created_idx',
+                      'desired_resources_assignment_chat_idx',
+                      'zulip_participant_sync_account_claim_idx',
+                      'zulip_backfill_jobs_account_claim_idx'
                   )
                 ORDER BY indexname
                 """
             ).fetchall()
-            assert applied["count"] == 15
+            assert applied["count"] == 16
             assert [row["indexname"] for row in indexes] == [
                 "bridge_operations_active_local_echo_idx",
+                "desired_resources_assignment_chat_idx",
                 "desired_resources_selected_assignment_account_idx",
                 "observed_report_outbox_catalog_readiness_idx",
                 "observed_report_outbox_pending_order_idx",
@@ -171,6 +179,8 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                 "workspace_delivery_outbox_pending_order_idx",
                 "workspace_delivery_outbox_provider_event_pending_idx",
                 "workspace_delivery_outbox_sent_at_idx",
+                "zulip_backfill_jobs_account_claim_idx",
+                "zulip_participant_sync_account_claim_idx",
                 "zulip_provider_events_pending_order_idx",
                 "zulip_provider_events_terminal_created_idx",
                 "zulip_provider_message_events_inflight_idx",
@@ -200,7 +210,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
             provider_cursor_count = session.execute(
                 "SELECT count(*) AS count FROM zulip_event_cursors"
             ).fetchone()
-            assert applied["count"] == 15
+            assert applied["count"] == 16
             assert cursor["control_cursor"] == "preserved"
             assert provider_cursor_count["count"] == 0
     finally:

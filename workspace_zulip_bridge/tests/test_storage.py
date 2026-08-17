@@ -855,6 +855,7 @@ def test_participant_claim_only_refreshes_channels():
     assert session.statements[0][1] == (
         storage.PARTICIPANT_RECHECK_INTERVAL_SECONDS,
         storage.PARTICIPANT_RECHECK_INTERVAL_SECONDS,
+        1,
     )
 
 

@@ -1849,6 +1849,125 @@ def test_selected_channel_participants_gate_messages_until_projection_matches(
     } == {"1", "2"}
 
 
+def test_selected_channel_participants_are_refreshed_in_one_account_batch():
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+    owner_uuid = "00000000-0000-4000-8000-000000000002"
+    project_uuid = "00000000-0000-4000-8000-000000000003"
+    assignments = {
+        "channel:42": {
+            "uuid": "00000000-0000-4000-8000-000000000042",
+            "generation": 3,
+            "selected": True,
+            "workspace_projection": {
+                "participants": [
+                    {"provider_user_id": "1"},
+                    {"provider_user_id": "2"},
+                ]
+            },
+        },
+        "channel:43": {
+            "uuid": "00000000-0000-4000-8000-000000000043",
+            "generation": 4,
+            "selected": True,
+            "workspace_projection": {
+                "participants": [{"provider_user_id": "1"}]
+            },
+        },
+    }
+
+    class Store:
+        def __init__(self):
+            self.completed = []
+            self.reports = []
+
+        def claim_participant_sync_batch(self, limit):
+            assert limit == service.BridgeService.PARTICIPANT_SYNC_BATCH_SIZE
+            return [
+                {
+                    "account_uuid": account_uuid,
+                    "provider_chat_key": chat_key,
+                    "assignment_generation": assignment["generation"],
+                    "assignment": assignment,
+                }
+                for chat_key, assignment in assignments.items()
+            ]
+
+        def assignment_for_provider_chat(self, *args):
+            raise AssertionError("claimed batches already carry their assignments")
+
+        def provider_event_cursor(self, requested):
+            assert requested == account_uuid
+            return {
+                "provider_realm_uuid": "00000000-0000-4000-8000-000000000005"
+            }
+
+        def account_resource(self, requested):
+            assert requested == account_uuid
+            return {
+                "generation": 2,
+                "owner_user_uuid": owner_uuid,
+                "settings": {
+                    "selection_mode": "manual",
+                    "default_project_id": project_uuid,
+                    "email": "owner@example.invalid",
+                },
+            }
+
+        def remember_provider_mapping(self, *args):
+            return None
+
+        def enqueue_observed_report(self, report):
+            self.reports.append(report)
+            return True
+
+        def complete_participant_sync_batch(self, updates):
+            self.completed.extend(updates)
+
+        def release_participant_sync_batch(self, jobs):
+            raise AssertionError(f"valid participant jobs were released: {jobs}")
+
+    class Adapter:
+        server_url = "https://zulip.example.invalid"
+
+        def __init__(self):
+            self.requests = []
+
+        def channel_catalogs(self, chat_keys):
+            self.requests.append(list(chat_keys))
+            return {
+                "user_id": 1,
+                "realm_users": [
+                    {"user_id": 1, "full_name": "Owner"},
+                    {"user_id": 2, "full_name": "Other User"},
+                ],
+                "subscriptions": [
+                    {
+                        "stream_id": 42,
+                        "name": "Engineering",
+                        "subscribers": [1, 2],
+                    },
+                    {
+                        "stream_id": 43,
+                        "name": "Operations",
+                        "subscribers": [1],
+                    },
+                ],
+            }
+
+    adapter = Adapter()
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance.provider_adapters = lambda requested: adapter
+
+    assert instance.refresh_selected_participants_once()
+    assert adapter.requests == [["channel:42", "channel:43"]]
+    assert [update["provider_chat_key"] for update in instance.store.completed] == [
+        "channel:42",
+        "channel:43",
+    ]
+    assert all(update["ready"] for update in instance.store.completed)
+
+
 def test_live_message_does_not_wait_for_full_participant_projection(monkeypatch):
     account_uuid = "00000000-0000-4000-8000-000000000001"
 
