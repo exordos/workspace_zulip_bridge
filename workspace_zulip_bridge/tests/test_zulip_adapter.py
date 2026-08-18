@@ -1454,6 +1454,29 @@ def test_provider_event_poll_uses_bounded_nonblocking_boundary():
     ]
 
 
+def test_provider_event_poll_can_use_one_blocking_request_per_account():
+    client = FakeClient()
+    adapter = zulip_adapter.OfficialZulipAdapter(client=client)
+
+    assert adapter.events("queue-1", 7, long_polling=True) == []
+    assert client.event_requests == [
+        {"queue_id": "queue-1", "last_event_id": 7, "dont_block": False}
+    ]
+    assert client.endpoint_requests == [
+        {
+            "url": "events",
+            "method": "GET",
+            "request": {
+                "queue_id": "queue-1",
+                "last_event_id": 7,
+                "dont_block": False,
+            },
+            "longpolling": True,
+            "timeout": None,
+        }
+    ]
+
+
 def test_official_client_disables_inline_retries(monkeypatch):
     calls = []
 

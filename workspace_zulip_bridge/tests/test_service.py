@@ -614,6 +614,40 @@ def test_heartbeat_advances_cursor_without_journaling_an_operation():
     assert calls == [("cursor", account_uuid, "queue", 5)]
 
 
+def test_account_poll_enables_configured_provider_long_polling():
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+    calls = []
+
+    class Store:
+        def account_resource(self, requested):
+            return None
+
+        def provider_event_cursor(self, requested):
+            return {"queue_id": "queue", "last_event_id": 4}
+
+        def update_provider_event_cursor(self, requested, queue_id, event_id):
+            calls.append(("cursor", requested, queue_id, event_id))
+
+    class Adapter:
+        def restore_queue(self, queue_id, last_event_id):
+            return None
+
+        def events(self, queue_id, last_event_id, *, long_polling=False):
+            calls.append(("events", queue_id, last_event_id, long_polling))
+            return [{"id": 5, "type": "heartbeat"}]
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance.provider_adapters = lambda requested: Adapter()
+    instance.provider_event_long_polling = True
+
+    assert instance._poll_provider_account(account_uuid) == (0, None)
+    assert calls == [
+        ("events", "queue", 4, True),
+        ("cursor", account_uuid, "queue", 5),
+    ]
+
+
 def test_adapter_connection_failure_is_reported_from_account_poll(monkeypatch):
     failed_account = "00000000-0000-4000-8000-000000000001"
 
@@ -777,6 +811,47 @@ def test_provider_journal_recovers_interrupted_deliveries_only_once():
     assert instance.process_provider_journal() == 0
     assert store.ambiguous_recoveries == 1
     assert store.stale_recoveries == 1
+
+
+def test_provider_journal_processes_distinct_account_heads_in_parallel():
+    instance = _delivery_service(DeliveryStore([]))
+    instance.provider_batch_size = 20
+    worker_count = instance._provider_journal_worker_count()
+    barrier = threading.Barrier(worker_count)
+    worker_threads = set()
+    worker_threads_lock = threading.Lock()
+    events = [
+        {
+            "account_uuid": f"00000000-0000-4000-8000-{index:012d}",
+            "queue_id": f"queue-{index}",
+            "event_id": 1,
+            "body": {"id": 1, "type": "heartbeat"},
+        }
+        for index in range(worker_count)
+    ]
+
+    class Store(DeliveryStore):
+        def account_is_active(self, account_uuid):
+            with worker_threads_lock:
+                worker_threads.add(threading.get_ident())
+            barrier.wait(timeout=2)
+            return False
+
+    instance = _delivery_service(Store(events))
+    instance.provider_batch_size = 20
+    instance.provider_journal_parallel_enabled = True
+
+    assert instance.process_provider_journal() == 0
+    assert len(worker_threads) == worker_count
+    instance.provider_journal_executor.shutdown(wait=True)
+
+
+def test_large_profile_scales_live_conversion_and_delivery_batches():
+    instance = object.__new__(service.BridgeService)
+    instance.provider_batch_size = 100
+
+    assert instance._provider_journal_worker_count() == 16
+    assert instance._live_delivery_batch_size() == 100
 
 
 def test_run_recovers_interrupted_deliveries_before_starting_workers(monkeypatch):
@@ -2003,9 +2078,7 @@ def test_selected_channel_participants_are_refreshed_in_one_account_batch():
             "uuid": "00000000-0000-4000-8000-000000000043",
             "generation": 4,
             "selected": True,
-            "workspace_projection": {
-                "participants": [{"provider_user_id": "1"}]
-            },
+            "workspace_projection": {"participants": [{"provider_user_id": "1"}]},
         },
     }
 
@@ -2031,9 +2104,7 @@ def test_selected_channel_participants_are_refreshed_in_one_account_batch():
 
         def provider_event_cursor(self, requested):
             assert requested == account_uuid
-            return {
-                "provider_realm_uuid": "00000000-0000-4000-8000-000000000005"
-            }
+            return {"provider_realm_uuid": "00000000-0000-4000-8000-000000000005"}
 
         def account_resource(self, requested):
             assert requested == account_uuid
@@ -2115,9 +2186,7 @@ def test_subscription_peer_event_invalidates_only_affected_channels():
                 "generation": 1,
                 "owner_user_uuid": "00000000-0000-4000-8000-000000000002",
                 "settings": {
-                    "default_project_id": (
-                        "00000000-0000-4000-8000-000000000003"
-                    )
+                    "default_project_id": ("00000000-0000-4000-8000-000000000003")
                 },
             }
 
@@ -2589,6 +2658,7 @@ def test_first_provider_poll_processes_registration_and_reports_live_ready():
     instance.provider_random = type(
         "Random", (), {"uniform": lambda self, lower, upper: lower}
     )()
+    instance.account_state_recheck_interval_seconds = 0
 
     assert instance._poll_provider_account(account_uuid) == (0, None)
     assert adapter.invalidations == 1
@@ -2637,6 +2707,7 @@ def test_live_ready_requires_catalog_assignment_but_not_initial_backfill():
     class Store:
         def __init__(self):
             self.cursor = None
+            self.account_calls = 0
             self.ready = {
                 "catchup": True,
                 "catalog": False,
@@ -2645,6 +2716,7 @@ def test_live_ready_requires_catalog_assignment_but_not_initial_backfill():
             }
 
         def account_resource(self, requested):
+            self.account_calls += 1
             return {"generation": 3}
 
         def provider_event_cursor(self, requested):
@@ -2667,6 +2739,7 @@ def test_live_ready_requires_catalog_assignment_but_not_initial_backfill():
 
     instance = object.__new__(service.BridgeService)
     instance.store = Store()
+    instance.account_state_recheck_interval_seconds = 0
     assert not instance._initial_sync_ready(account_uuid)
     instance.store.cursor = {
         "provider_realm_uuid": "00000000-0000-4000-8000-000000000002",
@@ -2681,8 +2754,57 @@ def test_live_ready_requires_catalog_assignment_but_not_initial_backfill():
     assert not instance._initial_sync_ready(account_uuid)
     instance.store.ready["assignment"] = True
     assert instance._initial_sync_ready(account_uuid)
+    account_calls = instance.store.account_calls
     instance.store.ready["backfill"] = True
     assert instance._initial_sync_ready(account_uuid)
+    assert instance.store.account_calls == account_calls
+
+
+def test_initial_sync_readiness_backs_off_repeated_negative_probes():
+    class Store:
+        def __init__(self):
+            self.account_calls = 0
+
+        def account_resource(self, requested):
+            self.account_calls += 1
+            return {"generation": 3}
+
+        def provider_event_cursor(self, requested):
+            return {
+                "provider_account_generation": 3,
+                "provider_realm_uuid": "00000000-0000-4000-8000-000000000001",
+                "provider_owner_user_id": "1",
+            }
+
+        def provider_catchup_ready(self, requested):
+            return False
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+
+    assert not instance._initial_sync_ready("account")
+    assert not instance._initial_sync_ready("account")
+    assert instance.store.account_calls == 1
+
+
+def test_account_report_is_queued_only_when_observed_state_changes():
+    reports = []
+
+    class Store:
+        def account_resource(self, requested):
+            return {"generation": 3}
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance._queue_observed_report = lambda *args, **kwargs: reports.append(
+        (args, kwargs)
+    )
+
+    instance._queue_account_report("account", "backfill")
+    instance._queue_account_report("account", "backfill")
+    instance._queue_account_report("account", "live_ready")
+
+    assert [args[3] for args, _kwargs in reports] == ["backfill", "live_ready"]
 
 
 def test_tick_reconciles_global_backfill_state_once_not_once_per_account(
@@ -2803,6 +2925,49 @@ def test_observed_report_flush_uses_a_bounded_batch():
         "applied",
         "rejected",
     ]
+
+
+def test_nonretryable_account_report_rejection_releases_observed_state_cache():
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+    report = {
+        "report_uuid": str(uuid.uuid4()),
+        "resource_type": "external_account",
+        "resource_uuid": account_uuid,
+        "observed_generation": 3,
+        "status": "live_ready",
+        "safe_error": None,
+    }
+
+    class Store:
+        def pending_observed_reports(self, limit):
+            return [report]
+
+        def apply_observed_report_results(self, results):
+            return None
+
+    class Control:
+        def observed_reports(self, supplied):
+            return {
+                "results": [
+                    {
+                        "report_uuid": report["report_uuid"],
+                        "status": "rejected",
+                        "safe_error": {
+                            "code": "invalid_state",
+                            "message": "The report cannot be applied.",
+                            "retryable": False,
+                        },
+                    }
+                ]
+            }
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance.control = Control()
+    instance.provider_account_report_states = {account_uuid: (3, "live_ready", None)}
+
+    assert instance.flush_observed_reports() == 1
+    assert account_uuid not in instance.provider_account_report_states
 
 
 def test_observed_reports_can_resolve_a_pending_live_journal_dependency():

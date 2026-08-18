@@ -635,9 +635,7 @@ class OfficialZulipAdapter:
         try:
             for user_id in sorted(referenced_user_ids - set(realm_users)):
                 try:
-                    user = _successful(self.client.get_user_by_id(user_id)).get(
-                        "user"
-                    )
+                    user = _successful(self.client.get_user_by_id(user_id)).get("user")
                 except ZulipOperationError as exc:
                     # Restored and long-lived realms can retain subscriber IDs
                     # for users that no longer exist. Zulip exposes this case as
@@ -670,9 +668,7 @@ class OfficialZulipAdapter:
     def channel_catalog(self, provider_chat_key: str) -> dict[str, object]:
         return self.channel_catalogs([provider_chat_key])
 
-    def channel_catalogs(
-        self, provider_chat_keys: list[str]
-    ) -> dict[str, object]:
+    def channel_catalogs(self, provider_chat_keys: list[str]) -> dict[str, object]:
         if not provider_chat_keys:
             raise ZulipOperationError("invalid_record", False)
         stream_ids = [self._channel_id(chat_key) for chat_key in provider_chat_keys]
@@ -1072,23 +1068,28 @@ class OfficialZulipAdapter:
             content = self._reply_quote(reply_to) + content
         return content
 
-    def events(self, queue_id: str, last_event_id: int) -> list[dict[str, object]]:
+    def events(
+        self,
+        queue_id: str,
+        last_event_id: int,
+        *,
+        long_polling: bool = False,
+    ) -> list[dict[str, object]]:
         try:
             call_endpoint = getattr(self.client, "call_endpoint", None)
             if callable(call_endpoint):
-                # Some provider deployments only release a blocking event request
-                # on the heartbeat interval even when a message is already queued.
-                # The account worker supplies the bounded delay between these
-                # nonblocking requests, keeping live delivery latency predictable.
+                # Nonblocking mode remains the compatibility default. Large
+                # deployments can opt into long-polling to avoid request churn
+                # while retaining one independently ordered queue per account.
                 response = call_endpoint(
                     url="events",
                     method="GET",
                     request={
                         "queue_id": queue_id,
                         "last_event_id": last_event_id,
-                        "dont_block": True,
+                        "dont_block": not long_polling,
                     },
-                    longpolling=False,
+                    longpolling=long_polling,
                 )
             else:
                 # Small test doubles and compatible client implementations may
@@ -1096,7 +1097,7 @@ class OfficialZulipAdapter:
                 response = self.client.get_events(
                     queue_id=queue_id,
                     last_event_id=last_event_id,
-                    dont_block=True,
+                    dont_block=not long_polling,
                 )
             result = _successful(response)
         except PROVIDER_NETWORK_ERRORS as exc:

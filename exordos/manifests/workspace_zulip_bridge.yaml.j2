@@ -23,21 +23,133 @@ imports:
     element: "$workspace"
     kind: "resource"
     link: "$core.secret.passwords.$workspace_zulip_bridge_enrollment_secret"
+  profile_develop:
+    element: "$core"
+    kind: "resource"
+    link: "$core.vs.profiles.$develop"
+  profile_small:
+    element: "$core"
+    kind: "resource"
+    link: "$core.vs.profiles.$small"
+  profile_medium:
+    element: "$core"
+    kind: "resource"
+    link: "$core.vs.profiles.$medium"
+  profile_large:
+    element: "$core"
+    kind: "resource"
+    link: "$core.vs.profiles.$large"
+  profile_legacy:
+    element: "$core"
+    kind: "resource"
+    link: "$core.vs.profiles.$legacy"
 
 resources:
+  $core.vs.variables:
+    workspace_zulip_bridge_cores:
+      name: "workspace_zulip_bridge_cores"
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      setter:
+        kind: profile
+        element: null
+        fallback_strategy: ignore
+        profiles:
+          - profile: $workspace_zulip_bridge.imports.$profile_develop:uuid
+            value: 2
+          - profile: $workspace_zulip_bridge.imports.$profile_small:uuid
+            value: 2
+          - profile: $workspace_zulip_bridge.imports.$profile_medium:uuid
+            value: 4
+          - profile: $workspace_zulip_bridge.imports.$profile_large:uuid
+            value: 8
+          - profile: $workspace_zulip_bridge.imports.$profile_legacy:uuid
+            value: 8
+    workspace_zulip_bridge_ram:
+      name: "workspace_zulip_bridge_ram"
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      setter:
+        kind: profile
+        element: null
+        fallback_strategy: ignore
+        profiles:
+          - profile: $workspace_zulip_bridge.imports.$profile_develop:uuid
+            value: 2048
+          - profile: $workspace_zulip_bridge.imports.$profile_small:uuid
+            value: 2048
+          - profile: $workspace_zulip_bridge.imports.$profile_medium:uuid
+            value: 4096
+          - profile: $workspace_zulip_bridge.imports.$profile_large:uuid
+            value: 8192
+          - profile: $workspace_zulip_bridge.imports.$profile_legacy:uuid
+            value: 8192
+    workspace_zulip_bridge_data_disk_size:
+      name: "workspace_zulip_bridge_data_disk_size"
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      setter:
+        kind: profile
+        element: null
+        fallback_strategy: ignore
+        profiles:
+          - profile: $workspace_zulip_bridge.imports.$profile_develop:uuid
+            value: 20
+          - profile: $workspace_zulip_bridge.imports.$profile_small:uuid
+            value: 30
+          - profile: $workspace_zulip_bridge.imports.$profile_medium:uuid
+            value: 100
+          - profile: $workspace_zulip_bridge.imports.$profile_large:uuid
+            value: 256
+          - profile: $workspace_zulip_bridge.imports.$profile_legacy:uuid
+            value: 256
+    workspace_zulip_bridge_batch_size:
+      name: "workspace_zulip_bridge_batch_size"
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      setter:
+        kind: profile
+        element: null
+        fallback_strategy: ignore
+        profiles:
+          - profile: $workspace_zulip_bridge.imports.$profile_develop:uuid
+            value: 20
+          - profile: $workspace_zulip_bridge.imports.$profile_small:uuid
+            value: 20
+          - profile: $workspace_zulip_bridge.imports.$profile_medium:uuid
+            value: 50
+          - profile: $workspace_zulip_bridge.imports.$profile_large:uuid
+            value: 100
+          - profile: $workspace_zulip_bridge.imports.$profile_legacy:uuid
+            value: 100
+    workspace_zulip_bridge_event_long_polling:
+      name: "workspace_zulip_bridge_event_long_polling"
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      setter:
+        kind: profile
+        element: null
+        fallback_strategy: ignore
+        profiles:
+          - profile: $workspace_zulip_bridge.imports.$profile_develop:uuid
+            value: 0
+          - profile: $workspace_zulip_bridge.imports.$profile_small:uuid
+            value: 0
+          - profile: $workspace_zulip_bridge.imports.$profile_medium:uuid
+            value: 0
+          - profile: $workspace_zulip_bridge.imports.$profile_large:uuid
+            value: 1
+          - profile: $workspace_zulip_bridge.imports.$profile_legacy:uuid
+            value: 1
+
   $core.compute.nodes:
     workspace_zulip_bridge:
       name: "workspace-zulip-bridge"
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      cores: 2
-      ram: 2048
+      cores: $core.vs.variables.$workspace_zulip_bridge_cores:value
+      ram: $core.vs.variables.$workspace_zulip_bridge_ram:value
       disk_spec:
         kind: "disks"
         disks:
           - size: 10
             image: "{{ images['workspace_zulip_bridge'] }}"
             label: root
-          - size: 20
+          - size: $core.vs.variables.$workspace_zulip_bridge_data_disk_size:value
             label: data
 
   $core.config.configs:
@@ -87,8 +199,9 @@ resources:
           certificate_file = /var/lib/workspace-zulip-bridge/pki/bridge.crt
           private_key_file = /var/lib/workspace-zulip-bridge/pki/bridge.key
           poll_interval_seconds = 2
+          event_long_polling = {$core.vs.variables.$workspace_zulip_bridge_event_long_polling:value}
           lease_seconds = 300
-          batch_size = 100
+          batch_size = {$core.vs.variables.$workspace_zulip_bridge_batch_size:value}
           timeout_seconds = 30
 
           [file_api]
