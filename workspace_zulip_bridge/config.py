@@ -53,6 +53,7 @@ class ProviderApiConfig:
     certificate_file: pathlib.Path
     private_key_file: pathlib.Path
     poll_interval_seconds: float = 2.0
+    event_long_polling: bool = False
     lease_seconds: int = 300
     batch_size: int = 20
     timeout_seconds: float = 30.0
@@ -116,6 +117,7 @@ def load(path: str | pathlib.Path) -> RuntimeConfig:
             certificate_file=_path(provider_api, "certificate_file"),
             private_key_file=_path(provider_api, "private_key_file"),
             poll_interval_seconds=provider_api.getfloat("poll_interval_seconds", 2.0),
+            event_long_polling=provider_api.getboolean("event_long_polling", False),
             lease_seconds=provider_api.getint("lease_seconds", 300),
             batch_size=provider_api.getint("batch_size", 20),
             timeout_seconds=provider_api.getfloat("timeout_seconds", 30.0),

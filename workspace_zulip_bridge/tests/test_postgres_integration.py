@@ -1384,9 +1384,7 @@ def test_participant_batch_reuses_one_fair_account_claim(postgres_store):
     )
     postgres_store.reconcile_participant_sync()
     with postgres_store.session() as session:
-        session.execute(
-            "UPDATE scheduler_accounts SET last_participant_sync_at = NULL"
-        )
+        session.execute("UPDATE scheduler_accounts SET last_participant_sync_at = NULL")
         session.execute(
             """
             UPDATE zulip_participant_sync
@@ -1402,9 +1400,7 @@ def test_participant_batch_reuses_one_fair_account_claim(postgres_store):
     first_batch = postgres_store.claim_participant_sync_batch(10)
 
     assert len(first_batch) == 2
-    assert {str(job["account_uuid"]) for job in first_batch} == {
-        first_account_uuid
-    }
+    assert {str(job["account_uuid"]) for job in first_batch} == {first_account_uuid}
     assert {job["provider_chat_key"] for job in first_batch} == {
         "channel:43",
         "channel:44",
@@ -1928,18 +1924,24 @@ def test_outbound_reaction_echo_reuses_workspace_identity(postgres_store):
     assert reaction["operation"]["payload"]["emoji_name"] == "👍"
     assert postgres_store.enqueue_workspace_delivery(reaction, 0)
     postgres_store.accept_result(_committed_result(reaction))
-    assert str(
+    assert (
+        str(
+            postgres_store.provider_mapping(
+                account_uuid,
+                "reaction",
+                "601:2:unicode_emoji:1f44d",
+            )["workspace_uuid"]
+        )
+        == workspace_reaction_uuid
+    )
+    assert (
         postgres_store.provider_mapping(
             account_uuid,
             "reaction",
-            "601:2:unicode_emoji:1f44d",
-        )["workspace_uuid"]
-    ) == workspace_reaction_uuid
-    assert postgres_store.provider_mapping(
-        account_uuid,
-        "reaction",
-        "601:2:thumbs_up",
-    ) is None
+            "601:2:thumbs_up",
+        )
+        is None
+    )
 
 
 def test_reaction_mapping_convergence_keeps_displaced_mapping_until_cleanup(
@@ -2159,9 +2161,10 @@ def test_reaction_mapping_cleanup_rolls_back_with_uncommitted_journal(
             )
             raise RuntimeError("simulated crash")
 
-    assert postgres_store.provider_mapping(
-        account_uuid, "reaction", "601:2:writing_hand"
-    ) is not None
+    assert (
+        postgres_store.provider_mapping(account_uuid, "reaction", "601:2:writing_hand")
+        is not None
+    )
     canonical = postgres_store.provider_mapping(
         account_uuid, "reaction", "601:2:unicode_emoji:270d"
     )
@@ -2187,9 +2190,10 @@ def test_reaction_mapping_cleanup_rolls_back_with_uncommitted_journal(
         "workspace_uuid": stale_uuid,
         "provider_id": "601:2:writing_hand",
     }
-    assert postgres_store.provider_mapping(
-        account_uuid, "reaction", "601:2:writing_hand"
-    ) is not None
+    assert (
+        postgres_store.provider_mapping(account_uuid, "reaction", "601:2:writing_hand")
+        is not None
+    )
     canonical = postgres_store.provider_mapping(
         account_uuid, "reaction", "601:2:unicode_emoji:270d"
     )
@@ -2208,9 +2212,10 @@ def test_reaction_mapping_cleanup_rolls_back_with_uncommitted_journal(
             700,
         )
     postgres_store.accept_result(_committed_result(prepared[0]))
-    assert postgres_store.provider_mapping(
-        account_uuid, "reaction", "601:2:writing_hand"
-    ) is None
+    assert (
+        postgres_store.provider_mapping(account_uuid, "reaction", "601:2:writing_hand")
+        is None
+    )
     postgres_store.accept_result(_committed_result(prepared[-1]))
     canonical = postgres_store.provider_mapping(
         account_uuid, "reaction", "601:2:unicode_emoji:270d"
@@ -2247,9 +2252,7 @@ def test_rejected_backfill_reaction_cleanup_is_requeued_on_replay(
         if record.get("transport", {}).get("reaction_mapping_delete")
     )
     assert postgres_store.enqueue_workspace_delivery(cleanup, 2)
-    assert postgres_store.mark_workspace_delivery_submitting(
-        cleanup["record_uuid"]
-    )
+    assert postgres_store.mark_workspace_delivery_submitting(cleanup["record_uuid"])
     assert postgres_store.reject_provider_event_submission(
         cleanup["record_uuid"],
         "provider_api_http_422",
@@ -2305,13 +2308,12 @@ def test_rejected_backfill_reaction_cleanup_is_requeued_on_replay(
         "submission_state": "pending",
         "submission_error_code": None,
     }
-    assert postgres_store.mark_workspace_delivery_submitting(
-        cleanup["record_uuid"]
-    )
+    assert postgres_store.mark_workspace_delivery_submitting(cleanup["record_uuid"])
     postgres_store.accept_result(_committed_result(cleanup))
-    assert postgres_store.provider_mapping(
-        account_uuid, "reaction", "601:2:writing_hand"
-    ) is None
+    assert (
+        postgres_store.provider_mapping(account_uuid, "reaction", "601:2:writing_hand")
+        is None
+    )
 
 
 def test_remove_reaction_tombstones_existing_mapping_only_after_acceptance(
@@ -2360,27 +2362,28 @@ def test_remove_reaction_tombstones_existing_mapping_only_after_acceptance(
     }
     assert postgres_store.record_provider_event(account_uuid, queue_id, event)
     records = converter.event_records(postgres_store, account_uuid, queue_id, event)
-    assert [record["operation"]["kind"] for record in records] == [
-        "reaction.delete"
-    ]
+    assert [record["operation"]["kind"] for record in records] == ["reaction.delete"]
     assert records[0]["transport"]["reaction_mapping"]["create_if_missing"] is False
     prepared = postgres_store.prepare_provider_event_records(
         account_uuid, queue_id, 701, records
     )
-    assert postgres_store.provider_mapping(
-        account_uuid, "reaction", "601:2:writing"
-    ) is not None
-    assert postgres_store.enqueue_workspace_delivery(
-        prepared[0], 0, queue_id, 701
+    assert (
+        postgres_store.provider_mapping(account_uuid, "reaction", "601:2:writing")
+        is not None
     )
+    assert postgres_store.enqueue_workspace_delivery(prepared[0], 0, queue_id, 701)
     postgres_store.accept_result(_committed_result(prepared[0]))
 
-    assert postgres_store.provider_mapping(
-        account_uuid, "reaction", "601:2:writing"
-    ) is None
-    assert postgres_store.provider_mapping(
-        account_uuid, "reaction", "601:2:unicode_emoji:270d"
-    ) is None
+    assert (
+        postgres_store.provider_mapping(account_uuid, "reaction", "601:2:writing")
+        is None
+    )
+    assert (
+        postgres_store.provider_mapping(
+            account_uuid, "reaction", "601:2:unicode_emoji:270d"
+        )
+        is None
+    )
     with postgres_store.session() as session:
         tombstone = session.execute(
             """
@@ -2417,9 +2420,10 @@ def test_existing_prepared_reaction_event_does_not_apply_new_mapping_plan(
     )
 
     assert replay == old_prepared
-    assert postgres_store.provider_mapping(
-        account_uuid, "reaction", "601:2:writing_hand"
-    ) is not None
+    assert (
+        postgres_store.provider_mapping(account_uuid, "reaction", "601:2:writing_hand")
+        is not None
+    )
     canonical = postgres_store.provider_mapping(
         account_uuid, "reaction", "601:2:unicode_emoji:270d"
     )
@@ -2875,6 +2879,50 @@ def test_pending_provider_probe_waits_for_each_accounts_head(postgres_store):
     assert postgres_store.has_pending_provider_events()
 
 
+def test_pending_provider_probe_includes_only_nonterminal_delivering_head(
+    postgres_store,
+):
+    account_uuid = str(uuid.uuid4())
+    delivery_uuid = str(uuid.uuid4())
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            INSERT INTO zulip_provider_events (
+                account_uuid, queue_id, event_id, event_type, body,
+                processing_state, available_at, created_at
+            ) VALUES (
+                %s, 'queue', 1, 'message', '{}'::jsonb, 'delivering',
+                now() + interval '5 minutes', now()
+            )
+            """,
+            (account_uuid,),
+        )
+        session.execute(
+            """
+            INSERT INTO workspace_delivery_outbox (
+                record_uuid, operation_uuid, account_uuid,
+                provider_queue_id, provider_event_id,
+                submission_state, priority, record
+            ) VALUES (%s, %s, %s, 'queue', 1, 'pending', 0, '{}'::jsonb)
+            """,
+            (delivery_uuid, str(uuid.uuid4()), account_uuid),
+        )
+
+    assert postgres_store.has_pending_provider_events()
+
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE workspace_delivery_outbox
+            SET submission_state = 'rejected'
+            WHERE record_uuid = %s
+            """,
+            (delivery_uuid,),
+        )
+
+    assert not postgres_store.has_pending_provider_events()
+
+
 def test_enqueue_assignment_change_race_requeues_unsubmitted_prefix(postgres_store):
     account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
     queue_id = "provider-message:604"
@@ -3324,13 +3372,9 @@ def test_stale_reset_replays_message_after_permanent_setup_rejection(
         event_id,
     )
     rejected = next(
-        record
-        for record in prepared
-        if record["operation"]["kind"] != "message.create"
+        record for record in prepared if record["operation"]["kind"] != "message.create"
     )
-    assert postgres_store.mark_workspace_delivery_submitting(
-        rejected["record_uuid"]
-    )
+    assert postgres_store.mark_workspace_delivery_submitting(rejected["record_uuid"])
     assert postgres_store.reject_provider_event_submission(
         rejected["record_uuid"],
         "provider_api_http_422",

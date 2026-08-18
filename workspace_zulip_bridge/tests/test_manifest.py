@@ -43,6 +43,46 @@ def test_zb_deploy_002_root_is_replaceable_and_data_disk_is_persistent():
     assert "workspace_zulip_bridge']" in text
 
 
+def test_bridge_resources_scale_only_with_the_selected_realm_profile():
+    text = MANIFEST.read_text(encoding="utf-8")
+
+    assert "cores: $core.vs.variables.$workspace_zulip_bridge_cores:value" in text
+    assert "ram: $core.vs.variables.$workspace_zulip_bridge_ram:value" in text
+    assert (
+        "size: $core.vs.variables.$workspace_zulip_bridge_data_disk_size:value" in text
+    )
+    assert (
+        "batch_size = "
+        "{$core.vs.variables.$workspace_zulip_bridge_batch_size:value}" in text
+    )
+    assert (
+        "event_long_polling = "
+        "{$core.vs.variables.$workspace_zulip_bridge_event_long_polling:value}" in text
+    )
+    for profile in ("develop", "small", "medium", "large", "legacy"):
+        assert f'link: "$core.vs.profiles.${profile}"' in text
+
+    small = text.split("    workspace_zulip_bridge_cores:", maxsplit=1)[1].split(
+        "    workspace_zulip_bridge_ram:", maxsplit=1
+    )[0]
+    assert "profile: $workspace_zulip_bridge.imports.$profile_small:uuid\n" in small
+    assert "            value: 2" in small
+    assert "profile: $workspace_zulip_bridge.imports.$profile_large:uuid\n" in small
+    assert "            value: 8" in small
+
+    long_polling = text.split(
+        "    workspace_zulip_bridge_event_long_polling:", maxsplit=1
+    )[1].split("\n\n  $core.compute.nodes:", maxsplit=1)[0]
+    assert (
+        "profile: $workspace_zulip_bridge.imports.$profile_small:uuid\n"
+        "            value: 0" in long_polling
+    )
+    assert (
+        "profile: $workspace_zulip_bridge.imports.$profile_large:uuid\n"
+        "            value: 1" in long_polling
+    )
+
+
 def test_zb_deploy_001_is_one_private_node_without_public_load_balancer():
     text = MANIFEST.read_text(encoding="utf-8")
     assert text.count("workspace_zulip_bridge:\n") >= 1

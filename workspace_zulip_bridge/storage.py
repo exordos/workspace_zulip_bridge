@@ -1437,11 +1437,7 @@ class RestAlchemyStore:
         )
         if survivor is None and create_if_missing:
             survivor = next(
-                (
-                    row
-                    for row in candidates
-                    if str(row["provider_id"]) == provider_id
-                ),
+                (row for row in candidates if str(row["provider_id"]) == provider_id),
                 candidates[0] if candidates else None,
             )
         displaced = [
@@ -1668,22 +1664,47 @@ class RestAlchemyStore:
             )
 
     def has_pending_provider_events(self) -> bool:
-        """Return whether live Zulip journal work is ready for conversion."""
+        """Return whether live Zulip journal work still needs processing."""
         with self.session() as session:
             row = session.execute(
                 """
                 WITH account_heads AS (
-                    SELECT account_uuid, available_at,
+                    SELECT account_uuid, queue_id, event_id,
+                           processing_state, available_at,
                            row_number() OVER (
                                PARTITION BY account_uuid
                                ORDER BY created_at, event_id, queue_id
                            ) AS position
                     FROM zulip_provider_events
-                    WHERE processing_state = 'pending'
+                    WHERE processing_state IN ('pending', 'delivering')
                 )
                 SELECT EXISTS (
-                    SELECT 1 FROM account_heads
-                    WHERE position = 1 AND available_at <= now()
+                    SELECT 1 FROM account_heads AS event
+                    WHERE event.position = 1
+                      AND (
+                          (
+                              event.processing_state = 'pending'
+                              AND event.available_at <= now()
+                          )
+                          OR (
+                              event.processing_state = 'delivering'
+                              AND EXISTS (
+                                  SELECT 1
+                                  FROM workspace_delivery_outbox AS delivery
+                                  WHERE delivery.account_uuid =
+                                        event.account_uuid
+                                    AND delivery.provider_queue_id =
+                                        event.queue_id
+                                    AND delivery.provider_event_id =
+                                        event.event_id
+                                    AND delivery.sent_at IS NULL
+                                    AND delivery.submission_state IN (
+                                        'pending', 'submitting', 'ambiguous',
+                                        'awaiting_result'
+                                    )
+                              )
+                          )
+                      )
                 ) AS pending
                 """
             ).fetchone()
@@ -2094,9 +2115,11 @@ class RestAlchemyStore:
             metadata = plan.get("metadata")
             displaced_plan = plan.get("displaced")
             create_if_missing = plan.get("create_if_missing")
-            if not isinstance(metadata, dict) or not isinstance(
-                displaced_plan, list
-            ) or not isinstance(create_if_missing, bool):
+            if (
+                not isinstance(metadata, dict)
+                or not isinstance(displaced_plan, list)
+                or not isinstance(create_if_missing, bool)
+            ):
                 raise ValueError("invalid_reaction_mapping_plan")
             operation = record.get("operation")
             if not isinstance(operation, dict) or operation.get("kind") not in {
@@ -2160,7 +2183,9 @@ class RestAlchemyStore:
             actual_workspace_uuid = (
                 planned_workspace_uuid
                 if survivor is None and create_if_missing
-                else None if survivor is None else str(survivor["workspace_uuid"])
+                else None
+                if survivor is None
+                else str(survivor["workspace_uuid"])
             )
             if actual_workspace_uuid != planned_workspace_uuid:
                 raise ValueError("reaction_mapping_plan_changed")
@@ -2206,9 +2231,7 @@ class RestAlchemyStore:
             raise ValueError("invalid_reaction_mapping_plan")
         metadata = plan.get("metadata")
         create_if_missing = plan.get("create_if_missing")
-        if not isinstance(metadata, dict) or not isinstance(
-            create_if_missing, bool
-        ):
+        if not isinstance(metadata, dict) or not isinstance(create_if_missing, bool):
             raise ValueError("invalid_reaction_mapping_plan")
         operation = record.get("operation")
         if not isinstance(operation, dict) or operation.get("kind") not in {
@@ -3505,9 +3528,7 @@ class RestAlchemyStore:
                 (account_uuid, sorted(set(provider_chat_keys))),
             )
 
-    def claim_participant_sync_batch(
-        self, limit: int = 50
-    ) -> list[dict[str, object]]:
+    def claim_participant_sync_batch(self, limit: int = 50) -> list[dict[str, object]]:
         if limit < 1:
             raise ValueError("Participant sync claim limit must be positive")
         with self.session() as session:
@@ -3660,9 +3681,7 @@ class RestAlchemyStore:
             ]
         )
 
-    def complete_participant_sync_batch(
-        self, updates: list[dict[str, object]]
-    ) -> None:
+    def complete_participant_sync_batch(self, updates: list[dict[str, object]]) -> None:
         if not updates:
             return
         normalized = [
@@ -3722,9 +3741,7 @@ class RestAlchemyStore:
             ]
         )
 
-    def release_participant_sync_batch(
-        self, jobs: list[dict[str, object]]
-    ) -> None:
+    def release_participant_sync_batch(self, jobs: list[dict[str, object]]) -> None:
         if not jobs:
             return
         normalized = [

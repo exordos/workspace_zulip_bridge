@@ -68,3 +68,21 @@ def test_legacy_database_dsn_remains_readable_during_config_upgrade(
     )
 
     assert config.load(path).database.connection_url == "postgresql:///legacy_bridge"
+
+
+def test_provider_event_long_polling_is_explicit_and_defaults_off(
+    tmp_path: pathlib.Path,
+):
+    source = pathlib.Path(__file__).parents[2] / "etc/bridge.conf.example"
+    path = tmp_path / "bridge.conf"
+    text = source.read_text(encoding="utf-8")
+    path.write_text(text, encoding="utf-8")
+
+    assert config.load(path).provider_api.event_long_polling is False
+
+    path.write_text(
+        text.replace("event_long_polling = false", "event_long_polling = true"),
+        encoding="utf-8",
+    )
+
+    assert config.load(path).provider_api.event_long_polling is True

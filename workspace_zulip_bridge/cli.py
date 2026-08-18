@@ -42,6 +42,7 @@ def build(
         file_client=file_client,
         certificate_renewer=certificate_renewer,
         provider_poll_interval_seconds=(runtime.provider_api.poll_interval_seconds),
+        provider_event_long_polling=runtime.provider_api.event_long_polling,
         provider_lease_seconds=runtime.provider_api.lease_seconds,
         provider_batch_size=runtime.provider_api.batch_size,
         control_poll_interval_seconds=runtime.control.poll_interval_seconds,

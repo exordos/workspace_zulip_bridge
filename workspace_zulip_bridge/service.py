@@ -1,3 +1,4 @@
+import concurrent.futures
 import contextlib
 import dataclasses
 import datetime
@@ -190,14 +191,16 @@ class BridgeService:
     # journal conversion remains concurrent with delivery and history still
     # runs across independent workers.
     BACKGROUND_LIVE_DELIVERY_WORKERS = 1
-    LIVE_DELIVERY_BATCH_SIZE = 20
+    LIVE_DELIVERY_BATCH_SIZE = 100
     PROVIDER_JOURNAL_QUANTUM = 20
+    PROVIDER_JOURNAL_WORKERS = 16
     PARTICIPANT_SYNC_BATCH_SIZE = 50
     # History conversion touches shared stream/topic/identity mappings. Commit
     # each message so live events never wait behind a multi-message lock set.
     BACKFILL_ENQUEUE_TRANSACTION_MESSAGES = 1
     RETRYABLE_DATABASE_CONFLICT_CODES = frozenset({"40001", "40P01"})
     PROVIDER_POLL_INTERVAL_SECONDS = 2.0
+    ACCOUNT_STATE_RECHECK_INTERVAL_SECONDS = 30.0
     # Desired-state changes reconcile immediately. This slower sweep is only a
     # recovery guard for state left behind by a prior process interruption.
     CONTROL_STATE_RECONCILE_INTERVAL_SECONDS = 60.0
@@ -224,6 +227,7 @@ class BridgeService:
         control_retry_cap_seconds: float = 30.0,
         control_retry_after_cap_seconds: float = 300.0,
         provider_poll_interval_seconds: float = 2.0,
+        provider_event_long_polling: bool = False,
         provider_lease_seconds: int = 300,
         provider_batch_size: int = 20,
     ):
@@ -243,6 +247,7 @@ class BridgeService:
         self.control_retry_cap_seconds = control_retry_cap_seconds
         self.control_retry_after_cap_seconds = control_retry_after_cap_seconds
         self.provider_poll_interval_seconds = provider_poll_interval_seconds
+        self.provider_event_long_polling = provider_event_long_polling
         self.provider_lease_seconds = provider_lease_seconds
         self.provider_batch_size = provider_batch_size
         self.provider_lease_request_uuid: uuid.UUID | None = None
@@ -265,6 +270,9 @@ class BridgeService:
         self.provider_successful_accounts: set[str] = set()
         self.provider_retry_attempts: dict[str, int] = {}
         self.provider_retry_after: dict[str, float] = {}
+        self.initial_sync_ready_accounts: set[str] = set()
+        self.initial_sync_probe_after: dict[str, float] = {}
+        self.provider_account_report_states: dict[str, tuple[int, str, str | None]] = {}
         self.provider_random = random.Random()
         self.control_retry_attempts = 0
         self.control_retry_after = 0.0
@@ -311,6 +319,9 @@ class BridgeService:
         self.store.clear_blocked_batch()
         if changes:
             self.control_state_dirty = True
+            getattr(self, "initial_sync_ready_accounts", set()).clear()
+            getattr(self, "initial_sync_probe_after", {}).clear()
+            getattr(self, "provider_account_report_states", {}).clear()
         return True
 
     def _install_control_snapshot(self) -> None:
@@ -342,6 +353,9 @@ class BridgeService:
             seen_page_cursors.add(page_cursor)
         self.store.install_snapshot(resources, str(session["anchor_cursor"]))
         self.control_state_dirty = True
+        getattr(self, "initial_sync_ready_accounts", set()).clear()
+        getattr(self, "initial_sync_probe_after", {}).clear()
+        getattr(self, "provider_account_report_states", {}).clear()
 
     def heartbeat(self) -> None:
         blocked_batch = (
@@ -584,6 +598,10 @@ class BridgeService:
                 )
             ):
                 self.store.invalidate_provider_event_cursor(account_uuid)
+                getattr(self, "initial_sync_ready_accounts", set()).discard(
+                    account_uuid
+                )
+                getattr(self, "initial_sync_probe_after", {}).pop(account_uuid, None)
                 cursor = None
             if cursor is None:
                 adapter.invalidate_queue()
@@ -621,11 +639,18 @@ class BridgeService:
                 queue_id = str(cursor["queue_id"])
                 last_event_id = int(cursor["last_event_id"])
                 adapter.restore_queue(queue_id, last_event_id)
-            events = adapter.events(queue_id, last_event_id)
+            if getattr(self, "provider_event_long_polling", False):
+                events = adapter.events(queue_id, last_event_id, long_polling=True)
+            else:
+                events = adapter.events(queue_id, last_event_id)
         except zulip_adapter.ZulipOperationError as exc:
             if exc.code == "bad_event_queue_id":
                 self.store.begin_provider_queue_catchup(account_uuid)
                 self.store.invalidate_provider_event_cursor(account_uuid)
+                getattr(self, "initial_sync_ready_accounts", set()).discard(
+                    account_uuid
+                )
+                getattr(self, "initial_sync_probe_after", {}).pop(account_uuid, None)
                 if adapter is not None:
                     adapter.invalidate_queue()
             return 0, exc
@@ -822,10 +847,18 @@ class BridgeService:
         account = self.store.account_resource(account_uuid)
         if account is None:
             return
+        generation = int(account["generation"])
+        report_state = (generation, status, safe_error_code)
+        report_states = getattr(self, "provider_account_report_states", None)
+        if report_states is None:
+            report_states = {}
+            self.provider_account_report_states = report_states
+        if report_states.get(account_uuid) == report_state:
+            return
         self._queue_observed_report(
             "external_account",
             account_uuid,
-            int(account["generation"]),
+            generation,
             status,
             (
                 "live"
@@ -836,6 +869,7 @@ class BridgeService:
             ),
             safe_error_code=safe_error_code,
         )
+        report_states[account_uuid] = report_state
 
     def _queue_ready_assignment_reports(self, account_uuid: str) -> None:
         for assignment in self.store.assignments_needing_live_report(account_uuid):
@@ -1169,9 +1203,7 @@ class BridgeService:
         owner_present = False
         for participant in participants:
             value = dict(participant)
-            is_owner = (
-                str(value.get("provider_user_id")) == provider_owner_user_id
-            )
+            is_owner = str(value.get("provider_user_id")) == provider_owner_user_id
             value["is_owner"] = is_owner
             owner_present |= is_owner
             normalized.append(value)
@@ -1186,9 +1218,7 @@ class BridgeService:
                 "identity",
                 provider_owner_user_id,
             )
-            if isinstance(mapping, dict) and isinstance(
-                mapping.get("metadata"), dict
-            ):
+            if isinstance(mapping, dict) and isinstance(mapping.get("metadata"), dict):
                 metadata = typing.cast(dict[str, object], mapping["metadata"])
         display_name = metadata.get("display_name")
         normalized.append(
@@ -1420,9 +1450,7 @@ class BridgeService:
         if operation in {"peer_add", "peer_remove"}:
             stream_ids = event.get("stream_ids")
             if isinstance(stream_ids, list):
-                invalidator = getattr(
-                    self.store, "invalidate_participant_sync", None
-                )
+                invalidator = getattr(self.store, "invalidate_participant_sync", None)
                 if callable(invalidator):
                     invalidator(
                         account_uuid,
@@ -1458,6 +1486,19 @@ class BridgeService:
             )
 
     def _initial_sync_ready(self, account_uuid: str) -> bool:
+        ready_accounts = getattr(self, "initial_sync_ready_accounts", None)
+        if ready_accounts is None:
+            ready_accounts = set()
+            self.initial_sync_ready_accounts = ready_accounts
+        if account_uuid in ready_accounts:
+            return True
+        probe_after = getattr(self, "initial_sync_probe_after", None)
+        if probe_after is None:
+            probe_after = {}
+            self.initial_sync_probe_after = probe_after
+        now = time.monotonic()
+        if now < probe_after.get(account_uuid, 0.0):
+            return False
         account = self.store.account_resource(account_uuid)
         if account is None:
             return False
@@ -1475,11 +1516,26 @@ class BridgeService:
             return False
         if provider_account_generation != generation:
             return False
-        return (
+        ready = (
             self.store.provider_catchup_ready(account_uuid)
             and self.store.catalog_reports_accepted(account_uuid, generation)
             and self.store.catalog_assignments_ready(account_uuid, generation)
         )
+        if ready:
+            ready_accounts.add(account_uuid)
+            probe_after.pop(account_uuid, None)
+        else:
+            probe_after[account_uuid] = now + max(
+                0.0,
+                float(
+                    getattr(
+                        self,
+                        "account_state_recheck_interval_seconds",
+                        self.ACCOUNT_STATE_RECHECK_INTERVAL_SECONDS,
+                    )
+                ),
+            )
+        return ready
 
     def flush_observed_reports(self) -> int:
         reports = self.store.pending_observed_reports(self.OBSERVED_REPORT_BATCH_SIZE)
@@ -1492,6 +1548,33 @@ class BridgeService:
         if actual != expected:
             raise ValueError("Observed report results do not match request order")
         self.store.apply_observed_report_results(results)
+        report_states = getattr(self, "provider_account_report_states", None)
+        if report_states is not None:
+            for report, result in zip(reports, results, strict=True):
+                safe_error = result.get("safe_error")
+                retryable = (
+                    isinstance(safe_error, dict) and safe_error.get("retryable") is True
+                )
+                if (
+                    result.get("status") != "rejected"
+                    or retryable
+                    or report.get("resource_type") != "external_account"
+                ):
+                    continue
+                account_uuid = str(report["resource_uuid"])
+                report_safe_error = report.get("safe_error")
+                safe_error_code = (
+                    str(report_safe_error["code"])
+                    if isinstance(report_safe_error, dict)
+                    else None
+                )
+                report_state = (
+                    int(report["observed_generation"]),
+                    str(report["status"]),
+                    safe_error_code,
+                )
+                if report_states.get(account_uuid) == report_state:
+                    report_states.pop(account_uuid, None)
         return len(results)
 
     def _defer_provider_account(self, account_uuid: str, now: float) -> None:
@@ -1766,9 +1849,31 @@ class BridgeService:
             self.store.reset_stale_workspace_deliveries()
         self._workspace_delivery_recovery_done = True
 
-    def process_provider_journal(self) -> int:
-        processed = 0
+    def process_provider_journal(
+        self,
+        rows: list[dict[str, object]] | None = None,
+    ) -> int:
         self._recover_interrupted_workspace_deliveries_once()
+        if rows is None:
+            rows = self.store.pending_provider_events(self.PROVIDER_JOURNAL_QUANTUM)
+            if (
+                getattr(self, "provider_journal_parallel_enabled", False)
+                and len(rows) > 1
+            ):
+                executor = getattr(self, "provider_journal_executor", None)
+                if executor is None:
+                    executor = concurrent.futures.ThreadPoolExecutor(
+                        max_workers=self._provider_journal_worker_count(),
+                        thread_name_prefix="workspace-zulip-journal",
+                    )
+                    self.provider_journal_executor = executor
+                return sum(
+                    executor.map(
+                        lambda row: self.process_provider_journal([row]),
+                        rows,
+                    )
+                )
+        processed = 0
         supported_types = {
             "message",
             "update_message",
@@ -1778,7 +1883,7 @@ class BridgeService:
             "subscription",
             "realm_user",
         }
-        for row in self.store.pending_provider_events(self.PROVIDER_JOURNAL_QUANTUM):
+        for row in rows:
             account_uuid = str(row["account_uuid"])
             queue_id = str(row["queue_id"])
             event_id = int(row["event_id"])
@@ -2009,6 +2114,19 @@ class BridgeService:
                 )
             processed += 1
         return processed
+
+    def _provider_journal_worker_count(self) -> int:
+        """Scale conversion concurrency with the deployment batch profile."""
+        configured_batch = max(1, int(getattr(self, "provider_batch_size", 20)))
+        return max(
+            1,
+            min(self.PROVIDER_JOURNAL_WORKERS, configured_batch // 5),
+        )
+
+    def _live_delivery_batch_size(self) -> int:
+        """Keep small defaults while letting large profiles amortize HTTP commits."""
+        configured_batch = max(1, int(getattr(self, "provider_batch_size", 20)))
+        return min(self.LIVE_DELIVERY_BATCH_SIZE, configured_batch)
 
     def enqueue_backfill(
         self,
@@ -2254,7 +2372,9 @@ class BridgeService:
                 if retry_after is not None:
                     delay = max(
                         delay,
-                        min(retry_after, self.PROVIDER_DELIVERY_RETRY_AFTER_CAP_SECONDS),
+                        min(
+                            retry_after, self.PROVIDER_DELIVERY_RETRY_AFTER_CAP_SECONDS
+                        ),
                     )
             self.provider_delivery_retry_after = max(
                 getattr(self, "provider_delivery_retry_after", 0.0),
@@ -2394,9 +2514,7 @@ class BridgeService:
         return len(event_records)
 
     def tick(self) -> bool:
-        background_heartbeat_error = getattr(
-            self, "background_heartbeat_error", None
-        )
+        background_heartbeat_error = getattr(self, "background_heartbeat_error", None)
         if background_heartbeat_error is not None:
             raise RuntimeError("Background heartbeat lane failed") from (
                 background_heartbeat_error
@@ -2518,7 +2636,7 @@ class BridgeService:
                     self.flush_provider_events(
                         minimum_priority=0,
                         maximum_priority=0,
-                        limit=self.LIVE_DELIVERY_BATCH_SIZE,
+                        limit=self._live_delivery_batch_size(),
                     )
                     > 0
                 )
@@ -2654,7 +2772,7 @@ class BridgeService:
                 delivered = self.flush_provider_events(
                     minimum_priority=0,
                     maximum_priority=0,
-                    limit=self.LIVE_DELIVERY_BATCH_SIZE,
+                    limit=self._live_delivery_batch_size(),
                 )
                 if not delivered:
                     time.sleep(0.05)
@@ -2679,6 +2797,7 @@ class BridgeService:
         if callable(release_dependency_gates):
             release_dependency_gates()
         self._recover_interrupted_workspace_deliveries_once()
+        self.provider_journal_parallel_enabled = True
         self.background_live_enabled = True
         self.background_live_delivery_enabled = True
         self.background_heartbeat_enabled = True

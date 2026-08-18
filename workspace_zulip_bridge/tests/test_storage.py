@@ -64,15 +64,19 @@ def test_transaction_reuses_one_session_for_nested_store_calls(monkeypatch):
     assert engine.opens == 1
 
 
-def test_pending_provider_event_probe_checks_only_ready_live_journal_rows():
+def test_pending_provider_event_probe_checks_ready_and_delivering_live_rows():
     session = Session(({"pending": True},))
     store = _store_with_session(session)
 
     assert store.has_pending_provider_events()
     statement, parameters = session.statements[0]
-    assert "processing_state = 'pending'" in statement
+    assert "processing_state IN ('pending', 'delivering')" in statement
     assert "PARTITION BY account_uuid" in statement
-    assert "position = 1 AND available_at <= now()" in statement
+    assert "processing_state = 'delivering'" in statement
+    assert "processing_state = 'pending'" in statement
+    assert "event.available_at <= now()" in statement
+    assert "workspace_delivery_outbox AS delivery" in statement
+    assert "'awaiting_result'" in statement
     assert parameters is None
 
 
