@@ -201,6 +201,7 @@ class BridgeService:
     RETRYABLE_DATABASE_CONFLICT_CODES = frozenset({"40001", "40P01"})
     PROVIDER_POLL_INTERVAL_SECONDS = 2.0
     ACCOUNT_STATE_RECHECK_INTERVAL_SECONDS = 30.0
+    OBSERVED_REPORT_RECHECK_INTERVAL_SECONDS = 300.0
     # Desired-state changes reconcile immediately. This slower sweep is only a
     # recovery guard for state left behind by a prior process interruption.
     CONTROL_STATE_RECONCILE_INTERVAL_SECONDS = 60.0
@@ -273,6 +274,9 @@ class BridgeService:
         self.initial_sync_ready_accounts: set[str] = set()
         self.initial_sync_probe_after: dict[str, float] = {}
         self.provider_account_report_states: dict[str, tuple[int, str, str | None]] = {}
+        self.provider_account_report_retry_after: dict[
+            str, tuple[tuple[int, str, str | None], float]
+        ] = {}
         self.provider_random = random.Random()
         self.control_retry_attempts = 0
         self.control_retry_after = 0.0
@@ -322,6 +326,7 @@ class BridgeService:
             getattr(self, "initial_sync_ready_accounts", set()).clear()
             getattr(self, "initial_sync_probe_after", {}).clear()
             getattr(self, "provider_account_report_states", {}).clear()
+            getattr(self, "provider_account_report_retry_after", {}).clear()
         return True
 
     def _install_control_snapshot(self) -> None:
@@ -356,6 +361,7 @@ class BridgeService:
         getattr(self, "initial_sync_ready_accounts", set()).clear()
         getattr(self, "initial_sync_probe_after", {}).clear()
         getattr(self, "provider_account_report_states", {}).clear()
+        getattr(self, "provider_account_report_retry_after", {}).clear()
 
     def heartbeat(self) -> None:
         blocked_batch = (
@@ -807,7 +813,7 @@ class BridgeService:
         phase: str,
         catalog: dict[str, object] | None = None,
         safe_error_code: str | None = None,
-    ) -> None:
+    ) -> bool:
         observed_at = (
             datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
         )
@@ -836,7 +842,7 @@ class BridgeService:
         if catalog is not None:
             report["catalog"] = catalog
         report["report_uuid"] = self._observed_report_uuid(report)
-        self.store.enqueue_observed_report(report)
+        return self.store.enqueue_observed_report(report)
 
     def _queue_account_report(
         self,
@@ -855,7 +861,19 @@ class BridgeService:
             self.provider_account_report_states = report_states
         if report_states.get(account_uuid) == report_state:
             return
-        self._queue_observed_report(
+        retry_after = getattr(self, "provider_account_report_retry_after", None)
+        if retry_after is None:
+            retry_after = {}
+            self.provider_account_report_retry_after = retry_after
+        now = time.monotonic()
+        suppressed = retry_after.get(account_uuid)
+        if (
+            suppressed is not None
+            and suppressed[0] == report_state
+            and now < suppressed[1]
+        ):
+            return
+        retained = self._queue_observed_report(
             "external_account",
             account_uuid,
             generation,
@@ -869,7 +887,14 @@ class BridgeService:
             ),
             safe_error_code=safe_error_code,
         )
-        report_states[account_uuid] = report_state
+        if retained:
+            report_states[account_uuid] = report_state
+            retry_after.pop(account_uuid, None)
+        else:
+            retry_after[account_uuid] = (
+                report_state,
+                now + self.OBSERVED_REPORT_RECHECK_INTERVAL_SECONDS,
+            )
 
     def _queue_ready_assignment_reports(self, account_uuid: str) -> None:
         for assignment in self.store.assignments_needing_live_report(account_uuid):

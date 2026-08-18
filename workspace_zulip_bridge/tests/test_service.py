@@ -2970,6 +2970,50 @@ def test_nonretryable_account_report_rejection_releases_observed_state_cache():
     assert account_uuid not in instance.provider_account_report_states
 
 
+def test_suppressed_account_report_is_retried_after_cooldown(monkeypatch):
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+    queued_reports = []
+    enqueue_results = iter([False, True])
+
+    class Store:
+        def account_resource(self, supplied_account_uuid):
+            assert supplied_account_uuid == account_uuid
+            return {"generation": 3}
+
+        def enqueue_observed_report(self, report):
+            queued_reports.append(report)
+            return next(enqueue_results)
+
+    now = [100.0]
+    monkeypatch.setattr(service.time, "monotonic", lambda: now[0])
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance.provider_account_report_states = {}
+    instance.provider_account_report_retry_after = {}
+
+    instance._queue_account_report(account_uuid, "live_ready")
+    assert len(queued_reports) == 1
+    assert account_uuid not in instance.provider_account_report_states
+    assert instance.provider_account_report_retry_after[account_uuid] == (
+        (3, "live_ready", None),
+        400.0,
+    )
+
+    now[0] = 399.0
+    instance._queue_account_report(account_uuid, "live_ready")
+    assert len(queued_reports) == 1
+
+    now[0] = 400.0
+    instance._queue_account_report(account_uuid, "live_ready")
+    assert len(queued_reports) == 2
+    assert instance.provider_account_report_states[account_uuid] == (
+        3,
+        "live_ready",
+        None,
+    )
+    assert account_uuid not in instance.provider_account_report_retry_after
+
+
 def test_observed_reports_can_resolve_a_pending_live_journal_dependency():
     calls = []
 
