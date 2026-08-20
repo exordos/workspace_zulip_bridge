@@ -43,7 +43,7 @@ def test_zb_deploy_002_root_is_replaceable_and_data_disk_is_persistent():
     assert "workspace_zulip_bridge']" in text
 
 
-def test_bridge_resources_scale_only_with_the_selected_realm_profile():
+def test_bridge_resources_use_selected_realm_profile_with_fixed_node_size():
     text = MANIFEST.read_text(encoding="utf-8")
 
     assert "cores: $core.vs.variables.$workspace_zulip_bridge_cores:value" in text
@@ -62,13 +62,18 @@ def test_bridge_resources_scale_only_with_the_selected_realm_profile():
     for profile in ("develop", "small", "medium", "large", "legacy"):
         assert f'link: "$core.vs.profiles.${profile}"' in text
 
-    small = text.split("    workspace_zulip_bridge_cores:", maxsplit=1)[1].split(
+    cores = text.split("    workspace_zulip_bridge_cores:", maxsplit=1)[1].split(
         "    workspace_zulip_bridge_ram:", maxsplit=1
     )[0]
-    assert "profile: $workspace_zulip_bridge.imports.$profile_small:uuid\n" in small
-    assert "            value: 2" in small
-    assert "profile: $workspace_zulip_bridge.imports.$profile_large:uuid\n" in small
-    assert "            value: 8" in small
+    ram = text.split("    workspace_zulip_bridge_ram:", maxsplit=1)[1].split(
+        "    workspace_zulip_bridge_data_disk_size:", maxsplit=1
+    )[0]
+    for profile in ("develop", "small", "medium", "large", "legacy"):
+        profile_ref = (
+            f"profile: $workspace_zulip_bridge.imports.$profile_{profile}:uuid\n"
+        )
+        assert f"{profile_ref}            value: 8" in cores
+        assert f"{profile_ref}            value: 8192" in ram
 
     long_polling = text.split(
         "    workspace_zulip_bridge_event_long_polling:", maxsplit=1
