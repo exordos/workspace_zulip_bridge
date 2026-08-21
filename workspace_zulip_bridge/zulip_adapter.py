@@ -130,10 +130,16 @@ class ZulipCredentials:
 
 
 class ZulipOperationError(RuntimeError):
-    def __init__(self, code: str, retryable: bool):
+    def __init__(
+        self,
+        code: str,
+        retryable: bool,
+        account_generation: int | None = None,
+    ):
         super().__init__(code)
         self.code = code
         self.retryable = retryable
+        self.account_generation = account_generation
 
 
 class ZulipAmbiguousOutcome(RuntimeError):
@@ -167,6 +173,21 @@ def _successful(result: dict[str, object]) -> dict[str, object]:
     if result.get("result") == "success":
         return result
     code = str(result.get("code", "provider_error")).lower()
+    message = str(result.get("msg", "")).lower()
+    if code in {
+        "unauthorized",
+        "bad_api_key",
+        "invalid_api_key",
+        "user_not_authorized",
+    } or any(
+        marker in message
+        for marker in (
+            "invalid api key",
+            "authentication failed",
+            "api key is not valid",
+        )
+    ):
+        raise ZulipOperationError("unauthorized_account", False)
     retryable = code in {
         "rate_limit_hit",
         "request_timeout",
@@ -221,6 +242,7 @@ class OfficialZulipAdapter:
         routing: ZulipRoutingMappings | None = None,
         owner_user_uuid: str | None = None,
         account_uuid: str | None = None,
+        account_generation: int | None = None,
         file_client: file_api.FileApiClient | None = None,
         file_limit: typing.Callable[[], int] | None = None,
     ):
@@ -253,6 +275,7 @@ class OfficialZulipAdapter:
         self.routing = routing
         self.owner_user_uuid = owner_user_uuid
         self.account_uuid = account_uuid
+        self.account_generation = account_generation
         self.file_client = file_client
         self.file_limit = file_limit
         self._queue_id: str | None = None

@@ -98,13 +98,45 @@ class Scheduler:
         self.adapters = adapters
         self.worker_id = worker_id
         self.random = random_source or random.Random()
+        self.account_failure_handler: typing.Callable[
+            [str, zulip_adapter.ZulipOperationError, int | None], bool
+        ] | None = None
+        self.account_success_handler: typing.Callable[[str, int | None], None] | None = (
+            None
+        )
+
+    def _account_failed(
+        self,
+        account_uuid: str,
+        error: zulip_adapter.ZulipOperationError,
+        attempted_generation: int | None,
+    ) -> bool:
+        if self.account_failure_handler is None:
+            return error.code == "unauthorized_account"
+        return self.account_failure_handler(
+            account_uuid, error, attempted_generation
+        )
+
+    def _account_succeeded(
+        self, account_uuid: str, attempted_generation: int | None
+    ) -> None:
+        if self.account_success_handler is not None:
+            self.account_success_handler(account_uuid, attempted_generation)
+
+    @staticmethod
+    def _adapter_generation(adapter: object | None) -> int | None:
+        generation = getattr(adapter, "account_generation", None)
+        if isinstance(generation, int) and not isinstance(generation, bool):
+            return generation
+        return None
 
     def run_once(self) -> bool:
         self.store.reap_expired_running()
         terminal = self.store.claim_terminal(self.worker_id)
         if terminal is not None:
-            item, outcome = terminal
-            result = result_record(item.record, outcome, None, outcome)
+            item, reason = terminal
+            outcome = "rejected" if reason == "unauthorized_account" else reason
+            result = result_record(item.record, outcome, None, reason)
             self.store.complete(item, result, outcome)
             return True
         item = self.store.claim(self.worker_id)
@@ -120,6 +152,7 @@ class Scheduler:
                 result = result_record(record, "expired", None, "expired")
                 self.store.complete(item, result, "expired")
                 return True
+        adapter: zulip_adapter.OfficialZulipAdapter | None = None
         try:
             operation = typing.cast(dict[str, object], record["operation"])
             adapter = self.adapters(str(record["account_uuid"]))
@@ -148,7 +181,14 @@ class Scheduler:
             self.store.mark_uncertain(item, str(exc))
             return True
         except zulip_adapter.ZulipOperationError as exc:
-            if exc.retryable:
+            attempted_generation = (
+                exc.account_generation or self._adapter_generation(adapter)
+            )
+            authentication = self._account_failed(
+                str(record["account_uuid"]), exc, attempted_generation
+            )
+            error_code = "unauthorized_account" if authentication else exc.code
+            if exc.retryable and not authentication:
                 exponent = min(item.attempts, 5)
                 maximum = min(30.0, float(2**exponent))
                 delay = self.random.uniform(0.0, maximum)
@@ -156,12 +196,15 @@ class Scheduler:
                     item,
                     datetime.datetime.now(datetime.UTC)
                     + datetime.timedelta(seconds=delay),
-                    exc.code,
+                    error_code,
                 )
             else:
-                result = result_record(record, "rejected", None, exc.code)
+                result = result_record(record, "rejected", None, error_code)
                 self.store.complete(item, result, "rejected")
             return True
+        self._account_succeeded(
+            str(record["account_uuid"]), self._adapter_generation(adapter)
+        )
         commit = TargetCommit(entity_id, revision)
         result = result_record(record, "committed", commit, None)
         self.store.complete(item, result, "committed")
@@ -193,14 +236,31 @@ class Scheduler:
             )
             return True
         operation = typing.cast(dict[str, object], item.record["operation"])
-        adapter = self.adapters(str(item.record["account_uuid"]))
+        account_uuid = str(item.record["account_uuid"])
+        adapter: zulip_adapter.OfficialZulipAdapter | None = None
         try:
+            adapter = self.adapters(account_uuid)
             evidence = adapter.reconcile_message(
                 operation,
                 item.provider_attempted_at,
                 item.provider_rendered_content,
             )
         except zulip_adapter.ZulipOperationError as exc:
+            attempted_generation = (
+                exc.account_generation or self._adapter_generation(adapter)
+            )
+            authentication = self._account_failed(
+                account_uuid, exc, attempted_generation
+            )
+            defer = getattr(self.store, "defer_uncertain", None)
+            if (authentication or exc.retryable) and callable(defer):
+                defer(
+                    item,
+                    datetime.datetime.now(datetime.UTC)
+                    + datetime.timedelta(seconds=5),
+                    "unauthorized_account" if authentication else exc.code,
+                )
+                return True
             reason = (
                 "provider_history_unavailable"
                 if exc.code == "provider_unavailable"
@@ -216,6 +276,9 @@ class Scheduler:
                 },
             )
             return True
+        self._account_succeeded(
+            account_uuid, self._adapter_generation(adapter)
+        )
         stored_evidence = {
             "checked_at": evidence.checked_at,
             "candidate_ids": list(evidence.candidate_ids),

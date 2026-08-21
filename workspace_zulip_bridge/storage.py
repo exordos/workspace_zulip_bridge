@@ -19,6 +19,10 @@ def backfill_health_component(account_uuid: str, provider_chat_key: str) -> str:
     return f"provider:{account_uuid}:{provider_chat_key}"
 
 
+def provider_account_health_component(account_uuid: str) -> str:
+    return f"provider:{account_uuid}"
+
+
 def _same_provider_identity_replay(
     accepted: dict[str, object],
     current: dict[str, object],
@@ -208,6 +212,10 @@ class QueueStore(typing.Protocol):
     ) -> None: ...
 
     def mark_uncertain(self, item: QueuedOperation, code: str) -> None: ...
+
+    def defer_uncertain(
+        self, item: QueuedOperation, available_at: datetime.datetime, code: str
+    ) -> None: ...
 
     def provider_event_cursor(self, account_uuid: str) -> dict[str, object] | None: ...
 
@@ -418,6 +426,50 @@ class RestAlchemyStore:
                 (account_uuid, provider_chat_key),
             )
 
+    @staticmethod
+    def _reconcile_provider_account_generation(
+        session: sessions.PgSQLSession,
+        account_uuid: str,
+        generation: int,
+    ) -> None:
+        """Reset only a breaker that belongs to an older desired generation."""
+        changed = session.execute(
+            """
+            INSERT INTO scheduler_accounts (
+                account_uuid, provider_generation, provider_state,
+                provider_retry_count, provider_retry_after,
+                provider_error_code, provider_state_updated_at
+            ) VALUES (%s, %s, 'ready', 0, NULL, NULL, now())
+            ON CONFLICT (account_uuid) DO UPDATE SET
+                provider_generation = EXCLUDED.provider_generation,
+                provider_state = 'ready',
+                provider_retry_count = 0,
+                provider_retry_after = NULL,
+                provider_error_code = NULL,
+                provider_state_updated_at = now()
+            WHERE scheduler_accounts.provider_generation IS DISTINCT FROM
+                  EXCLUDED.provider_generation
+            RETURNING account_uuid
+            """,
+            (account_uuid, generation),
+        ).fetchone()
+        if changed is None:
+            return
+        session.execute(
+            """
+            UPDATE zulip_backfill_jobs
+            SET state = 'pending', lease_until = NULL, available_at = now(),
+                retry_count = 0, last_error_code = NULL, updated_at = now()
+            WHERE account_uuid = %s AND state = 'failed'
+              AND last_error_code IN ('unauthorized', 'unauthorized_account')
+            """,
+            (account_uuid,),
+        )
+        session.execute(
+            "DELETE FROM bridge_health WHERE component = %s",
+            (provider_account_health_component(account_uuid),),
+        )
+
     def apply_desired_changes(
         self, changes: list[dict[str, object]], next_cursor: str
     ) -> None:
@@ -491,6 +543,12 @@ class RestAlchemyStore:
                         """,
                         (resource_uuid,),
                     )
+                    if operation == "upsert":
+                        self._reconcile_provider_account_generation(
+                            session,
+                            resource_uuid,
+                            generation,
+                        )
                 if resource_type == "external_chat_assignment":
                     if operation == "upsert":
                         if (
@@ -569,6 +627,12 @@ class RestAlchemyStore:
                     self._wake_assignment_pending_events(
                         session,
                         str(resource["external_account_uuid"]),
+                    )
+                elif resource["resource_type"] == "external_account":
+                    self._reconcile_provider_account_generation(
+                        session,
+                        str(resource["uuid"]),
+                        int(resource["generation"]),
                     )
             session.execute(
                 """
@@ -1654,8 +1718,46 @@ class RestAlchemyStore:
                         WHERE processing_state = 'pending'
                     )
                     SELECT account_uuid, queue_id, event_id, body
-                    FROM account_heads
+                    FROM account_heads AS event
                     WHERE position = 1 AND available_at <= now()
+                      AND (
+                          NOT EXISTS (
+                              SELECT 1
+                              FROM desired_resources AS account
+                              WHERE account.resource_type = 'external_account'
+                                AND account.resource_uuid = event.account_uuid
+                                AND NOT account.deleted
+                                AND COALESCE(
+                                      (account.body->>'synchronization_enabled')
+                                          ::boolean,
+                                      false
+                                    )
+                          )
+                          OR EXISTS (
+                              SELECT 1
+                              FROM desired_resources AS account
+                              LEFT JOIN scheduler_accounts AS scheduler
+                                ON scheduler.account_uuid = account.resource_uuid
+                              WHERE account.resource_type = 'external_account'
+                                AND account.resource_uuid = event.account_uuid
+                                AND NOT account.deleted
+                                AND COALESCE(
+                                      (account.body->>'synchronization_enabled')
+                                          ::boolean,
+                                      false
+                                    )
+                                AND (
+                                    scheduler.account_uuid IS NULL
+                                    OR scheduler.provider_generation IS DISTINCT
+                                       FROM account.generation
+                                    OR scheduler.provider_state = 'ready'
+                                    OR (
+                                        scheduler.provider_state = 'backoff'
+                                        AND scheduler.provider_retry_after <= now()
+                                    )
+                                )
+                          )
+                      )
                     ORDER BY available_at, created_at, event_id
                     LIMIT %s
                     """,
@@ -1685,6 +1787,54 @@ class RestAlchemyStore:
                           (
                               event.processing_state = 'pending'
                               AND event.available_at <= now()
+                              AND (
+                                  NOT EXISTS (
+                                      SELECT 1
+                                      FROM desired_resources AS account
+                                      WHERE account.resource_type =
+                                            'external_account'
+                                        AND account.resource_uuid =
+                                            event.account_uuid
+                                        AND NOT account.deleted
+                                        AND COALESCE(
+                                              (account.body
+                                                  ->>'synchronization_enabled')
+                                                  ::boolean,
+                                              false
+                                            )
+                                  )
+                                  OR EXISTS (
+                                      SELECT 1
+                                      FROM desired_resources AS account
+                                      LEFT JOIN scheduler_accounts AS scheduler
+                                        ON scheduler.account_uuid =
+                                           account.resource_uuid
+                                      WHERE account.resource_type =
+                                            'external_account'
+                                        AND account.resource_uuid =
+                                            event.account_uuid
+                                        AND NOT account.deleted
+                                        AND COALESCE(
+                                              (account.body
+                                                  ->>'synchronization_enabled')
+                                                  ::boolean,
+                                              false
+                                            )
+                                        AND (
+                                            scheduler.account_uuid IS NULL
+                                            OR scheduler.provider_generation
+                                               IS DISTINCT FROM
+                                               account.generation
+                                            OR scheduler.provider_state = 'ready'
+                                            OR (
+                                                scheduler.provider_state =
+                                                    'backoff'
+                                                AND scheduler.provider_retry_after
+                                                    <= now()
+                                            )
+                                        )
+                                  )
+                              )
                           )
                           OR (
                               event.processing_state = 'delivering'
@@ -3410,22 +3560,241 @@ class RestAlchemyStore:
             ).fetchall()
             return [str(row["resource_uuid"]) for row in rows]
 
+    def eligible_account_uuids(self) -> list[str]:
+        """Return active accounts whose persisted provider breaker permits work."""
+        if not self.provider_is_enabled("zulip"):
+            return []
+        with self.session() as session:
+            rows = session.execute(
+                """
+                SELECT account.resource_uuid
+                FROM desired_resources AS account
+                LEFT JOIN scheduler_accounts AS scheduler
+                  ON scheduler.account_uuid = account.resource_uuid
+                WHERE account.resource_type = 'external_account'
+                  AND NOT account.deleted
+                  AND COALESCE(
+                        (account.body->>'synchronization_enabled')::boolean,
+                        false
+                      )
+                  AND (
+                      scheduler.account_uuid IS NULL
+                      OR scheduler.provider_generation IS DISTINCT FROM
+                         account.generation
+                      OR scheduler.provider_state = 'ready'
+                      OR (
+                          scheduler.provider_state = 'backoff'
+                          AND scheduler.provider_retry_after <= now()
+                      )
+                  )
+                ORDER BY account.resource_uuid
+                """
+            ).fetchall()
+            return [str(row["resource_uuid"]) for row in rows]
+
+    def provider_account_is_eligible(self, account_uuid: str) -> bool:
+        with self.session() as session:
+            row = session.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM desired_resources AS account
+                    LEFT JOIN scheduler_accounts AS scheduler
+                      ON scheduler.account_uuid = account.resource_uuid
+                    WHERE account.resource_type = 'external_account'
+                      AND account.resource_uuid = %s
+                      AND NOT account.deleted
+                      AND COALESCE(
+                            (account.body->>'synchronization_enabled')::boolean,
+                            false
+                          )
+                      AND (
+                          scheduler.account_uuid IS NULL
+                          OR scheduler.provider_generation IS DISTINCT FROM
+                             account.generation
+                          OR scheduler.provider_state = 'ready'
+                          OR (
+                              scheduler.provider_state = 'backoff'
+                              AND scheduler.provider_retry_after <= now()
+                          )
+                      )
+                ) AS eligible
+                """,
+                (account_uuid,),
+            ).fetchone()
+            return bool(row and row["eligible"])
+
+    def record_provider_account_failure(
+        self,
+        account_uuid: str,
+        attempted_generation: int,
+        code: str,
+        retryable: bool,
+    ) -> dict[str, object] | None:
+        """Persist a failure only for the generation used by the request."""
+        state = "backoff" if retryable else "auth_required"
+        with self.session() as session:
+            desired = session.execute(
+                """
+                SELECT generation
+                FROM desired_resources
+                WHERE resource_type = 'external_account'
+                  AND resource_uuid = %s
+                  AND generation = %s
+                  AND NOT deleted
+                  AND COALESCE(
+                        (body->>'synchronization_enabled')::boolean, false
+                      )
+                FOR UPDATE
+                """,
+                (account_uuid, attempted_generation),
+            ).fetchone()
+            if desired is None:
+                return None
+            self._reconcile_provider_account_generation(
+                session, account_uuid, attempted_generation
+            )
+            row = session.execute(
+                """
+                UPDATE scheduler_accounts
+                SET provider_state = CASE
+                        WHEN provider_state = 'auth_required'
+                        THEN 'auth_required'
+                        ELSE %s
+                    END,
+                    provider_retry_count = provider_retry_count + 1,
+                    provider_retry_after = CASE
+                        WHEN provider_state = 'auth_required' THEN NULL
+                        WHEN %s THEN now() + (
+                            random() * LEAST(
+                                300.0,
+                                power(
+                                    2.0,
+                                    LEAST(provider_retry_count, 8)::double precision
+                                )
+                            ) * interval '1 second'
+                        )
+                        ELSE NULL
+                    END,
+                    provider_error_code = CASE
+                        WHEN provider_state = 'auth_required'
+                        THEN provider_error_code
+                        ELSE %s
+                    END,
+                    provider_state_updated_at = now()
+                WHERE account_uuid = %s AND provider_generation = %s
+                RETURNING provider_generation, provider_state,
+                          provider_retry_count, provider_retry_after,
+                          provider_error_code
+                """,
+                (
+                    state,
+                    retryable,
+                    code[:128],
+                    account_uuid,
+                    attempted_generation,
+                ),
+            ).fetchone()
+            return typing.cast(dict[str, object] | None, row)
+
+    def record_provider_account_success(
+        self, account_uuid: str, attempted_generation: int
+    ) -> bool | None:
+        """Close a transient breaker without clearing sticky authentication state."""
+        with self.session() as session:
+            desired = session.execute(
+                """
+                SELECT generation
+                FROM desired_resources
+                WHERE resource_type = 'external_account'
+                  AND resource_uuid = %s
+                  AND generation = %s
+                  AND NOT deleted
+                  AND COALESCE(
+                        (body->>'synchronization_enabled')::boolean, false
+                      )
+                FOR UPDATE
+                """,
+                (account_uuid, attempted_generation),
+            ).fetchone()
+            if desired is None:
+                return None
+            self._reconcile_provider_account_generation(
+                session, account_uuid, attempted_generation
+            )
+            row = session.execute(
+                """
+                UPDATE scheduler_accounts AS scheduler
+                SET provider_state = 'ready', provider_retry_count = 0,
+                    provider_retry_after = NULL, provider_error_code = NULL,
+                    provider_state_updated_at = now()
+                FROM desired_resources AS account
+                WHERE scheduler.account_uuid = %s
+                  AND account.resource_type = 'external_account'
+                  AND account.resource_uuid = scheduler.account_uuid
+                  AND NOT account.deleted
+                  AND account.generation = %s
+                  AND account.generation = scheduler.provider_generation
+                  AND scheduler.provider_state = 'backoff'
+                RETURNING scheduler.account_uuid
+                """,
+                (account_uuid, attempted_generation),
+            ).fetchone()
+            if row is None:
+                return False
+            session.execute(
+                "DELETE FROM bridge_health WHERE component = %s",
+                (provider_account_health_component(account_uuid),),
+            )
+            return True
+
+    def reap_expired_history_leases(self) -> int:
+        """Release stale participant and history leases from interrupted workers."""
+        with self.session() as session:
+            participants = session.execute(
+                """
+                UPDATE zulip_participant_sync
+                SET state = 'pending', lease_until = NULL, updated_at = now()
+                WHERE state = 'running' AND lease_until < now()
+                RETURNING account_uuid
+                """
+            ).fetchall()
+            backfills = session.execute(
+                """
+                UPDATE zulip_backfill_jobs
+                SET state = 'pending', lease_until = NULL, updated_at = now()
+                WHERE state = 'running' AND lease_until < now()
+                RETURNING account_uuid
+                """
+            ).fetchall()
+            return len(participants) + len(backfills)
+
     def reconcile_participant_sync(self) -> None:
         with self.session() as session:
             session.execute(
                 """
-                INSERT INTO scheduler_accounts (account_uuid)
-                SELECT DISTINCT
-                    (assignment.body->>'external_account_uuid')::uuid
-                FROM desired_resources AS assignment
-                WHERE assignment.resource_type = 'external_chat_assignment'
-                  AND NOT assignment.deleted
+                INSERT INTO scheduler_accounts (
+                    account_uuid, provider_generation, provider_state,
+                    provider_retry_count, provider_retry_after,
+                    provider_error_code, provider_state_updated_at
+                )
+                SELECT account.resource_uuid, account.generation, 'ready',
+                       0, NULL, NULL, now()
+                FROM desired_resources AS account
+                WHERE account.resource_type = 'external_account'
+                  AND NOT account.deleted
                   AND COALESCE(
-                      (assignment.body->>'selected')::boolean, true
+                      (account.body->>'synchronization_enabled')::boolean,
+                      false
                   )
-                ORDER BY
-                    (assignment.body->>'external_account_uuid')::uuid
-                ON CONFLICT (account_uuid) DO NOTHING
+                ORDER BY account.resource_uuid
+                ON CONFLICT (account_uuid) DO UPDATE SET
+                    provider_generation = EXCLUDED.provider_generation,
+                    provider_state = 'ready', provider_retry_count = 0,
+                    provider_retry_after = NULL, provider_error_code = NULL,
+                    provider_state_updated_at = now()
+                WHERE scheduler_accounts.provider_generation IS DISTINCT FROM
+                      EXCLUDED.provider_generation
                 """
             )
             session.execute(
@@ -3537,6 +3906,17 @@ class RestAlchemyStore:
                 WITH candidate_account AS MATERIALIZED (
                     SELECT scheduler.account_uuid
                     FROM scheduler_accounts AS scheduler
+                    JOIN desired_resources AS provider_account
+                      ON provider_account.resource_type = 'external_account'
+                     AND provider_account.resource_uuid = scheduler.account_uuid
+                     AND NOT provider_account.deleted
+                     AND provider_account.generation =
+                         scheduler.provider_generation
+                     AND COALESCE(
+                           (provider_account.body
+                               ->>'synchronization_enabled')::boolean,
+                           false
+                         )
                     JOIN LATERAL (
                         SELECT participant_sync.updated_at
                         FROM zulip_participant_sync AS participant_sync
@@ -3576,6 +3956,11 @@ class RestAlchemyStore:
                                  participant_sync.provider_chat_key
                         LIMIT 1
                     ) AS oldest ON true
+                    WHERE scheduler.provider_state = 'ready'
+                       OR (
+                           scheduler.provider_state = 'backoff'
+                           AND scheduler.provider_retry_after <= now()
+                       )
                     ORDER BY scheduler.last_participant_sync_at NULLS FIRST,
                              oldest.updated_at,
                              scheduler.account_uuid
@@ -4068,6 +4453,17 @@ class RestAlchemyStore:
                 WITH candidate_account AS MATERIALIZED (
                     SELECT scheduler.account_uuid
                     FROM scheduler_accounts AS scheduler
+                    JOIN desired_resources AS provider_account
+                      ON provider_account.resource_type = 'external_account'
+                     AND provider_account.resource_uuid = scheduler.account_uuid
+                     AND NOT provider_account.deleted
+                     AND provider_account.generation =
+                         scheduler.provider_generation
+                     AND COALESCE(
+                           (provider_account.body
+                               ->>'synchronization_enabled')::boolean,
+                           false
+                         )
                     JOIN LATERAL (
                         SELECT job.updated_at
                         FROM zulip_backfill_jobs AS job
@@ -4100,6 +4496,11 @@ class RestAlchemyStore:
                         ORDER BY job.updated_at, job.provider_chat_key
                         LIMIT 1
                     ) AS oldest ON true
+                    WHERE scheduler.provider_state = 'ready'
+                       OR (
+                           scheduler.provider_state = 'backoff'
+                           AND scheduler.provider_retry_after <= now()
+                       )
                     ORDER BY scheduler.last_backfill_at NULLS FIRST,
                              oldest.updated_at,
                              scheduler.account_uuid
@@ -4469,6 +4870,10 @@ class RestAlchemyStore:
                     SELECT operation.record_uuid,
                            CASE
                                WHEN operation.expires_at <= now() THEN 'expired'
+                               WHEN account.generation =
+                                    scheduler.provider_generation
+                                AND scheduler.provider_state = 'auth_required'
+                               THEN 'unauthorized_account'
                                ELSE 'cancelled'
                            END AS terminal_reason
                     FROM bridge_operations AS operation
@@ -4480,6 +4885,8 @@ class RestAlchemyStore:
                       ON account.resource_type = 'external_account'
                      AND account.resource_uuid = operation.account_uuid
                      AND NOT account.deleted
+                    LEFT JOIN scheduler_accounts AS scheduler
+                      ON scheduler.account_uuid = operation.account_uuid
                     WHERE operation.state = 'pending'
                       AND operation.available_at <= now()
                       AND (
@@ -4496,6 +4903,10 @@ class RestAlchemyStore:
                                 (account.body->>'synchronization_enabled')::boolean,
                                 false
                              )
+                          OR (
+                              account.generation = scheduler.provider_generation
+                              AND scheduler.provider_state = 'auth_required'
+                          )
                       )
                     ORDER BY operation.created_at
                     FOR UPDATE OF operation SKIP LOCKED
@@ -4529,8 +4940,17 @@ class RestAlchemyStore:
                 WITH candidates AS (
                     SELECT operation.record_uuid
                     FROM bridge_operations AS operation
-                    LEFT JOIN scheduler_accounts AS account
-                      ON account.account_uuid = operation.account_uuid
+                    JOIN scheduler_accounts AS scheduler
+                      ON scheduler.account_uuid = operation.account_uuid
+                    JOIN desired_resources AS account
+                      ON account.resource_type = 'external_account'
+                     AND account.resource_uuid = operation.account_uuid
+                     AND NOT account.deleted
+                     AND account.generation = scheduler.provider_generation
+                     AND COALESCE(
+                           (account.body->>'synchronization_enabled')::boolean,
+                           false
+                         )
                     LEFT JOIN causal_lane_state AS lane
                       ON lane.origin = operation.origin
                      AND lane.causal_lane = operation.causal_lane
@@ -4546,6 +4966,13 @@ class RestAlchemyStore:
                     WHERE operation.state = 'pending'
                       AND operation.available_at <= now()
                       AND (operation.expires_at IS NULL OR operation.expires_at > now())
+                      AND (
+                          scheduler.provider_state = 'ready'
+                          OR (
+                              scheduler.provider_state = 'backoff'
+                              AND scheduler.provider_retry_after <= now()
+                          )
+                      )
                       AND (
                           (
                               operation.attempt = 1
@@ -4577,7 +5004,7 @@ class RestAlchemyStore:
                           )
                       )
                     ORDER BY operation.priority,
-                             account.last_dispatched_at NULLS FIRST,
+                             scheduler.last_dispatched_at NULLS FIRST,
                              operation.available_at,
                              operation.created_at
                     FOR UPDATE OF operation SKIP LOCKED
@@ -4999,13 +5426,32 @@ class RestAlchemyStore:
             row = session.execute(
                 """
                 WITH candidate AS (
-                    SELECT record_uuid FROM bridge_operations
-                    WHERE state = 'uncertain'
-                      AND NOT manual_reconciliation_required
-                      AND reconciliation_after <= now()
-                      AND (lease_until IS NULL OR lease_until < now())
-                    ORDER BY reconciliation_after, created_at
-                    FOR UPDATE SKIP LOCKED
+                    SELECT operation.record_uuid
+                    FROM bridge_operations AS operation
+                    JOIN scheduler_accounts AS scheduler
+                      ON scheduler.account_uuid = operation.account_uuid
+                    JOIN desired_resources AS account
+                      ON account.resource_type = 'external_account'
+                     AND account.resource_uuid = operation.account_uuid
+                     AND NOT account.deleted
+                     AND account.generation = scheduler.provider_generation
+                    WHERE operation.state = 'uncertain'
+                      AND NOT operation.manual_reconciliation_required
+                      AND operation.reconciliation_after <= now()
+                      AND (
+                          operation.lease_until IS NULL
+                          OR operation.lease_until < now()
+                      )
+                      AND (
+                          scheduler.provider_state = 'ready'
+                          OR (
+                              scheduler.provider_state = 'backoff'
+                              AND scheduler.provider_retry_after <= now()
+                          )
+                      )
+                    ORDER BY operation.reconciliation_after,
+                             operation.created_at
+                    FOR UPDATE OF operation SKIP LOCKED
                     LIMIT 1
                 )
                 UPDATE bridge_operations AS operation
@@ -5034,6 +5480,23 @@ class RestAlchemyStore:
                 auto_resend_count=int(row["auto_resend_count"]),
                 reconciliation_check_count=int(row["reconciliation_check_count"]),
                 provider_rendered_content=row["provider_rendered_content"],
+            )
+
+    def defer_uncertain(
+        self,
+        item: QueuedOperation,
+        available_at: datetime.datetime,
+        code: str,
+    ) -> None:
+        with self.session() as session:
+            session.execute(
+                """
+                UPDATE bridge_operations
+                SET reconciliation_after = %s, last_error_code = %s,
+                    lease_owner = NULL, lease_until = NULL, updated_at = now()
+                WHERE record_uuid = %s AND state = 'uncertain'
+                """,
+                (available_at, code[:128], str(item.record_uuid)),
             )
 
     def schedule_reconciliation_check(
