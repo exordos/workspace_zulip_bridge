@@ -77,7 +77,23 @@ def test_pending_provider_event_probe_checks_ready_and_delivering_live_rows():
     assert "event.available_at <= now()" in statement
     assert "workspace_delivery_outbox AS delivery" in statement
     assert "'awaiting_result'" in statement
+    assert "scheduler.provider_state = 'ready'" in statement
+    assert "'backoff'" in statement
+    assert "scheduler.provider_retry_after" in statement
     assert parameters is None
+
+
+def test_eligible_accounts_are_generation_bound_and_backoff_aware():
+    session = Session(({"resource_uuid": "account"},))
+    store = _store_with_session(session)
+    store.provider_is_enabled = lambda provider: provider == "zulip"
+
+    assert store.eligible_account_uuids() == ["account"]
+    statement = session.statements[0][0]
+    assert "scheduler.provider_generation IS DISTINCT FROM" in statement
+    assert "scheduler.provider_state = 'ready'" in statement
+    assert "scheduler.provider_state = 'backoff'" in statement
+    assert "scheduler.provider_retry_after <= now()" in statement
 
 
 def test_pending_workspace_delivery_probe_requires_current_account_and_assignment():
@@ -494,7 +510,8 @@ def test_uncertain_claim_does_not_steal_a_live_reconciliation_lease():
 
     assert store.claim_uncertain("worker") is None
     statement = session.statements[0][0]
-    assert "lease_until IS NULL OR lease_until < now()" in statement
+    assert "operation.lease_until IS NULL" in statement
+    assert "operation.lease_until < now()" in statement
 
 
 def test_workspace_delivery_outbox_orders_live_before_backfill():
@@ -931,6 +948,9 @@ def test_claim_allows_explicit_retry_after_lane_advanced_without_later_delete():
     assert "operation.attempt > 1" in statement
     assert "NOT EXISTS" in statement
     assert "later_delete.state = 'committed'" in statement
+    assert "scheduler.provider_state = 'ready'" in statement
+    assert "scheduler.provider_state = 'backoff'" in statement
+    assert "account.generation = scheduler.provider_generation" in statement
 
 
 def test_terminal_claim_sweeps_expired_and_superseded_pending_work():
@@ -944,6 +964,8 @@ def test_terminal_claim_sweeps_expired_and_superseded_pending_work():
     assert "assignment.generation <> operation.assignment_generation" in statement
     assert "assignment.body->>'project_id'" in statement
     assert "account.body->>'synchronization_enabled'" in statement
+    assert "scheduler.provider_state = 'auth_required'" in statement
+    assert "THEN 'unauthorized_account'" in statement
 
 
 def test_provider_send_attempt_never_replaces_live_queue_cursor(operation_record):

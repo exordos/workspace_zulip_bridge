@@ -90,6 +90,7 @@ def test_adapter_registry_does_not_retain_decrypted_credentials(monkeypatch):
     class Adapter:
         def __init__(self, credentials, **kwargs):
             created.append(self)
+            self.account_generation = kwargs["account_generation"]
 
     monkeypatch.setattr(zulip_adapter, "OfficialZulipAdapter", Adapter)
     decryptor = Decryptor()
@@ -99,6 +100,7 @@ def test_adapter_registry_does_not_retain_decrypted_credentials(monkeypatch):
     assert first is not second
     assert decryptor.calls == 2
     assert not hasattr(registry, "cache")
+    assert first.account_generation == second.account_generation == 7
 
 
 def test_adapter_registry_uses_encrypted_credential_generation(monkeypatch):
@@ -176,6 +178,7 @@ def test_adapter_registry_rejects_invalid_credential_generation(
 
     assert error.value.code == "unauthorized_account"
     assert not error.value.retryable
+    assert error.value.account_generation == 7
 
 
 def test_adapter_registry_isolates_credential_decryption_failure():
@@ -3619,6 +3622,78 @@ def test_queue_loss_catchup_waits_for_workspace_chat_gates(pending_gate):
         "00000000-0000-0000-0000-000000000001", CatchupAdapter()
     )
     assert store.advanced == []
+
+
+def test_unauthorized_catchup_account_is_quarantined_without_blocking_healthy():
+    unauthorized_uuid = "00000000-0000-4000-8000-000000000001"
+    healthy_uuid = "00000000-0000-4000-8000-000000000002"
+    failures = []
+    successes = []
+    health = []
+    reports = []
+    catchups = []
+
+    class Store:
+        def active_account_uuids(self):
+            return [unauthorized_uuid, healthy_uuid]
+
+        def eligible_account_uuids(self):
+            return [unauthorized_uuid, healthy_uuid]
+
+        def provider_catchup_ready(self, account_uuid):
+            return False
+
+        def record_provider_account_failure(
+            self, account_uuid, attempted_generation, code, retryable
+        ):
+            failures.append((account_uuid, attempted_generation, code, retryable))
+            return {"provider_state": "auth_required"}
+
+        def record_provider_account_success(self, account_uuid, attempted_generation):
+            successes.append((account_uuid, attempted_generation))
+            return False
+
+        def mark_health(self, *args):
+            health.append(args)
+
+        def clear_health(self, *_args):
+            return None
+
+        def account_resource(self, account_uuid):
+            return {"generation": 1}
+
+        def enqueue_observed_report(self, report):
+            reports.append(report)
+            return True
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance.provider_adapters = lambda account_uuid: (
+        (_ for _ in ()).throw(
+            zulip_adapter.ZulipOperationError("bad_api_key", False, 1)
+        )
+        if account_uuid == unauthorized_uuid
+        else type("Adapter", (), {"account_generation": 1})()
+    )
+    instance._run_provider_queue_catchup = (
+        lambda account_uuid, _adapter: catchups.append(account_uuid) or True
+    )
+
+    assert instance.run_provider_catchup_once()
+    assert failures == [
+        (unauthorized_uuid, 1, "unauthorized_account", False)
+    ]
+    assert catchups == [healthy_uuid]
+    assert successes == [(healthy_uuid, 1)]
+    assert health == [
+        (
+            f"provider:{unauthorized_uuid}",
+            "degraded",
+            "unauthorized_account",
+        )
+    ]
+    assert reports[0]["status"] == "auth_required"
+    assert reports[0]["progress"]["phase"] == "auth_required"
 
 
 def test_ready_live_work_preempts_slow_history_and_backfill_delivery(tmp_path):

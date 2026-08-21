@@ -4,6 +4,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import threading
 import uuid
 
 import pytest
@@ -72,6 +73,213 @@ def postgres_store(migrated_postgres_dsn):
             """
         )
     return store
+
+
+def test_provider_account_breaker_survives_restart_and_reopens_on_generation(
+    postgres_store, migrated_postgres_dsn
+):
+    blocked_uuid = str(uuid.uuid4())
+    healthy_uuid = str(uuid.uuid4())
+    with postgres_store.session() as session:
+        policy_uuid = str(uuid.uuid4())
+        session.execute(
+            """
+            INSERT INTO desired_resources (
+                resource_type, resource_uuid, generation, body, deleted
+            ) VALUES (
+                'external_provider_policy', %s, 1,
+                jsonb_build_object(
+                    'uuid', %s::text,
+                    'generation', 1,
+                    'provider_kind', 'zulip',
+                    'enabled', true,
+                    'emergency_suspended', false
+                ),
+                false
+            )
+            """,
+            (policy_uuid, policy_uuid),
+        )
+        for account_uuid in (blocked_uuid, healthy_uuid):
+            session.execute(
+                """
+                INSERT INTO desired_resources (
+                    resource_type, resource_uuid, generation, body, deleted
+                ) VALUES (
+                    'external_account', %s, 1,
+                    jsonb_build_object(
+                        'uuid', %s::text,
+                        'generation', 1,
+                        'synchronization_enabled', true
+                    ),
+                    false
+                )
+                """,
+                (account_uuid, account_uuid),
+            )
+    postgres_store.reconcile_participant_sync()
+    postgres_store.record_provider_event(
+        blocked_uuid, "blocked-queue", {"id": 1, "type": "realm_user"}
+    )
+    postgres_store.record_provider_event(
+        healthy_uuid, "healthy-queue", {"id": 1, "type": "realm_user"}
+    )
+
+    state = postgres_store.record_provider_account_failure(
+        blocked_uuid, 1, "unauthorized_account", False
+    )
+
+    assert state is not None
+    assert state["provider_state"] == "auth_required"
+    raced = postgres_store.record_provider_account_failure(
+        blocked_uuid, 1, "provider_unavailable", True
+    )
+    assert raced is not None
+    assert raced["provider_state"] == "auth_required"
+    assert raced["provider_error_code"] == "unauthorized_account"
+    assert postgres_store.eligible_account_uuids() == [healthy_uuid]
+    assert not postgres_store.record_provider_account_success(blocked_uuid, 1)
+    assert [str(row["account_uuid"]) for row in postgres_store.pending_provider_events()] == [
+        healthy_uuid
+    ]
+
+    restarted = storage.RestAlchemyStore(migrated_postgres_dsn)
+    for _ in range(100):
+        assert restarted.eligible_account_uuids() == [healthy_uuid]
+
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE desired_resources
+            SET generation = 2,
+                body = jsonb_set(body, '{generation}', '2'::jsonb),
+                updated_at = now()
+            WHERE resource_type = 'external_account' AND resource_uuid = %s
+            """,
+            (blocked_uuid,),
+        )
+    postgres_store.reconcile_participant_sync()
+
+    assert postgres_store.eligible_account_uuids() == sorted(
+        [blocked_uuid, healthy_uuid]
+    )
+    with postgres_store.session() as session:
+        reopened = session.execute(
+            """
+            SELECT provider_generation, provider_state, provider_retry_count,
+                   provider_error_code
+            FROM scheduler_accounts WHERE account_uuid = %s
+            """,
+            (blocked_uuid,),
+        ).fetchone()
+    assert reopened == {
+        "provider_generation": 2,
+        "provider_state": "ready",
+        "provider_retry_count": 0,
+        "provider_error_code": None,
+    }
+
+
+def test_stale_provider_result_cannot_change_new_account_generation(postgres_store):
+    account_uuid = str(uuid.uuid4())
+    policy_uuid = str(uuid.uuid4())
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            INSERT INTO desired_resources (
+                resource_type, resource_uuid, generation, body, deleted
+            ) VALUES (
+                'external_provider_policy', %s, 1,
+                jsonb_build_object(
+                    'uuid', %s::text,
+                    'generation', 1,
+                    'provider_kind', 'zulip',
+                    'enabled', true,
+                    'emergency_suspended', false
+                ),
+                false
+            )
+            """,
+            (policy_uuid, policy_uuid),
+        )
+        session.execute(
+            """
+            INSERT INTO desired_resources (
+                resource_type, resource_uuid, generation, body, deleted
+            ) VALUES (
+                'external_account', %s, 1,
+                jsonb_build_object(
+                    'uuid', %s::text,
+                    'generation', 1,
+                    'synchronization_enabled', true
+                ),
+                false
+            )
+            """,
+            (account_uuid, account_uuid),
+        )
+    postgres_store.reconcile_participant_sync()
+
+    attempted_generation = 1
+    request_started = threading.Event()
+    complete_old_request = threading.Event()
+    stale_result: dict[str, object] = {}
+
+    def finish_old_request() -> None:
+        request_started.set()
+        assert complete_old_request.wait(timeout=2)
+        stale_result["failure"] = postgres_store.record_provider_account_failure(
+            account_uuid,
+            attempted_generation,
+            "unauthorized_account",
+            False,
+        )
+
+    request = threading.Thread(target=finish_old_request)
+    request.start()
+    assert request_started.wait(timeout=1)
+
+    # Credential rotation advances desired state while the generation 1
+    # provider request remains in flight.
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE desired_resources
+            SET generation = 2,
+                body = jsonb_set(body, '{generation}', '2'::jsonb),
+                updated_at = now()
+            WHERE resource_type = 'external_account' AND resource_uuid = %s
+            """,
+            (account_uuid,),
+        )
+    postgres_store.reconcile_participant_sync()
+    complete_old_request.set()
+    request.join(timeout=2)
+
+    assert not request.is_alive()
+    assert stale_result == {"failure": None}
+    assert (
+        postgres_store.record_provider_account_success(
+            account_uuid, attempted_generation
+        )
+        is None
+    )
+    assert postgres_store.eligible_account_uuids() == [account_uuid]
+    with postgres_store.session() as session:
+        current = session.execute(
+            """
+            SELECT provider_generation, provider_state, provider_retry_count,
+                   provider_error_code
+            FROM scheduler_accounts WHERE account_uuid = %s
+            """,
+            (account_uuid,),
+        ).fetchone()
+    assert current == {
+        "provider_generation": 2,
+        "provider_state": "ready",
+        "provider_retry_count": 0,
+        "provider_error_code": None,
+    }
 
 
 def _explain_text(session, query: str, parameters=()) -> str:

@@ -156,6 +156,46 @@ def test_expired_pending_is_terminally_swept_before_normal_claim(operation_recor
     assert store.completed[0][1]["result"]["manual_retry_allowed"] is True
 
 
+def test_auth_required_pending_work_is_rejected_without_provider_call(
+    operation_record,
+):
+    store = FakeStore(operation_record)
+    item = store.item
+    store.item = None
+    store.terminal = (item, "unauthorized_account")
+    called = []
+    worker = scheduler.Scheduler(store, lambda _: called.append(True), "worker")
+
+    assert worker.run_once()
+
+    assert not called
+    assert store.completed[0][2] == "rejected"
+    assert store.completed[0][1]["result"]["safe_error"]["code"] == (
+        "unauthorized_account"
+    )
+
+
+def test_outbound_auth_failure_notifies_account_breaker(operation_record):
+    store = FakeStore(operation_record)
+    failures = []
+
+    def unauthorized(_account_uuid):
+        raise zulip_adapter.ZulipOperationError("bad_api_key", False, 7)
+
+    worker = scheduler.Scheduler(store, unauthorized, "worker")
+    worker.account_failure_handler = (
+        lambda account_uuid, error, attempted_generation: failures.append(
+            (account_uuid, error.code, attempted_generation)
+        )
+        or True
+    )
+
+    assert worker.run_once()
+
+    assert failures == [(operation_record["account_uuid"], "bad_api_key", 7)]
+    assert store.completed[0][2] == "rejected"
+
+
 def _uncertain_item(record, checks=0, resends=0):
     return storage.QueuedOperation(
         uuid.uuid4(),

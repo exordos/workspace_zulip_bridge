@@ -71,11 +71,12 @@ def test_migrations_have_one_versioned_dependency_chain():
         "0014-bound-terminal-delivery-retention-4c61bd.py",
         "0015-scale-large-synchronizations-ad12e8.py",
         "0016-refresh-Zulip-reactions-by-emoji-code-e76ed0.py",
+        "0017-persist-provider-account-circuit-breaker-e875bc.py",
     ]
     assert engine.get_latest_migration() == (
-        "0016-refresh-Zulip-reactions-by-emoji-code-e76ed0.py"
+        "0017-persist-provider-account-circuit-breaker-e875bc.py"
     )
-    assert len({step["uuid"] for step in all_migrations.values()}) == 17
+    assert len({step["uuid"] for step in all_migrations.values()}) == 18
     assert all_migrations["0001-add-Zulip-provider-scheduler-state-143113.py"][
         "depends"
     ] == ["0000-initialize-bridge-operational-state-18f707.py"]
@@ -124,6 +125,37 @@ def test_migrations_have_one_versioned_dependency_chain():
     assert all_migrations[
         "0016-refresh-Zulip-reactions-by-emoji-code-e76ed0.py"
     ]["depends"] == ["0015-scale-large-synchronizations-ad12e8.py"]
+    assert all_migrations[
+        "0017-persist-provider-account-circuit-breaker-e875bc.py"
+    ]["depends"] == ["0016-refresh-Zulip-reactions-by-emoji-code-e76ed0.py"]
+
+
+def test_provider_account_breaker_migration_is_persisted_and_generation_bound():
+    migration_path = (
+        MIGRATIONS / "0017-persist-provider-account-circuit-breaker-e875bc.py"
+    )
+    spec = importlib.util.spec_from_file_location("provider_breaker", migration_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class Session:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, statement):
+            self.statements.append(statement)
+
+    session = Session()
+    module.migration_step.upgrade(session)
+
+    assert len(session.statements) == 1
+    statement = session.statements[0]
+    assert "provider_generation bigint" in statement
+    assert "provider_state IN ('ready', 'backoff', 'auth_required')" in statement
+    assert "provider_retry_after timestamptz" in statement
+    assert "scheduler_accounts_provider_ready_idx" in statement
+    assert "last_error_code IN ('unauthorized', 'unauthorized_account')" in statement
 
 
 def test_reaction_emoji_migration_requeues_configured_history():
@@ -270,12 +302,13 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                       'zulip_provider_events_terminal_created_idx',
                       'desired_resources_assignment_chat_idx',
                       'zulip_participant_sync_account_claim_idx',
-                      'zulip_backfill_jobs_account_claim_idx'
+                      'zulip_backfill_jobs_account_claim_idx',
+                      'scheduler_accounts_provider_ready_idx'
                   )
                 ORDER BY indexname
                 """
             ).fetchall()
-            assert applied["count"] == 17
+            assert applied["count"] == 18
             assert [row["indexname"] for row in indexes] == [
                 "bridge_operations_active_local_echo_idx",
                 "desired_resources_assignment_chat_idx",
@@ -283,6 +316,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                 "observed_report_outbox_catalog_readiness_idx",
                 "observed_report_outbox_pending_order_idx",
                 "observed_report_outbox_resource_latest_idx",
+                "scheduler_accounts_provider_ready_idx",
                 "workspace_delivery_outbox_initial_backfill_idx",
                 "workspace_delivery_outbox_pending_dependency_idx",
                 "workspace_delivery_outbox_pending_order_idx",
@@ -319,7 +353,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
             provider_cursor_count = session.execute(
                 "SELECT count(*) AS count FROM zulip_event_cursors"
             ).fetchone()
-            assert applied["count"] == 17
+            assert applied["count"] == 18
             assert cursor["control_cursor"] == "preserved"
             assert provider_cursor_count["count"] == 0
     finally:

@@ -90,12 +90,15 @@ class AdapterRegistry:
         if not self.store.provider_is_enabled("zulip"):
             raise zulip_adapter.ZulipOperationError("provider_suspended", True)
         resource = self.store.desired_resource("external_account", account_uuid)
-        if resource is None or not resource["synchronization_enabled"]:
-            raise zulip_adapter.ZulipOperationError("unauthorized_account", False)
+        generation: int | None = None
         try:
+            if resource is None:
+                raise ValueError("Zulip provider account is unavailable")
             generation = int(resource["generation"])
             if generation < 1:
                 raise ValueError("Account generation must be positive")
+            if not resource["synchronization_enabled"]:
+                raise ValueError("Zulip provider account is disabled")
             envelope = typing.cast(dict[str, object], resource["credential_envelope"])
             associated_data = typing.cast(
                 dict[str, object], envelope["associated_data"]
@@ -116,20 +119,28 @@ class AdapterRegistry:
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise zulip_adapter.ZulipOperationError(
-                "unauthorized_account", False
+                "unauthorized_account", False, generation
             ) from exc
-        account_credentials = dataclasses.replace(
-            account_credentials,
-            cert_bundle=self._cert_bundle(),
-        )
-        return zulip_adapter.OfficialZulipAdapter(
-            account_credentials,
-            routing=_AccountRouting(self.store, account_uuid),
-            owner_user_uuid=str(resource["owner_user_uuid"]),
-            account_uuid=account_uuid,
-            file_client=self.file_client,
-            file_limit=lambda: self.store.effective_file_limit(file_api.MAX_FILE_BYTES),
-        )
+        try:
+            account_credentials = dataclasses.replace(
+                account_credentials,
+                cert_bundle=self._cert_bundle(),
+            )
+            return zulip_adapter.OfficialZulipAdapter(
+                account_credentials,
+                routing=_AccountRouting(self.store, account_uuid),
+                owner_user_uuid=str(resource["owner_user_uuid"]),
+                account_uuid=account_uuid,
+                account_generation=generation,
+                file_client=self.file_client,
+                file_limit=lambda: self.store.effective_file_limit(
+                    file_api.MAX_FILE_BYTES
+                ),
+            )
+        except zulip_adapter.ZulipOperationError as exc:
+            if exc.account_generation is None:
+                exc.account_generation = generation
+            raise
 
 
 class _AccountRouting:
@@ -171,6 +182,15 @@ class _AccountRouting:
 
 
 class BridgeService:
+    PROVIDER_AUTH_ERROR_CODES = frozenset(
+        {
+            "unauthorized",
+            "unauthorized_account",
+            "bad_api_key",
+            "invalid_api_key",
+            "user_not_authorized",
+        }
+    )
     MAX_QUEUE_CATCHUP_PAGES = 20
     MAX_CONTROL_SNAPSHOT_PAGES = 10_000
     MAX_CONTROL_SNAPSHOT_RESOURCES = 2_000_000
@@ -208,6 +228,7 @@ class BridgeService:
     HISTORY_QUANTUM_INTERVAL_SECONDS = 1.0
     HISTORY_PROGRESS_DELAY_SECONDS = 2.0
     TERMINAL_STATE_PRUNE_INTERVAL_SECONDS = 10.0
+    HISTORY_LEASE_REAP_INTERVAL_SECONDS = 30.0
     PROVIDER_DELIVERY_RETRY_BASE_SECONDS = 1.0
     PROVIDER_DELIVERY_RETRY_CAP_SECONDS = 30.0
     PROVIDER_DELIVERY_RETRY_AFTER_CAP_SECONDS = 300.0
@@ -262,10 +283,11 @@ class BridgeService:
         self.history_quantum_lock = threading.Lock()
         self.history_delivery_lock = threading.Lock()
         self.last_terminal_state_prune = time.monotonic()
+        self.last_history_lease_reap = time.monotonic()
         self.provider_poll_threads: dict[str, threading.Thread] = {}
         self.provider_poll_stops: dict[str, threading.Event] = {}
         self.provider_poll_results: queue.SimpleQueue[
-            tuple[str, int, zulip_adapter.ZulipOperationError | None]
+            tuple[str, int | None, int, zulip_adapter.ZulipOperationError | None]
         ] = queue.SimpleQueue()
         self.provider_failed_accounts: set[str] = set()
         self.provider_successful_accounts: set[str] = set()
@@ -298,6 +320,8 @@ class BridgeService:
             "control": None,
             "desired": None,
         }
+        self.scheduler.account_failure_handler = self._handle_provider_account_error
+        self.scheduler.account_success_handler = self._record_provider_account_success
 
     def synchronize_control(self) -> bool:
         cursor = self.store.control_cursor()
@@ -708,9 +732,12 @@ class BridgeService:
         """Continuously capture one account queue outside the main sync thread."""
         try:
             adapter = self.provider_adapters(account_uuid)
+            attempted_generation = self._adapter_generation(adapter)
             while not stop.is_set():
                 processed, error = self._poll_provider_account(account_uuid, adapter)
-                self.provider_poll_results.put((account_uuid, processed, error))
+                self.provider_poll_results.put(
+                    (account_uuid, attempted_generation, processed, error)
+                )
                 if error is not None:
                     return
                 poll_interval = getattr(
@@ -721,11 +748,14 @@ class BridgeService:
                 if stop.wait(max(0.1, poll_interval)):
                     return
         except zulip_adapter.ZulipOperationError as exc:
-            self.provider_poll_results.put((account_uuid, 0, exc))
+            self.provider_poll_results.put(
+                (account_uuid, exc.account_generation, 0, exc)
+            )
         except Exception:
             self.provider_poll_results.put(
                 (
                     account_uuid,
+                    None,
                     0,
                     zulip_adapter.ZulipOperationError(
                         "provider_poll_failed",
@@ -735,14 +765,14 @@ class BridgeService:
             )
 
     def poll_provider_events(self) -> int:
-        """Supervise one persistent long-poll thread for every active account."""
+        """Supervise one persistent long-poll thread for every eligible account."""
         self._ensure_provider_poll_state()
         now = time.monotonic()
-        active_accounts = set(self.store.active_account_uuids())
+        active_accounts = set(self._eligible_provider_accounts())
         processed = 0
         while True:
             try:
-                account_uuid, account_processed, error = (
+                account_uuid, attempted_generation, account_processed, error = (
                     self.provider_poll_results.get_nowait()
                 )
             except queue.Empty:
@@ -750,20 +780,21 @@ class BridgeService:
             if account_uuid not in active_accounts:
                 continue
             if error is None:
-                self._clear_provider_retry(account_uuid)
+                self._record_provider_account_success(
+                    account_uuid, attempted_generation
+                )
                 self.provider_failed_accounts.discard(account_uuid)
                 self.provider_successful_accounts.add(account_uuid)
                 processed += account_processed
             else:
                 self.provider_successful_accounts.discard(account_uuid)
                 self.provider_failed_accounts.add(account_uuid)
-                self._defer_provider_account(account_uuid, now)
-                self.store.mark_health("provider", "degraded", error.code)
-                self._queue_account_report(
-                    account_uuid,
-                    "degraded",
-                    error.code,
+                if not hasattr(self.store, "record_provider_account_failure"):
+                    self._defer_provider_account(account_uuid, now)
+                self._handle_provider_account_error(
+                    account_uuid, error, attempted_generation
                 )
+                active_accounts.discard(account_uuid)
 
         for account_uuid, thread in list(self.provider_poll_threads.items()):
             if account_uuid not in active_accounts:
@@ -778,7 +809,7 @@ class BridgeService:
         for account_uuid in sorted(active_accounts):
             if account_uuid in self.provider_poll_threads:
                 continue
-            if self.provider_retry_after.get(account_uuid, 0.0) > now:
+            if getattr(self, "provider_retry_after", {}).get(account_uuid, 0.0) > now:
                 continue
             stop = threading.Event()
             thread = threading.Thread(
@@ -849,11 +880,17 @@ class BridgeService:
         account_uuid: str,
         status: str,
         safe_error_code: str | None = None,
+        expected_generation: int | None = None,
     ) -> None:
-        account = self.store.account_resource(account_uuid)
+        account_resource = getattr(self.store, "account_resource", None)
+        if not callable(account_resource):
+            return
+        account = account_resource(account_uuid)
         if account is None:
             return
         generation = int(account["generation"])
+        if expected_generation is not None and generation != expected_generation:
+            return
         report_state = (generation, status, safe_error_code)
         report_states = getattr(self, "provider_account_report_states", None)
         if report_states is None:
@@ -881,6 +918,8 @@ class BridgeService:
             (
                 "live"
                 if status == "live_ready"
+                else "auth_required"
+                if status == "auth_required"
                 else "retry"
                 if status == "degraded"
                 else "backfill"
@@ -1129,6 +1168,7 @@ class BridgeService:
         if self.store.provider_event_cursor(account_uuid) is None:
             self._release_participant_jobs(valid_jobs)
             return False
+        adapter: zulip_adapter.OfficialZulipAdapter | None = None
         try:
             adapter = self.provider_adapters(account_uuid)
             chat_keys = [str(job["provider_chat_key"]) for job in valid_jobs]
@@ -1147,8 +1187,12 @@ class BridgeService:
             )
         except zulip_adapter.ZulipOperationError as exc:
             self._release_participant_jobs(valid_jobs)
-            self.store.mark_health("provider", "degraded", exc.code)
-            self._queue_account_report(account_uuid, "degraded", exc.code)
+            authentication = self._handle_provider_account_error(
+                account_uuid, exc, self._adapter_generation(adapter)
+            )
+            if not authentication and not exc.retryable:
+                self.store.mark_health("provider", "degraded", exc.code)
+                self._queue_account_report(account_uuid, "degraded", exc.code)
             return False
         subscriptions = {
             f"channel:{int(subscription['stream_id'])}": subscription
@@ -1187,6 +1231,9 @@ class BridgeService:
                     typing.cast(list[int], completion["provider_user_ids"]),
                     bool(completion["ready"]),
                 )
+        self._record_provider_account_success(
+            account_uuid, self._adapter_generation(adapter)
+        )
         return True
 
     def _release_participant_jobs(self, jobs: list[dict[str, object]]) -> None:
@@ -1603,16 +1650,105 @@ class BridgeService:
         return len(results)
 
     def _defer_provider_account(self, account_uuid: str, now: float) -> None:
-        attempts = self.provider_retry_attempts.get(account_uuid, 0) + 1
+        retry_attempts = getattr(self, "provider_retry_attempts", None)
+        if retry_attempts is None:
+            retry_attempts = {}
+            self.provider_retry_attempts = retry_attempts
+        retry_after = getattr(self, "provider_retry_after", None)
+        if retry_after is None:
+            retry_after = {}
+            self.provider_retry_after = retry_after
+        attempts = retry_attempts.get(account_uuid, 0) + 1
         self.provider_retry_attempts[account_uuid] = attempts
         ceiling = min(300.0, float(2 ** min(attempts - 1, 8)))
-        self.provider_retry_after[account_uuid] = now + self.provider_random.uniform(
+        random_source = getattr(self, "provider_random", random)
+        self.provider_retry_after[account_uuid] = now + random_source.uniform(
             0.0, ceiling
         )
 
     def _clear_provider_retry(self, account_uuid: str) -> None:
-        self.provider_retry_attempts.pop(account_uuid, None)
-        self.provider_retry_after.pop(account_uuid, None)
+        getattr(self, "provider_retry_attempts", {}).pop(account_uuid, None)
+        getattr(self, "provider_retry_after", {}).pop(account_uuid, None)
+
+    def _eligible_provider_accounts(self) -> list[str]:
+        eligible = getattr(self.store, "eligible_account_uuids", None)
+        if callable(eligible):
+            return typing.cast(list[str], eligible())
+        return self.store.active_account_uuids()
+
+    @classmethod
+    def _provider_auth_error(cls, code: str) -> bool:
+        return code.lower() in cls.PROVIDER_AUTH_ERROR_CODES
+
+    @staticmethod
+    def _adapter_generation(
+        adapter: zulip_adapter.OfficialZulipAdapter | object | None,
+    ) -> int | None:
+        generation = getattr(adapter, "account_generation", None)
+        if isinstance(generation, int) and not isinstance(generation, bool):
+            return generation
+        return None
+
+    def _handle_provider_account_error(
+        self,
+        account_uuid: str,
+        error: zulip_adapter.ZulipOperationError,
+        attempted_generation: int | None = None,
+    ) -> bool:
+        """Persist account-scoped retry or sticky authentication quarantine."""
+        authentication = self._provider_auth_error(error.code)
+        normalized_code = "unauthorized_account" if authentication else error.code
+        if attempted_generation is None:
+            attempted_generation = error.account_generation
+        recorder = getattr(self.store, "record_provider_account_failure", None)
+        recorded: dict[str, object] | None = None
+        if (
+            callable(recorder)
+            and attempted_generation is not None
+            and (authentication or error.retryable)
+        ):
+            recorded = recorder(
+                account_uuid,
+                attempted_generation,
+                normalized_code,
+                error.retryable and not authentication,
+            )
+            if (
+                isinstance(recorded, dict)
+                and recorded.get("provider_state") == "auth_required"
+            ):
+                authentication = True
+                normalized_code = "unauthorized_account"
+        if not authentication and not error.retryable:
+            return False
+        if callable(recorder) and recorded is None:
+            # No desired resource matched the generation used by this request.
+            # Classify the old operation, but do not mutate/report a newer one.
+            return authentication
+        component = (
+            storage.provider_account_health_component(account_uuid)
+            if callable(recorder)
+            else "provider"
+        )
+        self.store.mark_health(component, "degraded", normalized_code)
+        self._queue_account_report(
+            account_uuid,
+            "auth_required" if authentication else "degraded",
+            normalized_code,
+            attempted_generation,
+        )
+        return authentication
+
+    def _record_provider_account_success(
+        self, account_uuid: str, attempted_generation: int | None = None
+    ) -> None:
+        recorder = getattr(self.store, "record_provider_account_success", None)
+        if callable(recorder):
+            if attempted_generation is None:
+                return
+            if recorder(account_uuid, attempted_generation) is None:
+                return
+        self._clear_provider_retry(account_uuid)
 
     def _run_provider_queue_catchup(
         self,
@@ -1772,18 +1908,24 @@ class BridgeService:
             or not hasattr(store, "provider_catchup_ready")
         ):
             return False
-        for account_uuid in store.active_account_uuids():
+        for account_uuid in self._eligible_provider_accounts():
             if store.provider_catchup_ready(account_uuid):
                 continue
+            adapter: zulip_adapter.OfficialZulipAdapter | None = None
             try:
-                self._run_provider_queue_catchup(
-                    account_uuid,
-                    self.provider_adapters(account_uuid),
-                )
+                adapter = self.provider_adapters(account_uuid)
+                self._run_provider_queue_catchup(account_uuid, adapter)
             except zulip_adapter.ZulipOperationError as exc:
-                self.store.mark_health("provider", "degraded", exc.code)
-                self._queue_account_report(account_uuid, "degraded", exc.code)
-                return False
+                authentication = self._handle_provider_account_error(
+                    account_uuid, exc, self._adapter_generation(adapter)
+                )
+                if not authentication and not exc.retryable:
+                    self.store.mark_health("provider", "degraded", exc.code)
+                    self._queue_account_report(account_uuid, "degraded", exc.code)
+                continue
+            self._record_provider_account_success(
+                account_uuid, self._adapter_generation(adapter)
+            )
             return True
         return False
 
@@ -1927,7 +2069,11 @@ class BridgeService:
             try:
                 adapter = self.provider_adapters(account_uuid)
             except zulip_adapter.ZulipOperationError as exc:
-                self.store.mark_health("provider", "degraded", exc.code)
+                authentication = self._handle_provider_account_error(
+                    account_uuid, exc, exc.account_generation
+                )
+                if not authentication and not exc.retryable:
+                    self.store.mark_health("provider", "degraded", exc.code)
                 continue
             supported = str(event["type"]) in supported_types
             try:
@@ -2039,11 +2185,17 @@ class BridgeService:
                         records,
                     )
             except zulip_adapter.ZulipOperationError as exc:
+                authentication = self._handle_provider_account_error(
+                    account_uuid, exc, self._adapter_generation(adapter)
+                )
+                if authentication:
+                    # Keep the durable journal head intact until reconnecting
+                    # advances the account generation and opens the breaker.
+                    continue
                 if exc.retryable:
                     self.store.retry_provider_event(
                         account_uuid, queue_id, event_id, exc.code
                     )
-                    self.store.mark_health("provider", "degraded", exc.code)
                     continue
                 self.store.mark_provider_event_invalid(
                     account_uuid, queue_id, event_id, exc.code
@@ -2261,11 +2413,18 @@ class BridgeService:
         if not self.store.account_is_active(account_uuid):
             self.store.release_backfill_job(account_uuid, provider_chat_key)
             return False
+        adapter: zulip_adapter.OfficialZulipAdapter | None = None
         try:
             adapter = self.provider_adapters(account_uuid)
             anchor = "newest" if job["next_anchor"] is None else int(job["next_anchor"])
             messages = adapter.message_history(provider_chat_key, anchor=anchor)
         except zulip_adapter.ZulipOperationError as exc:
+            authentication = self._handle_provider_account_error(
+                account_uuid, exc, self._adapter_generation(adapter)
+            )
+            if authentication:
+                self.store.release_backfill_job(account_uuid, provider_chat_key)
+                return True
             if not exc.retryable:
                 self.store.fail_backfill_job(
                     account_uuid,
@@ -2289,7 +2448,6 @@ class BridgeService:
                 datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=delay),
                 exc.code,
             )
-            self.store.mark_health("provider", "degraded", exc.code)
             return True
         cutoff = job["cutoff_at"]
         eligible = messages
@@ -2307,6 +2465,12 @@ class BridgeService:
         try:
             self.enqueue_backfill(account_uuid, provider_chat_key, eligible)
         except zulip_adapter.ZulipOperationError as exc:
+            authentication = self._handle_provider_account_error(
+                account_uuid, exc, self._adapter_generation(adapter)
+            )
+            if authentication:
+                self.store.release_backfill_job(account_uuid, provider_chat_key)
+                return True
             if not exc.retryable:
                 self.store.fail_backfill_job(
                     account_uuid,
@@ -2330,7 +2494,6 @@ class BridgeService:
                 datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=delay),
                 exc.code,
             )
-            self.store.mark_health("provider", "degraded", exc.code)
             return True
         except ValueError as exc:
             if str(exc) not in {
@@ -2367,6 +2530,9 @@ class BridgeService:
             provider_chat_key,
             next_anchor,
             complete,
+        )
+        self._record_provider_account_success(
+            account_uuid, self._adapter_generation(adapter)
         )
         return True
 
@@ -2566,6 +2732,17 @@ class BridgeService:
             progressed |= self._run_heartbeat(now)
         progressed |= self._run_control_poll(now)
         store = getattr(self, "store", None)
+        last_history_lease_reap = getattr(
+            self, "last_history_lease_reap", 0.0
+        )
+        if (
+            store is not None
+            and hasattr(store, "reap_expired_history_leases")
+            and now - last_history_lease_reap
+            >= self.HISTORY_LEASE_REAP_INTERVAL_SECONDS
+        ):
+            progressed |= store.reap_expired_history_leases() > 0
+            self.last_history_lease_reap = now
         last_reconcile = getattr(self, "last_control_state_reconcile", 0.0)
         control_state_dirty = getattr(self, "control_state_dirty", True)
         if control_state_dirty or (

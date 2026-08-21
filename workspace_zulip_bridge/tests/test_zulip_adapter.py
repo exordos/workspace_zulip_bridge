@@ -19,6 +19,25 @@ DIRECT_TOPIC_UUID = "10000000-0000-4000-8000-000000000009"
 SELF_STREAM_UUID = "10000000-0000-4000-8000-000000000010"
 
 
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"result": "error", "code": "BAD_API_KEY"},
+        {
+            "result": "error",
+            "code": "BAD_REQUEST",
+            "msg": "Invalid API key",
+        },
+    ],
+)
+def test_provider_authentication_failures_use_account_quarantine_code(response):
+    with pytest.raises(zulip_adapter.ZulipOperationError) as captured:
+        zulip_adapter._successful(response)
+
+    assert captured.value.code == "unauthorized_account"
+    assert not captured.value.retryable
+
+
 class FakeClient:
     def __init__(self):
         self.base_url = "https://zulip.example.invalid/api/"
