@@ -214,6 +214,11 @@ class BridgeService:
     LIVE_DELIVERY_BATCH_SIZE = 100
     PROVIDER_JOURNAL_QUANTUM = 20
     PROVIDER_JOURNAL_WORKERS = 16
+    # Give a newly discovered chat five minutes to reach desired state, then
+    # quarantine the reaction so one missing assignment cannot block the rest
+    # of an account's journal forever. The start time is persisted separately
+    # from retry backoff so provider failures cannot restart this deadline.
+    REACTION_CHAT_ASSIGNMENT_TIMEOUT = datetime.timedelta(minutes=5)
     PARTICIPANT_SYNC_BATCH_SIZE = 50
     # History conversion touches shared stream/topic/identity mappings. Commit
     # each message so live events never wait behind a multi-message lock set.
@@ -1376,6 +1381,19 @@ class BridgeService:
             )
         elif operation == "delete" and hasattr(self.store, "delete_catalog_topology"):
             self.store.delete_catalog_topology(account_uuid, chat_key)
+        if operation == "upsert" and chat_type in {"direct", "group_direct"}:
+            peer_names = [
+                str(
+                    participant.get(
+                        "display_name",
+                        participant.get("provider_user_id", "User"),
+                    )
+                )
+                for participant in participants or []
+                if not bool(participant.get("is_owner"))
+            ]
+            if peer_names:
+                display_name = ", ".join(peer_names)
         common_capabilities = {
             "messenger.chat_catalog",
             "messenger.message.send",
@@ -1442,12 +1460,41 @@ class BridgeService:
             return f"{provider_site}/#narrow/dm/{identifiers}-group"
         return provider_site
 
+    @staticmethod
+    def _reaction_message_context(
+        provider_message: dict[str, object],
+    ) -> dict[str, object]:
+        """Retain only fields needed to resolve and catalog a reaction's chat."""
+        return {
+            name: provider_message[name]
+            for name in (
+                "id",
+                "type",
+                "stream_id",
+                "display_recipient",
+                "subject",
+                "timestamp",
+            )
+            if name in provider_message
+        }
+
+    @classmethod
+    def _reaction_assignment_wait_expired(
+        cls, row: dict[str, object]
+    ) -> bool:
+        pending_since = row.get("assignment_pending_since")
+        return (
+            isinstance(pending_since, datetime.datetime)
+            and pending_since + cls.REACTION_CHAT_ASSIGNMENT_TIMEOUT
+            <= datetime.datetime.now(datetime.UTC)
+        )
+
     def _queue_event_catalog(
         self, account_uuid: str, event: dict[str, object], server_url: str
-    ) -> None:
+    ) -> bool:
         account = self.store.account_resource(account_uuid)
         if account is None:
-            return
+            return False
         settings = typing.cast(dict[str, object], account["settings"])
         common = (
             str(account["owner_user_uuid"]),
@@ -1493,7 +1540,7 @@ class BridgeService:
                     if isinstance(person, dict) and isinstance(person.get("id"), int)
                 ]
             else:
-                return
+                return False
             if display_name:
                 self._queue_catalog_report(
                     account_uuid,
@@ -1515,9 +1562,10 @@ class BridgeService:
                         ]
                     ),
                 )
-            return
+                return True
+            return False
         if event_type != "subscription":
-            return
+            return False
         operation = str(event.get("op"))
         if operation in {"peer_add", "peer_remove"}:
             stream_ids = event.get("stream_ids")
@@ -1532,7 +1580,7 @@ class BridgeService:
                             if isinstance(stream_id, int)
                         ],
                     )
-            return
+            return False
         subscriptions: list[dict[str, object]] = []
         if operation in {"add", "remove"}:
             subscriptions = typing.cast(
@@ -1542,6 +1590,7 @@ class BridgeService:
             subscriptions = [
                 {"stream_id": event.get("stream_id"), "name": event.get("value")}
             ]
+        catalog_changed = False
         for subscription in subscriptions:
             stream_id = subscription.get("stream_id")
             display_name = subscription.get("name")
@@ -1556,6 +1605,8 @@ class BridgeService:
                 server_url,
                 "delete" if operation == "remove" else "upsert",
             )
+            catalog_changed = True
+        return catalog_changed
 
     def _initial_sync_ready(self, account_uuid: str) -> bool:
         ready_accounts = getattr(self, "initial_sync_ready_accounts", None)
@@ -2123,15 +2174,72 @@ class BridgeService:
                         account_uuid, "message", str(provider_message_id)
                     )
                     if mapping is None:
-                        provider_message = adapter.message_by_id(provider_message_id)
-                        if provider_message is None:
-                            raise ValueError("provider_message_not_found")
+                        cached_message = row.get("provider_message_context")
+                        if isinstance(cached_message, dict):
+                            provider_message = typing.cast(
+                                dict[str, object], cached_message
+                            )
+                        else:
+                            fetched_message = adapter.message_by_id(
+                                provider_message_id
+                            )
+                            if fetched_message is None:
+                                raise ValueError("provider_message_not_found")
+                            provider_message = self._reaction_message_context(
+                                fetched_message
+                            )
+                            cache_message = getattr(
+                                self.store,
+                                "cache_provider_event_message_context",
+                                None,
+                            )
+                            if callable(cache_message):
+                                provider_message = cache_message(
+                                    account_uuid,
+                                    queue_id,
+                                    event_id,
+                                    provider_message,
+                                )
                         _, chat_key = converter.provider_chat_reference(
                             provider_message
                         )
-                        converter.provider_chat_assignment(
-                            self.store, account_uuid, chat_key
-                        )
+                        try:
+                            converter.provider_chat_assignment(
+                                self.store, account_uuid, chat_key
+                            )
+                        except ValueError as exc:
+                            if (
+                                str(exc) == "provider_chat_assignment_pending"
+                                and row.get("assignment_catalog_reported_at") is None
+                            ):
+                                # A reaction can be the first live event that
+                                # exposes an older direct chat omitted from
+                                # Zulip's registration snapshot. Publish it
+                                # once, then persist the publication boundary.
+                                # If the process stops before that marker, the
+                                # durable outbox deduplicates the safe retry.
+                                catalog_reported = self._queue_event_catalog(
+                                    account_uuid,
+                                    {
+                                        "type": "message",
+                                        "message": provider_message,
+                                    },
+                                    adapter.server_url,
+                                )
+                                mark_catalog_reported = getattr(
+                                    self.store,
+                                    "mark_provider_event_catalog_reported",
+                                    None,
+                                )
+                                if catalog_reported and callable(
+                                    mark_catalog_reported
+                                ):
+                                    mark_catalog_reported(
+                                        account_uuid,
+                                        queue_id,
+                                        event_id,
+                                    )
+                            raise
                         provider_timestamp = provider_message.get("timestamp")
                         provider_message_time = None
                         if not isinstance(provider_timestamp, bool):
@@ -2204,7 +2312,21 @@ class BridgeService:
                 processed += 1
                 continue
             except ValueError as exc:
-                if str(exc) in {
+                reason = str(exc)
+                if reason == "provider_reaction_chat_assignment_timeout" or (
+                    reason == "provider_chat_assignment_pending"
+                    and event.get("type") == "reaction"
+                    and self._reaction_assignment_wait_expired(row)
+                ):
+                    self.store.mark_provider_event_invalid(
+                        account_uuid,
+                        queue_id,
+                        event_id,
+                        "provider_reaction_chat_assignment_timeout",
+                    )
+                    processed += 1
+                    continue
+                if reason in {
                     "provider_chat_assignment_pending",
                     "provider_chat_participants_pending",
                     "provider_event_replay_incomplete",
@@ -2214,10 +2336,10 @@ class BridgeService:
                         account_uuid,
                         queue_id,
                         event_id,
-                        str(exc),
+                        reason,
                     )
                     continue
-                if str(exc) in {
+                if reason in {
                     "provider_chat_not_selected",
                     "provider_message_not_found",
                 }:

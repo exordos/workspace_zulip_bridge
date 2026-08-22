@@ -3087,6 +3087,87 @@ def test_pending_provider_probe_waits_for_each_accounts_head(postgres_store):
     assert postgres_store.has_pending_provider_events()
 
 
+def test_pending_provider_events_include_retry_count(postgres_store):
+    account_uuid = str(uuid.uuid4())
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        {"id": 1, "type": "reaction"},
+    )
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_provider_events
+            SET retry_count = 37,
+                processing_reason = 'provider_unavailable'
+            WHERE account_uuid = %s AND queue_id = 'queue' AND event_id = 1
+            """,
+            (account_uuid,),
+        )
+
+    pending = postgres_store.pending_provider_events()
+    assert len(pending) == 1
+    assert pending[0]["retry_count"] == 37
+    assert pending[0]["processing_reason"] == "provider_unavailable"
+
+
+def test_provider_assignment_context_survives_intervening_retry_reason(postgres_store):
+    account_uuid = str(uuid.uuid4())
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        {"id": 1, "type": "reaction"},
+    )
+    message_context = {
+        "id": 601,
+        "type": "stream",
+        "stream_id": 42,
+        "display_recipient": "Engineering",
+        "timestamp": 1_800_000_000,
+    }
+    assert postgres_store.cache_provider_event_message_context(
+        account_uuid,
+        "queue",
+        1,
+        message_context,
+    ) == message_context
+
+    postgres_store.retry_provider_event(
+        account_uuid,
+        "queue",
+        1,
+        "provider_chat_assignment_pending",
+    )
+    postgres_store.retry_provider_event(
+        account_uuid,
+        "queue",
+        1,
+        "rate_limit_hit",
+    )
+    assert postgres_store.mark_provider_event_catalog_reported(
+        account_uuid,
+        "queue",
+        1,
+    )
+
+    with postgres_store.session() as session:
+        event = session.execute(
+            """
+            SELECT retry_count, processing_reason,
+                   assignment_pending_since, assignment_catalog_reported_at,
+                   provider_message_context
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = 'queue' AND event_id = 1
+            """,
+            (account_uuid,),
+        ).fetchone()
+    assert event["retry_count"] == 2
+    assert event["processing_reason"] == "rate_limit_hit"
+    assert event["assignment_pending_since"] is not None
+    assert event["assignment_catalog_reported_at"] is not None
+    assert event["provider_message_context"] == message_context
+
+
 def test_pending_provider_probe_includes_only_nonterminal_delivering_head(
     postgres_store,
 ):
