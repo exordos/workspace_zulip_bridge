@@ -172,6 +172,24 @@ def test_zulip_record_adapts_to_atomic_provider_event_resource():
     }
 
 
+def test_topic_only_message_update_preserves_move_in_provider_event():
+    destination_topic_uuid = str(uuid.uuid4())
+    record = provider_protocol.leased_operation_record(Store(), _lease())
+    record["origin"] = "zulip"
+    record["operation_uuid"] = str(uuid.uuid4())
+    record["operation"]["kind"] = "message.update"
+    record["operation"]["provider"]["entity_id"] = "101"
+    record["operation"]["payload"].pop("payload")
+    record["operation"]["payload"]["topic_uuid"] = destination_topic_uuid
+
+    event = provider_protocol.event_payload(Store(), record)
+
+    resource = event["payload"]["resource"]
+    assert event["kind"] == "message.upsert"
+    assert resource["topic_uuid"] == destination_topic_uuid
+    assert "payload" not in resource
+
+
 def test_provider_event_normalizes_naive_live_message_timestamp_to_utc():
     class LiveStore(Store):
         def provider_mapping(self, account_uuid, kind, provider_id):

@@ -1178,6 +1178,79 @@ class RestAlchemyStore:
                 (account_uuid, entity_kind, provider_id),
             ).fetchone()
 
+    def provider_message_mapping(
+        self,
+        account_uuid: str,
+        provider_id: str,
+    ) -> dict[str, object] | None:
+        """Include a tombstone only while a later recreation is nonterminal."""
+        with self.session() as session:
+            return session.execute(
+                """
+                SELECT mapping.workspace_uuid, mapping.provider_id,
+                       mapping.provider_revision, mapping.metadata,
+                       mapping.deleted AS pending_tombstone,
+                       EXISTS (
+                           SELECT 1 FROM provider_mapping_aliases AS alias
+                           WHERE alias.account_uuid = mapping.account_uuid
+                             AND alias.entity_kind = mapping.entity_kind
+                             AND alias.workspace_uuid = mapping.workspace_uuid
+                             AND alias.provider_id = mapping.provider_id
+                             AND NOT alias.deleted
+                       ) AS convergent_alias
+                FROM provider_mappings AS mapping
+                WHERE mapping.account_uuid = %s
+                  AND mapping.entity_kind = 'message'
+                  AND mapping.provider_id = %s
+                  AND (
+                      NOT mapping.deleted
+                      OR EXISTS (
+                          SELECT 1
+                          FROM zulip_provider_events AS event
+                          WHERE event.account_uuid = mapping.account_uuid
+                            AND event.processing_state IN (
+                                'pending', 'delivering'
+                            )
+                            AND event.provider_message_context->>'context_kind' =
+                                'pending_delete_recreations'
+                            AND event.provider_message_context->'messages' ?
+                                mapping.provider_id
+                      )
+                      OR EXISTS (
+                          SELECT 1
+                          FROM workspace_delivery_outbox AS delivery
+                          JOIN operation_idempotency AS operation
+                            ON operation.operation_uuid = delivery.operation_uuid
+                          WHERE delivery.account_uuid = mapping.account_uuid
+                            AND delivery.record->'operation'->>'entity_uuid' =
+                                mapping.workspace_uuid::text
+                            AND delivery.record->'operation'->>'kind' =
+                                'message.create'
+                            AND operation.terminal_outcome IS NULL
+                      )
+                  )
+                """,
+                (account_uuid, provider_id),
+            ).fetchone()
+
+    def provider_message_tombstone(
+        self,
+        account_uuid: str,
+        provider_id: str,
+    ) -> dict[str, object] | None:
+        """Return a committed message tombstone for an explicit recreation."""
+        with self.session() as session:
+            return session.execute(
+                """
+                SELECT workspace_uuid, provider_id, provider_revision, metadata,
+                       true AS pending_tombstone, false AS convergent_alias
+                FROM provider_mappings
+                WHERE account_uuid = %s AND entity_kind = 'message'
+                  AND provider_id = %s AND deleted
+                """,
+                (account_uuid, provider_id),
+            ).fetchone()
+
     def provider_mapping_by_name(
         self, account_uuid: str, entity_kind: str, name: str
     ) -> dict[str, object] | None:
@@ -1336,6 +1409,53 @@ class RestAlchemyStore:
                 ),
             ).fetchone()
 
+    def pending_provider_message_context(
+        self, account_uuid: str, workspace_uuid: str
+    ) -> dict[str, object] | None:
+        """Return the newest accepted destination before its result commits."""
+        with self.session() as session:
+            row = session.execute(
+                """
+                SELECT delivery.record
+                FROM workspace_delivery_outbox AS delivery
+                JOIN operation_idempotency AS operation
+                  ON operation.operation_uuid = delivery.operation_uuid
+                WHERE delivery.account_uuid = %s
+                  AND operation.terminal_outcome IS NULL
+                  AND delivery.record->'operation'->>'kind' IN (
+                      'message.create', 'message.update', 'message.delete'
+                  )
+                  AND delivery.record->'operation'->>'entity_uuid' = %s
+                ORDER BY (delivery.record->>'sequence')::bigint DESC NULLS LAST,
+                         delivery.created_at DESC
+                LIMIT 1
+                """,
+                (account_uuid, workspace_uuid),
+            ).fetchone()
+            if row is None:
+                return None
+            record = typing.cast(dict[str, object], row["record"])
+            operation = typing.cast(dict[str, object], record["operation"])
+            if operation["kind"] == "message.delete":
+                return {"deleted": True, "causal_lane": record["causal_lane"]}
+            payload = typing.cast(dict[str, object], operation["payload"])
+            provider = typing.cast(dict[str, object], operation["provider"])
+            extensions = typing.cast(
+                dict[str, object], operation.get("extensions", {})
+            )
+            return {
+                "project_uuid": record["project_uuid"],
+                "stream_uuid": payload["stream_uuid"],
+                "topic_uuid": payload["topic_uuid"],
+                "chat_key": provider["chat_id"],
+                "causal_lane": record["causal_lane"],
+                **(
+                    {"subject": extensions["subject"]}
+                    if extensions.get("subject") is not None
+                    else {}
+                ),
+            }
+
     def workspace_message_mappings_through(
         self,
         account_uuid: str,
@@ -1424,6 +1544,33 @@ class RestAlchemyStore:
                 ),
             )
 
+    def remember_pending_provider_message_recreation(
+        self,
+        account_uuid: str,
+        provider_id: str,
+        workspace_uuid: str,
+        metadata: dict[str, object],
+    ) -> None:
+        """Refresh a recreation target without clearing a committed tombstone."""
+        with self.session() as session:
+            mapping = session.execute(
+                """
+                UPDATE provider_mappings
+                SET metadata = %s, updated_at = now()
+                WHERE account_uuid = %s AND entity_kind = 'message'
+                  AND provider_id = %s AND workspace_uuid = %s
+                RETURNING workspace_uuid
+                """,
+                (
+                    json.dumps(metadata),
+                    account_uuid,
+                    provider_id,
+                    workspace_uuid,
+                ),
+            ).fetchone()
+        if mapping is None:
+            raise ValueError("provider_message_mapping_not_found")
+
     def rename_provider_mapping(
         self,
         account_uuid: str,
@@ -1434,16 +1581,62 @@ class RestAlchemyStore:
         provider_revision: str | None = None,
     ) -> dict[str, object] | None:
         with self.session() as session:
+            # The lock is acquired in its own statement so a caller that waits
+            # for a competing rename gets a fresh READ COMMITTED snapshot for
+            # the mapping query below.
+            session.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (f"{account_uuid}:{entity_kind}:{new_provider_id}",),
+            )
             row = session.execute(
                 """
-                UPDATE provider_mappings
-                SET provider_id = %s, provider_revision = %s, metadata = %s,
-                    deleted = false, updated_at = now()
-                WHERE account_uuid = %s AND entity_kind = %s
-                  AND provider_id = %s AND NOT deleted
-                RETURNING workspace_uuid, provider_id, provider_revision, metadata
+                WITH existing_target AS (
+                    UPDATE provider_mappings AS mapping
+                    SET provider_revision = CASE
+                            WHEN mapping.deleted
+                            THEN COALESCE(%s, mapping.provider_revision)
+                            ELSE mapping.provider_revision
+                        END,
+                        metadata = CASE
+                            WHEN mapping.deleted THEN %s
+                            ELSE mapping.metadata
+                        END,
+                        deleted = false,
+                        updated_at = CASE
+                            WHEN mapping.deleted THEN now()
+                            ELSE mapping.updated_at
+                        END
+                    WHERE mapping.account_uuid = %s
+                      AND mapping.entity_kind = %s
+                      AND mapping.provider_id = %s
+                    RETURNING mapping.workspace_uuid, mapping.provider_id,
+                              mapping.provider_revision, mapping.metadata,
+                              false AS mapping_renamed
+                ),
+                renamed AS (
+                    UPDATE provider_mappings AS mapping
+                    SET provider_id = %s, provider_revision = %s, metadata = %s,
+                        deleted = false, updated_at = now()
+                    WHERE mapping.account_uuid = %s
+                      AND mapping.entity_kind = %s
+                      AND mapping.provider_id = %s
+                      AND NOT mapping.deleted
+                      AND NOT EXISTS (SELECT 1 FROM existing_target)
+                    RETURNING mapping.workspace_uuid, mapping.provider_id,
+                              mapping.provider_revision, mapping.metadata,
+                              true AS mapping_renamed
+                )
+                SELECT * FROM renamed
+                UNION ALL
+                SELECT * FROM existing_target
+                LIMIT 1
                 """,
                 (
+                    provider_revision,
+                    json.dumps(metadata),
+                    account_uuid,
+                    entity_kind,
+                    new_provider_id,
                     new_provider_id,
                     provider_revision,
                     json.dumps(metadata),
@@ -1452,7 +1645,8 @@ class RestAlchemyStore:
                     old_provider_id,
                 ),
             ).fetchone()
-            if row is not None:
+            mapping_renamed = row is not None and bool(row["mapping_renamed"])
+            if mapping_renamed:
                 session.execute(
                     """
                     UPDATE provider_mapping_aliases
@@ -1469,7 +1663,11 @@ class RestAlchemyStore:
                         old_provider_id,
                     ),
                 )
-            return row
+            if row is None:
+                return None
+            result = dict(row)
+            result.pop("mapping_renamed", None)
+            return result
 
     @staticmethod
     def _select_reaction_mappings(
@@ -1881,33 +2079,42 @@ class RestAlchemyStore:
         event_id: int,
         reason: str,
     ) -> None:
+        normalized_reason = reason[:128] or "provider_file_unavailable"
         with self.session() as session:
             session.execute(
                 """
+                WITH retry AS (SELECT %s::text AS reason)
                 UPDATE zulip_provider_events
-                SET retry_count = retry_count + 1,
+                SET retry_count = CASE
+                        WHEN retry.reason = 'provider_event_processing_failed'
+                          AND processing_reason IS DISTINCT FROM retry.reason
+                        THEN 1
+                        ELSE retry_count + 1
+                    END,
                     available_at = now() + CASE
-                        WHEN %s IN (
+                        WHEN retry.reason IN (
                             'provider_chat_assignment_pending',
                             'provider_chat_participants_pending',
                             'provider_event_replay_incomplete'
                         ) THEN interval '250 milliseconds'
+                        WHEN retry.reason = 'provider_event_processing_failed'
+                          AND processing_reason IS DISTINCT FROM retry.reason
+                        THEN interval '1 second'
                         ELSE LEAST(300, power(2, LEAST(retry_count, 8)))
                              * interval '1 second'
                     END,
                     assignment_pending_since = CASE
-                        WHEN %s = 'provider_chat_assignment_pending'
+                        WHEN retry.reason = 'provider_chat_assignment_pending'
                         THEN COALESCE(assignment_pending_since, now())
                         ELSE assignment_pending_since
                     END,
-                    processing_reason = %s
+                    processing_reason = retry.reason
+                FROM retry
                 WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
                   AND processing_state = 'pending'
                 """,
                 (
-                    reason[:128] or "provider_file_unavailable",
-                    reason[:128] or "provider_file_unavailable",
-                    reason[:128] or "provider_file_unavailable",
+                    normalized_reason,
                     account_uuid,
                     queue_id,
                     event_id,
@@ -2744,6 +2951,25 @@ class RestAlchemyStore:
             ):
                 self._validate_reaction_mapping_plans(session, [record])
             return result is not None
+
+    def enqueue_provider_event_records(
+        self,
+        records: list[dict[str, object]],
+        priority: int,
+        account_uuid: str,
+        queue_id: str,
+        event_id: int,
+    ) -> None:
+        """Publish a complete provider event to the outbox atomically."""
+        with self.transaction():
+            for record in records:
+                self.enqueue_workspace_delivery(
+                    record,
+                    priority,
+                    queue_id,
+                    event_id,
+                )
+            self.mark_provider_event_delivering(account_uuid, queue_id, event_id)
 
     def pending_workspace_deliveries(
         self,
@@ -5289,6 +5515,7 @@ class RestAlchemyStore:
                             "author_uuid": payload["author_uuid"],
                             "chat_key": provider["chat_id"],
                             "project_uuid": record["project_uuid"],
+                            "causal_lane": record["causal_lane"],
                             "mapping_origin": str(record["origin"]),
                             "workspace_delivery_state": "committed",
                         }
@@ -5318,6 +5545,7 @@ class RestAlchemyStore:
                             "author_uuid": payload["author_uuid"],
                             "chat_key": provider["chat_id"],
                             "project_uuid": record["project_uuid"],
+                            "causal_lane": record["causal_lane"],
                             "mapping_origin": str(record["origin"]),
                             "workspace_delivery_state": "committed",
                         }
@@ -5369,6 +5597,7 @@ class RestAlchemyStore:
             )
         elif kind == "message.update":
             extensions = typing.cast(dict[str, object], operation.get("extensions", {}))
+            payload = typing.cast(dict[str, object], operation["payload"])
             session.execute(
                 """
                 UPDATE provider_mappings
@@ -5376,7 +5605,11 @@ class RestAlchemyStore:
                     metadata = metadata || jsonb_strip_nulls(jsonb_build_object(
                         'content_sha256', %s::text,
                         'provider_content_sha256', %s::text,
-                        'subject', %s::text
+                        'subject', %s::text,
+                        'stream_uuid', %s::text,
+                        'topic_uuid', %s::text,
+                        'chat_key', %s::text,
+                        'project_uuid', %s::text
                     )) || jsonb_build_object(
                         'workspace_delivery_state', 'committed'
                     ),
@@ -5389,6 +5622,40 @@ class RestAlchemyStore:
                     extensions.get("content_sha256"),
                     extensions.get("provider_content_sha256"),
                     extensions.get("subject"),
+                    payload.get("stream_uuid"),
+                    payload.get("topic_uuid"),
+                    provider.get("chat_id"),
+                    record.get("project_uuid"),
+                    account_uuid,
+                    workspace_uuid,
+                ),
+            )
+            session.execute(
+                """
+                UPDATE provider_mapping_aliases
+                SET metadata = metadata || jsonb_strip_nulls(jsonb_build_object(
+                        'content_sha256', %s::text,
+                        'provider_content_sha256', %s::text,
+                        'subject', %s::text,
+                        'stream_uuid', %s::text,
+                        'topic_uuid', %s::text,
+                        'chat_key', %s::text,
+                        'project_uuid', %s::text
+                    )) || jsonb_build_object(
+                        'workspace_delivery_state', 'committed'
+                    ),
+                    deleted = false, updated_at = now()
+                WHERE account_uuid = %s AND entity_kind = 'message'
+                  AND workspace_uuid = %s
+                """,
+                (
+                    extensions.get("content_sha256"),
+                    extensions.get("provider_content_sha256"),
+                    extensions.get("subject"),
+                    payload.get("stream_uuid"),
+                    payload.get("topic_uuid"),
+                    provider.get("chat_id"),
+                    record.get("project_uuid"),
                     account_uuid,
                     workspace_uuid,
                 ),
@@ -6204,7 +6471,108 @@ class RestAlchemyStore:
                         session,
                         operation_record,
                     )
-                elif kind in {"message.create", "topic.upsert"}:
+                elif kind == "message.delete":
+                    session.execute(
+                        """
+                        UPDATE provider_mappings
+                        SET deleted = true, updated_at = now()
+                        WHERE account_uuid = %s AND entity_kind = 'message'
+                          AND workspace_uuid = %s AND NOT deleted
+                        """,
+                        (
+                            str(operation_record["account_uuid"]),
+                            str(operation["entity_uuid"]),
+                        ),
+                    )
+                    session.execute(
+                        """
+                        UPDATE provider_mapping_aliases
+                        SET deleted = true, updated_at = now()
+                        WHERE account_uuid = %s AND entity_kind = 'message'
+                          AND workspace_uuid = %s AND NOT deleted
+                        """,
+                        (
+                            str(operation_record["account_uuid"]),
+                            str(operation["entity_uuid"]),
+                        ),
+                    )
+                elif kind == "message.update":
+                    payload = typing.cast(dict[str, object], operation["payload"])
+                    extensions = typing.cast(
+                        dict[str, object], operation.get("extensions", {})
+                    )
+                    session.execute(
+                        """
+                        UPDATE provider_mappings
+                        SET metadata = metadata || jsonb_strip_nulls(
+                                jsonb_build_object(
+                                    'project_uuid', %s::text,
+                                    'stream_uuid', %s::text,
+                                    'topic_uuid', %s::text,
+                                    'chat_key', %s::text,
+                                    'causal_lane', %s::text,
+                                    'subject', %s::text
+                                )
+                            ) || jsonb_build_object(
+                                'workspace_delivery_state', 'committed'
+                            ),
+                            updated_at = now()
+                        WHERE account_uuid = %s AND entity_kind = 'message'
+                          AND workspace_uuid = %s AND NOT deleted
+                        """,
+                        (
+                            str(operation_record["project_uuid"]),
+                            str(payload["stream_uuid"]),
+                            str(payload["topic_uuid"]),
+                            str(provider["chat_id"]),
+                            str(operation_record["causal_lane"]),
+                            extensions.get("subject"),
+                            str(operation_record["account_uuid"]),
+                            str(operation["entity_uuid"]),
+                        ),
+                    )
+                    session.execute(
+                        """
+                        UPDATE provider_mapping_aliases
+                        SET metadata = metadata || jsonb_strip_nulls(
+                                jsonb_build_object(
+                                    'project_uuid', %s::text,
+                                    'stream_uuid', %s::text,
+                                    'topic_uuid', %s::text,
+                                    'chat_key', %s::text,
+                                    'causal_lane', %s::text,
+                                    'subject', %s::text
+                                )
+                            ) || jsonb_build_object(
+                                'workspace_delivery_state', 'committed'
+                            ),
+                            updated_at = now()
+                        WHERE account_uuid = %s AND entity_kind = 'message'
+                          AND workspace_uuid = %s AND NOT deleted
+                        """,
+                        (
+                            str(operation_record["project_uuid"]),
+                            str(payload["stream_uuid"]),
+                            str(payload["topic_uuid"]),
+                            str(provider["chat_id"]),
+                            str(operation_record["causal_lane"]),
+                            extensions.get("subject"),
+                            str(operation_record["account_uuid"]),
+                            str(operation["entity_uuid"]),
+                        ),
+                    )
+                elif kind == "message.create":
+                    self._persist_committed_mapping(
+                        session,
+                        operation_record,
+                        str(provider["entity_id"]),
+                        (
+                            None
+                            if result_body.get("provider_revision") is None
+                            else str(result_body["provider_revision"])
+                        ),
+                    )
+                elif kind == "topic.upsert":
                     entity_kind = kind.partition(".")[0]
                     session.execute(
                         """

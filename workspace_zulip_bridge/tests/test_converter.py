@@ -35,6 +35,7 @@ class FakeStore:
         self.mappings = {}
         self.positions = {}
         self.accepted_contexts = {}
+        self.pending_contexts = {}
         self.auto_materialize = auto_materialize
 
     def account_resource(self, account_uuid):
@@ -57,6 +58,9 @@ class FakeStore:
             lane.append(operation_uuid)
         index = lane.index(operation_uuid)
         return index + 1, None if index == 0 else lane[index - 1]
+
+    def pending_provider_message_context(self, account_uuid, workspace_uuid):
+        return self.pending_contexts.get((account_uuid, workspace_uuid))
 
     def provider_mapping(self, account_uuid, entity_kind, provider_id):
         mapping = self.mappings.get((entity_kind, provider_id))
@@ -162,6 +166,9 @@ class FakeStore:
         metadata,
         provider_revision=None,
     ):
+        existing = self.mappings.get((entity_kind, new_provider_id))
+        if existing is not None:
+            return existing
         mapping = self.mappings.pop((entity_kind, old_provider_id), None)
         if mapping is None:
             return None
@@ -999,6 +1006,7 @@ def test_message_mutations_and_topic_rename_reuse_stable_mappings():
     topic_uuid = store.provider_mapping(ACCOUNT_UUID, "topic", "42:Topic")[
         "workspace_uuid"
     ]
+    store.auto_materialize = False
     update = {
         "id": 11,
         "type": "update_message",
@@ -1058,6 +1066,435 @@ def test_message_mutations_and_topic_rename_reuse_stable_mappings():
     assert read[0]["payload"]["reader_uuid"] == OWNER_UUID
     assert read[0]["payload"]["message_uuids"] == [created_message["entity_uuid"]]
     assert "through_message_uuid" not in read[0]["payload"]
+
+
+def test_repeated_topic_rename_reuses_existing_target_mapping():
+    store = FakeStore()
+    stream_uuid = str(uuid.uuid4())
+    old_topic_uuid = str(uuid.uuid4())
+    target_topic_uuid = str(uuid.uuid4())
+    store.remember_provider_mapping(
+        ACCOUNT_UUID,
+        "stream",
+        "channel:42",
+        stream_uuid,
+        {
+            "chat_type": "channel",
+            "project_uuid": PROJECT_UUID,
+            "participants": [OWNER_UUID],
+            "name": "Engineering",
+            "description": "",
+            "private": False,
+            "default_topic_uuid": None,
+        },
+    )
+    topic_metadata = {
+        "stream_uuid": stream_uuid,
+        "chat_key": "channel:42",
+        "is_default": False,
+    }
+    store.remember_provider_mapping(
+        ACCOUNT_UUID,
+        "topic",
+        "42:TopicA",
+        old_topic_uuid,
+        {**topic_metadata, "name": "TopicA"},
+    )
+    store.remember_provider_mapping(
+        ACCOUNT_UUID,
+        "topic",
+        "42:TopicB",
+        target_topic_uuid,
+        {**topic_metadata, "name": "TopicB"},
+    )
+    message_uuid = str(uuid.uuid4())
+    author_uuid = str(uuid.uuid4())
+    store.remember_provider_mapping(
+        ACCOUNT_UUID,
+        "message",
+        "601",
+        message_uuid,
+        {
+            "project_uuid": PROJECT_UUID,
+            "stream_uuid": stream_uuid,
+            "topic_uuid": old_topic_uuid,
+            "author_uuid": author_uuid,
+            "chat_key": "channel:42",
+        },
+    )
+
+    operations = _operations(
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "queue",
+            {
+                "id": 303,
+                "type": "update_message",
+                "message_id": 601,
+                "message_ids": [601],
+                "stream_id": 42,
+                "orig_subject": "TopicA",
+                "subject": "TopicB",
+                "propagate_mode": "change_one",
+                "edit_timestamp": 1_700_000_010,
+            },
+        )
+    )
+
+    assert [operation["kind"] for operation in operations] == [
+        "topic.upsert",
+        "message.update",
+    ]
+    assert operations[0]["entity_uuid"] == target_topic_uuid
+    assert operations[1]["entity_uuid"] == message_uuid
+    assert operations[1]["payload"]["topic_uuid"] == target_topic_uuid
+    assert "payload" not in operations[1]["payload"]
+    assert store.provider_mapping(ACCOUNT_UUID, "topic", "42:TopicA") is not None
+    assert (
+        store.provider_mapping(ACCOUNT_UUID, "topic", "42:TopicB")["workspace_uuid"]
+        == target_topic_uuid
+    )
+
+
+def test_single_message_topic_move_creates_target_without_renaming_source():
+    store = FakeStore()
+    created = _operations(
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "queue",
+            {"id": 10, "type": "message", "message": _stream_message()},
+        )
+    )
+    created_message = next(
+        operation for operation in created if operation["kind"] == "message.create"
+    )
+    source_topic_uuid = created_message["payload"]["topic_uuid"]
+    store.auto_materialize = False
+
+    moved = _operations(
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "queue",
+            {
+                "id": 11,
+                "type": "update_message",
+                "message_id": 601,
+                "message_ids": [601],
+                "stream_id": 42,
+                "orig_subject": "Topic",
+                "subject": "TopicB",
+                "propagate_mode": "change_one",
+                "edit_timestamp": 1_700_000_010,
+            },
+        )
+    )
+
+    target_topic = store.provider_mapping(ACCOUNT_UUID, "topic", "42:TopicB")
+    assert target_topic is not None
+    assert target_topic["workspace_uuid"] != source_topic_uuid
+    assert store.provider_mapping(ACCOUNT_UUID, "topic", "42:Topic") is not None
+    assert [operation["kind"] for operation in moved] == [
+        "topic.upsert",
+        "message.update",
+    ]
+    assert moved[1]["payload"]["topic_uuid"] == target_topic["workspace_uuid"]
+
+
+def test_combined_topic_move_applies_content_only_to_edited_message():
+    store = FakeStore()
+    for message_id in (601, 602):
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "queue",
+            {
+                "id": message_id,
+                "type": "message",
+                "message": _stream_message(message_id),
+            },
+        )
+    store.auto_materialize = False
+
+    operations = _operations(
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "queue",
+            {
+                "id": 700,
+                "type": "update_message",
+                "message_id": 602,
+                "message_ids": [601, 602],
+                "stream_id": 42,
+                "orig_subject": "Topic",
+                "subject": "Renamed",
+                "propagate_mode": "change_all",
+                "content": "edited only once",
+                "edit_timestamp": 1_700_000_010,
+            },
+        )
+    )
+
+    message_updates = [
+        operation for operation in operations if operation["kind"] == "message.update"
+    ]
+    assert len(message_updates) == 2
+    by_provider_id = {
+        operation["provider"]["entity_id"]: operation for operation in message_updates
+    }
+    assert "payload" not in by_provider_id["601"]["payload"]
+    assert by_provider_id["602"]["payload"]["payload"] == {
+        "kind": "markdown",
+        "content": "edited only once",
+    }
+
+
+def test_channel_move_uses_destination_stream_and_topic_with_unchanged_subject():
+    store = FakeStore()
+    created = _operations(
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "queue",
+            {"id": 10, "type": "message", "message": _stream_message()},
+        )
+    )
+    created_message = next(
+        operation for operation in created if operation["kind"] == "message.create"
+    )
+    source_topic_uuid = created_message["payload"]["topic_uuid"]
+    destination_stream_uuid = str(uuid.uuid4())
+    destination_topic_uuid = str(uuid.uuid4())
+    store.assignments["channel:43"] = {
+        "selected": True,
+        "project_id": PROJECT_UUID,
+    }
+    store.remember_provider_mapping(
+        ACCOUNT_UUID,
+        "stream",
+        "channel:43",
+        destination_stream_uuid,
+        {
+            "chat_type": "channel",
+            "project_uuid": PROJECT_UUID,
+            "participants": [OWNER_UUID],
+            "name": "Operations",
+            "description": "",
+            "private": False,
+            "default_topic_uuid": None,
+        },
+    )
+    store.remember_provider_mapping(
+        ACCOUNT_UUID,
+        "topic",
+        "43:Topic",
+        destination_topic_uuid,
+        {
+            "stream_uuid": destination_stream_uuid,
+            "chat_key": "channel:43",
+            "is_default": False,
+            "name": "Topic",
+        },
+    )
+    store.auto_materialize = False
+
+    records = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {
+            "id": 11,
+            "type": "update_message",
+            "message_id": 601,
+            "message_ids": [601],
+            "stream_id": 42,
+            "new_stream_id": 43,
+            "orig_subject": "Topic",
+            "subject": "Topic",
+            "propagate_mode": "change_one",
+            "edit_timestamp": 1_700_000_010,
+        },
+    )
+    operations = _operations(records)
+
+    assert [operation["kind"] for operation in operations] == [
+        "topic.upsert",
+        "message.update",
+    ]
+    assert operations[0]["payload"]["stream_uuid"] == destination_stream_uuid
+    assert operations[1]["payload"]["stream_uuid"] == destination_stream_uuid
+    assert operations[1]["payload"]["topic_uuid"] == destination_topic_uuid
+    assert operations[1]["provider"]["chat_id"] == "channel:43"
+    assert records[0]["project_uuid"] == PROJECT_UUID
+    assert records[1]["project_uuid"] == PROJECT_UUID
+    assert (
+        store.provider_mapping(ACCOUNT_UUID, "topic", "42:Topic")["workspace_uuid"]
+        == source_topic_uuid
+    )
+
+
+def test_channel_move_and_followup_edit_keep_original_message_lane_and_destination():
+    store = FakeStore()
+    created_records = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {"id": 10, "type": "message", "message": _stream_message()},
+    )
+    created_message = next(
+        record
+        for record in created_records
+        if record["operation"]["kind"] == "message.create"
+    )
+    message_uuid = str(created_message["operation"]["entity_uuid"])
+    destination_project_uuid = str(uuid.uuid4())
+    destination_stream_uuid = str(uuid.uuid4())
+    destination_topic_uuid = str(uuid.uuid4())
+    store.assignments["channel:43"] = {
+        "selected": True,
+        "project_id": destination_project_uuid,
+    }
+    store.remember_provider_mapping(
+        ACCOUNT_UUID,
+        "stream",
+        "channel:43",
+        destination_stream_uuid,
+        {
+            "chat_type": "channel",
+            "project_uuid": destination_project_uuid,
+            "participants": [OWNER_UUID],
+            "name": "Operations",
+            "description": "",
+            "private": False,
+            "default_topic_uuid": None,
+        },
+    )
+    store.remember_provider_mapping(
+        ACCOUNT_UUID,
+        "topic",
+        "43:Topic",
+        destination_topic_uuid,
+        {
+            "stream_uuid": destination_stream_uuid,
+            "chat_key": "channel:43",
+            "is_default": False,
+            "name": "Topic",
+        },
+    )
+    store.auto_materialize = False
+
+    move_records = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {
+            "id": 11,
+            "type": "update_message",
+            "message_id": 601,
+            "message_ids": [601],
+            "stream_id": 42,
+            "new_stream_id": 43,
+            "orig_subject": "Topic",
+            "subject": "Topic",
+            "propagate_mode": "change_one",
+            "edit_timestamp": 1_700_000_010,
+        },
+    )
+    moved_message = next(
+        record
+        for record in move_records
+        if record["operation"]["kind"] == "message.update"
+    )
+    store.pending_contexts[(ACCOUNT_UUID, message_uuid)] = {
+        "project_uuid": destination_project_uuid,
+        "stream_uuid": destination_stream_uuid,
+        "topic_uuid": destination_topic_uuid,
+        "chat_key": "channel:43",
+        "causal_lane": moved_message["causal_lane"],
+        "subject": "Topic",
+    }
+
+    edit_records = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {
+            "id": 12,
+            "type": "update_message",
+            "message_id": 601,
+            "stream_id": 43,
+            "content": "edited after move",
+            "edit_timestamp": 1_700_000_011,
+        },
+    )
+    edited_message = next(
+        record
+        for record in edit_records
+        if record["operation"]["kind"] == "message.update"
+    )
+
+    assert moved_message["causal_lane"] == created_message["causal_lane"]
+    assert edited_message["causal_lane"] == created_message["causal_lane"]
+    assert edited_message["project_uuid"] == destination_project_uuid
+    assert edited_message["operation"]["provider"]["chat_id"] == "channel:43"
+    assert edited_message["operation"]["payload"]["stream_uuid"] == (
+        destination_stream_uuid
+    )
+    assert edited_message["operation"]["payload"]["topic_uuid"] == (
+        destination_topic_uuid
+    )
+
+
+def test_channel_move_to_unselected_destination_deletes_source_projection():
+    store = FakeStore(selection_mode="manual")
+    store.assignments["channel:42"] = {
+        "selected": True,
+        "project_id": PROJECT_UUID,
+    }
+    store.assignments["channel:43"] = {
+        "selected": False,
+        "project_id": PROJECT_UUID,
+    }
+    created_records = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {"id": 10, "type": "message", "message": _stream_message()},
+    )
+    created_message = next(
+        record
+        for record in created_records
+        if record["operation"]["kind"] == "message.create"
+    )
+    store.auto_materialize = False
+
+    moved_records = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {
+            "id": 11,
+            "type": "update_message",
+            "message_id": 601,
+            "message_ids": [601],
+            "stream_id": 42,
+            "new_stream_id": 43,
+            "orig_subject": "Topic",
+            "subject": "Topic",
+            "propagate_mode": "change_one",
+            "edit_timestamp": 1_700_000_010,
+        },
+    )
+
+    assert [record["operation"]["kind"] for record in moved_records] == [
+        "message.delete"
+    ]
+    assert moved_records[0]["project_uuid"] == PROJECT_UUID
+    assert moved_records[0]["operation"]["provider"]["chat_id"] == "channel:42"
+    assert moved_records[0]["causal_lane"] == created_message["causal_lane"]
 
 
 def test_content_only_message_update_does_not_infer_a_topic_name():

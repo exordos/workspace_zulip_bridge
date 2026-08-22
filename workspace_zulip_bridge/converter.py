@@ -77,6 +77,10 @@ class ConversionStore(typing.Protocol):
         self, account_uuid: str, queue_id: str, event_id: int
     ) -> dict[str, object] | None: ...
 
+    def pending_provider_message_context(
+        self, account_uuid: str, workspace_uuid: str
+    ) -> dict[str, object] | None: ...
+
     def remember_provider_mapping(
         self,
         account_uuid: str,
@@ -231,6 +235,17 @@ def provider_chat_assignment(
     if settings is None or settings["selection_mode"] != "all":
         raise ValueError("provider_chat_not_selected")
     raise ValueError("provider_chat_assignment_pending")
+
+
+def provider_message_mapping(
+    store: ConversionStore,
+    account_uuid: str,
+    provider_message_id: str,
+) -> dict[str, object] | None:
+    pending_lookup = getattr(store, "provider_message_mapping", None)
+    if callable(pending_lookup):
+        return pending_lookup(account_uuid, provider_message_id)
+    return store.provider_mapping(account_uuid, "message", provider_message_id)
 
 
 def _reconcile_assignment_projection(
@@ -609,7 +624,7 @@ def _canonicalize_semantic_quotes(
         provider_id = _reply_provider_id(link)
         if provider_id is None:
             return None
-        message = store.provider_mapping(account_uuid, "message", provider_id)
+        message = provider_message_mapping(store, account_uuid, provider_id)
         if message is None:
             return None
         metadata = message.get("metadata")
@@ -1190,8 +1205,10 @@ def message_event_records(
         raise ValueError("unknown_external_account")
     owner_uuid = str(account["owner_user_uuid"])
     provider_message_id = str(message["id"])
-    existing_message = store.provider_mapping(
-        account_uuid, "message", provider_message_id
+    existing_message = provider_message_mapping(
+        store,
+        account_uuid,
+        provider_message_id,
     )
     existing_message_metadata = (
         typing.cast(dict[str, object], existing_message.get("metadata", {}))
@@ -1258,16 +1275,39 @@ def message_event_records(
         if existing_message is not None
         else stable_entity_uuid(account_uuid, "message", provider_message_id)
     )
-    workspace_delivery_committed = existing_message is not None and (
-        existing_message.get("convergent_alias") is True
-        or existing_message_metadata.get("mapping_origin") == "workspace"
-        or existing_message_metadata.get("workspace_delivery_state") == "committed"
+    pending_context_lookup = getattr(store, "pending_provider_message_context", None)
+    pending_context = (
+        pending_context_lookup(account_uuid, message_uuid)
+        if delivery_class == "live"
+        and existing_message is not None
+        and callable(pending_context_lookup)
+        else None
+    )
+    pending_tombstone = (
+        existing_message is not None
+        and existing_message.get("pending_tombstone") is True
+    )
+    pending_delete = (
+        (pending_context is not None and pending_context.get("deleted") is True)
+        or (pending_tombstone and pending_context is None)
+    )
+    workspace_delivery_committed = (
+        existing_message is not None
+        and (
+            existing_message.get("convergent_alias") is True
+            or existing_message_metadata.get("mapping_origin") == "workspace"
+            or existing_message_metadata.get("workspace_delivery_state") == "committed"
+        )
+        and not pending_delete
     )
     occurred_at_dt = datetime.datetime.fromtimestamp(
         float(message["timestamp"]), datetime.UTC
     )
     occurred_at = occurred_at_dt.isoformat().replace("+00:00", "Z")
-    lane = f"chat:{account_uuid}:{stream_uuid}"
+    lane = str(
+        existing_message_metadata.get("causal_lane")
+        or f"chat:{account_uuid}:{stream_uuid}"
+    )
     (
         identity_operations,
         identity_uuids,
@@ -1348,7 +1388,7 @@ def message_event_records(
         ZulipLinkResolver(store, account_uuid, owner_uuid),
     )
     reply_mapping = (
-        store.provider_mapping(account_uuid, "message", reply_provider_id)
+        provider_message_mapping(store, account_uuid, reply_provider_id)
         if reply_provider_id is not None
         else None
     )
@@ -1499,35 +1539,54 @@ def message_event_records(
             "chat_key": chat_key,
         },
     )
-    store.remember_provider_mapping(
-        account_uuid,
-        "message",
-        provider_message_id,
-        message_uuid,
-        {
-            **existing_message_metadata,
-            "stream_uuid": stream_uuid,
-            "topic_uuid": topic_uuid,
-            "author_uuid": author_uuid,
-            "chat_key": chat_key,
-            "project_uuid": project_uuid,
-            "provider_timestamp": float(message["timestamp"]),
-            "content_sha256": content_sha256,
-            "provider_content_sha256": provider_content_sha256,
-            "subject": channel_subject if chat_type == "channel" else "",
-            "mapping_origin": existing_message_metadata.get("mapping_origin", "zulip"),
-            "provider_event_id": existing_message_metadata.get(
-                "provider_event_id", int(event["id"])
-            ),
-            "workspace_delivery_state": (
+    message_mapping_metadata = {
+        **existing_message_metadata,
+        "stream_uuid": stream_uuid,
+        "topic_uuid": topic_uuid,
+        "author_uuid": author_uuid,
+        "chat_key": chat_key,
+        "project_uuid": project_uuid,
+        "causal_lane": lane,
+        "provider_timestamp": float(message["timestamp"]),
+        "content_sha256": content_sha256,
+        "provider_content_sha256": provider_content_sha256,
+        "subject": channel_subject if chat_type == "channel" else "",
+        "mapping_origin": existing_message_metadata.get("mapping_origin", "zulip"),
+        "provider_event_id": existing_message_metadata.get(
+            "provider_event_id", int(event["id"])
+        ),
+        "workspace_delivery_state": (
+            "pending"
+            if pending_delete
+            else (
                 "committed"
                 if workspace_delivery_committed
                 else existing_message_metadata.get(
                     "workspace_delivery_state", "pending"
                 )
-            ),
-        },
+            )
+        ),
+    }
+    pending_recreation = getattr(
+        store,
+        "remember_pending_provider_message_recreation",
+        None,
     )
+    if (pending_delete or pending_tombstone) and callable(pending_recreation):
+        pending_recreation(
+            account_uuid,
+            provider_message_id,
+            message_uuid,
+            message_mapping_metadata,
+        )
+    else:
+        store.remember_provider_mapping(
+            account_uuid,
+            "message",
+            provider_message_id,
+            message_uuid,
+            message_mapping_metadata,
+        )
     for provider_user_id, identity_uuid in identity_uuids.items():
         user = provider_users[provider_user_id]
         payload = {
@@ -1618,9 +1677,9 @@ def _reaction_event_records(
     account = store.account_resource(account_uuid)
     if account is None:
         return []
-    message = store.provider_mapping(
+    message = provider_message_mapping(
+        store,
         account_uuid,
-        "message",
         str(event["message_id"]),
     )
     if message is None:
@@ -1687,77 +1746,249 @@ def _mapped_event_records(
         message_ids = [event["message_id"]]
     records: list[dict[str, object]] = []
     next_subindex = 0
+    destination_project_uuid: str | None = None
+    destination_stream_uuid: str | None = None
+    destination_chat_key: str | None = None
+    destination_topic_uuid: str | None = None
+    destination_topic_name: str | None = None
+    destination_unselected = False
+    source_stream_id = event.get("stream_id")
+    destination_stream_id = event.get("new_stream_id", source_stream_id)
     if (
         event_type == "update_message"
         and event.get("orig_subject") is not None
         and event.get("subject") is not None
-        and event.get("stream_id") is not None
-        and channel_topic_name(str(event["orig_subject"]))
-        != channel_topic_name(str(event["subject"]))
+        and source_stream_id is not None
+        and destination_stream_id is not None
+        and (
+            channel_topic_name(str(event["orig_subject"]))
+            != channel_topic_name(str(event["subject"]))
+            or str(source_stream_id) != str(destination_stream_id)
+        )
     ):
         old_topic_name = channel_topic_name(str(event["orig_subject"]))
         new_topic_name = channel_topic_name(str(event["subject"]))
-        old_provider_id = channel_topic_provider_id(event["stream_id"], old_topic_name)
+        destination_topic_name = new_topic_name
+        old_provider_id = channel_topic_provider_id(source_stream_id, old_topic_name)
         old_topic = store.provider_mapping(account_uuid, "topic", old_provider_id)
-        if old_topic is not None:
-            topic_metadata = typing.cast(dict[str, object], old_topic["metadata"])
-            new_provider_id = channel_topic_provider_id(
-                event["stream_id"], new_topic_name
+        new_provider_id = channel_topic_provider_id(
+            destination_stream_id, new_topic_name
+        )
+        target_topic = store.provider_mapping(account_uuid, "topic", new_provider_id)
+        stream_changed = str(source_stream_id) != str(destination_stream_id)
+        source_metadata = (
+            dict(typing.cast(dict[str, object], old_topic["metadata"]))
+            if old_topic is not None
+            else None
+        )
+        if source_metadata is None:
+            for provider_message_id_raw in typing.cast(list[object], message_ids or []):
+                message_mapping = provider_message_mapping(
+                    store,
+                    account_uuid,
+                    str(provider_message_id_raw),
+                )
+                if message_mapping is not None:
+                    message_metadata = typing.cast(
+                        dict[str, object], message_mapping["metadata"]
+                    )
+                    source_metadata = {
+                        "stream_uuid": message_metadata["stream_uuid"],
+                        "chat_key": message_metadata["chat_key"],
+                        "is_default": False,
+                    }
+                    break
+        target_metadata = source_metadata
+        if stream_changed:
+            destination_chat_key = f"channel:{int(destination_stream_id)}"
+            try:
+                destination_project_uuid, _assignment_exists = (
+                    provider_chat_assignment(store, account_uuid, destination_chat_key)
+                )
+            except ValueError as exc:
+                if str(exc) != "provider_chat_not_selected":
+                    raise
+                destination_unselected = True
+            if destination_unselected:
+                destination_chat_key = None
+            else:
+                destination_stream = store.provider_mapping(
+                    account_uuid, "stream", destination_chat_key
+                )
+                if destination_stream is None and _reconcile_assignment_projection(
+                    store, account_uuid, destination_chat_key
+                ):
+                    destination_stream = store.provider_mapping(
+                        account_uuid, "stream", destination_chat_key
+                    )
+                if destination_stream is None:
+                    raise ValueError("provider_chat_assignment_pending")
+                destination_stream_uuid = str(destination_stream["workspace_uuid"])
+                target_metadata = {
+                    "stream_uuid": destination_stream_uuid,
+                    "chat_key": destination_chat_key,
+                    "is_default": False,
+                }
+        move_only = (
+            str(event.get("propagate_mode") or "change_all")
+            in {
+                "change_one",
+                "change_later",
+            }
+            or stream_changed
+        )
+        if (
+            not destination_unselected
+            and target_topic is None
+            and target_metadata is not None
+            and move_only
+        ):
+            store.remember_provider_mapping(
+                account_uuid,
+                "topic",
+                new_provider_id,
+                stable_entity_uuid(account_uuid, "topic", new_provider_id),
+                {**target_metadata, "name": new_topic_name},
+                str(event.get("edit_timestamp")),
             )
-            renamed = store.rename_provider_mapping(
+            target_topic = store.provider_mapping(
+                account_uuid, "topic", new_provider_id
+            )
+        elif (
+            not destination_unselected
+            and target_topic is None
+            and old_topic is not None
+        ):
+            target_topic = store.rename_provider_mapping(
                 account_uuid,
                 "topic",
                 old_provider_id,
                 new_provider_id,
-                topic_metadata,
+                {
+                    **typing.cast(dict[str, object], old_topic["metadata"]),
+                    "name": new_topic_name,
+                },
                 str(event.get("edit_timestamp")),
             )
-            if renamed is not None:
-                stream_uuid = str(topic_metadata["stream_uuid"])
-                stream_mapping = store.provider_mapping(
-                    account_uuid, "stream", str(topic_metadata["chat_key"])
+        elif (
+            not destination_unselected
+            and target_topic is None
+            and target_metadata is not None
+        ):
+            store.remember_provider_mapping(
+                account_uuid,
+                "topic",
+                new_provider_id,
+                stable_entity_uuid(account_uuid, "topic", new_provider_id),
+                {**target_metadata, "name": new_topic_name},
+                str(event.get("edit_timestamp")),
+            )
+            target_topic = store.provider_mapping(
+                account_uuid, "topic", new_provider_id
+            )
+        if not destination_unselected and target_topic is not None:
+            destination_topic_uuid = str(target_topic["workspace_uuid"])
+            topic_metadata = typing.cast(dict[str, object], target_topic["metadata"])
+            destination_stream_uuid = str(topic_metadata["stream_uuid"])
+            destination_chat_key = str(topic_metadata["chat_key"])
+            stream_mapping = store.provider_mapping(
+                account_uuid, "stream", destination_chat_key
+            )
+            if stream_mapping is not None:
+                stream_metadata = typing.cast(
+                    dict[str, object], stream_mapping["metadata"]
                 )
-                if stream_mapping is not None:
-                    stream_metadata = typing.cast(
-                        dict[str, object], stream_mapping["metadata"]
+                destination_project_uuid = str(stream_metadata["project_uuid"])
+                operation = {
+                    "kind": "topic.upsert",
+                    "entity_uuid": destination_topic_uuid,
+                    "actor_uuid": owner_uuid,
+                    "occurred_at": event_time.isoformat().replace("+00:00", "Z"),
+                    "provider": _provider(
+                        destination_chat_key,
+                        new_provider_id,
+                        str(event.get("edit_timestamp")),
+                    ),
+                    "payload": {
+                        "stream_uuid": destination_stream_uuid,
+                        "name": new_topic_name,
+                    },
+                    "extensions": {"provider_badge": "zulip"},
+                }
+                records.append(
+                    _record(
+                        store,
+                        account_uuid,
+                        destination_project_uuid,
+                        queue_id,
+                        int(event["id"]),
+                        next_subindex,
+                        operation,
+                        f"chat:{account_uuid}:{destination_stream_uuid}",
+                        event_time,
+                        delivery_class,
                     )
-                    project_uuid = str(stream_metadata["project_uuid"])
-                    operation = {
-                        "kind": "topic.upsert",
-                        "entity_uuid": str(renamed["workspace_uuid"]),
-                        "actor_uuid": owner_uuid,
-                        "occurred_at": event_time.isoformat().replace("+00:00", "Z"),
-                        "provider": _provider(
-                            str(topic_metadata["chat_key"]),
-                            new_provider_id,
-                            str(event.get("edit_timestamp")),
-                        ),
-                        "payload": {
-                            "stream_uuid": stream_uuid,
-                            "name": new_topic_name,
-                        },
-                        "extensions": {"provider_badge": "zulip"},
-                    }
-                    records.append(
-                        _record(
-                            store,
-                            account_uuid,
-                            project_uuid,
-                            queue_id,
-                            int(event["id"]),
-                            next_subindex,
-                            operation,
-                            f"chat:{account_uuid}:{stream_uuid}",
-                            event_time,
-                            delivery_class,
-                        )
-                    )
-                    next_subindex += 1
+                )
+                next_subindex += 1
+    if destination_unselected:
+        for provider_message_id_raw in typing.cast(list[object], message_ids or []):
+            provider_message_id = str(provider_message_id_raw)
+            mapping = provider_message_mapping(
+                store,
+                account_uuid,
+                provider_message_id,
+            )
+            if mapping is None:
+                continue
+            metadata = _provider_message_metadata(
+                store,
+                account_uuid,
+                mapping,
+            )
+            if metadata is None:
+                continue
+            stream_uuid = str(metadata["stream_uuid"])
+            chat_key = str(metadata["chat_key"])
+            causal_lane = str(
+                metadata.get("causal_lane")
+                or f"chat:{account_uuid}:{stream_uuid}"
+            )
+            operation = {
+                "kind": "message.delete",
+                "entity_uuid": str(mapping["workspace_uuid"]),
+                "actor_uuid": str(metadata["author_uuid"]),
+                "occurred_at": event_time.isoformat().replace("+00:00", "Z"),
+                "provider": _provider(chat_key, provider_message_id),
+                "payload": {
+                    "stream_uuid": stream_uuid,
+                    "topic_uuid": str(metadata["topic_uuid"]),
+                    "author_uuid": str(metadata["author_uuid"]),
+                },
+                "extensions": {"provider_badge": "zulip"},
+            }
+            records.append(
+                _record(
+                    store,
+                    account_uuid,
+                    str(metadata["project_uuid"]),
+                    f"provider-message-delete:{provider_message_id}",
+                    int(event["id"]),
+                    next_subindex,
+                    operation,
+                    causal_lane,
+                    event_time,
+                    delivery_class,
+                )
+            )
+            next_subindex += 1
+        return records
     if event_type == "update_message_flags" and event.get("flag") == "read":
         grouped: dict[tuple[str, str, str, str], list[dict[str, object]]] = {}
         for provider_message_id_raw in typing.cast(list[object], message_ids or []):
-            mapping = store.provider_mapping(
-                account_uuid, "message", str(provider_message_id_raw)
+            mapping = provider_message_mapping(
+                store,
+                account_uuid,
+                str(provider_message_id_raw),
             )
             if mapping is None:
                 continue
@@ -1828,15 +2059,24 @@ def _mapped_event_records(
         return records
     for provider_message_id_raw in typing.cast(list[object], message_ids or []):
         provider_message_id = str(provider_message_id_raw)
-        mapping = store.provider_mapping(account_uuid, "message", provider_message_id)
+        mapping = provider_message_mapping(store, account_uuid, provider_message_id)
         if mapping is None:
             continue
-        metadata = typing.cast(dict[str, object], mapping["metadata"])
+        metadata = _provider_message_metadata(store, account_uuid, mapping)
+        if metadata is None:
+            continue
         project_uuid = str(metadata["project_uuid"])
         stream_uuid = str(metadata["stream_uuid"])
         topic_uuid = str(metadata["topic_uuid"])
+        updated_topic_uuid = destination_topic_uuid or topic_uuid
+        updated_project_uuid = destination_project_uuid or project_uuid
+        updated_stream_uuid = destination_stream_uuid or stream_uuid
         author_uuid = str(metadata["author_uuid"])
         chat_key = str(metadata["chat_key"])
+        message_causal_lane = str(
+            metadata.get("causal_lane") or f"chat:{account_uuid}:{stream_uuid}"
+        )
+        updated_chat_key = destination_chat_key or chat_key
         operation: dict[str, object]
         record_source = queue_id
         if event_type == "delete_message":
@@ -1854,7 +2094,12 @@ def _mapped_event_records(
                 },
                 "extensions": {"provider_badge": "zulip"},
             }
-        elif event_type == "update_message" and event.get("content") is not None:
+        elif (
+            event_type == "update_message"
+            and event.get("content") is not None
+            and event.get("message_id") is not None
+            and provider_message_id == str(event["message_id"])
+        ):
             provider_content_sha256 = hashlib.sha256(
                 str(event["content"]).encode("utf-8")
             ).hexdigest()
@@ -1870,7 +2115,7 @@ def _mapped_event_records(
                 store,
                 account_uuid,
                 owner_uuid,
-                chat_key,
+                updated_chat_key,
                 str(event["content"]),
                 occurred_at,
             )
@@ -1879,7 +2124,7 @@ def _mapped_event_records(
                     _record(
                         store,
                         account_uuid,
-                        project_uuid,
+                        updated_project_uuid,
                         record_source,
                         int(event["id"]),
                         next_subindex,
@@ -1899,7 +2144,7 @@ def _mapped_event_records(
             )
             event_subject = event.get("subject")
             mapped_subject = metadata.get("subject")
-            is_channel = chat_key.startswith("channel:")
+            is_channel = updated_chat_key.startswith("channel:")
             if is_channel:
                 event_topic_name = (
                     channel_topic_name(str(event_subject))
@@ -1918,32 +2163,32 @@ def _mapped_event_records(
             if event_topic_name is not None:
                 topic_provider_id = (
                     channel_topic_provider_id(
-                        chat_key.removeprefix("channel:"), event_topic_name
+                        updated_chat_key.removeprefix("channel:"), event_topic_name
                     )
                     if is_channel
-                    else f"{chat_key}:default"
+                    else f"{updated_chat_key}:default"
                 )
             if (
                 event_topic_name is not None
                 and topic_provider_id is not None
                 and not any(
                     record["operation"]["kind"] == "topic.upsert"
-                    and record["operation"]["entity_uuid"] == topic_uuid
+                    and record["operation"]["entity_uuid"] == updated_topic_uuid
                     for record in records
                 )
             ):
                 topic_operation = {
                     "kind": "topic.upsert",
-                    "entity_uuid": topic_uuid,
+                    "entity_uuid": updated_topic_uuid,
                     "actor_uuid": owner_uuid,
                     "occurred_at": occurred_at,
                     "provider": _provider(
-                        chat_key,
+                        updated_chat_key,
                         topic_provider_id,
                         str(event.get("edit_timestamp")),
                     ),
                     "payload": {
-                        "stream_uuid": stream_uuid,
+                        "stream_uuid": updated_stream_uuid,
                         "name": event_topic_name,
                     },
                     "extensions": {"provider_badge": "zulip"},
@@ -1952,12 +2197,12 @@ def _mapped_event_records(
                     _record(
                         store,
                         account_uuid,
-                        project_uuid,
+                        updated_project_uuid,
                         record_source,
                         int(event["id"]),
                         next_subindex,
                         topic_operation,
-                        f"chat:{account_uuid}:{stream_uuid}",
+                        f"chat:{account_uuid}:{updated_stream_uuid}",
                         event_time,
                         delivery_class,
                     )
@@ -1969,11 +2214,13 @@ def _mapped_event_records(
                 "actor_uuid": author_uuid,
                 "occurred_at": event_time.isoformat().replace("+00:00", "Z"),
                 "provider": _provider(
-                    chat_key, provider_message_id, str(event.get("edit_timestamp"))
+                    updated_chat_key,
+                    provider_message_id,
+                    str(event.get("edit_timestamp")),
                 ),
                 "payload": {
-                    "stream_uuid": stream_uuid,
-                    "topic_uuid": topic_uuid,
+                    "stream_uuid": updated_stream_uuid,
+                    "topic_uuid": updated_topic_uuid,
                     "author_uuid": author_uuid,
                     "payload": {"kind": "markdown", "content": markdown},
                 },
@@ -1992,24 +2239,72 @@ def _mapped_event_records(
                     ),
                 },
             }
+        elif event_type == "update_message" and destination_topic_uuid is not None:
+            record_source = (
+                f"provider-message-move:{provider_message_id}:{destination_topic_uuid}"
+            )
+            operation = {
+                "kind": "message.update",
+                "entity_uuid": str(mapping["workspace_uuid"]),
+                "actor_uuid": author_uuid,
+                "occurred_at": event_time.isoformat().replace("+00:00", "Z"),
+                "provider": _provider(
+                    updated_chat_key,
+                    provider_message_id,
+                    str(event.get("edit_timestamp")),
+                ),
+                "payload": {
+                    "stream_uuid": updated_stream_uuid,
+                    "topic_uuid": destination_topic_uuid,
+                    "author_uuid": author_uuid,
+                },
+                "extensions": {
+                    "provider_badge": "zulip",
+                    **(
+                        {"subject": destination_topic_name}
+                        if destination_topic_name is not None
+                        else {}
+                    ),
+                },
+            }
         else:
             continue
         records.append(
             _record(
                 store,
                 account_uuid,
-                project_uuid,
+                updated_project_uuid,
                 record_source,
                 int(event["id"]),
                 next_subindex,
                 operation,
-                f"chat:{account_uuid}:{stream_uuid}",
+                message_causal_lane,
                 event_time,
                 delivery_class,
             )
         )
         next_subindex += 1
     return records
+
+
+def _provider_message_metadata(
+    store: ConversionStore,
+    account_uuid: str,
+    mapping: dict[str, object],
+) -> dict[str, object] | None:
+    """Overlay the newest accepted mutation on a committed message mapping."""
+    metadata = dict(typing.cast(dict[str, object], mapping["metadata"]))
+    pending_context_lookup = getattr(store, "pending_provider_message_context", None)
+    pending_context = (
+        pending_context_lookup(account_uuid, str(mapping["workspace_uuid"]))
+        if callable(pending_context_lookup)
+        else None
+    )
+    if pending_context is not None and pending_context.get("deleted") is True:
+        return None
+    if pending_context is not None:
+        metadata.update(pending_context)
+    return metadata
 
 
 def _event_time(event: dict[str, object]) -> datetime.datetime:

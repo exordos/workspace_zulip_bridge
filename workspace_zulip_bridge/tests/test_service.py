@@ -1098,6 +1098,156 @@ def test_provider_journal_enqueues_live_before_marking_event(monkeypatch):
     ]
 
 
+def test_provider_journal_retries_unexpected_row_failure(monkeypatch):
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+    store = DeliveryStore(
+        [
+            {
+                "account_uuid": account_uuid,
+                "queue_id": "queue",
+                "event_id": 7,
+                "retry_count": 0,
+                "body": {"id": 7, "type": "realm_user", "person": {}},
+            }
+        ]
+    )
+    instance = _delivery_service(store)
+    monkeypatch.setattr(
+        instance,
+        "_event_records_with_file_fallback",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("unexpected conversion failure")
+        ),
+    )
+
+    assert instance.process_provider_journal() == 0
+    assert store.retried == [
+        (account_uuid, "queue", 7, "provider_event_processing_failed")
+    ]
+    assert store.invalid == []
+
+
+def test_provider_journal_terminalizes_repeated_unexpected_row_failure(monkeypatch):
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+    store = DeliveryStore(
+        [
+            {
+                "account_uuid": account_uuid,
+                "queue_id": "queue",
+                "event_id": 7,
+                "retry_count": (
+                    service.BridgeService.PROVIDER_EVENT_FAILURE_MAX_ATTEMPTS - 1
+                ),
+                "processing_reason": "provider_event_processing_failed",
+                "body": {"id": 7, "type": "realm_user", "person": {}},
+            }
+        ]
+    )
+    instance = _delivery_service(store)
+    monkeypatch.setattr(
+        instance,
+        "_event_records_with_file_fallback",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("unexpected conversion failure")
+        ),
+    )
+
+    assert instance.process_provider_journal() == 1
+    assert store.retried == []
+    assert store.invalid == [
+        (account_uuid, "queue", 7, "provider_event_processing_failed")
+    ]
+
+
+def test_dependency_retries_do_not_count_toward_unexpected_failure_limit(
+    monkeypatch,
+):
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+    store = DeliveryStore(
+        [
+            {
+                "account_uuid": account_uuid,
+                "queue_id": "queue",
+                "event_id": 7,
+                "retry_count": (
+                    service.BridgeService.PROVIDER_EVENT_FAILURE_MAX_ATTEMPTS - 1
+                ),
+                "processing_reason": "provider_chat_assignment_pending",
+                "body": {"id": 7, "type": "realm_user", "person": {}},
+            }
+        ]
+    )
+    instance = _delivery_service(store)
+    monkeypatch.setattr(
+        instance,
+        "_event_records_with_file_fallback",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("first unexpected conversion failure")
+        ),
+    )
+
+    assert instance.process_provider_journal() == 0
+    assert store.retried == [
+        (account_uuid, "queue", 7, "provider_event_processing_failed")
+    ]
+    assert store.invalid == []
+
+
+def test_adapter_environment_failure_is_not_quarantined():
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+    store = DeliveryStore(
+        [
+            {
+                "account_uuid": account_uuid,
+                "queue_id": "queue",
+                "event_id": 7,
+                "retry_count": 0,
+                "body": {"id": 7, "type": "realm_user", "person": {}},
+            }
+        ]
+    )
+    instance = _delivery_service(store)
+    instance.provider_adapters = lambda _account_uuid: (_ for _ in ()).throw(
+        OSError("managed CA directory unavailable")
+    )
+
+    with pytest.raises(OSError, match="managed CA directory unavailable"):
+        instance.process_provider_journal()
+    assert store.retried == []
+    assert store.invalid == []
+
+
+def test_provider_journal_contains_unexpected_delivery_enqueue_failure(monkeypatch):
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+
+    class Store(DeliveryStore):
+        def enqueue_workspace_delivery(self, record, priority):
+            raise RuntimeError("unexpected outbox failure")
+
+    store = Store(
+        [
+            {
+                "account_uuid": account_uuid,
+                "queue_id": "queue",
+                "event_id": 7,
+                "retry_count": 0,
+                "body": {"id": 7, "type": "realm_user", "person": {}},
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        converter,
+        "event_records",
+        lambda *_args, **_kwargs: [{"record_uuid": "record"}],
+    )
+
+    assert _delivery_service(store).process_provider_journal() == 0
+    assert store.retried == [
+        (account_uuid, "queue", 7, "provider_event_processing_failed")
+    ]
+    assert store.invalid == []
+
+
 def test_unselected_provider_event_is_finalized_without_crashing(monkeypatch):
     account_uuid = "00000000-0000-0000-0000-000000000001"
     store = DeliveryStore(
@@ -1571,7 +1721,7 @@ def test_reaction_assignment_poll_reuses_persisted_message_context():
     ]
 
 
-def test_reaction_catalog_publication_retries_if_process_stops_before_marker():
+def test_reaction_catalog_publication_retries_row_before_durable_marker():
     account_uuid = "00000000-0000-0000-0000-000000000001"
     reaction = {
         "id": 7,
@@ -1638,10 +1788,12 @@ def test_reaction_catalog_publication_retries_if_process_stops_before_marker():
 
     instance._queue_event_catalog = queue_catalog
 
-    with pytest.raises(RuntimeError, match="before durable catalog enqueue"):
-        instance.process_provider_journal()
+    assert instance.process_provider_journal() == 0
     assert len(catalog_attempts) == 1
     assert store.catalog_marks == []
+    assert [retry[-1] for retry in store.retried] == [
+        "provider_event_processing_failed"
+    ]
 
     stop_before_durable = False
     store.events = [event_row]
@@ -1649,6 +1801,7 @@ def test_reaction_catalog_publication_retries_if_process_stops_before_marker():
     assert len(catalog_attempts) == 2
     assert store.catalog_marks == [(account_uuid, "queue", 7)]
     assert [retry[-1] for retry in store.retried] == [
+        "provider_event_processing_failed",
         "provider_chat_assignment_pending"
     ]
 
@@ -2049,6 +2202,7 @@ def test_live_event_preempts_large_backfill_and_is_exactly_once_across_restart(
     class State:
         cursor = {"queue_id": "queue", "last_event_id": 7}
         processing_state = "pending"
+        retries = []
         deliveries = [
             (
                 {
@@ -2073,6 +2227,7 @@ def test_live_event_preempts_large_backfill_and_is_exactly_once_across_restart(
                     "account_uuid": account_uuid,
                     "queue_id": "queue",
                     "event_id": 7,
+                    "retry_count": len(State.retries),
                     "body": {
                         "id": 7,
                         "type": "message",
@@ -2113,7 +2268,7 @@ def test_live_event_preempts_large_backfill_and_is_exactly_once_across_restart(
             raise AssertionError("valid buffered event must not be quarantined")
 
         def retry_provider_event(self, *args):
-            raise AssertionError("valid buffered event must not be retried")
+            State.retries.append(args)
 
         def mark_health(self, *args):
             return None
@@ -2137,10 +2292,12 @@ def test_live_event_preempts_large_backfill_and_is_exactly_once_across_restart(
     )
 
     first_process = bridge_instance(crash_after_enqueue=True)
-    with pytest.raises(RuntimeError, match="simulated process crash"):
-        first_process.process_provider_journal()
+    assert first_process.process_provider_journal() == 0
     assert State.processing_state == "pending"
     assert State.cursor == {"queue_id": "queue", "last_event_id": 7}
+    assert [retry[-1] for retry in State.retries] == [
+        "provider_event_processing_failed"
+    ]
     live_deliveries = [
         delivery
         for delivery in State.deliveries
