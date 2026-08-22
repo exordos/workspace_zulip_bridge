@@ -323,7 +323,7 @@ def test_catalog_participants_merge_is_monotonic_and_enriches_placeholders():
     ]
 
 
-def test_authoritative_catalog_participants_remove_stale_members_and_keep_facts():
+def test_authoritative_catalog_participants_remove_stale_members_and_refresh_names():
     current = [
         {
             "provider_user_id": "10",
@@ -343,6 +343,38 @@ def test_authoritative_catalog_participants_remove_stale_members_and_keep_facts(
     observed = [
         {
             "provider_user_id": "10",
+            "display_name": "Renamed User",
+            "email": None,
+            "avatar_urn": None,
+            "is_owner": True,
+        }
+    ]
+
+    assert storage._merge_catalog_participants(
+        current,
+        observed,
+        authoritative=True,
+    ) == [
+        {
+            **current[0],
+            "display_name": "Renamed User",
+        }
+    ]
+
+
+def test_authoritative_catalog_participants_keep_rich_name_over_id_placeholder():
+    current = [
+        {
+            "provider_user_id": "10",
+            "display_name": "Known User",
+            "email": "known@example.test",
+            "avatar_urn": "urn:avatar:10",
+            "is_owner": True,
+        }
+    ]
+    observed = [
+        {
+            "provider_user_id": "10",
             "display_name": "10",
             "email": None,
             "avatar_urn": None,
@@ -354,7 +386,7 @@ def test_authoritative_catalog_participants_remove_stale_members_and_keep_facts(
         current,
         observed,
         authoritative=True,
-    ) == [current[0]]
+    ) == current
 
 
 @pytest.mark.parametrize(

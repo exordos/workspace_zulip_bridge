@@ -72,11 +72,12 @@ def test_migrations_have_one_versioned_dependency_chain():
         "0015-scale-large-synchronizations-ad12e8.py",
         "0016-refresh-Zulip-reactions-by-emoji-code-e76ed0.py",
         "0017-persist-provider-account-circuit-breaker-e875bc.py",
+        "0018-persist-reaction-assignment-context-372258.py",
     ]
     assert engine.get_latest_migration() == (
-        "0017-persist-provider-account-circuit-breaker-e875bc.py"
+        "0018-persist-reaction-assignment-context-372258.py"
     )
-    assert len({step["uuid"] for step in all_migrations.values()}) == 18
+    assert len({step["uuid"] for step in all_migrations.values()}) == 19
     assert all_migrations["0001-add-Zulip-provider-scheduler-state-143113.py"][
         "depends"
     ] == ["0000-initialize-bridge-operational-state-18f707.py"]
@@ -128,6 +129,36 @@ def test_migrations_have_one_versioned_dependency_chain():
     assert all_migrations[
         "0017-persist-provider-account-circuit-breaker-e875bc.py"
     ]["depends"] == ["0016-refresh-Zulip-reactions-by-emoji-code-e76ed0.py"]
+    assert all_migrations[
+        "0018-persist-reaction-assignment-context-372258.py"
+    ]["depends"] == ["0017-persist-provider-account-circuit-breaker-e875bc.py"]
+
+
+def test_reaction_assignment_context_migration_is_persisted():
+    migration_path = (
+        MIGRATIONS / "0018-persist-reaction-assignment-context-372258.py"
+    )
+    spec = importlib.util.spec_from_file_location("reaction_context", migration_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class Session:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, statement):
+            self.statements.append(statement)
+
+    session = Session()
+    module.migration_step.upgrade(session)
+
+    assert len(session.statements) == 1
+    statement = session.statements[0]
+    assert "assignment_pending_since timestamptz" in statement
+    assert "assignment_catalog_reported_at timestamptz" in statement
+    assert "provider_message_context jsonb" in statement
+    assert "jsonb_typeof(provider_message_context) = 'object'" in statement
 
 
 def test_provider_account_breaker_migration_is_persisted_and_generation_bound():
@@ -308,7 +339,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                 ORDER BY indexname
                 """
             ).fetchall()
-            assert applied["count"] == 18
+            assert applied["count"] == 19
             assert [row["indexname"] for row in indexes] == [
                 "bridge_operations_active_local_echo_idx",
                 "desired_resources_assignment_chat_idx",
@@ -353,7 +384,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
             provider_cursor_count = session.execute(
                 "SELECT count(*) AS count FROM zulip_event_cursors"
             ).fetchone()
-            assert applied["count"] == 18
+            assert applied["count"] == 19
             assert cursor["control_cursor"] == "preserved"
             assert provider_cursor_count["count"] == 0
     finally:

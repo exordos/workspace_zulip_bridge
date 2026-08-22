@@ -86,7 +86,13 @@ def _merge_catalog_participants(
                 merged[name] = value[name]
         prior_name = str(prior.get("display_name", "")).strip()
         observed_name = str(value.get("display_name", "")).strip()
-        if (not prior_name or prior_name == provider_user_id) and observed_name:
+        if (
+            authoritative
+            and observed_name
+            and observed_name != provider_user_id
+        ):
+            merged["display_name"] = observed_name
+        elif (not prior_name or prior_name == provider_user_id) and observed_name:
             merged["display_name"] = observed_name
         participants[provider_user_id] = merged
     return [participants[key] for key in sorted(participants)]
@@ -1709,6 +1715,10 @@ class RestAlchemyStore:
                     """
                     WITH account_heads AS (
                         SELECT account_uuid, queue_id, event_id, body,
+                               processing_reason, retry_count,
+                               assignment_pending_since,
+                               assignment_catalog_reported_at,
+                               provider_message_context,
                                created_at, available_at,
                                row_number() OVER (
                                    PARTITION BY account_uuid
@@ -1717,7 +1727,11 @@ class RestAlchemyStore:
                         FROM zulip_provider_events
                         WHERE processing_state = 'pending'
                     )
-                    SELECT account_uuid, queue_id, event_id, body
+                    SELECT account_uuid, queue_id, event_id, body,
+                           processing_reason, retry_count,
+                           assignment_pending_since,
+                           assignment_catalog_reported_at,
+                           provider_message_context
                     FROM account_heads AS event
                     WHERE position = 1 AND available_at <= now()
                       AND (
@@ -1881,6 +1895,11 @@ class RestAlchemyStore:
                         ELSE LEAST(300, power(2, LEAST(retry_count, 8)))
                              * interval '1 second'
                     END,
+                    assignment_pending_since = CASE
+                        WHEN %s = 'provider_chat_assignment_pending'
+                        THEN COALESCE(assignment_pending_since, now())
+                        ELSE assignment_pending_since
+                    END,
                     processing_reason = %s
                 WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
                   AND processing_state = 'pending'
@@ -1888,11 +1907,66 @@ class RestAlchemyStore:
                 (
                     reason[:128] or "provider_file_unavailable",
                     reason[:128] or "provider_file_unavailable",
+                    reason[:128] or "provider_file_unavailable",
                     account_uuid,
                     queue_id,
                     event_id,
                 ),
             )
+
+    def cache_provider_event_message_context(
+        self,
+        account_uuid: str,
+        queue_id: str,
+        event_id: int,
+        provider_message_context: dict[str, object],
+    ) -> dict[str, object]:
+        """Persist the minimal provider message facts needed by a reaction."""
+        with self.session() as session:
+            row = session.execute(
+                """
+                UPDATE zulip_provider_events
+                SET provider_message_context = COALESCE(
+                        provider_message_context,
+                        %s
+                    )
+                WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
+                  AND processing_state = 'pending'
+                RETURNING provider_message_context
+                """,
+                (
+                    json.dumps(provider_message_context),
+                    account_uuid,
+                    queue_id,
+                    event_id,
+                ),
+            ).fetchone()
+        if row is None or not isinstance(row["provider_message_context"], dict):
+            raise ValueError("Provider event message context is unavailable")
+        return typing.cast(dict[str, object], row["provider_message_context"])
+
+    def mark_provider_event_catalog_reported(
+        self,
+        account_uuid: str,
+        queue_id: str,
+        event_id: int,
+    ) -> bool:
+        """Persist that the discovered chat catalog reached the durable outbox."""
+        with self.session() as session:
+            row = session.execute(
+                """
+                UPDATE zulip_provider_events
+                SET assignment_catalog_reported_at = COALESCE(
+                        assignment_catalog_reported_at,
+                        now()
+                    )
+                WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
+                  AND processing_state = 'pending'
+                RETURNING assignment_catalog_reported_at
+                """,
+                (account_uuid, queue_id, event_id),
+            ).fetchone()
+        return row is not None
 
     def release_dependency_gated_provider_events(self) -> int:
         """Wake live events whose control-plane dependency may now be ready."""

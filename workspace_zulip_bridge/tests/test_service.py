@@ -1291,6 +1291,12 @@ def test_reaction_event_for_selected_chat_waits_for_message_mapping():
         ]
     )
     instance = _delivery_service(store)
+    catalog_events = []
+    instance._queue_event_catalog = (
+        lambda requested, event, server_url: catalog_events.append(
+            (requested, event, server_url)
+        )
+    )
 
     class Adapter(ProviderAdapter):
         def message_by_id(self, provider_message_id):
@@ -1324,6 +1330,397 @@ def test_reaction_event_for_selected_chat_waits_for_message_mapping():
             "queue",
             7,
             "provider_chat_assignment_pending",
+        )
+    ]
+    assert catalog_events == [
+        (account_uuid, reaction, "https://zulip.example.invalid"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("assignment_pending_since", "processing_reason", "expected_processed"),
+    [
+        (None, None, 0),
+        (
+            datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=1),
+            "provider_chat_assignment_pending",
+            0,
+        ),
+        (
+            datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=6),
+            "rate_limit_hit",
+            1,
+        ),
+    ],
+)
+def test_reaction_event_for_uncatalogued_chat_has_bounded_assignment_wait(
+    assignment_pending_since,
+    processing_reason,
+    expected_processed,
+):
+    account_uuid = "00000000-0000-0000-0000-000000000001"
+    reaction = {
+        "id": 7,
+        "type": "reaction",
+        "op": "add",
+        "message_id": 601,
+        "user_id": 3,
+        "emoji_name": "thumbs_up",
+        "emoji_code": "1f44d",
+        "reaction_type": "unicode_emoji",
+    }
+
+    class Store(DeliveryStore):
+        def provider_mapping(self, requested, entity_kind, provider_id):
+            assert requested == account_uuid
+            assert entity_kind == "message"
+            assert provider_id == "601"
+            return None
+
+        def assignment_for_provider_chat(self, requested, provider_chat_key):
+            assert requested == account_uuid
+            assert provider_chat_key == "group_direct:3,4,5"
+            return None
+
+        def account_settings(self, requested):
+            assert requested == account_uuid
+            return {"selection_mode": "all"}
+
+    store = Store(
+        [
+            {
+                "account_uuid": account_uuid,
+                "queue_id": "queue",
+                "event_id": 7,
+                "assignment_pending_since": assignment_pending_since,
+                "processing_reason": processing_reason,
+                "body": reaction,
+            }
+        ]
+    )
+    instance = _delivery_service(store)
+    catalog_events = []
+    instance._queue_event_catalog = (
+        lambda requested, event, server_url: catalog_events.append(
+            (requested, event, server_url)
+        )
+    )
+
+    class Adapter(ProviderAdapter):
+        def message_by_id(self, provider_message_id):
+            assert provider_message_id == 601
+            return {
+                "id": 601,
+                "type": "private",
+                "display_recipient": [
+                    {"id": 3, "full_name": "One"},
+                    {"id": 4, "full_name": "Two"},
+                    {"id": 5, "full_name": "Three"},
+                ],
+                "timestamp": 1_800_000_000,
+            }
+
+    instance.provider_adapters = lambda _account_uuid: Adapter()
+
+    assert instance.process_provider_journal() == expected_processed
+    assert store.enqueued == []
+    assert store.processed == []
+    if expected_processed:
+        assert store.retried == []
+        assert store.invalid == [
+            (
+                account_uuid,
+                "queue",
+                7,
+                "provider_reaction_chat_assignment_timeout",
+            )
+        ]
+    else:
+        assert store.retried == [
+            (
+                account_uuid,
+                "queue",
+                7,
+                "provider_chat_assignment_pending",
+            )
+        ]
+        assert store.invalid == []
+    assert catalog_events == [
+        (account_uuid, reaction, "https://zulip.example.invalid"),
+        (
+            account_uuid,
+            {
+                "type": "message",
+                "message": {
+                    "id": 601,
+                    "type": "private",
+                    "display_recipient": [
+                        {"id": 3, "full_name": "One"},
+                        {"id": 4, "full_name": "Two"},
+                        {"id": 5, "full_name": "Three"},
+                    ],
+                    "timestamp": 1_800_000_000,
+                },
+            },
+            "https://zulip.example.invalid",
+        ),
+    ]
+
+
+def test_reaction_assignment_poll_reuses_persisted_message_context():
+    account_uuid = "00000000-0000-0000-0000-000000000001"
+    reaction = {
+        "id": 7,
+        "type": "reaction",
+        "op": "add",
+        "message_id": 601,
+        "user_id": 3,
+        "emoji_name": "thumbs_up",
+        "emoji_code": "1f44d",
+        "reaction_type": "unicode_emoji",
+    }
+
+    class Store(DeliveryStore):
+        def __init__(self, events):
+            super().__init__(events)
+            self.message_context = None
+            self.catalog_marks = []
+
+        def provider_mapping(self, *_args):
+            return None
+
+        def assignment_for_provider_chat(self, _account, provider_chat_key):
+            assert provider_chat_key == "direct:3,4"
+            return None
+
+        def account_settings(self, _account):
+            return {"selection_mode": "all"}
+
+        def cache_provider_event_message_context(
+            self, _account, _queue, _event, message_context
+        ):
+            assert "content" not in message_context
+            self.message_context = message_context
+            return message_context
+
+        def mark_provider_event_catalog_reported(
+            self, account, queue, event_id
+        ):
+            self.catalog_marks.append((account, queue, event_id))
+            return True
+
+    event_row = {
+        "account_uuid": account_uuid,
+        "queue_id": "queue",
+        "event_id": 7,
+        "assignment_pending_since": None,
+        "processing_reason": None,
+        "body": reaction,
+    }
+    store = Store([event_row])
+    instance = _delivery_service(store)
+    fetches = []
+    catalog_events = []
+    def queue_catalog(account, event, server):
+        catalog_events.append((account, event, server))
+        return event.get("type") == "message"
+
+    instance._queue_event_catalog = queue_catalog
+
+    class Adapter(ProviderAdapter):
+        def message_by_id(self, provider_message_id):
+            fetches.append(provider_message_id)
+            return {
+                "id": provider_message_id,
+                "type": "private",
+                "display_recipient": [
+                    {"id": 3, "full_name": "Owner"},
+                    {"id": 4, "full_name": "Peer"},
+                ],
+                "timestamp": 1_800_000_000,
+                "content": "not retained in the journal context",
+            }
+
+    instance.provider_adapters = lambda _account_uuid: Adapter()
+
+    assert instance.process_provider_journal() == 0
+    assert fetches == [601]
+    assert store.message_context is not None
+    assert len(catalog_events) == 2
+    assert catalog_events[-1][1]["type"] == "message"
+    assert store.catalog_marks == [(account_uuid, "queue", 7)]
+
+    store.events = [
+        {
+            **event_row,
+            "assignment_pending_since": datetime.datetime.now(datetime.UTC),
+            "assignment_catalog_reported_at": datetime.datetime.now(datetime.UTC),
+            "processing_reason": "provider_chat_assignment_pending",
+            "provider_message_context": store.message_context,
+        }
+    ]
+
+    assert instance.process_provider_journal() == 0
+    assert fetches == [601]
+    assert len(catalog_events) == 3
+    assert catalog_events[-1][1]["type"] == "reaction"
+    assert store.catalog_marks == [(account_uuid, "queue", 7)]
+    assert [retry[-1] for retry in store.retried] == [
+        "provider_chat_assignment_pending",
+        "provider_chat_assignment_pending",
+    ]
+
+
+def test_reaction_catalog_publication_retries_if_process_stops_before_marker():
+    account_uuid = "00000000-0000-0000-0000-000000000001"
+    reaction = {
+        "id": 7,
+        "type": "reaction",
+        "op": "add",
+        "message_id": 601,
+        "user_id": 3,
+        "emoji_name": "thumbs_up",
+        "emoji_code": "1f44d",
+        "reaction_type": "unicode_emoji",
+    }
+    event_row = {
+        "account_uuid": account_uuid,
+        "queue_id": "queue",
+        "event_id": 7,
+        "assignment_pending_since": datetime.datetime.now(datetime.UTC),
+        "assignment_catalog_reported_at": None,
+        "provider_message_context": {
+            "id": 601,
+            "type": "private",
+            "display_recipient": [
+                {"id": 3, "full_name": "Owner"},
+                {"id": 4, "full_name": "Peer"},
+            ],
+            "timestamp": 1_800_000_000,
+        },
+        "body": reaction,
+    }
+
+    class Store(DeliveryStore):
+        def __init__(self, events):
+            super().__init__(events)
+            self.catalog_marks = []
+
+        def provider_mapping(self, *_args):
+            return None
+
+        def assignment_for_provider_chat(self, _account, _chat):
+            return None
+
+        def account_settings(self, _account):
+            return {"selection_mode": "all"}
+
+        def mark_provider_event_catalog_reported(
+            self, account, queue, event_id
+        ):
+            self.catalog_marks.append((account, queue, event_id))
+            return True
+
+    store = Store([event_row])
+    instance = _delivery_service(store)
+    instance.provider_adapters = lambda _account_uuid: ProviderAdapter()
+    catalog_attempts = []
+    stop_before_durable = True
+
+    def queue_catalog(account, event, server):
+        nonlocal stop_before_durable
+        if event.get("type") != "message":
+            return
+        catalog_attempts.append((account, event, server))
+        if stop_before_durable:
+            raise RuntimeError("process stopped before durable catalog enqueue")
+        return True
+
+    instance._queue_event_catalog = queue_catalog
+
+    with pytest.raises(RuntimeError, match="before durable catalog enqueue"):
+        instance.process_provider_journal()
+    assert len(catalog_attempts) == 1
+    assert store.catalog_marks == []
+
+    stop_before_durable = False
+    store.events = [event_row]
+    assert instance.process_provider_journal() == 0
+    assert len(catalog_attempts) == 2
+    assert store.catalog_marks == [(account_uuid, "queue", 7)]
+    assert [retry[-1] for retry in store.retried] == [
+        "provider_chat_assignment_pending"
+    ]
+
+
+def test_expired_reaction_mapping_wait_is_quarantined_after_assignment_exists():
+    account_uuid = "00000000-0000-0000-0000-000000000001"
+    reaction = {
+        "id": 7,
+        "type": "reaction",
+        "op": "add",
+        "message_id": 601,
+        "user_id": 3,
+        "emoji_name": "thumbs_up",
+        "emoji_code": "1f44d",
+        "reaction_type": "unicode_emoji",
+    }
+
+    class Store(DeliveryStore):
+        def provider_mapping(self, *_args):
+            return None
+
+        def assignment_for_provider_chat(self, _account, provider_chat_key):
+            assert provider_chat_key == "direct:3,4"
+            return {
+                "uuid": "00000000-0000-0000-0000-000000000090",
+                "generation": 1,
+                "project_id": "00000000-0000-0000-0000-000000000091",
+                "selected": True,
+            }
+
+    store = Store(
+        [
+            {
+                "account_uuid": account_uuid,
+                "queue_id": "queue",
+                "event_id": 7,
+                "assignment_pending_since": (
+                    datetime.datetime.now(datetime.UTC)
+                    - datetime.timedelta(minutes=6)
+                ),
+                "assignment_catalog_reported_at": datetime.datetime.now(
+                    datetime.UTC
+                ),
+                "provider_message_context": {
+                    "id": 601,
+                    "type": "private",
+                    "display_recipient": [
+                        {"id": 3, "full_name": "Owner"},
+                        {"id": 4, "full_name": "Peer"},
+                    ],
+                    "timestamp": 1_800_000_000,
+                },
+                "body": reaction,
+            }
+        ]
+    )
+    instance = _delivery_service(store)
+    instance.provider_adapters = lambda _account_uuid: ProviderAdapter()
+
+    def wait_for_mapping(*_args, **_kwargs):
+        raise ValueError("provider_chat_assignment_pending")
+
+    instance._event_records_with_file_fallback = wait_for_mapping
+
+    assert instance.process_provider_journal() == 1
+    assert store.retried == []
+    assert store.invalid == [
+        (
+            account_uuid,
+            "queue",
+            7,
+            "provider_reaction_chat_assignment_timeout",
         )
     ]
 
@@ -2406,6 +2803,58 @@ def test_catalog_report_repairs_authenticated_owner_in_persisted_topology():
     assert [value["provider_user_id"] for value in participants] == ["9", "14"]
     assert [value["is_owner"] for value in participants] == [True, False]
     assert instance.store.reports[0]["catalog"]["participants"] == participants
+    assert instance.store.reports[0]["catalog"]["display_name"] == "Peer"
+
+
+def test_direct_message_event_catalog_excludes_authenticated_owner_from_name():
+    class Store:
+        def __init__(self):
+            self.reports = []
+
+        def account_resource(self, _account_uuid):
+            return {
+                "owner_user_uuid": "10000000-0000-4000-8000-000000000001",
+                "generation": 1,
+                "settings": {
+                    "default_project_id": "10000000-0000-4000-8000-000000000002"
+                },
+            }
+
+        def provider_event_cursor(self, _account_uuid):
+            return {
+                "provider_realm_uuid": "10000000-0000-4000-8000-000000000004",
+                "provider_owner_user_id": "9",
+            }
+
+        def enqueue_observed_report(self, report):
+            self.reports.append(report)
+            return True
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance._queue_event_catalog(
+        "10000000-0000-4000-8000-000000000003",
+        {
+            "type": "message",
+            "message": {
+                "type": "private",
+                "display_recipient": [
+                    {"id": 9, "full_name": "Owner"},
+                    {"id": 14, "full_name": "Peer One"},
+                    {"id": 18, "full_name": "Peer Two"},
+                ],
+            },
+        },
+        "https://zulip.example.invalid",
+    )
+
+    catalog = instance.store.reports[0]["catalog"]
+    assert catalog["display_name"] == "Peer One, Peer Two"
+    assert [value["is_owner"] for value in catalog["participants"]] == [
+        True,
+        False,
+        False,
+    ]
 
 
 @pytest.mark.parametrize(
