@@ -424,6 +424,41 @@ def _materialize_channel_projection(
     return stream_uuid, topic_uuid, author_uuid
 
 
+def _materialize_destination_channel(
+    store: storage.RestAlchemyStore,
+    account_uuid: str,
+    project_uuid: str,
+    channel_id: int,
+) -> tuple[str, str]:
+    _insert_channel_assignment(store, account_uuid, project_uuid, channel_id)
+    stream_uuid = str(uuid.uuid4())
+    topic_uuid = str(uuid.uuid4())
+    chat_key = f"channel:{channel_id}"
+    store.remember_provider_mapping(
+        account_uuid,
+        "stream",
+        chat_key,
+        stream_uuid,
+        {
+            "chat_type": "channel",
+            "project_uuid": project_uuid,
+            "participants": [],
+            "name": f"Channel {channel_id}",
+            "description": "",
+            "private": True,
+            "default_topic_uuid": None,
+        },
+    )
+    store.remember_provider_mapping(
+        account_uuid,
+        "topic",
+        f"{channel_id}:Topic",
+        topic_uuid,
+        {"stream_uuid": stream_uuid, "chat_key": chat_key},
+    )
+    return stream_uuid, topic_uuid
+
+
 def _provider_history_message(provider_message_id: int) -> dict[str, object]:
     return {
         "id": provider_message_id,
@@ -787,6 +822,236 @@ def test_topic_recanonicalization_keeps_previous_workspace_route(postgres_store)
     assert canonical_route is not None
     assert canonical_route["provider_id"] == "42:renamed again"
     assert canonical_route["metadata"]["name"] == "renamed again"
+
+
+def test_provider_topic_rename_is_idempotent_when_target_mapping_already_exists(
+    postgres_store,
+):
+    account_uuid = str(uuid.uuid4())
+    source_workspace_uuid = str(uuid.uuid4())
+    target_workspace_uuid = str(uuid.uuid4())
+    source_metadata = {
+        "name": "TopicA",
+        "workspace_delivery_state": "committed",
+    }
+    target_metadata = {
+        "name": "TopicB",
+        "workspace_delivery_state": "committed",
+    }
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "topic",
+        "42:TopicA",
+        source_workspace_uuid,
+        source_metadata,
+        "1",
+    )
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "topic",
+        "42:TopicB",
+        target_workspace_uuid,
+        target_metadata,
+        "2",
+    )
+
+    renamed = postgres_store.rename_provider_mapping(
+        account_uuid,
+        "topic",
+        "42:TopicA",
+        "42:TopicB",
+        source_metadata,
+        "3",
+    )
+
+    assert renamed is not None
+    assert str(renamed["workspace_uuid"]) == target_workspace_uuid
+    assert renamed["provider_revision"] == "2"
+    assert renamed["metadata"] == target_metadata
+    assert str(
+        postgres_store.provider_mapping(account_uuid, "topic", "42:TopicA")[
+            "workspace_uuid"
+        ]
+    ) == source_workspace_uuid
+    assert str(
+        postgres_store.provider_mapping(account_uuid, "topic", "42:TopicB")[
+            "workspace_uuid"
+        ]
+    ) == target_workspace_uuid
+
+
+def test_provider_topic_rename_reactivates_tombstoned_target_mapping(postgres_store):
+    account_uuid = str(uuid.uuid4())
+    source_workspace_uuid = str(uuid.uuid4())
+    target_workspace_uuid = str(uuid.uuid4())
+    current_stream_uuid = str(uuid.uuid4())
+    retired_stream_uuid = str(uuid.uuid4())
+    metadata = {
+        "workspace_delivery_state": "committed",
+        "stream_uuid": current_stream_uuid,
+        "chat_key": "channel:42",
+    }
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "topic",
+        "42:TopicA",
+        source_workspace_uuid,
+        {**metadata, "name": "TopicA"},
+        "1",
+    )
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "topic",
+        "42:TopicB",
+        target_workspace_uuid,
+        {
+            **metadata,
+            "stream_uuid": retired_stream_uuid,
+            "name": "TopicB",
+        },
+        "2",
+    )
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE provider_mappings SET deleted = true
+            WHERE account_uuid = %s AND entity_kind = 'topic'
+              AND provider_id = '42:TopicB'
+            """,
+            (account_uuid,),
+        )
+
+    renamed = postgres_store.rename_provider_mapping(
+        account_uuid,
+        "topic",
+        "42:TopicA",
+        "42:TopicB",
+        {**metadata, "name": "TopicA"},
+        "3",
+    )
+
+    assert renamed is not None
+    assert str(renamed["workspace_uuid"]) == target_workspace_uuid
+    assert renamed["provider_revision"] == "3"
+    assert renamed["metadata"] == {**metadata, "name": "TopicA"}
+    assert str(
+        postgres_store.provider_mapping(account_uuid, "topic", "42:TopicA")[
+            "workspace_uuid"
+        ]
+    ) == source_workspace_uuid
+    assert str(
+        postgres_store.provider_mapping(account_uuid, "topic", "42:TopicB")[
+            "workspace_uuid"
+        ]
+    ) == target_workspace_uuid
+
+
+def test_provider_event_records_are_enqueued_atomically(postgres_store):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    queue_id = "provider-message:atomic"
+    event_id = 21
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        queue_id,
+        {"id": event_id, "type": "heartbeat"},
+    )
+    valid = _provider_record(account_uuid, project_uuid)
+    invalid = _provider_record(account_uuid, project_uuid, chat_id="channel:999")
+
+    with pytest.raises(ValueError, match="provider_chat_assignment_pending"):
+        postgres_store.enqueue_provider_event_records(
+            [valid, invalid],
+            0,
+            account_uuid,
+            queue_id,
+            event_id,
+        )
+
+    with postgres_store.session() as session:
+        delivery_count = session.execute(
+            """
+            SELECT count(*) AS count FROM workspace_delivery_outbox
+            WHERE account_uuid = %s AND provider_queue_id = %s
+              AND provider_event_id = %s
+            """,
+            (account_uuid, queue_id, event_id),
+        ).fetchone()["count"]
+        provider_event = session.execute(
+            """
+            SELECT processing_state FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
+            """,
+            (account_uuid, queue_id, event_id),
+        ).fetchone()
+    assert delivery_count == 0
+    assert provider_event["processing_state"] == "pending"
+
+
+def test_concurrent_provider_topic_renames_converge_on_one_target(postgres_store):
+    account_uuid = str(uuid.uuid4())
+    source_ids = ["42:TopicA", "42:TopicB"]
+    source_workspace_uuids = [str(uuid.uuid4()), str(uuid.uuid4())]
+    for provider_id, workspace_uuid in zip(
+        source_ids, source_workspace_uuids, strict=True
+    ):
+        postgres_store.remember_provider_mapping(
+            account_uuid,
+            "topic",
+            provider_id,
+            workspace_uuid,
+            {"name": provider_id.partition(":")[2]},
+            "1",
+        )
+
+    barrier = threading.Barrier(2)
+    results = []
+    errors = []
+
+    def rename(provider_id):
+        barrier.wait(timeout=5)
+        try:
+            results.append(
+                postgres_store.rename_provider_mapping(
+                    account_uuid,
+                    "topic",
+                    provider_id,
+                    "42:Target",
+                    {"name": "Target"},
+                    "2",
+                )
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=rename, args=(provider_id,))
+        for provider_id in source_ids
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert len(results) == 2
+    assert results[0] is not None
+    assert results[1] is not None
+    assert results[0]["workspace_uuid"] == results[1]["workspace_uuid"]
+    assert str(results[0]["workspace_uuid"]) in source_workspace_uuids
+    with postgres_store.session() as session:
+        active = session.execute(
+            """
+            SELECT provider_id FROM provider_mappings
+            WHERE account_uuid = %s AND entity_kind = 'topic' AND NOT deleted
+            ORDER BY provider_id
+            """,
+            (account_uuid,),
+        ).fetchall()
+    assert [row["provider_id"] for row in active] in [
+        ["42:Target", "42:TopicA"],
+        ["42:Target", "42:TopicB"],
+    ]
 
 
 def test_observed_report_state_can_recover_to_a_previous_value(postgres_store):
@@ -2065,6 +2330,1146 @@ def test_content_only_update_preserves_workspace_origin_topic_mapping(postgres_s
     )
 
 
+def test_single_message_topic_move_updates_committed_message_mapping(postgres_store):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    stream_uuid, source_topic_uuid, author_uuid = _materialize_channel_projection(
+        postgres_store, account_uuid, project_uuid
+    )
+    target_topic_uuid = str(uuid.uuid4())
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "topic",
+        "42:TopicB",
+        target_topic_uuid,
+        {"stream_uuid": stream_uuid, "chat_key": "channel:42"},
+    )
+    message_uuid = str(uuid.uuid4())
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "message",
+        "601",
+        message_uuid,
+        {
+            "project_uuid": project_uuid,
+            "stream_uuid": stream_uuid,
+            "topic_uuid": source_topic_uuid,
+            "author_uuid": author_uuid,
+            "chat_key": "channel:42",
+            "workspace_delivery_state": "committed",
+        },
+    )
+
+    records = converter.event_records(
+        postgres_store,
+        account_uuid,
+        "provider-message-move:601",
+        {
+            "id": 701,
+            "type": "update_message",
+            "message_id": 601,
+            "message_ids": [601],
+            "stream_id": 42,
+            "orig_subject": "Topic",
+            "subject": "TopicB",
+            "propagate_mode": "change_one",
+            "edit_timestamp": 1_700_000_011,
+        },
+    )
+
+    assert [record["operation"]["kind"] for record in records] == [
+        "topic.upsert",
+        "message.update",
+    ]
+    move = records[1]
+    assert move["operation"]["payload"]["topic_uuid"] == target_topic_uuid
+    assert "payload" not in move["operation"]["payload"]
+    with postgres_store.session() as session:
+        postgres_store._persist_committed_mapping(session, move, None, "2")
+
+    persisted = postgres_store.provider_mapping(account_uuid, "message", "601")
+    assert persisted["provider_revision"] == "2"
+    assert persisted["metadata"]["topic_uuid"] == target_topic_uuid
+    assert persisted["metadata"]["subject"] == "TopicB"
+
+
+def test_channel_move_updates_primary_and_alias_message_context(postgres_store):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    source_stream_uuid, source_topic_uuid, author_uuid = (
+        _materialize_channel_projection(postgres_store, account_uuid, project_uuid)
+    )
+    _insert_channel_assignment(postgres_store, account_uuid, project_uuid, 43)
+    destination_stream_uuid = str(uuid.uuid4())
+    destination_topic_uuid = str(uuid.uuid4())
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "stream",
+        "channel:43",
+        destination_stream_uuid,
+        {
+            "chat_type": "channel",
+            "project_uuid": project_uuid,
+            "participants": [],
+            "name": "Operations",
+            "description": "",
+            "private": True,
+            "default_topic_uuid": None,
+        },
+    )
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "topic",
+        "43:Topic",
+        destination_topic_uuid,
+        {
+            "stream_uuid": destination_stream_uuid,
+            "chat_key": "channel:43",
+        },
+    )
+    message_uuid = str(uuid.uuid4())
+    outbound = _provider_record(account_uuid, project_uuid)
+    outbound["origin"] = "workspace"
+    outbound["operation"]["entity_uuid"] = message_uuid
+    outbound["operation"]["payload"].update(
+        {
+            "stream_uuid": source_stream_uuid,
+            "topic_uuid": source_topic_uuid,
+            "author_uuid": author_uuid,
+        }
+    )
+    outbound["operation_sha256"] = canonical.operation_digest(outbound)
+    with postgres_store.session() as session:
+        postgres_store._persist_committed_mapping(session, outbound, "601", None)
+
+    records = converter.event_records(
+        postgres_store,
+        account_uuid,
+        "provider-message-channel-move:601",
+        {
+            "id": 702,
+            "type": "update_message",
+            "message_id": 601,
+            "message_ids": [601],
+            "stream_id": 42,
+            "new_stream_id": 43,
+            "orig_subject": "Topic",
+            "subject": "Topic",
+            "propagate_mode": "change_one",
+            "edit_timestamp": 1_700_000_012,
+        },
+    )
+    move = next(
+        record
+        for record in records
+        if record["operation"]["kind"] == "message.update"
+    )
+    with postgres_store.session() as session:
+        postgres_store._persist_committed_mapping(session, move, None, "3")
+
+    primary = postgres_store.provider_mapping(account_uuid, "message", "601")
+    alias = postgres_store.workspace_mapping(account_uuid, "message", message_uuid)
+    for mapping in (primary, alias):
+        assert mapping["metadata"]["project_uuid"] == project_uuid
+        assert mapping["metadata"]["stream_uuid"] == destination_stream_uuid
+        assert mapping["metadata"]["topic_uuid"] == destination_topic_uuid
+        assert mapping["metadata"]["chat_key"] == "channel:43"
+
+
+def test_pending_channel_move_routes_followup_edit_before_result_commit(
+    postgres_store,
+):
+    account_uuid, source_project_uuid = _insert_account_and_assignment(
+        postgres_store
+    )
+    source_stream_uuid, source_topic_uuid, author_uuid = (
+        _materialize_channel_projection(
+            postgres_store, account_uuid, source_project_uuid
+        )
+    )
+    destination_project_uuid = str(uuid.uuid4())
+    _insert_channel_assignment(
+        postgres_store,
+        account_uuid,
+        destination_project_uuid,
+        43,
+    )
+    destination_stream_uuid = str(uuid.uuid4())
+    destination_topic_uuid = str(uuid.uuid4())
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "stream",
+        "channel:43",
+        destination_stream_uuid,
+        {
+            "chat_type": "channel",
+            "project_uuid": destination_project_uuid,
+            "participants": [],
+            "name": "Operations",
+            "description": "",
+            "private": True,
+            "default_topic_uuid": None,
+        },
+    )
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "topic",
+        "43:Topic",
+        destination_topic_uuid,
+        {
+            "stream_uuid": destination_stream_uuid,
+            "chat_key": "channel:43",
+        },
+    )
+    message_uuid = str(uuid.uuid4())
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "message",
+        "601",
+        message_uuid,
+        {
+            "project_uuid": source_project_uuid,
+            "stream_uuid": source_stream_uuid,
+            "topic_uuid": source_topic_uuid,
+            "author_uuid": author_uuid,
+            "chat_key": "channel:42",
+            "causal_lane": f"chat:{account_uuid}:{source_stream_uuid}",
+            "workspace_delivery_state": "committed",
+        },
+    )
+    queue_id = "provider-message-channel-move:601"
+    move_event = {
+        "id": 703,
+        "type": "update_message",
+        "message_id": 601,
+        "message_ids": [601],
+        "stream_id": 42,
+        "new_stream_id": 43,
+        "orig_subject": "Topic",
+        "subject": "Topic",
+        "propagate_mode": "change_one",
+        "edit_timestamp": 1_700_000_013,
+    }
+    assert postgres_store.record_provider_event(
+        account_uuid, queue_id, move_event
+    )
+    move_records = converter.event_records(
+        postgres_store,
+        account_uuid,
+        queue_id,
+        move_event,
+    )
+    move_records = postgres_store.prepare_provider_event_records(
+        account_uuid,
+        queue_id,
+        int(move_event["id"]),
+        move_records,
+    )
+    postgres_store.enqueue_provider_event_records(
+        move_records,
+        0,
+        account_uuid,
+        queue_id,
+        int(move_event["id"]),
+    )
+    move = next(
+        record
+        for record in move_records
+        if record["operation"]["kind"] == "message.update"
+    )
+
+    pending = postgres_store.pending_provider_message_context(
+        account_uuid, message_uuid
+    )
+    assert pending == {
+        "project_uuid": destination_project_uuid,
+        "stream_uuid": destination_stream_uuid,
+        "topic_uuid": destination_topic_uuid,
+        "chat_key": "channel:43",
+        "causal_lane": f"chat:{account_uuid}:{source_stream_uuid}",
+        "subject": "Topic",
+    }
+
+    edit_records = converter.event_records(
+        postgres_store,
+        account_uuid,
+        "provider-message-update:601",
+        {
+            "id": 704,
+            "type": "update_message",
+            "message_id": 601,
+            "stream_id": 43,
+            "content": "edited after move",
+            "edit_timestamp": 1_700_000_014,
+        },
+    )
+    edit = next(
+        record
+        for record in edit_records
+        if record["operation"]["kind"] == "message.update"
+    )
+    assert edit["project_uuid"] == destination_project_uuid
+    assert edit["causal_lane"] == move["causal_lane"]
+    assert edit["operation"]["provider"]["chat_id"] == "channel:43"
+    assert edit["operation"]["payload"]["stream_uuid"] == destination_stream_uuid
+    assert edit["operation"]["payload"]["topic_uuid"] == destination_topic_uuid
+
+    postgres_store.accept_result(_committed_result(move))
+    persisted = postgres_store.provider_mapping(account_uuid, "message", "601")
+    assert persisted["metadata"]["project_uuid"] == destination_project_uuid
+    assert persisted["metadata"]["stream_uuid"] == destination_stream_uuid
+    assert persisted["metadata"]["topic_uuid"] == destination_topic_uuid
+    assert persisted["metadata"]["chat_key"] == "channel:43"
+    assert persisted["metadata"]["causal_lane"] == move["causal_lane"]
+    assert (
+        postgres_store.pending_provider_message_context(account_uuid, message_uuid)
+        is None
+    )
+
+
+def test_pending_message_context_uses_lane_sequence_across_provider_queues(
+    postgres_store,
+):
+    account_uuid, source_project_uuid = _insert_account_and_assignment(
+        postgres_store
+    )
+    source_stream_uuid, source_topic_uuid, author_uuid = (
+        _materialize_channel_projection(
+            postgres_store, account_uuid, source_project_uuid
+        )
+    )
+    first_project_uuid = str(uuid.uuid4())
+    first_stream_uuid, first_topic_uuid = _materialize_destination_channel(
+        postgres_store,
+        account_uuid,
+        first_project_uuid,
+        43,
+    )
+    second_project_uuid = str(uuid.uuid4())
+    second_stream_uuid, second_topic_uuid = _materialize_destination_channel(
+        postgres_store,
+        account_uuid,
+        second_project_uuid,
+        44,
+    )
+    message_uuid = str(uuid.uuid4())
+    causal_lane = f"chat:{account_uuid}:{source_stream_uuid}"
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "message",
+        "601",
+        message_uuid,
+        {
+            "project_uuid": source_project_uuid,
+            "stream_uuid": source_stream_uuid,
+            "topic_uuid": source_topic_uuid,
+            "author_uuid": author_uuid,
+            "chat_key": "channel:42",
+            "causal_lane": causal_lane,
+            "workspace_delivery_state": "committed",
+        },
+    )
+
+    moves = (
+        (
+            "old-provider-queue",
+            {
+                "id": 900,
+                "type": "update_message",
+                "message_id": 601,
+                "message_ids": [601],
+                "stream_id": 42,
+                "new_stream_id": 43,
+                "orig_subject": "Topic",
+                "subject": "Topic",
+                "propagate_mode": "change_one",
+                "edit_timestamp": 1_700_000_020,
+            },
+        ),
+        (
+            "replacement-provider-queue",
+            {
+                "id": 1,
+                "type": "update_message",
+                "message_id": 601,
+                "message_ids": [601],
+                "stream_id": 43,
+                "new_stream_id": 44,
+                "orig_subject": "Topic",
+                "subject": "Topic",
+                "propagate_mode": "change_one",
+                "edit_timestamp": 1_700_000_021,
+            },
+        ),
+    )
+    for queue_id, event in moves:
+        assert postgres_store.record_provider_event(account_uuid, queue_id, event)
+        records = converter.event_records(
+            postgres_store,
+            account_uuid,
+            queue_id,
+            event,
+        )
+        prepared = postgres_store.prepare_provider_event_records(
+            account_uuid,
+            queue_id,
+            int(event["id"]),
+            records,
+        )
+        postgres_store.enqueue_provider_event_records(
+            prepared,
+            0,
+            account_uuid,
+            queue_id,
+            int(event["id"]),
+        )
+
+    assert postgres_store.pending_provider_message_context(
+        account_uuid, message_uuid
+    ) == {
+        "project_uuid": second_project_uuid,
+        "stream_uuid": second_stream_uuid,
+        "topic_uuid": second_topic_uuid,
+        "chat_key": "channel:44",
+        "causal_lane": causal_lane,
+        "subject": "Topic",
+    }
+    edit = next(
+        record
+        for record in converter.event_records(
+            postgres_store,
+            account_uuid,
+            "replacement-provider-queue",
+            {
+                "id": 2,
+                "type": "update_message",
+                "message_id": 601,
+                "stream_id": 44,
+                "content": "edited after queue replacement",
+                "edit_timestamp": 1_700_000_022,
+            },
+        )
+        if record["operation"]["kind"] == "message.update"
+    )
+    assert edit["project_uuid"] == second_project_uuid
+    assert edit["operation"]["provider"]["chat_id"] == "channel:44"
+    assert edit["operation"]["payload"]["stream_uuid"] == second_stream_uuid
+    assert edit["operation"]["payload"]["topic_uuid"] == second_topic_uuid
+    assert first_stream_uuid != second_stream_uuid
+    assert first_topic_uuid != second_topic_uuid
+
+
+def test_selected_move_then_unselected_move_deletes_pending_destination(
+    postgres_store,
+):
+    account_uuid, source_project_uuid = _insert_account_and_assignment(
+        postgres_store
+    )
+    source_stream_uuid, source_topic_uuid, author_uuid = (
+        _materialize_channel_projection(
+            postgres_store, account_uuid, source_project_uuid
+        )
+    )
+    destination_project_uuid = str(uuid.uuid4())
+    destination_stream_uuid, destination_topic_uuid = (
+        _materialize_destination_channel(
+            postgres_store,
+            account_uuid,
+            destination_project_uuid,
+            43,
+        )
+    )
+    _insert_channel_assignment(
+        postgres_store,
+        account_uuid,
+        destination_project_uuid,
+        44,
+    )
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE desired_resources
+            SET body = jsonb_set(body, '{selected}', 'false'::jsonb)
+            WHERE resource_type = 'external_chat_assignment'
+              AND body->'provider_chat'->>'provider_chat_key' = 'channel:44'
+            """
+        )
+    message_uuid = str(uuid.uuid4())
+    causal_lane = f"chat:{account_uuid}:{source_stream_uuid}"
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "message",
+        "601",
+        message_uuid,
+        {
+            "project_uuid": source_project_uuid,
+            "stream_uuid": source_stream_uuid,
+            "topic_uuid": source_topic_uuid,
+            "author_uuid": author_uuid,
+            "chat_key": "channel:42",
+            "causal_lane": causal_lane,
+            "workspace_delivery_state": "committed",
+        },
+    )
+    move_event = {
+        "id": 900,
+        "type": "update_message",
+        "message_id": 601,
+        "message_ids": [601],
+        "stream_id": 42,
+        "new_stream_id": 43,
+        "orig_subject": "Topic",
+        "subject": "Topic",
+        "propagate_mode": "change_one",
+        "edit_timestamp": 1_700_000_023,
+    }
+    assert postgres_store.record_provider_event(
+        account_uuid, "old-provider-queue", move_event
+    )
+    move_records = converter.event_records(
+        postgres_store,
+        account_uuid,
+        "old-provider-queue",
+        move_event,
+    )
+    move_records = postgres_store.prepare_provider_event_records(
+        account_uuid,
+        "old-provider-queue",
+        int(move_event["id"]),
+        move_records,
+    )
+    postgres_store.enqueue_provider_event_records(
+        move_records,
+        0,
+        account_uuid,
+        "old-provider-queue",
+        int(move_event["id"]),
+    )
+
+    leave_event = {
+        "id": 1,
+        "type": "update_message",
+        "message_id": 601,
+        "message_ids": [601],
+        "stream_id": 43,
+        "new_stream_id": 44,
+        "orig_subject": "Topic",
+        "subject": "Topic",
+        "propagate_mode": "change_one",
+        "edit_timestamp": 1_700_000_024,
+    }
+    delete = converter.event_records(
+        postgres_store,
+        account_uuid,
+        "replacement-provider-queue",
+        leave_event,
+    )
+    assert [record["operation"]["kind"] for record in delete] == [
+        "message.delete"
+    ]
+    assert delete[0]["project_uuid"] == destination_project_uuid
+    assert delete[0]["causal_lane"] == causal_lane
+    assert delete[0]["operation"]["provider"]["chat_id"] == "channel:43"
+    assert delete[0]["operation"]["payload"] == {
+        "stream_uuid": destination_stream_uuid,
+        "topic_uuid": destination_topic_uuid,
+        "author_uuid": author_uuid,
+    }
+
+
+def test_channel_move_to_unselected_destination_retires_message_mapping(
+    postgres_store,
+):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    stream_uuid, topic_uuid, author_uuid = _materialize_channel_projection(
+        postgres_store, account_uuid, project_uuid
+    )
+    _insert_channel_assignment(postgres_store, account_uuid, project_uuid, 43)
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE desired_resources
+            SET body = jsonb_set(body, '{selected}', 'false'::jsonb)
+            WHERE resource_type = 'external_chat_assignment'
+              AND body->'provider_chat'->>'provider_chat_key' = 'channel:43'
+            """
+        )
+    message_uuid = str(uuid.uuid4())
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "message",
+        "601",
+        message_uuid,
+        {
+            "project_uuid": project_uuid,
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "author_uuid": author_uuid,
+            "chat_key": "channel:42",
+            "causal_lane": f"chat:{account_uuid}:{stream_uuid}",
+            "workspace_delivery_state": "committed",
+        },
+    )
+    queue_id = "provider-message-unselected-move:601"
+    event = {
+        "id": 705,
+        "type": "update_message",
+        "message_id": 601,
+        "message_ids": [601],
+        "stream_id": 42,
+        "new_stream_id": 43,
+        "orig_subject": "Topic",
+        "subject": "Topic",
+        "propagate_mode": "change_one",
+        "edit_timestamp": 1_700_000_015,
+    }
+    assert postgres_store.record_provider_event(account_uuid, queue_id, event)
+    records = converter.event_records(
+        postgres_store,
+        account_uuid,
+        queue_id,
+        event,
+    )
+    assert [record["operation"]["kind"] for record in records] == [
+        "message.delete"
+    ]
+    records = postgres_store.prepare_provider_event_records(
+        account_uuid,
+        queue_id,
+        int(event["id"]),
+        records,
+    )
+    postgres_store.enqueue_provider_event_records(
+        records,
+        0,
+        account_uuid,
+        queue_id,
+        int(event["id"]),
+    )
+    assert postgres_store.pending_provider_message_context(
+        account_uuid, message_uuid
+    ) == {
+        "deleted": True,
+        "causal_lane": f"chat:{account_uuid}:{stream_uuid}",
+    }
+    assert converter.event_records(
+        postgres_store,
+        account_uuid,
+        "provider-message-update:601",
+        {
+            "id": 706,
+            "type": "update_message",
+            "message_id": 601,
+            "stream_id": 43,
+            "content": "must not resurrect",
+            "edit_timestamp": 1_700_000_016,
+        },
+    ) == []
+
+    postgres_store.accept_result(_committed_result(records[0]))
+
+    assert postgres_store.provider_mapping(account_uuid, "message", "601") is None
+    with postgres_store.session() as session:
+        deleted = session.execute(
+            """
+            SELECT deleted FROM provider_mappings
+            WHERE account_uuid = %s AND entity_kind = 'message'
+              AND workspace_uuid = %s
+            """,
+            (account_uuid, message_uuid),
+        ).fetchone()
+    assert deleted == {"deleted": True}
+
+
+@pytest.mark.parametrize(
+    "delete_committed_before_return_conversion",
+    [False, True],
+    ids=["pending-delete", "committed-delete"],
+)
+def test_unselected_delete_is_followed_by_full_selected_recreation(
+    postgres_store,
+    delete_committed_before_return_conversion,
+):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    stream_uuid, topic_uuid, author_uuid = _materialize_channel_projection(
+        postgres_store, account_uuid, project_uuid
+    )
+    _insert_channel_assignment(postgres_store, account_uuid, project_uuid, 43)
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE desired_resources
+            SET body = jsonb_set(body, '{selected}', 'false'::jsonb)
+            WHERE resource_type = 'external_chat_assignment'
+              AND body->'provider_chat'->>'provider_chat_key' = 'channel:43'
+            """
+        )
+    destination_stream_uuid, destination_topic_uuid = _materialize_destination_channel(
+        postgres_store,
+        account_uuid,
+        project_uuid,
+        44,
+    )
+    destination_stream = postgres_store.provider_mapping(
+        account_uuid,
+        "stream",
+        "channel:44",
+    )
+    assert destination_stream is not None
+    destination_stream_metadata = dict(destination_stream["metadata"])
+    destination_stream_metadata["participants"] = sorted(
+        [
+            str(postgres_store.account_resource(account_uuid)["owner_user_uuid"]),
+            author_uuid,
+        ]
+    )
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "stream",
+        "channel:44",
+        destination_stream_uuid,
+        destination_stream_metadata,
+    )
+    message_uuid = str(uuid.uuid4())
+    causal_lane = f"chat:{account_uuid}:{stream_uuid}"
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "message",
+        "601",
+        message_uuid,
+        {
+            "project_uuid": project_uuid,
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "author_uuid": author_uuid,
+            "chat_key": "channel:42",
+            "causal_lane": causal_lane,
+            "workspace_delivery_state": "committed",
+        },
+    )
+    delete_queue_id = "provider-message-unselected-move:601"
+    delete_event = {
+        "id": 705,
+        "type": "update_message",
+        "message_id": 601,
+        "message_ids": [601],
+        "stream_id": 42,
+        "new_stream_id": 43,
+        "orig_subject": "Topic",
+        "subject": "Topic",
+        "propagate_mode": "change_one",
+        "edit_timestamp": 1_700_000_015,
+    }
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        delete_queue_id,
+        delete_event,
+    )
+    delete_records = converter.event_records(
+        postgres_store,
+        account_uuid,
+        delete_queue_id,
+        delete_event,
+    )
+    delete_records = postgres_store.prepare_provider_event_records(
+        account_uuid,
+        delete_queue_id,
+        int(delete_event["id"]),
+        delete_records,
+    )
+    postgres_store.enqueue_provider_event_records(
+        delete_records,
+        0,
+        account_uuid,
+        delete_queue_id,
+        int(delete_event["id"]),
+    )
+
+    return_queue_id = "provider-message-selected-return:601"
+    return_event = {
+        "id": 706,
+        "type": "update_message",
+        "message_id": 601,
+        "message_ids": [601],
+        "stream_id": 43,
+        "new_stream_id": 44,
+        "orig_subject": "Topic",
+        "subject": "Topic",
+        "propagate_mode": "change_one",
+        "edit_timestamp": 1_700_000_016,
+    }
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        return_queue_id,
+        return_event,
+    )
+    provider_snapshot = _provider_history_message(601)
+    provider_snapshot.update(
+        {
+            "stream_id": 44,
+            "display_recipient": "Channel 44",
+            "timestamp": 1_700_000_016,
+            "content": "restored with the current provider content",
+        }
+    )
+
+    class Adapter:
+        server_url = "https://zulip.example.invalid"
+
+        def __init__(self):
+            self.fetches = []
+
+        def message_by_id(self, provider_message_id):
+            self.fetches.append(provider_message_id)
+            return dict(provider_snapshot)
+
+    adapter = Adapter()
+    bridge_service = object.__new__(service.BridgeService)
+    bridge_service.store = postgres_store
+    bridge_service.file_client = None
+    row = {
+        "account_uuid": account_uuid,
+        "queue_id": return_queue_id,
+        "event_id": int(return_event["id"]),
+        "provider_message_context": None,
+    }
+    if delete_committed_before_return_conversion:
+        postgres_store.accept_result(_committed_result(delete_records[0]))
+        assert postgres_store.provider_mapping(account_uuid, "message", "601") is None
+    converted_records = bridge_service._event_records_with_pending_delete_recreations(
+        adapter,
+        row,
+        str(uuid.UUID(int=0)),
+        return_event,
+        "live",
+    )
+    with postgres_store.session() as session:
+        cached = session.execute(
+            """
+            SELECT provider_message_context
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
+            """,
+            (account_uuid, return_queue_id, int(return_event["id"])),
+        ).fetchone()
+    assert cached is not None
+    row["provider_message_context"] = cached["provider_message_context"]
+    assert adapter.fetches == [601]
+    assert [record["operation"]["kind"] for record in converted_records] == [
+        "topic.upsert",
+        "message.create",
+    ]
+    message_create = converted_records[-1]
+    assert message_create["causal_lane"] == causal_lane
+    assert message_create["operation"]["payload"]["payload"] == {
+        "kind": "markdown",
+        "content": "restored with the current provider content",
+    }
+    if not delete_committed_before_return_conversion:
+        postgres_store.accept_result(_committed_result(delete_records[0]))
+    assert postgres_store.provider_mapping(account_uuid, "message", "601") is None
+    assert (
+        bridge_service._event_records_with_pending_delete_recreations(
+            adapter,
+            row,
+            str(uuid.UUID(int=0)),
+            return_event,
+            "live",
+        )
+        == converted_records
+    )
+    assert adapter.fetches == [601]
+    recreation_records = postgres_store.prepare_provider_event_records(
+        account_uuid,
+        return_queue_id,
+        int(return_event["id"]),
+        converted_records,
+    )
+    message_create = next(
+        record
+        for record in recreation_records
+        if record["operation"]["kind"] == "message.create"
+    )
+    postgres_store.enqueue_provider_event_records(
+        recreation_records,
+        0,
+        account_uuid,
+        return_queue_id,
+        int(return_event["id"]),
+    )
+    mapping = postgres_store.provider_message_mapping(account_uuid, "601")
+    assert mapping is not None
+    assert mapping["metadata"]["workspace_delivery_state"] == "pending"
+    with postgres_store.session() as session:
+        stored_mapping = session.execute(
+            """
+            SELECT deleted FROM provider_mappings
+            WHERE account_uuid = %s AND entity_kind = 'message'
+              AND provider_id = '601'
+            """,
+            (account_uuid,),
+        ).fetchone()
+    assert stored_mapping == {"deleted": True}
+    assert postgres_store.pending_provider_message_context(
+        account_uuid,
+        message_uuid,
+    ) == {
+        "project_uuid": project_uuid,
+        "stream_uuid": destination_stream_uuid,
+        "topic_uuid": destination_topic_uuid,
+        "chat_key": "channel:44",
+        "causal_lane": causal_lane,
+    }
+    follow_up = converter.event_records(
+        postgres_store,
+        account_uuid,
+        "provider-message-update:601",
+        {
+            "id": 707,
+            "type": "update_message",
+            "message_id": 601,
+            "stream_id": 44,
+            "content": "newer edit",
+            "edit_timestamp": 1_700_000_017,
+        },
+    )
+    assert follow_up[-1]["operation"]["kind"] == "message.update"
+    assert follow_up[-1]["project_uuid"] == project_uuid
+    assert follow_up[-1]["operation"]["payload"]["stream_uuid"] == (
+        destination_stream_uuid
+    )
+    with postgres_store.session() as session:
+        stored_mapping = session.execute(
+            """
+            SELECT deleted FROM provider_mappings
+            WHERE account_uuid = %s AND entity_kind = 'message'
+              AND provider_id = '601'
+            """,
+            (account_uuid,),
+        ).fetchone()
+    assert stored_mapping == {"deleted": True}
+    postgres_store.accept_result(_committed_result(message_create, "601"))
+    mapping = postgres_store.provider_mapping(account_uuid, "message", "601")
+    assert mapping is not None
+    assert mapping["metadata"]["workspace_delivery_state"] == "committed"
+    assert mapping["metadata"]["stream_uuid"] == destination_stream_uuid
+    assert mapping["metadata"]["topic_uuid"] == destination_topic_uuid
+
+
+@pytest.mark.parametrize(
+    "delete_committed_before_grouped_return",
+    [False, True],
+    ids=["pending-delete", "committed-delete"],
+)
+def test_grouped_selected_return_skips_missing_tombstone_and_moves_remaining_message(
+    postgres_store,
+    delete_committed_before_grouped_return,
+):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    stream_uuid, topic_uuid, author_uuid = _materialize_channel_projection(
+        postgres_store, account_uuid, project_uuid
+    )
+    _insert_channel_assignment(postgres_store, account_uuid, project_uuid, 43)
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE desired_resources
+            SET body = jsonb_set(body, '{selected}', 'false'::jsonb)
+            WHERE resource_type = 'external_chat_assignment'
+              AND body->'provider_chat'->>'provider_chat_key' = 'channel:43'
+            """
+        )
+    destination_stream_uuid, destination_topic_uuid = _materialize_destination_channel(
+        postgres_store,
+        account_uuid,
+        project_uuid,
+        44,
+    )
+    destination_stream = postgres_store.provider_mapping(
+        account_uuid,
+        "stream",
+        "channel:44",
+    )
+    assert destination_stream is not None
+    destination_stream_metadata = dict(destination_stream["metadata"])
+    destination_stream_metadata["participants"] = sorted(
+        [
+            str(postgres_store.account_resource(account_uuid)["owner_user_uuid"]),
+            author_uuid,
+        ]
+    )
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "stream",
+        "channel:44",
+        destination_stream_uuid,
+        destination_stream_metadata,
+    )
+    causal_lane = f"chat:{account_uuid}:{stream_uuid}"
+    message_uuids = {}
+    for provider_message_id in (601, 602):
+        message_uuid = str(uuid.uuid4())
+        message_uuids[provider_message_id] = message_uuid
+        postgres_store.remember_provider_mapping(
+            account_uuid,
+            "message",
+            str(provider_message_id),
+            message_uuid,
+            {
+                "project_uuid": project_uuid,
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "author_uuid": author_uuid,
+                "chat_key": "channel:42",
+                "causal_lane": causal_lane,
+                "workspace_delivery_state": "committed",
+            },
+        )
+
+    delete_queue_id = "provider-message-unselected-move:601"
+    delete_event = {
+        "id": 705,
+        "type": "update_message",
+        "message_id": 601,
+        "message_ids": [601],
+        "stream_id": 42,
+        "new_stream_id": 43,
+        "orig_subject": "Topic",
+        "subject": "Topic",
+        "propagate_mode": "change_one",
+        "edit_timestamp": 1_700_000_015,
+    }
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        delete_queue_id,
+        delete_event,
+    )
+    delete_records = converter.event_records(
+        postgres_store,
+        account_uuid,
+        delete_queue_id,
+        delete_event,
+    )
+    delete_records = postgres_store.prepare_provider_event_records(
+        account_uuid,
+        delete_queue_id,
+        int(delete_event["id"]),
+        delete_records,
+    )
+    postgres_store.enqueue_provider_event_records(
+        delete_records,
+        0,
+        account_uuid,
+        delete_queue_id,
+        int(delete_event["id"]),
+    )
+    if delete_committed_before_grouped_return:
+        postgres_store.accept_result(_committed_result(delete_records[0]))
+        assert postgres_store.provider_mapping(account_uuid, "message", "601") is None
+    else:
+        assert postgres_store.pending_provider_message_context(
+            account_uuid,
+            message_uuids[601],
+        ) == {
+            "deleted": True,
+            "causal_lane": causal_lane,
+        }
+    assert postgres_store.provider_mapping(account_uuid, "message", "602") is not None
+
+    return_queue_id = "provider-message-grouped-selected-return"
+    return_event = {
+        "id": 706,
+        "type": "update_message",
+        "message_id": 602,
+        "message_ids": [601, 602],
+        "stream_id": 43,
+        "new_stream_id": 44,
+        "orig_subject": "Topic",
+        "subject": "Topic",
+        "propagate_mode": "change_all",
+        "edit_timestamp": 1_700_000_016,
+    }
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        return_queue_id,
+        return_event,
+    )
+
+    class Adapter:
+        server_url = "https://zulip.example.invalid"
+
+        def __init__(self):
+            self.fetches = []
+
+        def message_by_id(self, provider_message_id):
+            self.fetches.append(provider_message_id)
+            return None
+
+    adapter = Adapter()
+    bridge_service = object.__new__(service.BridgeService)
+    bridge_service.store = postgres_store
+    bridge_service.file_client = None
+    row = {
+        "account_uuid": account_uuid,
+        "queue_id": return_queue_id,
+        "event_id": int(return_event["id"]),
+        "provider_message_context": None,
+    }
+    converted_records = bridge_service._event_records_with_pending_delete_recreations(
+        adapter,
+        row,
+        str(uuid.UUID(int=0)),
+        return_event,
+        "live",
+    )
+    assert adapter.fetches == [601]
+    message_updates = [
+        record
+        for record in converted_records
+        if record["operation"]["kind"] == "message.update"
+    ]
+    assert len(message_updates) == 1
+    assert message_updates[0]["operation"]["provider"]["entity_id"] == "602"
+    assert message_updates[0]["operation"]["entity_uuid"] == message_uuids[602]
+    assert message_updates[0]["operation"]["payload"]["stream_uuid"] == (
+        destination_stream_uuid
+    )
+    assert message_updates[0]["operation"]["payload"]["topic_uuid"] == (
+        destination_topic_uuid
+    )
+    assert not any(
+        record["operation"]["kind"] == "message.create"
+        for record in converted_records
+    )
+
+    with postgres_store.session() as session:
+        cached = session.execute(
+            """
+            SELECT provider_message_context
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
+            """,
+            (account_uuid, return_queue_id, int(return_event["id"])),
+        ).fetchone()
+    assert cached == {
+        "provider_message_context": {
+            "context_kind": "pending_delete_recreations",
+            "messages": {},
+            "missing_message_ids": ["601"],
+        }
+    }
+    row["provider_message_context"] = cached["provider_message_context"]
+    assert (
+        bridge_service._event_records_with_pending_delete_recreations(
+            adapter,
+            row,
+            str(uuid.UUID(int=0)),
+            return_event,
+            "live",
+        )
+        == converted_records
+    )
+    assert adapter.fetches == [601]
+
+
 def test_outbound_reaction_echo_reuses_workspace_identity(postgres_store):
     account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
     stream_uuid, topic_uuid, author_uuid = _materialize_channel_projection(
@@ -3166,6 +4571,46 @@ def test_provider_assignment_context_survives_intervening_retry_reason(postgres_
     assert event["assignment_pending_since"] is not None
     assert event["assignment_catalog_reported_at"] is not None
     assert event["provider_message_context"] == message_context
+
+    postgres_store.retry_provider_event(
+        account_uuid,
+        "queue",
+        1,
+        "provider_event_processing_failed",
+    )
+    with postgres_store.session() as session:
+        first_unexpected_failure = session.execute(
+            """
+            SELECT retry_count, processing_reason
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = 'queue' AND event_id = 1
+            """,
+            (account_uuid,),
+        ).fetchone()
+    assert first_unexpected_failure == {
+        "retry_count": 1,
+        "processing_reason": "provider_event_processing_failed",
+    }
+
+    postgres_store.retry_provider_event(
+        account_uuid,
+        "queue",
+        1,
+        "provider_event_processing_failed",
+    )
+    with postgres_store.session() as session:
+        consecutive_failure = session.execute(
+            """
+            SELECT retry_count, processing_reason
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = 'queue' AND event_id = 1
+            """,
+            (account_uuid,),
+        ).fetchone()
+    assert consecutive_failure == {
+        "retry_count": 2,
+        "processing_reason": "provider_event_processing_failed",
+    }
 
 
 def test_pending_provider_probe_includes_only_nonterminal_delivering_head(

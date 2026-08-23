@@ -214,6 +214,7 @@ class BridgeService:
     LIVE_DELIVERY_BATCH_SIZE = 100
     PROVIDER_JOURNAL_QUANTUM = 20
     PROVIDER_JOURNAL_WORKERS = 16
+    PROVIDER_EVENT_FAILURE_MAX_ATTEMPTS = 5
     # Give a newly discovered chat five minutes to reach desired state, then
     # quarantine the reaction so one missing assignment cannot block the rest
     # of an account's journal forever. The start time is persisted separately
@@ -1842,8 +1843,10 @@ class BridgeService:
         unmapped_messages = []
         for message in converter.newest_first(messages):
             provider_message_id = str(message["id"])
-            mapping = self.store.provider_mapping(
-                account_uuid, "message", provider_message_id
+            mapping = converter.provider_message_mapping(
+                self.store,
+                account_uuid,
+                provider_message_id,
             )
             if mapping is None:
                 unmapped_messages.append(message)
@@ -2057,6 +2060,234 @@ class BridgeService:
             ),
         )
 
+    def _pending_delete_recreation_messages(
+        self,
+        adapter: zulip_adapter.OfficialZulipAdapter,
+        row: dict[str, object],
+        event: dict[str, object],
+    ) -> tuple[dict[str, dict[str, object]], set[str]]:
+        if event.get("type") != "update_message":
+            return {}, set()
+        destination_stream_id = event.get("new_stream_id")
+        if destination_stream_id is None:
+            return {}, set()
+        account_uuid = str(row["account_uuid"])
+        destination_chat_key = f"channel:{int(destination_stream_id)}"
+        try:
+            converter.provider_chat_assignment(
+                self.store,
+                account_uuid,
+                destination_chat_key,
+            )
+        except ValueError as exc:
+            if str(exc) == "provider_chat_not_selected":
+                return {}, set()
+            raise
+        message_ids = event.get("message_ids")
+        if message_ids is None and event.get("message_id") is not None:
+            message_ids = [event["message_id"]]
+        provider_message_ids = [
+            str(value) for value in typing.cast(list[object], message_ids or [])
+        ]
+        cached_context = row.get("provider_message_context")
+        if (
+            isinstance(cached_context, dict)
+            and cached_context.get("context_kind")
+            == "pending_delete_recreations"
+        ):
+            return self._validated_pending_delete_recreations(
+                cached_context,
+                provider_message_ids,
+            )
+        pending_context_lookup = getattr(
+            self.store,
+            "pending_provider_message_context",
+            None,
+        )
+        tombstone_lookup = getattr(
+            self.store,
+            "provider_message_tombstone",
+            None,
+        )
+        if not callable(pending_context_lookup) and not callable(tombstone_lookup):
+            return {}, set()
+        pending_ids = []
+        for provider_message_id in provider_message_ids:
+            mapping = converter.provider_message_mapping(
+                self.store,
+                account_uuid,
+                provider_message_id,
+            )
+            if mapping is None and callable(tombstone_lookup):
+                mapping = tombstone_lookup(account_uuid, provider_message_id)
+                if mapping is not None:
+                    pending_ids.append(provider_message_id)
+                    continue
+            if mapping is None:
+                continue
+            if not callable(pending_context_lookup):
+                continue
+            pending_context = pending_context_lookup(
+                account_uuid,
+                str(mapping["workspace_uuid"]),
+            )
+            if pending_context is not None and pending_context.get("deleted") is True:
+                pending_ids.append(provider_message_id)
+        if not pending_ids:
+            return {}, set()
+
+        snapshots = {}
+        missing_message_ids = []
+        for provider_message_id in pending_ids:
+            snapshot = adapter.message_by_id(int(provider_message_id))
+            if snapshot is None:
+                missing_message_ids.append(provider_message_id)
+                continue
+            snapshots[provider_message_id] = snapshot
+        cache_context = getattr(
+            self.store,
+            "cache_provider_event_message_context",
+            None,
+        )
+        cached_context = {
+            "context_kind": "pending_delete_recreations",
+            "messages": snapshots,
+            "missing_message_ids": missing_message_ids,
+        }
+        if callable(cache_context):
+            cached_context = cache_context(
+                account_uuid,
+                str(row["queue_id"]),
+                int(row["event_id"]),
+                cached_context,
+            )
+        return self._validated_pending_delete_recreations(
+            cached_context,
+            provider_message_ids,
+        )
+
+    @staticmethod
+    def _validated_pending_delete_recreations(
+        cached_context: dict[str, object],
+        provider_message_ids: list[str],
+    ) -> tuple[dict[str, dict[str, object]], set[str]]:
+        cached_messages = cached_context.get("messages")
+        if not isinstance(cached_messages, dict):
+            raise ValueError("provider_event_replay_incomplete")
+        cached_missing_message_ids = cached_context.get("missing_message_ids", [])
+        if not isinstance(cached_missing_message_ids, list) or any(
+            not isinstance(provider_message_id, str)
+            for provider_message_id in cached_missing_message_ids
+        ):
+            raise ValueError("provider_event_replay_incomplete")
+        missing_message_ids = set(cached_missing_message_ids)
+        cached_message_ids = set(cached_messages)
+        unexpected_ids = (cached_message_ids | missing_message_ids).difference(
+            provider_message_ids
+        )
+        if unexpected_ids:
+            raise ValueError("provider_event_replay_incomplete")
+        if cached_message_ids & missing_message_ids:
+            raise ValueError("provider_event_replay_incomplete")
+        recreations = {}
+        for provider_message_id in provider_message_ids:
+            snapshot = cached_messages.get(provider_message_id)
+            if snapshot is None:
+                continue
+            if not isinstance(snapshot, dict) or str(snapshot.get("id")) != (
+                provider_message_id
+            ):
+                raise ValueError("provider_event_replay_incomplete")
+            recreations[provider_message_id] = typing.cast(
+                dict[str, object],
+                snapshot,
+            )
+        return recreations, missing_message_ids
+
+    def _event_records_with_pending_delete_recreations(
+        self,
+        adapter: zulip_adapter.OfficialZulipAdapter,
+        row: dict[str, object],
+        external_chat_uuid: str,
+        event: dict[str, object],
+        delivery_class: str,
+    ) -> list[dict[str, object]]:
+        account_uuid = str(row["account_uuid"])
+        queue_id = str(row["queue_id"])
+        recreations, missing_message_ids = self._pending_delete_recreation_messages(
+            adapter,
+            row,
+            event,
+        )
+        conversion_events: list[tuple[dict[str, object], str]] = []
+        if recreations or missing_message_ids:
+            message_ids = event.get("message_ids")
+            if message_ids is None and event.get("message_id") is not None:
+                message_ids = [event["message_id"]]
+            remaining_ids = [
+                value
+                for value in typing.cast(list[object], message_ids or [])
+                if str(value) not in recreations
+                and str(value) not in missing_message_ids
+            ]
+            if remaining_ids:
+                mapped_event = dict(event)
+                mapped_event["message_ids"] = remaining_ids
+                conversion_events.append((mapped_event, external_chat_uuid))
+            for provider_message_id_raw in typing.cast(list[object], message_ids or []):
+                provider_message_id = str(provider_message_id_raw)
+                snapshot = recreations.get(provider_message_id)
+                if snapshot is None:
+                    continue
+                _chat_type, chat_key = converter.provider_chat_reference(snapshot)
+                snapshot_chat_uuid = _AccountRouting(
+                    self.store,
+                    account_uuid,
+                ).external_chat_uuid(chat_key)
+                conversion_events.append(
+                    (
+                        {
+                            "id": event["id"],
+                            "type": "message",
+                            "message": snapshot,
+                        },
+                        snapshot_chat_uuid,
+                    )
+                )
+        else:
+            conversion_events.append((event, external_chat_uuid))
+
+        records: list[dict[str, object]] = []
+        setup_operations: set[tuple[str, str, str]] = set()
+        for conversion_event, target_chat_uuid in conversion_events:
+            converted = self._event_records_with_file_fallback(
+                adapter,
+                account_uuid,
+                target_chat_uuid,
+                queue_id,
+                conversion_event,
+                delivery_class,
+            )
+            for record in converted:
+                operation = typing.cast(
+                    dict[str, object] | None,
+                    record.get("operation"),
+                )
+                if operation is not None and operation.get("kind") in {
+                    "identity.upsert",
+                    "topic.upsert",
+                }:
+                    setup_key = (
+                        str(operation["kind"]),
+                        str(record["project_uuid"]),
+                        str(operation["entity_uuid"]),
+                    )
+                    if setup_key in setup_operations:
+                        continue
+                    setup_operations.add(setup_key)
+                records.append(record)
+        return records
+
     def _recover_interrupted_workspace_deliveries_once(self) -> None:
         """Recover prior-process submissions before concurrent delivery starts."""
         if getattr(self, "_workspace_delivery_recovery_done", False):
@@ -2066,6 +2297,38 @@ class BridgeService:
         if hasattr(self.store, "reset_stale_workspace_deliveries"):
             self.store.reset_stale_workspace_deliveries()
         self._workspace_delivery_recovery_done = True
+
+    def _contain_provider_event_failure(
+        self,
+        row: dict[str, object],
+        error: Exception,
+    ) -> int:
+        """Retry one failed journal row without terminating the live lane."""
+        if self._is_retryable_database_conflict(error):
+            raise error
+        account_uuid = str(row["account_uuid"])
+        queue_id = str(row["queue_id"])
+        event_id = int(row["event_id"])
+        reason = "provider_event_processing_failed"
+        attempts = 1
+        if row.get("processing_reason") == reason:
+            attempts = int(row.get("retry_count") or 0) + 1
+        self.store.mark_health("provider", "degraded", reason)
+        if attempts >= self.PROVIDER_EVENT_FAILURE_MAX_ATTEMPTS:
+            self.store.mark_provider_event_invalid(
+                account_uuid,
+                queue_id,
+                event_id,
+                reason,
+            )
+            return 1
+        self.store.retry_provider_event(
+            account_uuid,
+            queue_id,
+            event_id,
+            reason,
+        )
+        return 0
 
     def process_provider_journal(
         self,
@@ -2126,8 +2389,8 @@ class BridgeService:
                 if not authentication and not exc.retryable:
                     self.store.mark_health("provider", "degraded", exc.code)
                 continue
-            supported = str(event["type"]) in supported_types
             try:
+                supported = str(event["type"]) in supported_types
                 self._queue_event_catalog(account_uuid, event, adapter.server_url)
                 external_chat_uuid = uuid.UUID(int=0)
                 if event["type"] == "message":
@@ -2148,30 +2411,42 @@ class BridgeService:
                     "delete_message",
                     "update_message_flags",
                 }:
-                    message_ids = event.get("message_ids", event.get("messages"))
-                    if message_ids is None and event.get("message_id") is not None:
-                        message_ids = [event["message_id"]]
-                    first_message_id = next(
-                        iter(typing.cast(list[object], message_ids or [])), None
+                    destination_stream_id = event.get("new_stream_id")
+                    chat_key = (
+                        f"channel:{int(destination_stream_id)}"
+                        if destination_stream_id is not None
+                        else None
                     )
-                    if first_message_id is not None:
-                        mapping = self.store.provider_mapping(
-                            account_uuid, "message", str(first_message_id)
+                    if chat_key is None:
+                        message_ids = event.get("message_ids", event.get("messages"))
+                        if message_ids is None and event.get("message_id") is not None:
+                            message_ids = [event["message_id"]]
+                        first_message_id = next(
+                            iter(typing.cast(list[object], message_ids or [])), None
                         )
-                        if mapping is not None:
-                            metadata = typing.cast(
-                                dict[str, object], mapping["metadata"]
+                        if first_message_id is not None:
+                            mapping = converter.provider_message_mapping(
+                                self.store,
+                                account_uuid,
+                                str(first_message_id),
                             )
-                            chat_key = str(metadata["chat_key"])
-                            external_chat_uuid = uuid.UUID(
-                                _AccountRouting(
-                                    self.store, account_uuid
-                                ).external_chat_uuid(chat_key)
-                            )
+                            if mapping is not None:
+                                metadata = typing.cast(
+                                    dict[str, object], mapping["metadata"]
+                                )
+                                chat_key = str(metadata["chat_key"])
+                    if chat_key is not None:
+                        external_chat_uuid = uuid.UUID(
+                            _AccountRouting(
+                                self.store, account_uuid
+                            ).external_chat_uuid(chat_key)
+                        )
                 elif event["type"] == "reaction":
                     provider_message_id = int(str(event["message_id"]))
-                    mapping = self.store.provider_mapping(
-                        account_uuid, "message", str(provider_message_id)
+                    mapping = converter.provider_message_mapping(
+                        self.store,
+                        account_uuid,
+                        str(provider_message_id),
                     )
                     if mapping is None:
                         cached_message = row.get("provider_message_context")
@@ -2274,11 +2549,10 @@ class BridgeService:
                                 account_uuid, "external_chat", chat_key
                             )
                         )
-                records = self._event_records_with_file_fallback(
+                records = self._event_records_with_pending_delete_recreations(
                     adapter,
-                    account_uuid,
+                    row,
                     str(external_chat_uuid),
-                    queue_id,
                     event,
                     "live",
                 )
@@ -2356,17 +2630,35 @@ class BridgeService:
                 )
                 processed += 1
                 continue
+            except Exception as exc:
+                processed += self._contain_provider_event_failure(row, exc)
+                continue
+            event_enqueued_atomically = False
             try:
-                for record in records:
-                    if hasattr(self.store, "mark_provider_event_delivering"):
-                        self.store.enqueue_workspace_delivery(
-                            record, 0, queue_id, event_id
-                        )
-                    else:
-                        self.store.enqueue_workspace_delivery(record, 0)
+                enqueue_event_records = getattr(
+                    self.store, "enqueue_provider_event_records", None
+                )
+                if records and callable(enqueue_event_records):
+                    enqueue_event_records(
+                        records,
+                        0,
+                        account_uuid,
+                        queue_id,
+                        event_id,
+                    )
+                    event_enqueued_atomically = True
+                else:
+                    for record in records:
+                        if hasattr(self.store, "mark_provider_event_delivering"):
+                            self.store.enqueue_workspace_delivery(
+                                record, 0, queue_id, event_id
+                            )
+                        else:
+                            self.store.enqueue_workspace_delivery(record, 0)
             except ValueError as exc:
                 if str(exc) != "provider_chat_assignment_pending":
-                    raise
+                    processed += self._contain_provider_event_failure(row, exc)
+                    continue
                 finalize_assignment_change = getattr(
                     self.store,
                     "finalize_provider_event_assignment_changed",
@@ -2391,26 +2683,38 @@ class BridgeService:
                         str(exc),
                     )
                 continue
-            deleted_message_ids: list[str] = []
-            if event.get("type") == "delete_message":
-                raw_ids = event.get("message_ids")
-                if raw_ids is None and event.get("message_id") is not None:
-                    raw_ids = [event["message_id"]]
-                deleted_message_ids = [
-                    str(value) for value in typing.cast(list[object], raw_ids or [])
-                ]
-            if records and hasattr(self.store, "mark_provider_event_delivering"):
-                self.store.mark_provider_event_delivering(
-                    account_uuid, queue_id, event_id
-                )
-            else:
-                self.store.finalize_provider_event(
-                    account_uuid,
-                    queue_id,
-                    event_id,
-                    supported,
-                    deleted_message_ids,
-                )
+            except Exception as exc:
+                processed += self._contain_provider_event_failure(row, exc)
+                continue
+            try:
+                deleted_message_ids: list[str] = []
+                if event.get("type") == "delete_message":
+                    raw_ids = event.get("message_ids")
+                    if raw_ids is None and event.get("message_id") is not None:
+                        raw_ids = [event["message_id"]]
+                    deleted_message_ids = [
+                        str(value)
+                        for value in typing.cast(list[object], raw_ids or [])
+                    ]
+                if records and event_enqueued_atomically:
+                    pass
+                elif records and hasattr(
+                    self.store, "mark_provider_event_delivering"
+                ):
+                    self.store.mark_provider_event_delivering(
+                        account_uuid, queue_id, event_id
+                    )
+                else:
+                    self.store.finalize_provider_event(
+                        account_uuid,
+                        queue_id,
+                        event_id,
+                        supported,
+                        deleted_message_ids,
+                    )
+            except Exception as exc:
+                processed += self._contain_provider_event_failure(row, exc)
+                continue
             processed += 1
         return processed
 

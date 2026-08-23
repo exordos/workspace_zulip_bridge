@@ -1152,7 +1152,15 @@ def test_provider_topic_rename_moves_workspace_aliases_to_current_provider_id():
         "provider_revision": "2",
         "metadata": {"name": "renamed"},
     }
-    session = Session((row,))
+
+    class RenameSession(Session):
+        def execute(self, statement, parameters=None):
+            self.statements.append((statement, parameters))
+            if "WITH existing_target AS" in statement:
+                return Result(({**row, "mapping_renamed": True},))
+            return Result()
+
+    session = RenameSession()
     store = _store_with_session(session)
 
     assert (
@@ -1167,11 +1175,22 @@ def test_provider_topic_rename_moves_workspace_aliases_to_current_provider_id():
         == row
     )
 
-    assert len(session.statements) == 2
-    primary_statement, primary_parameters = session.statements[0]
-    alias_statement, alias_parameters = session.statements[1]
-    assert "UPDATE provider_mappings" in primary_statement
+    assert len(session.statements) == 3
+    lock_statement, lock_parameters = session.statements[0]
+    primary_statement, primary_parameters = session.statements[1]
+    alias_statement, alias_parameters = session.statements[2]
+    assert "pg_advisory_xact_lock" in lock_statement
+    assert lock_parameters == (f"{account_uuid}:topic:42:renamed",)
+    assert "existing_target AS" in primary_statement
+    assert "metadata = CASE" in primary_statement
+    assert "deleted = false" in primary_statement
+    assert "UPDATE provider_mappings AS mapping" in primary_statement
     assert primary_parameters == (
+        "2",
+        json.dumps({"name": "renamed"}),
+        account_uuid,
+        "topic",
+        "42:renamed",
         "42:renamed",
         "2",
         json.dumps({"name": "renamed"}),
@@ -1187,6 +1206,46 @@ def test_provider_topic_rename_moves_workspace_aliases_to_current_provider_id():
         "topic",
         "42:old",
     )
+
+
+def test_provider_topic_rename_returns_existing_target_without_mutating_source():
+    account_uuid = str(uuid.uuid4())
+    target_workspace_uuid = str(uuid.uuid4())
+    target = {
+        "workspace_uuid": target_workspace_uuid,
+        "provider_id": "42:renamed",
+        "provider_revision": "2",
+        "metadata": {"name": "renamed", "workspace_delivery_state": "committed"},
+        "mapping_renamed": False,
+    }
+
+    class ExistingTargetSession(Session):
+        def execute(self, statement, parameters=None):
+            self.statements.append((statement, parameters))
+            if "WITH existing_target AS" in statement:
+                return Result((target,))
+            return Result()
+
+    session = ExistingTargetSession()
+    store = _store_with_session(session)
+
+    assert store.rename_provider_mapping(
+        account_uuid,
+        "topic",
+        "42:old",
+        "42:renamed",
+        {"name": "renamed"},
+        "3",
+    ) == {
+        "workspace_uuid": target_workspace_uuid,
+        "provider_id": "42:renamed",
+        "provider_revision": "2",
+        "metadata": {"name": "renamed", "workspace_delivery_state": "committed"},
+    }
+
+    assert len(session.statements) == 2
+    assert "pg_advisory_xact_lock" in session.statements[0][0]
+    assert "existing_target AS" in session.statements[1][0]
 
 
 def test_workspace_projection_contract_materializes_first_outbound_mappings():
@@ -1412,6 +1471,7 @@ def test_committed_message_mapping_preserves_workspace_alias():
         "account_uuid": str(uuid.uuid4()),
         "project_uuid": str(uuid.uuid4()),
         "origin": "workspace",
+        "causal_lane": f"message:{uuid.uuid4()}",
         "operation": {
             "kind": "message.create",
             "entity_uuid": str(uuid.uuid4()),
