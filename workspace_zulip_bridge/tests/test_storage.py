@@ -71,7 +71,9 @@ def test_pending_provider_event_probe_checks_ready_and_delivering_live_rows():
     assert store.has_pending_provider_events()
     statement, parameters = session.statements[0]
     assert "processing_state IN ('pending', 'delivering')" in statement
-    assert "PARTITION BY account_uuid" in statement
+    assert "JOIN LATERAL" in statement
+    assert "journal.account_uuid" in statement
+    assert "ORDER BY created_at, event_id, queue_id" in statement
     assert "processing_state = 'delivering'" in statement
     assert "processing_state = 'pending'" in statement
     assert "event.available_at <= now()" in statement
@@ -81,6 +83,22 @@ def test_pending_provider_event_probe_checks_ready_and_delivering_live_rows():
     assert "'backoff'" in statement
     assert "scheduler.provider_retry_after" in statement
     assert parameters is None
+
+
+def test_pending_provider_events_claim_fair_account_heads():
+    session = Session(({"account_uuid": "account", "event_id": 7},))
+    store = _store_with_session(session)
+
+    assert store.pending_provider_events(limit=20) == [
+        {"account_uuid": "account", "event_id": 7}
+    ]
+    statement, parameters = session.statements[0]
+    assert "JOIN LATERAL" in statement
+    assert "last_provider_event_dispatched_at NULLS FIRST" in statement
+    assert "FOR UPDATE OF journal SKIP LOCKED" in statement
+    assert "UPDATE scheduler_accounts AS journal" in statement
+    assert "ORDER BY event.created_at, event.event_id, event.queue_id" in statement
+    assert parameters == (20,)
 
 
 def test_eligible_accounts_are_generation_bound_and_backoff_aware():
