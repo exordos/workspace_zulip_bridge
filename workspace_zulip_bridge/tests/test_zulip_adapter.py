@@ -45,6 +45,7 @@ class FakeClient:
         self.sent = []
         self.updated = []
         self.flags = []
+        self.subscription_settings = []
         self.deleted = []
         self.fail_send = False
         self.messages = []
@@ -72,6 +73,8 @@ class FakeClient:
                 "stream_id": 42,
                 "name": "Engineering",
                 "subscribers": [1, 2],
+                "is_muted": False,
+                "desktop_notifications": None,
             }
         ]
         self.members = [
@@ -95,6 +98,7 @@ class FakeClient:
             "last_event_id": 7,
             "user_id": 1,
             "realm_uuid": "00000000-0000-4000-8000-000000000001",
+            "user_settings": {"enable_stream_desktop_notifications": True},
         }
 
     def get_subscriptions(self, request=None):
@@ -127,9 +131,11 @@ class FakeClient:
                 "timeout": timeout,
             }
         )
-        if url != "events":
-            raise AssertionError(f"Unexpected endpoint: {url}")
-        return self.get_events(**request)
+        if url == "events":
+            return self.get_events(**request)
+        if url == "user_topics":
+            return {"result": "success"}
+        raise AssertionError(f"Unexpected endpoint: {url}")
 
     def get_profile(self):
         self.profile_requests += 1
@@ -174,6 +180,10 @@ class FakeClient:
 
     def update_message_flags(self, request):
         self.flags.append(request)
+        return {"result": "success"}
+
+    def update_subscription_settings(self, subscription_data):
+        self.subscription_settings.append(subscription_data)
         return {"result": "success"}
 
     def mark_stream_as_read(self, stream_id):
@@ -367,6 +377,8 @@ def test_selected_channel_catalog_reads_authoritative_subscribers_and_users():
                 "stream_id": 42,
                 "name": "Engineering",
                 "subscribers": [1, 2],
+                "is_muted": False,
+                "desktop_notifications": None,
             }
         ],
         "realm_users": client.members,
@@ -1290,6 +1302,121 @@ def test_stream_rename_uses_canonical_provider_chat_id():
     ]
 
 
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        (
+            "all_messages",
+            [
+                {
+                    "stream_id": 42,
+                    "property": "desktop_notifications",
+                    "value": True,
+                },
+                {"stream_id": 42, "property": "is_muted", "value": False},
+            ],
+        ),
+        (
+            "mentions_only",
+            [
+                {
+                    "stream_id": 42,
+                    "property": "desktop_notifications",
+                    "value": False,
+                },
+                {"stream_id": 42, "property": "is_muted", "value": False},
+            ],
+        ),
+        (
+            "muted",
+            [{"stream_id": 42, "property": "is_muted", "value": True}],
+        ),
+    ],
+)
+def test_stream_notification_modes_use_official_subscription_api(mode, expected):
+    client = FakeClient()
+    adapter = _adapter(client)
+    operation = {
+        "kind": "stream.notification.update",
+        "entity_uuid": STREAM_UUID,
+        "provider": {"kind": "zulip", "chat_id": "channel:42"},
+        "payload": {
+            "uuid": STREAM_UUID,
+            "stream_uuid": STREAM_UUID,
+            "user_uuid": OWNER_UUID,
+            "notification_mode": mode,
+            "notification_updated_at": "2026-08-23T12:30:00Z",
+        },
+    }
+
+    assert adapter.apply(operation) == ("channel:42", None)
+    assert client.subscription_settings == [expected]
+
+
+def test_topic_notification_mode_uses_user_topic_endpoint():
+    client = FakeClient()
+    adapter = _adapter(client)
+    operation = {
+        "kind": "topic.notification.update",
+        "entity_uuid": TOPIC_UUID,
+        "provider": {"kind": "zulip", "chat_id": "channel:42"},
+        "payload": {
+            "uuid": TOPIC_UUID,
+            "stream_uuid": STREAM_UUID,
+            "user_uuid": OWNER_UUID,
+            "notification_mode": "follow",
+            "notification_updated_at": "2026-08-23T12:31:00Z",
+        },
+    }
+
+    assert adapter.apply(operation) == ("42:bridge", None)
+    assert client.endpoint_requests == [
+        {
+            "url": "user_topics",
+            "method": "POST",
+            "request": {
+                "stream_id": 42,
+                "topic": "bridge",
+                "visibility_policy": 3,
+            },
+            "longpolling": False,
+            "timeout": None,
+        }
+    ]
+
+
+def test_newer_provider_notification_observation_skips_stale_workspace_write():
+    class Routing(FakeRouting):
+        workspace = {
+            **FakeRouting.workspace,
+            ("stream", STREAM_UUID): {
+                **FakeRouting.workspace[("stream", STREAM_UUID)],
+                "metadata": {
+                    **FakeRouting.workspace[("stream", STREAM_UUID)]["metadata"],
+                    "notification_updated_at": "2026-08-23T12:32:00Z",
+                },
+            },
+        }
+
+    client = FakeClient()
+    adapter = _adapter(client, routing=Routing())
+    operation = {
+        "kind": "stream.notification.update",
+        "entity_uuid": STREAM_UUID,
+        "provider": {"kind": "zulip", "chat_id": "channel:42"},
+        "payload": {
+            "uuid": STREAM_UUID,
+            "stream_uuid": STREAM_UUID,
+            "user_uuid": OWNER_UUID,
+            "notification_mode": "all_messages",
+            "notification_updated_at": "2026-08-23T12:31:00Z",
+        },
+    }
+
+    assert adapter.apply(operation) == ("channel:42", None)
+    assert client.subscription_settings == []
+
+
 @pytest.mark.parametrize("kind", ["membership.add", "membership.remove"])
 def test_membership_write_uses_official_subscription_api(kind):
     client = FakeClient()
@@ -1556,18 +1683,24 @@ def test_registration_requests_and_retains_catalog_snapshot_fields():
             "stream_id": 42,
             "name": "Engineering",
             "subscribers": [1, 2],
+            "is_muted": False,
+            "desktop_notifications": None,
         }
     ]
+    assert snapshot["user_settings"] == {"enable_stream_desktop_notifications": True}
     assert client.subscriptions_request == {"include_subscribers": True}
     assert client.users_request == {"include_deactivated": True}
     assert client.registration_request["fetch_event_types"] == [
         "message",
         "subscription",
+        "user_topic",
+        "user_settings",
         "realm_user",
         "realm",
         "recent_private_conversations",
     ]
     assert "reaction" in client.registration_request["event_types"]
+    assert "user_settings" in client.registration_request["event_types"]
     assert client.registration_request["client_capabilities"] == {
         "notification_settings_null": True,
         "bulk_message_deletion": True,
@@ -1576,6 +1709,20 @@ def test_registration_requests_and_retains_catalog_snapshot_fields():
         zulip_adapter.PROVIDER_QUEUE_IDLE_TIMEOUT_SECONDS
     )
     assert adapter.take_registration_snapshot() is None
+
+
+def test_notification_subscriptions_validate_current_overrides():
+    client = FakeClient()
+    adapter = zulip_adapter.OfficialZulipAdapter(client=client)
+
+    assert adapter.notification_subscriptions() == client.subscriptions
+    assert client.subscriptions_request == {"include_subscribers": False}
+
+    client.subscriptions[0]["is_muted"] = "false"
+    with pytest.raises(zulip_adapter.ZulipOperationError) as error:
+        adapter.notification_subscriptions()
+    assert error.value.code == "invalid_record"
+    assert not error.value.retryable
 
 
 def test_registration_hydrates_referenced_user_missing_from_bulk_directory():

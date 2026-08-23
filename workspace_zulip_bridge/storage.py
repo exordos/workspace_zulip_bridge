@@ -86,11 +86,7 @@ def _merge_catalog_participants(
                 merged[name] = value[name]
         prior_name = str(prior.get("display_name", "")).strip()
         observed_name = str(value.get("display_name", "")).strip()
-        if (
-            authoritative
-            and observed_name
-            and observed_name != provider_user_id
-        ):
+        if authoritative and observed_name and observed_name != provider_user_id:
             merged["display_name"] = observed_name
         elif (not prior_name or prior_name == provider_user_id) and observed_name:
             merged["display_name"] = observed_name
@@ -757,7 +753,7 @@ class RestAlchemyStore:
             ) VALUES (%s, %s, %s, %s, %s, false)
             ON CONFLICT (account_uuid, entity_kind, provider_id) DO UPDATE SET
                 workspace_uuid = EXCLUDED.workspace_uuid,
-                metadata = EXCLUDED.metadata,
+                metadata = provider_mappings.metadata || EXCLUDED.metadata,
                 deleted = false, updated_at = now()
             """,
             (
@@ -1178,6 +1174,27 @@ class RestAlchemyStore:
                 (account_uuid, entity_kind, provider_id),
             ).fetchone()
 
+    def provider_topic_mappings(
+        self, account_uuid: str
+    ) -> list[dict[str, object]]:
+        """Return active non-default topics for registration tombstones."""
+        with self.session() as session:
+            return list(
+                session.execute(
+                    """
+                    SELECT provider_id, metadata
+                    FROM provider_mappings
+                    WHERE account_uuid = %s AND entity_kind = 'topic'
+                      AND NOT deleted
+                      AND metadata->>'notification_mode' IN (
+                          'mute', 'unmute', 'follow'
+                      )
+                    ORDER BY provider_id
+                    """,
+                    (account_uuid,),
+                ).fetchall()
+            )
+
     def provider_message_mapping(
         self,
         account_uuid: str,
@@ -1440,9 +1457,7 @@ class RestAlchemyStore:
                 return {"deleted": True, "causal_lane": record["causal_lane"]}
             payload = typing.cast(dict[str, object], operation["payload"])
             provider = typing.cast(dict[str, object], operation["provider"])
-            extensions = typing.cast(
-                dict[str, object], operation.get("extensions", {})
-            )
+            extensions = typing.cast(dict[str, object], operation.get("extensions", {}))
             return {
                 "project_uuid": record["project_uuid"],
                 "stream_uuid": payload["stream_uuid"],
@@ -6837,10 +6852,13 @@ class RestAlchemyStore:
                         ORDER BY created_at, event_id, queue_id
                         LIMIT 1
                     ) AS event ON true
-                    WHERE event.body->>'type' = 'message'
+                    WHERE event.body->>'type' IN ('message', 'user_topic')
                 ), dependency_chats AS (
                     SELECT account_uuid::text AS account_uuid,
                            CASE
+                               WHEN body->>'type' = 'user_topic'
+                                    AND body->>'stream_id' IS NOT NULL
+                               THEN 'channel:' || (body->>'stream_id')
                                WHEN body->'message'->>'stream_id' IS NOT NULL
                                THEN 'channel:' ||
                                     (body->'message'->>'stream_id')
@@ -6934,6 +6952,10 @@ class RestAlchemyStore:
                            THEN event.body->'message'
                            WHEN event.body->>'type' = 'reaction'
                            THEN event.provider_message_context
+                           WHEN event.body->>'type' = 'user_topic'
+                           THEN jsonb_build_object(
+                               'stream_id', event.body->'stream_id'
+                           )
                        END AS message
                 FROM zulip_provider_events AS event
                 JOIN unapplied_catalog AS unapplied

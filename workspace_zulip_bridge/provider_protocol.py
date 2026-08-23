@@ -14,6 +14,8 @@ _OUTBOUND_KIND = {
     "read_state.set": "read_state.set",
     "membership.add": "membership.add",
     "membership.remove": "membership.remove",
+    "stream.notification.update": "stream.notification.update",
+    "topic.notification.update": "topic.notification.update",
     "stream.update": "stream.upsert",
     "topic.update": "topic.upsert",
 }
@@ -30,6 +32,8 @@ _INBOUND_KIND = {
     "reaction.upsert": "reaction.upsert",
     "reaction.delete": "reaction.delete",
     "read_state.set": "read_state.set",
+    "stream.notification.update": "stream.notification.update",
+    "topic.notification.update": "topic.notification.update",
 }
 
 
@@ -157,7 +161,8 @@ def leased_operation_record(store, leased: dict[str, object]) -> dict[str, objec
             or uuid.UUID(int=0)
         ),
         "occurred_at": str(
-            payload.get("updated_at")
+            payload.get("notification_updated_at")
+            or payload.get("updated_at")
             or payload.get("created_at")
             or datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
         ),

@@ -1143,6 +1143,7 @@ def test_topic_projection_replacement_preserves_displaced_workspace_alias():
     )
     assert "INSERT INTO provider_mapping_aliases" in alias_statement
     assert "mapping.workspace_uuid <> %s" in alias_statement
+    assert "provider_mappings.metadata || EXCLUDED.metadata" in insert_statement
     assert "mapping.workspace_uuid = ANY(%s)" in alias_statement
     assert alias_parameters == (
         "42:new-topic",

@@ -72,6 +72,18 @@ bridge resolves the mapped Zulip user and channel, then uses the official
 subscription add/remove methods. Duplicate delivery, retry, removal, and re-add
 therefore converge without a bridge-local membership source of truth.
 
+Provider-backed notification changes arrive as durable
+`stream.notification.update` and `topic.notification.update` operations gated
+by `messenger.notification.write`. Every operation carries its source
+`notification_updated_at` value. The bridge stores the newest provider-side
+timestamp in mapping metadata and skips an older Workspace operation; the
+backend locks the corresponding user setting and performs the symmetric check
+for Zulip events. Registration snapshots seed both channel and topic settings,
+and live global-setting events refresh every channel that inherits Zulip's
+`enable_stream_desktop_notifications` value. Restart and queue replacement
+therefore converge without treating the generic model `updated_at` value as
+notification history.
+
 Zulip topics are discovered from messages. The durable provider mapping table
 is the local processed-topic cache: a missing topic queues an idempotent catalog
 report, message delivery waits for the resulting Workspace topic mapping, and

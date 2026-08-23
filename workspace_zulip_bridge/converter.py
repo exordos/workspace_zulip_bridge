@@ -1288,9 +1288,8 @@ def message_event_records(
         and existing_message.get("pending_tombstone") is True
     )
     pending_delete = (
-        (pending_context is not None and pending_context.get("deleted") is True)
-        or (pending_tombstone and pending_context is None)
-    )
+        pending_context is not None and pending_context.get("deleted") is True
+    ) or (pending_tombstone and pending_context is None)
     workspace_delivery_committed = (
         existing_message is not None
         and (
@@ -1642,8 +1641,7 @@ def message_event_records(
             "reaction."
         ):
             operation_record_source = (
-                f"{record_source}:reaction-projection:"
-                f"{REACTION_PROJECTION_VERSION}"
+                f"{record_source}:reaction-projection:{REACTION_PROJECTION_VERSION}"
             )
         operation_lane = (
             f"identity:{account_uuid}:{operation['entity_uuid']}"
@@ -1802,8 +1800,8 @@ def _mapped_event_records(
         if stream_changed:
             destination_chat_key = f"channel:{int(destination_stream_id)}"
             try:
-                destination_project_uuid, _assignment_exists = (
-                    provider_chat_assignment(store, account_uuid, destination_chat_key)
+                destination_project_uuid, _assignment_exists = provider_chat_assignment(
+                    store, account_uuid, destination_chat_key
                 )
             except ValueError as exc:
                 if str(exc) != "provider_chat_not_selected":
@@ -1950,8 +1948,7 @@ def _mapped_event_records(
             stream_uuid = str(metadata["stream_uuid"])
             chat_key = str(metadata["chat_key"])
             causal_lane = str(
-                metadata.get("causal_lane")
-                or f"chat:{account_uuid}:{stream_uuid}"
+                metadata.get("causal_lane") or f"chat:{account_uuid}:{stream_uuid}"
             )
             operation = {
                 "kind": "message.delete",
@@ -2308,7 +2305,10 @@ def _provider_message_metadata(
 
 
 def _event_time(event: dict[str, object]) -> datetime.datetime:
-    supplied = event.get("edit_timestamp", event.get("timestamp"))
+    supplied = event.get(
+        "edit_timestamp",
+        event.get("timestamp", event.get("last_updated", event.get("observed_at"))),
+    )
     if supplied is not None:
         return datetime.datetime.fromtimestamp(float(supplied), datetime.UTC)
     return datetime.datetime(1970, 1, 1, tzinfo=datetime.UTC) + datetime.timedelta(
@@ -2328,13 +2328,38 @@ def _subscription_records(
         return []
     owner_uuid = str(account["owner_user_uuid"])
     event_time = _event_time(event)
+    event_operation = str(event.get("op"))
+    global_notification_event = (
+        event.get("type") == "user_settings"
+        and event_operation == "update"
+        and event.get("property") == "enable_stream_desktop_notifications"
+    )
+    if global_notification_event and not isinstance(event.get("value"), bool):
+        raise ValueError("invalid_notification_setting")
+    global_notification_update = global_notification_event
     subscriptions: list[dict[str, object]] = []
-    if event.get("op") in {"add", "remove"}:
+    if event_operation in {"add", "remove"}:
         subscriptions = typing.cast(list[dict[str, object]], event["subscriptions"])
-    elif event.get("op") == "update" and event.get("property") == "name":
-        subscriptions = [{"stream_id": event["stream_id"], "name": event["value"]}]
+    elif event_operation == "notification_snapshot":
+        subscriptions = [event]
+    elif event_operation == "update" and event.get("property") in {
+        "name",
+        "is_muted",
+        "desktop_notifications",
+    }:
+        subscriptions = [
+            {
+                "stream_id": event["stream_id"],
+                "name": event.get("value") if event.get("property") == "name" else None,
+            }
+        ]
+    elif global_notification_update:
+        subscriptions = typing.cast(
+            list[dict[str, object]], event.get("subscriptions", [])
+        )
     records: list[dict[str, object]] = []
-    for index, subscription in enumerate(subscriptions):
+    next_subindex = 0
+    for subscription in subscriptions:
         chat_key = f"channel:{int(subscription['stream_id'])}"
         try:
             project_uuid, assignment_exists = provider_chat_assignment(
@@ -2353,8 +2378,9 @@ def _subscription_records(
             if mapping is not None
             else {}
         )
-        if event.get("op") == "remove":
-            operation = {
+        next_metadata = dict(old_metadata)
+        if event_operation == "remove":
+            stream_operation = {
                 "kind": "stream.delete",
                 "entity_uuid": stream_uuid,
                 "actor_uuid": owner_uuid,
@@ -2363,7 +2389,25 @@ def _subscription_records(
                 "payload": {"stream_uuid": stream_uuid},
                 "extensions": {"provider_badge": "zulip"},
             }
-        else:
+            records.append(
+                _record(
+                    store,
+                    account_uuid,
+                    project_uuid,
+                    queue_id,
+                    int(event["id"]),
+                    next_subindex,
+                    stream_operation,
+                    f"chat:{account_uuid}:{stream_uuid}",
+                    event_time,
+                    delivery_class,
+                )
+            )
+            next_subindex += 1
+            continue
+        if event_operation == "add" or (
+            event_operation == "update" and event.get("property") == "name"
+        ):
             participants = typing.cast(list[str], old_metadata.get("participants", []))
             if not participants:
                 raise ValueError("provider_chat_assignment_pending")
@@ -2377,7 +2421,7 @@ def _subscription_records(
                 "participant_uuids": participants,
                 "default_topic_uuid": old_metadata.get("default_topic_uuid"),
             }
-            operation = {
+            stream_operation = {
                 "kind": "stream.upsert",
                 "entity_uuid": stream_uuid,
                 "actor_uuid": owner_uuid,
@@ -2389,33 +2433,313 @@ def _subscription_records(
                     "assignment_materialized": assignment_exists,
                 },
             }
-            store.remember_provider_mapping(
-                account_uuid,
-                "stream",
-                chat_key,
-                stream_uuid,
+            next_metadata.update(
                 {
                     **stream_payload,
                     "chat_type": "channel",
                     "project_uuid": project_uuid,
                     "participants": participants,
-                },
+                }
             )
-        records.append(
-            _record(
-                store,
-                account_uuid,
-                project_uuid,
-                queue_id,
-                int(event["id"]),
-                index,
-                operation,
-                f"chat:{account_uuid}:{stream_uuid}",
-                event_time,
-                delivery_class,
+            records.append(
+                _record(
+                    store,
+                    account_uuid,
+                    project_uuid,
+                    queue_id,
+                    int(event["id"]),
+                    next_subindex,
+                    stream_operation,
+                    f"chat:{account_uuid}:{stream_uuid}",
+                    event_time,
+                    delivery_class,
+                )
+            )
+            next_subindex += 1
+
+        notification_update = (
+            global_notification_update
+            or event_operation == "notification_snapshot"
+            or (
+                event_operation == "update"
+                and event.get("property") in {"is_muted", "desktop_notifications"}
+            )
+            or (
+                event_operation == "add"
+                and (
+                    "is_muted" in subscription
+                    or "desktop_notifications" in subscription
+                )
             )
         )
+        if notification_update:
+            is_muted = next_metadata.get("notification_is_muted", False)
+            desktop_notifications = next_metadata.get(
+                "notification_desktop_notifications"
+            )
+            global_desktop_notifications = next_metadata.get(
+                "notification_global_desktop_notifications"
+            )
+            if isinstance(subscription.get("is_muted"), bool):
+                is_muted = subscription["is_muted"]
+            if "desktop_notifications" in subscription and (
+                subscription["desktop_notifications"] is None
+                or isinstance(subscription["desktop_notifications"], bool)
+            ):
+                desktop_notifications = subscription["desktop_notifications"]
+            if isinstance(
+                subscription.get("enable_stream_desktop_notifications"), bool
+            ):
+                global_desktop_notifications = subscription[
+                    "enable_stream_desktop_notifications"
+                ]
+            if event_operation == "notification_snapshot":
+                if isinstance(event.get("is_muted"), bool):
+                    is_muted = event["is_muted"]
+                if event.get("desktop_notifications") is None or isinstance(
+                    event.get("desktop_notifications"), bool
+                ):
+                    desktop_notifications = event.get("desktop_notifications")
+                if isinstance(event.get("enable_stream_desktop_notifications"), bool):
+                    global_desktop_notifications = event[
+                        "enable_stream_desktop_notifications"
+                    ]
+            elif event_operation == "update":
+                if event.get("property") == "is_muted":
+                    is_muted = event["value"]
+                elif event.get("property") == "desktop_notifications":
+                    desktop_notifications = event["value"]
+            if global_notification_update:
+                global_desktop_notifications = event["value"]
+            if (
+                not isinstance(is_muted, bool)
+                or (
+                    desktop_notifications is not None
+                    and not isinstance(desktop_notifications, bool)
+                )
+                or not isinstance(global_desktop_notifications, bool)
+            ):
+                raise ValueError("invalid_notification_setting")
+            notification_mode = (
+                "muted"
+                if is_muted
+                else "all_messages"
+                if (
+                    desktop_notifications is True
+                    or (desktop_notifications is None and global_desktop_notifications)
+                )
+                else "mentions_only"
+            )
+            previous_updated_at = next_metadata.get("notification_updated_at")
+            previous_time = (
+                datetime.datetime.fromisoformat(
+                    previous_updated_at.replace("Z", "+00:00")
+                )
+                if isinstance(previous_updated_at, str)
+                else None
+            )
+            previous_mode = next_metadata.get("notification_mode")
+            emit_notification = False
+            if global_notification_update:
+                previous_global_updated_at = next_metadata.get(
+                    "notification_global_updated_at"
+                )
+                previous_global_time = (
+                    datetime.datetime.fromisoformat(
+                        previous_global_updated_at.replace("Z", "+00:00")
+                    )
+                    if isinstance(previous_global_updated_at, str)
+                    else None
+                )
+                if previous_global_time is None or event_time > previous_global_time:
+                    next_metadata.update(
+                        {
+                            "notification_is_muted": is_muted,
+                            "notification_desktop_notifications": (
+                                desktop_notifications
+                            ),
+                            "notification_global_desktop_notifications": (
+                                global_desktop_notifications
+                            ),
+                            "notification_global_updated_at": (
+                                event_time.isoformat().replace("+00:00", "Z")
+                            ),
+                        }
+                    )
+                    if previous_mode != notification_mode:
+                        notification_updated_at = event_time.isoformat().replace(
+                            "+00:00", "Z"
+                        )
+                        next_metadata.update(
+                            {
+                                "notification_mode": notification_mode,
+                                "notification_updated_at": notification_updated_at,
+                            }
+                        )
+                        emit_notification = True
+            elif previous_time is None or event_time > previous_time:
+                notification_updated_at = event_time.isoformat().replace("+00:00", "Z")
+                next_metadata.update(
+                    {
+                        "notification_is_muted": is_muted,
+                        "notification_desktop_notifications": desktop_notifications,
+                        "notification_global_desktop_notifications": (
+                            global_desktop_notifications
+                        ),
+                        "notification_mode": notification_mode,
+                        "notification_updated_at": notification_updated_at,
+                    }
+                )
+                if event_operation == "notification_snapshot":
+                    next_metadata["notification_global_updated_at"] = (
+                        notification_updated_at
+                    )
+                emit_notification = previous_mode != notification_mode
+            if emit_notification:
+                notification_operation = {
+                    "kind": "stream.notification.update",
+                    "entity_uuid": stream_uuid,
+                    "actor_uuid": owner_uuid,
+                    "occurred_at": notification_updated_at,
+                    "provider": _provider(chat_key, chat_key),
+                    "payload": {
+                        "stream_uuid": stream_uuid,
+                        "user_uuid": owner_uuid,
+                        "notification_mode": notification_mode,
+                        "notification_updated_at": notification_updated_at,
+                    },
+                    "extensions": {"provider_badge": "zulip"},
+                }
+                records.append(
+                    _record(
+                        store,
+                        account_uuid,
+                        project_uuid,
+                        queue_id,
+                        int(event["id"]),
+                        next_subindex,
+                        notification_operation,
+                        f"chat:{account_uuid}:{stream_uuid}",
+                        event_time,
+                        delivery_class,
+                    )
+                )
+                next_subindex += 1
+        if next_metadata != old_metadata:
+            store.remember_provider_mapping(
+                account_uuid,
+                "stream",
+                chat_key,
+                stream_uuid,
+                next_metadata,
+            )
     return records
+
+
+def _user_topic_records(
+    store: ConversionStore,
+    account_uuid: str,
+    queue_id: str,
+    event: dict[str, object],
+    delivery_class: str,
+) -> list[dict[str, object]]:
+    account = store.account_resource(account_uuid)
+    if account is None:
+        return []
+    owner_uuid = str(account["owner_user_uuid"])
+    stream_id = int(event["stream_id"])
+    topic_name = channel_topic_name(str(event["topic_name"]))
+    chat_key = f"channel:{stream_id}"
+    project_uuid, _assignment_exists = provider_chat_assignment(
+        store,
+        account_uuid,
+        chat_key,
+    )
+    stream_mapping = store.provider_mapping(account_uuid, "stream", chat_key)
+    if stream_mapping is None:
+        raise ValueError("provider_chat_assignment_pending")
+    stream_uuid = str(stream_mapping["workspace_uuid"])
+    provider_topic_id = channel_topic_provider_id(stream_id, topic_name)
+    topic_mapping = store.provider_mapping(account_uuid, "topic", provider_topic_id)
+    if topic_mapping is None:
+        raise ValueError("provider_chat_assignment_pending")
+    topic_uuid = str(topic_mapping["workspace_uuid"])
+    visibility_policy = int(event["visibility_policy"])
+    notification_mode = {
+        0: "default",
+        1: "mute",
+        2: "unmute",
+        3: "follow",
+    }.get(visibility_policy)
+    if notification_mode is None:
+        raise ValueError("invalid_notification_setting")
+    event_time = _event_time(event)
+    topic_metadata = typing.cast(dict[str, object], topic_mapping["metadata"])
+    previous_updated_at = topic_metadata.get("notification_updated_at")
+    previous_time = (
+        datetime.datetime.fromisoformat(previous_updated_at.replace("Z", "+00:00"))
+        if isinstance(previous_updated_at, str)
+        else None
+    )
+    provider_updated_at = int(event.get("last_updated", event_time.timestamp()))
+    previous_provider_updated_at = topic_metadata.get(
+        "notification_provider_updated_at"
+    )
+    if not isinstance(previous_provider_updated_at, int) and previous_time is not None:
+        previous_provider_updated_at = int(previous_time.timestamp())
+    previous_mode = topic_metadata.get("notification_mode")
+    if (
+        isinstance(previous_provider_updated_at, int)
+        and previous_provider_updated_at > provider_updated_at
+    ) or (
+        previous_provider_updated_at == provider_updated_at
+        and previous_mode == notification_mode
+    ):
+        return []
+    logical_time = event_time
+    if previous_time is not None and logical_time <= previous_time:
+        logical_time = previous_time + datetime.timedelta(microseconds=1)
+    notification_updated_at = logical_time.isoformat().replace("+00:00", "Z")
+    store.remember_provider_mapping(
+        account_uuid,
+        "topic",
+        provider_topic_id,
+        topic_uuid,
+        {
+            **topic_metadata,
+            "notification_mode": notification_mode,
+            "notification_provider_updated_at": provider_updated_at,
+            "notification_updated_at": notification_updated_at,
+        },
+    )
+    operation = {
+        "kind": "topic.notification.update",
+        "entity_uuid": topic_uuid,
+        "actor_uuid": owner_uuid,
+        "occurred_at": notification_updated_at,
+        "provider": _provider(chat_key, provider_topic_id),
+        "payload": {
+            "stream_uuid": stream_uuid,
+            "user_uuid": owner_uuid,
+            "notification_mode": notification_mode,
+            "notification_updated_at": notification_updated_at,
+        },
+        "extensions": {"provider_badge": "zulip"},
+    }
+    return [
+        _record(
+            store,
+            account_uuid,
+            project_uuid,
+            queue_id,
+            int(event["id"]),
+            0,
+            operation,
+            f"chat:{account_uuid}:{stream_uuid}",
+            event_time,
+            delivery_class,
+        )
+    ]
 
 
 def _realm_user_records(
@@ -2526,6 +2850,12 @@ def event_records(
         return _subscription_records(
             store, account_uuid, queue_id, event, delivery_class
         )
+    if event_type == "user_settings":
+        return _subscription_records(
+            store, account_uuid, queue_id, event, delivery_class
+        )
+    if event_type == "user_topic":
+        return _user_topic_records(store, account_uuid, queue_id, event, delivery_class)
     if event_type == "realm_user":
         return _realm_user_records(store, account_uuid, queue_id, event, delivery_class)
     return []

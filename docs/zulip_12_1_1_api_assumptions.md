@@ -56,9 +56,22 @@ Zulip's history fallback name `general chat` identify the special empty topic;
 the bridge reports that topic as the Workspace channel's default topic and
 routes its messages through the backend-owned `default_topic_uuid`. It accepts
 `null` channel notification settings as an instruction to inherit the user's
-global notification settings. It does not assume event IDs are gapless and
+`enable_stream_desktop_notifications` value. The bridge requests and persists
+both registration snapshots and live `user_settings` updates so inherited
+channels converge when that global value changes. It does not assume event IDs
+are gapless and
 persists each queue's last acknowledged event ID on the element's persistent
 PostgreSQL disk.
+
+Per-channel notification synchronization maps Workspace `muted` to Zulip
+`is_muted=true`, `all_messages` to `is_muted=false` plus
+`desktop_notifications=true`, and `mentions_only` to `is_muted=false` plus
+`desktop_notifications=false`. Per-topic modes map directly to Zulip
+`visibility_policy`: `default=0`, `mute=1`, `unmute=2`, and `follow=3`.
+`user_topic` events and registration snapshots provide Zulip's
+`last_updated` timestamp. Zulip subscription update events do not include a
+setting timestamp, so the bridge durably records the event observation time;
+that observation time is the provider-side LWW timestamp for channel settings.
 
 Zulip does not provide a general idempotency key for every mutation. For
 outgoing messages the bridge registers an event queue and persists `queue_id`
