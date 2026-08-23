@@ -4462,19 +4462,27 @@ def test_terminal_delivery_state_is_pruned_by_priority_and_age(postgres_store):
 
 def test_pending_provider_probe_waits_for_each_accounts_head(postgres_store):
     account_uuid = str(uuid.uuid4())
+    assert postgres_store.record_provider_event(
+        account_uuid, "queue", {"id": 1, "type": "message"}
+    )
+    assert postgres_store.record_provider_event(
+        account_uuid, "queue", {"id": 2, "type": "message"}
+    )
     with postgres_store.session() as session:
         session.execute(
             """
-            INSERT INTO zulip_provider_events (
-                account_uuid, queue_id, event_id, event_type, body,
-                processing_state, available_at, created_at
-            ) VALUES
-                (%s, 'queue', 1, 'message', '{}'::jsonb, 'pending',
-                 now() + interval '5 minutes', now() - interval '1 minute'),
-                (%s, 'queue', 2, 'message', '{}'::jsonb, 'pending',
-                 now(), now())
+            UPDATE zulip_provider_events
+            SET available_at = CASE event_id
+                    WHEN 1 THEN now() + interval '5 minutes'
+                    ELSE now()
+                END,
+                created_at = CASE event_id
+                    WHEN 1 THEN now() - interval '1 minute'
+                    ELSE now()
+                END
+            WHERE account_uuid = %s AND queue_id = 'queue'
             """,
-            (account_uuid, account_uuid),
+            (account_uuid,),
         )
 
     assert not postgres_store.has_pending_provider_events()
@@ -4514,6 +4522,29 @@ def test_pending_provider_events_include_retry_count(postgres_store):
     assert len(pending) == 1
     assert pending[0]["retry_count"] == 37
     assert pending[0]["processing_reason"] == "provider_unavailable"
+
+
+def test_pending_provider_events_rotate_beyond_one_quantum(postgres_store):
+    account_uuids = [str(uuid.uuid4()) for _ in range(25)]
+    for account_uuid in account_uuids:
+        assert postgres_store.record_provider_event(
+            account_uuid, "queue", {"id": 1, "type": "realm_user"}
+        )
+        assert postgres_store.record_provider_event(
+            account_uuid, "queue", {"id": 2, "type": "realm_user"}
+        )
+
+    first = postgres_store.pending_provider_events(limit=20)
+    second = postgres_store.pending_provider_events(limit=20)
+    first_accounts = {str(row["account_uuid"]) for row in first}
+    second_accounts = {str(row["account_uuid"]) for row in second}
+
+    assert len(first) == 20
+    assert len(second) == 20
+    assert all(row["event_id"] == 1 for row in first + second)
+    assert len(first_accounts) == 20
+    assert len(second_accounts) == 20
+    assert set(account_uuids) == first_accounts | second_accounts
 
 
 def test_provider_assignment_context_survives_intervening_retry_reason(postgres_store):
@@ -4618,16 +4649,16 @@ def test_pending_provider_probe_includes_only_nonterminal_delivering_head(
 ):
     account_uuid = str(uuid.uuid4())
     delivery_uuid = str(uuid.uuid4())
+    assert postgres_store.record_provider_event(
+        account_uuid, "queue", {"id": 1, "type": "message"}
+    )
     with postgres_store.session() as session:
         session.execute(
             """
-            INSERT INTO zulip_provider_events (
-                account_uuid, queue_id, event_id, event_type, body,
-                processing_state, available_at, created_at
-            ) VALUES (
-                %s, 'queue', 1, 'message', '{}'::jsonb, 'delivering',
-                now() + interval '5 minutes', now()
-            )
+            UPDATE zulip_provider_events
+            SET processing_state = 'delivering',
+                available_at = now() + interval '5 minutes'
+            WHERE account_uuid = %s AND queue_id = 'queue' AND event_id = 1
             """,
             (account_uuid,),
         )

@@ -1907,71 +1907,103 @@ class RestAlchemyStore:
             )
 
     def pending_provider_events(self, limit: int = 100) -> list[dict[str, object]]:
+        """Select a fair batch of eligible per-account FIFO journal heads."""
         with self.session() as session:
             return list(
                 session.execute(
                     """
-                    WITH account_heads AS (
-                        SELECT account_uuid, queue_id, event_id, body,
-                               processing_reason, retry_count,
-                               assignment_pending_since,
-                               assignment_catalog_reported_at,
-                               provider_message_context,
-                               created_at, available_at,
-                               row_number() OVER (
-                                   PARTITION BY account_uuid
-                                   ORDER BY created_at, event_id, queue_id
-                               ) AS position
-                        FROM zulip_provider_events
-                        WHERE processing_state = 'pending'
+                    WITH candidates AS MATERIALIZED (
+                        SELECT event.account_uuid, event.queue_id,
+                               event.event_id, event.body,
+                               event.processing_reason, event.retry_count,
+                               event.assignment_pending_since,
+                               event.assignment_catalog_reported_at,
+                               event.provider_message_context,
+                               event.created_at, event.available_at
+                        FROM scheduler_accounts AS journal
+                        JOIN LATERAL (
+                            SELECT account_uuid, queue_id, event_id, body,
+                                   processing_reason, retry_count,
+                                   assignment_pending_since,
+                                   assignment_catalog_reported_at,
+                                   provider_message_context,
+                                   created_at, available_at
+                            FROM zulip_provider_events
+                            WHERE account_uuid = journal.account_uuid
+                              AND processing_state = 'pending'
+                            ORDER BY created_at, event_id, queue_id
+                            LIMIT 1
+                        ) AS event ON true
+                        WHERE event.available_at <= now()
+                          AND (
+                              NOT EXISTS (
+                                  SELECT 1
+                                  FROM desired_resources AS account
+                                  WHERE account.resource_type =
+                                        'external_account'
+                                    AND account.resource_uuid =
+                                        event.account_uuid
+                                    AND NOT account.deleted
+                                    AND COALESCE(
+                                          (account.body
+                                              ->>'synchronization_enabled')
+                                              ::boolean,
+                                          false
+                                        )
+                                    )
+                              OR EXISTS (
+                                  SELECT 1
+                                  FROM desired_resources AS account
+                                  LEFT JOIN scheduler_accounts AS scheduler
+                                    ON scheduler.account_uuid =
+                                       account.resource_uuid
+                                  WHERE account.resource_type =
+                                        'external_account'
+                                    AND account.resource_uuid =
+                                        event.account_uuid
+                                    AND NOT account.deleted
+                                    AND COALESCE(
+                                          (account.body
+                                              ->>'synchronization_enabled')
+                                              ::boolean,
+                                          false
+                                        )
+                                    AND (
+                                        scheduler.account_uuid IS NULL
+                                        OR scheduler.provider_generation
+                                           IS DISTINCT FROM account.generation
+                                        OR scheduler.provider_state = 'ready'
+                                        OR (
+                                            scheduler.provider_state = 'backoff'
+                                            AND scheduler.provider_retry_after
+                                                <= now()
+                                        )
+                                    )
+                              )
+                          )
+                        ORDER BY
+                            journal.last_provider_event_dispatched_at NULLS FIRST,
+                            event.available_at, event.created_at,
+                            event.event_id, event.queue_id, event.account_uuid
+                        FOR UPDATE OF journal SKIP LOCKED
+                        LIMIT %s
+                    ), dispatched AS (
+                        UPDATE scheduler_accounts AS journal
+                        SET last_provider_event_dispatched_at = clock_timestamp()
+                        FROM candidates AS event
+                        WHERE journal.account_uuid = event.account_uuid
+                        RETURNING journal.account_uuid
                     )
-                    SELECT account_uuid, queue_id, event_id, body,
-                           processing_reason, retry_count,
-                           assignment_pending_since,
-                           assignment_catalog_reported_at,
-                           provider_message_context
-                    FROM account_heads AS event
-                    WHERE position = 1 AND available_at <= now()
-                      AND (
-                          NOT EXISTS (
-                              SELECT 1
-                              FROM desired_resources AS account
-                              WHERE account.resource_type = 'external_account'
-                                AND account.resource_uuid = event.account_uuid
-                                AND NOT account.deleted
-                                AND COALESCE(
-                                      (account.body->>'synchronization_enabled')
-                                          ::boolean,
-                                      false
-                                    )
-                          )
-                          OR EXISTS (
-                              SELECT 1
-                              FROM desired_resources AS account
-                              LEFT JOIN scheduler_accounts AS scheduler
-                                ON scheduler.account_uuid = account.resource_uuid
-                              WHERE account.resource_type = 'external_account'
-                                AND account.resource_uuid = event.account_uuid
-                                AND NOT account.deleted
-                                AND COALESCE(
-                                      (account.body->>'synchronization_enabled')
-                                          ::boolean,
-                                      false
-                                    )
-                                AND (
-                                    scheduler.account_uuid IS NULL
-                                    OR scheduler.provider_generation IS DISTINCT
-                                       FROM account.generation
-                                    OR scheduler.provider_state = 'ready'
-                                    OR (
-                                        scheduler.provider_state = 'backoff'
-                                        AND scheduler.provider_retry_after <= now()
-                                    )
-                                )
-                          )
-                      )
-                    ORDER BY available_at, created_at, event_id
-                    LIMIT %s
+                    SELECT event.account_uuid, event.queue_id, event.event_id,
+                           event.body, event.processing_reason,
+                           event.retry_count,
+                           event.assignment_pending_since,
+                           event.assignment_catalog_reported_at,
+                           event.provider_message_context
+                    FROM candidates AS event
+                    JOIN dispatched
+                      ON dispatched.account_uuid = event.account_uuid
+                    ORDER BY event.created_at, event.event_id, event.queue_id
                     """,
                     (limit,),
                 ).fetchall()
@@ -1982,20 +2014,19 @@ class RestAlchemyStore:
         with self.session() as session:
             row = session.execute(
                 """
-                WITH account_heads AS (
-                    SELECT account_uuid, queue_id, event_id,
-                           processing_state, available_at,
-                           row_number() OVER (
-                               PARTITION BY account_uuid
-                               ORDER BY created_at, event_id, queue_id
-                           ) AS position
-                    FROM zulip_provider_events
-                    WHERE processing_state IN ('pending', 'delivering')
-                )
                 SELECT EXISTS (
-                    SELECT 1 FROM account_heads AS event
-                    WHERE event.position = 1
-                      AND (
+                    SELECT 1
+                    FROM scheduler_accounts AS journal
+                    JOIN LATERAL (
+                        SELECT account_uuid, queue_id, event_id,
+                               processing_state, available_at
+                        FROM zulip_provider_events
+                        WHERE account_uuid = journal.account_uuid
+                          AND processing_state IN ('pending', 'delivering')
+                        ORDER BY created_at, event_id, queue_id
+                        LIMIT 1
+                    ) AS event ON true
+                    WHERE (
                           (
                               event.processing_state = 'pending'
                               AND event.available_at <= now()
@@ -6023,6 +6054,11 @@ class RestAlchemyStore:
         with self.session() as session:
             result = session.execute(
                 """
+                WITH registered_account AS (
+                    INSERT INTO scheduler_accounts (account_uuid)
+                    VALUES (%s)
+                    ON CONFLICT (account_uuid) DO NOTHING
+                )
                 INSERT INTO zulip_provider_events (
                     account_uuid, queue_id, event_id, event_type, body
                 ) VALUES (%s, %s, %s, %s, %s)
@@ -6030,6 +6066,7 @@ class RestAlchemyStore:
                 RETURNING event_id
                 """,
                 (
+                    account_uuid,
                     account_uuid,
                     queue_id,
                     int(event["id"]),
