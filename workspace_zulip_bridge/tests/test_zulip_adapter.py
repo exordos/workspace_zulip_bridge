@@ -1841,18 +1841,26 @@ def test_provider_file_download_streams_with_a_strict_effective_limit(monkeypatc
     assert response.closed
 
 
-def test_provider_file_http_error_always_closes_streamed_response(monkeypatch):
+@pytest.mark.parametrize(
+    ("status_code", "retryable"),
+    [(404, False), (410, False), (503, True)],
+)
+def test_provider_file_http_error_is_classified_and_closes_response(
+    monkeypatch, status_code, retryable
+):
     class Response:
         headers = {}
         closed = False
+        status_code = 0
 
         def raise_for_status(self):
-            raise requests.HTTPError("not found")
+            raise requests.HTTPError("file unavailable", response=self)
 
         def close(self):
             self.closed = True
 
     response = Response()
+    response.status_code = status_code
     monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response)
     client = FakeClient()
     client.email = "owner@example.test"
@@ -1864,6 +1872,7 @@ def test_provider_file_http_error_always_closes_streamed_response(monkeypatch):
     with pytest.raises(zulip_adapter.ZulipOperationError) as error:
         adapter.download_file("/user_uploads/missing.bin")
     assert error.value.code == "provider_file_unavailable"
+    assert error.value.retryable is retryable
     assert response.closed
 
 

@@ -114,7 +114,8 @@ class ConversionStore(typing.Protocol):
     ) -> tuple[dict[str, object] | None, list[dict[str, object]]]: ...
 
 
-FileResolver = typing.Callable[[str, str], str]
+FileResolver = typing.Callable[[str, str], str | None]
+UNAVAILABLE_FILE_MARKER = "File unavailable"
 
 
 class ZulipLinkResolver:
@@ -740,7 +741,12 @@ def _convert_zulip_links(
             if file_resolver is None:
                 lossy = True
                 return link.with_destination(original_url)
-            return link.with_destination(file_resolver(link.destination, link.label))
+            destination = file_resolver(link.destination, link.label)
+            if destination is None:
+                lossy = True
+                label = link.label.strip() or "attachment"
+                return f"**{UNAVAILABLE_FILE_MARKER}:** {label}"
+            return link.with_destination(destination)
         target = _workspace_link_target(
             link.destination,
             provider_site,

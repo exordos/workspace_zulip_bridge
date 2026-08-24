@@ -2265,6 +2265,25 @@ class BridgeService:
         event: dict[str, object],
         delivery_class: str,
     ) -> list[dict[str, object]]:
+        file_resolver = self._file_resolver(
+            adapter,
+            account_uuid,
+            external_chat_uuid,
+        )
+        if file_resolver is not None and delivery_class == "backfill":
+            transfer_file = file_resolver
+
+            def resolve_historical_file(
+                provider_url: str, display_name: str
+            ) -> str | None:
+                try:
+                    return transfer_file(provider_url, display_name)
+                except zulip_adapter.ZulipOperationError as exc:
+                    if exc.code == "provider_file_unavailable" and not exc.retryable:
+                        return None
+                    raise
+
+            file_resolver = resolve_historical_file
         return converter.event_records(
             self.store,
             account_uuid,
@@ -2272,11 +2291,7 @@ class BridgeService:
             event,
             delivery_class,
             adapter.server_url,
-            self._file_resolver(
-                adapter,
-                account_uuid,
-                external_chat_uuid,
-            ),
+            file_resolver,
         )
 
     def _pending_delete_recreation_messages(
