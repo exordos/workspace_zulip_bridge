@@ -4382,15 +4382,17 @@ def test_backfill_caches_durable_topic_upsert_per_assignment_generation(monkeypa
     ]
 
 
-def test_backfill_does_not_enqueue_broken_attachment_fallback(monkeypatch):
+def test_backfill_marks_permanently_unavailable_attachment_and_enqueues_message(
+    monkeypatch,
+):
     store = DeliveryStore()
     instance = _delivery_service(store)
+    resolved = []
 
     def records(*args, **kwargs):
         resolver = args[6]
-        if resolver is not None:
-            resolver("/user_uploads/report.pdf", "report.pdf")
-        pytest.fail("attachment failure must abort conversion")
+        resolved.append(resolver("/user_uploads/report.pdf", "report.pdf"))
+        return [{"record_uuid": "message-record"}]
 
     monkeypatch.setattr(converter, "event_records", records)
     monkeypatch.setattr(
@@ -4399,19 +4401,21 @@ def test_backfill_does_not_enqueue_broken_attachment_fallback(monkeypatch):
     instance._file_resolver = lambda *args: (
         lambda *resolver_args: (_ for _ in ()).throw(
             zulip_adapter.ZulipOperationError(
-                "workspace_file_import_unavailable", False
+                "provider_file_unavailable", False
             )
         )
     )
 
-    with pytest.raises(zulip_adapter.ZulipOperationError) as captured:
+    assert (
         instance.enqueue_backfill(
             "00000000-0000-0000-0000-000000000001",
             "channel:42",
             [{"id": 7, "timestamp": 7}],
         )
-    assert captured.value.code == "workspace_file_import_unavailable"
-    assert store.enqueued == []
+        == 1
+    )
+    assert resolved == [None]
+    assert store.enqueued == [({"record_uuid": "message-record"}, 2)]
 
 
 def test_backfill_discovers_all_topics_before_waiting_for_workspace_mappings(

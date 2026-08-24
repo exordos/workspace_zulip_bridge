@@ -463,6 +463,11 @@ class OfficialZulipAdapter:
                 if len(content) + len(chunk) > max_bytes:
                     raise ZulipOperationError("provider_file_too_large", False)
                 content.extend(chunk)
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            raise ZulipOperationError(
+                "provider_file_unavailable", status not in {404, 410}
+            ) from exc
         except PROVIDER_NETWORK_ERRORS as exc:
             raise ZulipOperationError("provider_file_unavailable", True) from exc
         finally:

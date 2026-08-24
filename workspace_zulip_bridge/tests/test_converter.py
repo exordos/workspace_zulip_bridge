@@ -326,6 +326,23 @@ def test_dm_conversion_has_owner_membership_identity_urn_and_copied_file():
     assert topic["payload"]["name"] == "Zulip"
 
 
+def test_unavailable_historical_file_is_replaced_with_visible_marker():
+    original_url = "https://chat.example.invalid/#narrow/near/501"
+    converted, lossy = converter.convert_markdown(
+        "See [archive.pdf](/user_uploads/a/archive.pdf)",
+        {},
+        original_url,
+        file_resolver=lambda _url, _name: None,
+    )
+
+    assert lossy
+    assert converted == (
+        "See **File unavailable:** archive.pdf\n\n"
+        f"[Open original](urn:url:{original_url})"
+    )
+    assert "/user_uploads/" not in converted
+
+
 def test_lossy_markdown_without_original_url_does_not_add_empty_link():
     converted, lossy = converter.convert_markdown("@**Unknown User**", {}, "")
 
