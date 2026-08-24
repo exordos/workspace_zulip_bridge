@@ -2011,6 +2011,16 @@ class BridgeService:
                 return
         self._clear_provider_retry(account_uuid)
 
+    def _enqueue_queue_recovery_delivery(self, record: dict[str, object]) -> None:
+        try:
+            self.store.enqueue_workspace_delivery(record, 2)
+        except ValueError as exc:
+            if str(exc) != "Operation UUID reused with a different digest":
+                raise
+            # Catch-up can rediscover an edit or deletion whose deterministic
+            # operation was already accepted from an earlier recovery page.
+            # Preserve the first accepted operation as the idempotent result.
+
     def _run_provider_queue_catchup(
         self,
         account_uuid: str,
@@ -2109,7 +2119,7 @@ class BridgeService:
                 "backfill",
             )
             for record in records:
-                self.store.enqueue_workspace_delivery(record, 2)
+                self._enqueue_queue_recovery_delivery(record)
 
         if unmapped_messages:
             try:
@@ -2147,7 +2157,7 @@ class BridgeService:
                     "backfill",
                     adapter.server_url,
                 ):
-                    self.store.enqueue_workspace_delivery(record, 2)
+                    self._enqueue_queue_recovery_delivery(record)
 
         next_anchor = (
             None

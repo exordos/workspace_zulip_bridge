@@ -4498,6 +4498,37 @@ def test_queue_loss_catchup_recovers_create_edit_delete_before_live_ready(
     assert store.advanced == [([10, 12, 13], 9, True, None)]
 
 
+def test_queue_loss_catchup_keeps_first_accepted_recovery_operations(monkeypatch):
+    store = CatchupStore()
+    instance = _delivery_service(store)
+    instance.enqueue_backfill = lambda *args: 2
+    attempted = []
+
+    def reject_replayed_digest(record, priority):
+        attempted.append((record["operation_uuid"], priority))
+        raise ValueError("Operation UUID reused with a different digest")
+
+    store.enqueue_workspace_delivery = reject_replayed_digest
+
+    def records(*args, **kwargs):
+        event = args[3]
+        message_id = event.get("message_id", event.get("message_ids", [0])[0])
+        return [
+            {
+                "operation_uuid": f"{event['type']}:{message_id}",
+                "record_uuid": f"record:{event['type']}:{message_id}",
+            }
+        ]
+
+    monkeypatch.setattr(converter, "event_records", records)
+
+    assert instance._run_provider_queue_catchup(
+        "00000000-0000-0000-0000-000000000001", CatchupAdapter()
+    )
+    assert attempted == [("update_message:10", 2), ("delete_message:11", 2)]
+    assert store.advanced == [([10, 12, 13], 9, True, None)]
+
+
 @pytest.mark.parametrize(
     "pending_gate",
     [
