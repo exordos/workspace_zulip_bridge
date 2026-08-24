@@ -354,6 +354,29 @@ def _insert_account_and_assignment(
     return account_uuid, project_uuid
 
 
+def _enable_zulip_provider(store: storage.RestAlchemyStore) -> None:
+    policy_uuid = str(uuid.uuid4())
+    with store.session() as session:
+        session.execute(
+            """
+            INSERT INTO desired_resources (
+                resource_type, resource_uuid, generation, body, deleted
+            ) VALUES (
+                'external_provider_policy', %s, 1,
+                jsonb_build_object(
+                    'uuid', %s::text,
+                    'generation', 1,
+                    'provider_kind', 'zulip',
+                    'enabled', true,
+                    'emergency_suspended', false
+                ),
+                false
+            )
+            """,
+            (policy_uuid, policy_uuid),
+        )
+
+
 def _insert_channel_assignment(
     store: storage.RestAlchemyStore,
     account_uuid: str,
@@ -635,6 +658,94 @@ def test_assignment_projection_repair_restores_mapping_and_wakes_event(
     topic = postgres_store.provider_mapping(account_uuid, "topic", "42:Topic")
     assert topic is not None
     assert str(topic["workspace_uuid"]) == topic_uuid
+    with postgres_store.session() as session:
+        event = session.execute(
+            """
+            SELECT available_at <= now() AS due
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
+            """,
+            (account_uuid, queue_id, event_id),
+        ).fetchone()
+    assert event["due"]
+
+
+@pytest.mark.parametrize("control_path", ["changes", "snapshot"])
+def test_assignment_control_update_wakes_backed_off_event(
+    postgres_store,
+    control_path,
+):
+    account_uuid = str(uuid.uuid4())
+    assignment_uuid = str(uuid.uuid4())
+    project_uuid = str(uuid.uuid4())
+    queue_id = "queue"
+    event_id = 18
+    resource = {
+        "resource_type": "external_chat_assignment",
+        "uuid": assignment_uuid,
+        "generation": 1,
+        "external_account_uuid": account_uuid,
+        "project_id": project_uuid,
+        "provider_chat": {
+            "provider_chat_key": "channel:42",
+            "chat_type": "channel",
+        },
+        "workspace_projection": {
+            "stream": {
+                "uuid": str(uuid.uuid4()),
+                "name": "Engineering",
+                "description": "",
+                "private": False,
+                "default_topic_uuid": None,
+            },
+            "participants": [],
+            "topics": [
+                {
+                    "topic_uuid": str(uuid.uuid4()),
+                    "provider_topic_id": "42:New topic",
+                    "name": "New topic",
+                    "is_default": False,
+                }
+            ],
+        },
+    }
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            INSERT INTO zulip_provider_events (
+                account_uuid, queue_id, event_id, event_type, body,
+                processing_state, processing_reason, available_at
+            ) VALUES (
+                %s, %s, %s, 'message', '{}'::jsonb, 'pending',
+                'provider_chat_assignment_pending',
+                now() + interval '5 minutes'
+            )
+            """,
+            (account_uuid, queue_id, event_id),
+        )
+
+    if control_path == "changes":
+        postgres_store.apply_desired_changes(
+            [
+                {
+                    "change_uuid": str(uuid.uuid4()),
+                    "sequence": 1,
+                    "resource_type": "external_chat_assignment",
+                    "resource_uuid": assignment_uuid,
+                    "operation": "upsert",
+                    "generation": 1,
+                    "required_capabilities": {},
+                    "resource": resource,
+                }
+            ],
+            "cursor-1",
+        )
+    else:
+        postgres_store.install_snapshot(
+            [{**resource, "required_capabilities": {}}],
+            "cursor-1",
+        )
+
     with postgres_store.session() as session:
         event = session.execute(
             """
@@ -1138,6 +1249,293 @@ def test_rejected_observed_report_retries_after_cooldown(postgres_store):
     assert postgres_store.pending_observed_reports() == [retry]
 
 
+@pytest.mark.parametrize("event_kind", ["message", "reaction"])
+@pytest.mark.parametrize("chat_kind", ["channel", "direct"])
+@pytest.mark.parametrize("terminal_status", ["rejected", "stale"])
+def test_unapplied_catalog_report_releases_event_marker_and_republishes(
+    postgres_store,
+    event_kind,
+    chat_kind,
+    terminal_status,
+):
+    account_uuid, _project_uuid = _insert_account_and_assignment(postgres_store)
+    provider_message = (
+        {
+            "id": 701,
+            "type": "stream",
+            "stream_id": 77,
+            "display_recipient": "Operations",
+            "subject": "New dependency",
+            "timestamp": 1_800_000_000,
+        }
+        if chat_kind == "channel"
+        else {
+            "id": 701,
+            "type": "private",
+            "display_recipient": [
+                {"id": 14, "full_name": "Peer"},
+                {"id": 1, "full_name": "Owner", "is_me": True},
+            ],
+            "timestamp": 1_800_000_000,
+        }
+    )
+    provider_event = (
+        {"id": 7, "type": "message", "message": provider_message}
+        if event_kind == "message"
+        else {
+            "id": 7,
+            "type": "reaction",
+            "message_id": 701,
+            "user_id": 2,
+            "emoji_name": "thumbs_up",
+            "emoji_code": "1f44d",
+            "reaction_type": "unicode_emoji",
+            "op": "add",
+        }
+    )
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        provider_event,
+    )
+    if event_kind == "reaction":
+        assert postgres_store.cache_provider_event_message_context(
+            account_uuid,
+            "queue",
+            7,
+            provider_message,
+        ) == provider_message
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = postgres_store
+    catalog_event = {"id": 7, "type": "message", "message": provider_message}
+
+    def publish_catalog() -> bool:
+        return instance._queue_event_catalog(
+            account_uuid,
+            catalog_event,
+            "https://zulip.example.invalid",
+            (account_uuid, "queue", 7),
+        )
+
+    assert publish_catalog()
+    postgres_store.retry_provider_event(
+        account_uuid,
+        "queue",
+        7,
+        "provider_chat_assignment_pending",
+    )
+    report = postgres_store.pending_observed_reports()[0]
+    result = {
+        "report_uuid": report["report_uuid"],
+        "status": terminal_status,
+    }
+    if terminal_status == "rejected":
+        result["safe_error"] = {"retryable": False}
+    postgres_store.apply_observed_report_results([result])
+
+    with postgres_store.session() as session:
+        marker = session.execute(
+            """
+            SELECT assignment_catalog_reported_at
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = 'queue' AND event_id = 7
+            """,
+            (account_uuid,),
+        ).fetchone()
+    assert marker["assignment_catalog_reported_at"] is None
+
+    assert not publish_catalog()
+    if terminal_status == "rejected":
+        with postgres_store.session() as session:
+            session.execute(
+                """
+                UPDATE observed_report_outbox
+                SET completed_at =
+                    clock_timestamp() - interval '5 minutes 1 second'
+                WHERE report_uuid = %s
+                """,
+                (report["report_uuid"],),
+            )
+    else:
+        account = postgres_store.desired_resource(
+            "external_account",
+            account_uuid,
+        )
+        cursor = postgres_store.provider_event_cursor(account_uuid)
+        assert account is not None
+        assert cursor is not None
+        generation = 2
+        account = {
+            **account,
+            "resource_type": "external_account",
+            "generation": generation,
+        }
+        postgres_store.apply_desired_changes(
+            [
+                {
+                    "change_uuid": str(uuid.uuid4()),
+                    "sequence": generation,
+                    "resource_type": "external_account",
+                    "resource_uuid": account_uuid,
+                    "operation": "upsert",
+                    "generation": generation,
+                    "required_capabilities": {},
+                    "resource": account,
+                }
+            ],
+            "cursor-new-account-generation",
+        )
+        postgres_store.update_provider_event_cursor(
+            account_uuid,
+            "registration-new-account-generation",
+            int(cursor["last_event_id"]),
+            provider_realm_uuid=str(cursor["provider_realm_uuid"]),
+            provider_owner_user_id=str(cursor["provider_owner_user_id"]),
+            provider_account_generation=generation,
+        )
+
+    assert publish_catalog()
+    with postgres_store.session() as session:
+        state = session.execute(
+            """
+            SELECT event.assignment_catalog_reported_at,
+                   count(report.report_uuid) AS report_count,
+                   array_agg(
+                       (report.body->>'observed_generation')::bigint
+                       ORDER BY report.created_at
+                   ) AS report_generations
+            FROM zulip_provider_events AS event
+            CROSS JOIN observed_report_outbox AS report
+            WHERE event.account_uuid = %s
+              AND event.queue_id = 'queue' AND event.event_id = 7
+              AND report.body->>'resource_type' = 'external_chat_catalog'
+            GROUP BY event.assignment_catalog_reported_at
+            """,
+            (account_uuid,),
+        ).fetchone()
+    assert state["assignment_catalog_reported_at"] is not None
+    assert state["report_count"] == 2
+    assert state["report_generations"] == (
+        [1, 2] if terminal_status == "stale" else [1, 1]
+    )
+
+
+@pytest.mark.parametrize("terminal_status", ["rejected", "stale"])
+def test_unapplied_catalog_result_serializes_with_event_marker_update(
+    postgres_store,
+    monkeypatch,
+    terminal_status,
+):
+    account_uuid, _project_uuid = _insert_account_and_assignment(postgres_store)
+    provider_message = {
+        "id": 701,
+        "type": "stream",
+        "stream_id": 77,
+        "display_recipient": "Operations",
+        "subject": "New dependency",
+        "timestamp": 1_800_000_000,
+    }
+    provider_event = {"id": 7, "type": "message", "message": provider_message}
+    assert postgres_store.record_provider_event(account_uuid, "queue", provider_event)
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = postgres_store
+    assert instance._queue_event_catalog(
+        account_uuid,
+        provider_event,
+        "https://zulip.example.invalid",
+    )
+    report = postgres_store.pending_observed_reports()[0]
+
+    original_enqueue = storage.RestAlchemyStore._enqueue_observed_report_in_session
+    report_locked = threading.Event()
+    release_marker_update = threading.Event()
+
+    def pause_after_report_ensure(session, supplied_report, *, confirm_existing):
+        durable = original_enqueue(
+            session,
+            supplied_report,
+            confirm_existing=confirm_existing,
+        )
+        report_locked.set()
+        assert release_marker_update.wait(timeout=5)
+        return durable
+
+    monkeypatch.setattr(
+        storage.RestAlchemyStore,
+        "_enqueue_observed_report_in_session",
+        staticmethod(pause_after_report_ensure),
+    )
+    failures = []
+    ensure_results = []
+    result_started = threading.Event()
+    result_finished = threading.Event()
+
+    def ensure_and_mark():
+        try:
+            ensure_results.append(
+                postgres_store.ensure_provider_event_catalog_report(
+                    report,
+                    account_uuid,
+                    "queue",
+                    7,
+                )
+            )
+        except Exception as exc:  # pragma: no cover - reported by assertion below
+            failures.append(exc)
+
+    def apply_terminal_result():
+        result_started.set()
+        try:
+            postgres_store.apply_observed_report_results(
+                [
+                    {
+                        "report_uuid": report["report_uuid"],
+                        "status": terminal_status,
+                        "safe_error": {"retryable": False},
+                    }
+                ]
+            )
+        except Exception as exc:  # pragma: no cover - reported by assertion below
+            failures.append(exc)
+        finally:
+            result_finished.set()
+
+    ensure_thread = threading.Thread(target=ensure_and_mark)
+    result_thread = threading.Thread(target=apply_terminal_result)
+    ensure_thread.start()
+    assert report_locked.wait(timeout=5)
+    result_thread.start()
+    assert result_started.wait(timeout=5)
+    assert not result_finished.wait(timeout=0.2)
+
+    release_marker_update.set()
+    ensure_thread.join(timeout=5)
+    result_thread.join(timeout=5)
+
+    assert not ensure_thread.is_alive()
+    assert not result_thread.is_alive()
+    assert failures == []
+    assert ensure_results == [True]
+    with postgres_store.session() as session:
+        final_state = session.execute(
+            """
+            SELECT event.assignment_catalog_reported_at, report.result_status
+            FROM zulip_provider_events AS event
+            JOIN observed_report_outbox AS report
+              ON report.report_uuid = %s
+            WHERE event.account_uuid = %s
+              AND event.queue_id = 'queue' AND event.event_id = 7
+            """,
+            (report["report_uuid"], account_uuid),
+        ).fetchone()
+    assert final_state == {
+        "assignment_catalog_reported_at": None,
+        "result_status": terminal_status,
+    }
+
+
 def test_pending_observed_reports_supersede_older_unsent_resource_states(
     postgres_store,
 ):
@@ -1256,29 +1654,66 @@ def test_pending_observed_reports_prioritize_live_message_dependency(postgres_st
         }
         assert postgres_store.enqueue_observed_report(report)
 
-    with postgres_store.session() as session:
-        session.execute(
-            """
-            INSERT INTO zulip_provider_events (
-                account_uuid, queue_id, event_id, event_type, body
-            ) VALUES (%s, %s, 1, 'message', %s::jsonb)
-            """,
-            (
-                account_uuid,
-                queue_id,
-                json.dumps(
-                    {
-                        "id": 1,
-                        "type": "message",
-                        "message": {"id": 1, "stream_id": 1},
-                    }
-                ),
-            ),
-        )
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        queue_id,
+        {
+            "id": 1,
+            "type": "message",
+            "message": {"id": 1, "stream_id": 1},
+        },
+    )
 
     pending = postgres_store.pending_observed_reports(limit=1)
 
     assert pending[0]["catalog"]["source"]["provider_chat_key"] == "channel:1"
+
+
+def test_pending_observed_reports_prioritize_direct_fifo_head(postgres_store):
+    account_uuid = str(uuid.uuid4())
+    reports = {}
+    for chat_key in ("channel:42", "direct:9,11"):
+        report = {
+            "report_uuid": str(uuid.uuid4()),
+            "resource_type": "external_chat_catalog",
+            "resource_uuid": str(uuid.uuid4()),
+            "observed_generation": 1,
+            "status": "ready",
+            "observed_at": datetime.datetime.now(datetime.UTC).isoformat(),
+            "catalog": {
+                "external_account_uuid": account_uuid,
+                "source": {"provider_chat_key": chat_key},
+            },
+        }
+        reports[chat_key] = report
+        assert postgres_store.enqueue_observed_report(report)
+
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        {
+            "id": 1,
+            "type": "message",
+            "message": {
+                "id": 1,
+                "type": "private",
+                "display_recipient": [{"id": 11}, {"id": 9}],
+            },
+        },
+    )
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        {
+            "id": 2,
+            "type": "message",
+            "message": {"id": 2, "type": "stream", "stream_id": 42},
+        },
+    )
+
+    assert postgres_store.pending_observed_reports(limit=1) == [
+        reports["direct:9,11"]
+    ]
 
 
 def test_observed_report_hot_queries_use_migration_indexes(postgres_store):
@@ -1481,8 +1916,138 @@ def _committed_result(
     }
 
 
+def test_workspace_delivery_probe_ignores_inactive_accounts_and_provider(
+    postgres_store,
+):
+    policy_uuid = str(uuid.uuid4())
+    active_account_uuid = str(uuid.uuid4())
+    paused_account_uuid = str(uuid.uuid4())
+    active_record = {
+        "record_uuid": str(uuid.uuid4()),
+        "operation_uuid": str(uuid.uuid4()),
+        "account_uuid": active_account_uuid,
+        "operation": {
+            "kind": "identity.upsert",
+            "entity_uuid": str(uuid.uuid4()),
+        },
+    }
+    paused_record = {
+        "record_uuid": str(uuid.uuid4()),
+        "operation_uuid": str(uuid.uuid4()),
+        "account_uuid": paused_account_uuid,
+        "operation": {
+            "kind": "identity.upsert",
+            "entity_uuid": str(uuid.uuid4()),
+        },
+    }
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            INSERT INTO desired_resources (
+                resource_type, resource_uuid, generation, body, deleted
+            ) VALUES (
+                'external_provider_policy', %s, 1,
+                jsonb_build_object(
+                    'uuid', %s::text,
+                    'generation', 1,
+                    'provider_kind', 'zulip',
+                    'enabled', true,
+                    'emergency_suspended', false
+                ),
+                false
+            ), (
+                'external_account', %s, 1,
+                jsonb_build_object(
+                    'uuid', %s::text,
+                    'generation', 1,
+                    'synchronization_enabled', true
+                ),
+                false
+            ), (
+                'external_account', %s, 1,
+                jsonb_build_object(
+                    'uuid', %s::text,
+                    'generation', 1,
+                    'synchronization_enabled', false
+                ),
+                false
+            )
+            """,
+            (
+                policy_uuid,
+                policy_uuid,
+                active_account_uuid,
+                active_account_uuid,
+                paused_account_uuid,
+                paused_account_uuid,
+            ),
+        )
+        for account_uuid, record in (
+            (active_account_uuid, active_record),
+            (paused_account_uuid, paused_record),
+        ):
+            session.execute(
+                """
+                INSERT INTO workspace_delivery_outbox (
+                    record_uuid, operation_uuid, account_uuid,
+                    account_generation, priority, record
+                ) VALUES (%s, %s, %s, 1, 0, %s)
+                """,
+                (
+                    record["record_uuid"],
+                    record["operation_uuid"],
+                    account_uuid,
+                    json.dumps(record),
+                ),
+            )
+
+    assert postgres_store.has_pending_workspace_deliveries(0, 0)
+    assert postgres_store.pending_workspace_deliveries(0, 0) == [active_record]
+
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE desired_resources
+            SET body = jsonb_set(
+                    body,
+                    '{synchronization_enabled}',
+                    'false'::jsonb
+                )
+            WHERE resource_type = 'external_account' AND resource_uuid = %s
+            """,
+            (active_account_uuid,),
+        )
+    assert not postgres_store.has_pending_workspace_deliveries(0, 0)
+    assert postgres_store.pending_workspace_deliveries(0, 0) == []
+
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE desired_resources
+            SET body = CASE
+                    WHEN resource_type = 'external_account'
+                    THEN jsonb_set(
+                        body,
+                        '{synchronization_enabled}',
+                        'true'::jsonb
+                    )
+                    ELSE jsonb_set(
+                        body,
+                        '{emergency_suspended}',
+                        'true'::jsonb
+                    )
+                END
+            WHERE resource_uuid IN (%s, %s)
+            """,
+            (active_account_uuid, policy_uuid),
+        )
+    assert not postgres_store.has_pending_workspace_deliveries(0, 0)
+    assert postgres_store.pending_workspace_deliveries(0, 2) == []
+
+
 def test_message_delivery_waits_for_one_durable_topic_projection(postgres_store):
     account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    _enable_zulip_provider(postgres_store)
     _materialize_channel_projection(postgres_store, account_uuid, project_uuid)
     records = []
     for message_id in (101, 102):
@@ -1571,6 +2136,7 @@ def test_read_state_waits_until_every_message_projection_is_committed(
     postgres_store,
 ):
     account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    _enable_zulip_provider(postgres_store)
     message_uuid = str(uuid.uuid4())
     stream_uuid = str(uuid.uuid4())
     topic_uuid = str(uuid.uuid4())
@@ -1621,6 +2187,7 @@ def test_read_state_waits_until_every_message_projection_is_committed(
 
 def test_reaction_waits_until_message_projection_is_committed(postgres_store):
     account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    _enable_zulip_provider(postgres_store)
     message_uuid = str(uuid.uuid4())
     reaction_uuid = str(uuid.uuid4())
     stream_uuid = str(uuid.uuid4())
@@ -3842,6 +4409,7 @@ def test_rejected_backfill_reaction_cleanup_is_requeued_on_replay(
     account_uuid, _queue_id, canonical_uuid, stale_uuid, _records = (
         _reaction_mapping_recovery_case(postgres_store)
     )
+    _enable_zulip_provider(postgres_store)
     message = _provider_history_message(601)
     message["reactions"] = [
         {
@@ -4641,6 +5209,67 @@ def test_provider_assignment_context_survives_intervening_retry_reason(postgres_
     assert consecutive_failure == {
         "retry_count": 2,
         "processing_reason": "provider_event_processing_failed",
+    }
+
+
+def test_assignment_retry_uses_bounded_exponential_backoff(postgres_store):
+    account_uuid = str(uuid.uuid4())
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        {"id": 1, "type": "message"},
+    )
+
+    postgres_store.retry_provider_event(
+        account_uuid,
+        "queue",
+        1,
+        "provider_chat_assignment_pending",
+    )
+    with postgres_store.session() as session:
+        first = session.execute(
+            """
+            SELECT retry_count,
+                   available_at > now() + interval '500 milliseconds'
+                       AS backed_off
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = 'queue' AND event_id = 1
+            """,
+            (account_uuid,),
+        ).fetchone()
+        session.execute(
+            """
+            UPDATE zulip_provider_events
+            SET retry_count = 20, available_at = now()
+            WHERE account_uuid = %s AND queue_id = 'queue' AND event_id = 1
+            """,
+            (account_uuid,),
+        )
+
+    assert first == {"retry_count": 1, "backed_off": True}
+
+    postgres_store.retry_provider_event(
+        account_uuid,
+        "queue",
+        1,
+        "provider_chat_assignment_pending",
+    )
+    with postgres_store.session() as session:
+        capped = session.execute(
+            """
+            SELECT retry_count,
+                   available_at > now() + interval '55 seconds' AS capped_low,
+                   available_at <= now() + interval '60 seconds' AS capped_high
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = 'queue' AND event_id = 1
+            """,
+            (account_uuid,),
+        ).fetchone()
+
+    assert capped == {
+        "retry_count": 21,
+        "capped_low": True,
+        "capped_high": True,
     }
 
 
@@ -6277,6 +6906,7 @@ def test_pre_provider_result_crash_retries_same_immutable_record_until_result(
     postgres_store,
 ):
     account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    _enable_zulip_provider(postgres_store)
     record = _provider_record(account_uuid, project_uuid)
     assert postgres_store.enqueue_workspace_delivery(record, 0, "queue", 8)
 

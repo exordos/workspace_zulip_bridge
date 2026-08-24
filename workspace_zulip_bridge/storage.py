@@ -2123,8 +2123,13 @@ class RestAlchemyStore:
                         ELSE retry_count + 1
                     END,
                     available_at = now() + CASE
+                        WHEN retry.reason =
+                             'provider_chat_assignment_pending'
+                        THEN LEAST(
+                                 60,
+                                 power(2, LEAST(retry_count, 6))
+                             ) * interval '1 second'
                         WHEN retry.reason IN (
-                            'provider_chat_assignment_pending',
                             'provider_chat_participants_pending',
                             'provider_event_replay_incomplete'
                         ) THEN interval '250 milliseconds'
@@ -3111,10 +3116,14 @@ class RestAlchemyStore:
                 """
                     SELECT delivery.record FROM workspace_delivery_outbox AS delivery
                     JOIN desired_resources AS account
-                      ON account.resource_type = 'external_account'
+                     ON account.resource_type = 'external_account'
                      AND account.resource_uuid = delivery.account_uuid
                      AND account.generation = delivery.account_generation
                      AND NOT account.deleted
+                     AND COALESCE(
+                         (account.body->>'synchronization_enabled')::boolean,
+                         false
+                     )
                     LEFT JOIN desired_resources AS assignment
                       ON assignment.resource_type = 'external_chat_assignment'
                      AND assignment.resource_uuid = delivery.assignment_uuid
@@ -3125,7 +3134,30 @@ class RestAlchemyStore:
                      AND COALESCE(
                          (assignment.body->>'selected')::boolean, true
                      )
-                    WHERE delivery.sent_at IS NULL
+                    WHERE COALESCE(
+                              (
+                                  SELECT COALESCE(
+                                             (policy.body->>'enabled')::boolean,
+                                             false
+                                         )
+                                         AND NOT COALESCE(
+                                             (
+                                                 policy.body
+                                                     ->>'emergency_suspended'
+                                             )::boolean,
+                                             false
+                                         )
+                                  FROM desired_resources AS policy
+                                  WHERE policy.resource_type =
+                                        'external_provider_policy'
+                                    AND NOT policy.deleted
+                                    AND policy.body->>'provider_kind' = 'zulip'
+                                  ORDER BY policy.generation DESC
+                                  LIMIT 1
+                              ),
+                              false
+                          )
+                      AND delivery.sent_at IS NULL
                       AND (
                           delivery.submission_state IN ('pending', 'ambiguous')
                           OR (
@@ -3307,7 +3339,25 @@ class RestAlchemyStore:
         with self.session() as session:
             row = session.execute(
                 """
-                SELECT EXISTS (
+                SELECT COALESCE(
+                    (
+                        SELECT COALESCE(
+                                   (policy.body->>'enabled')::boolean,
+                                   false
+                               )
+                               AND NOT COALESCE(
+                                   (policy.body->>'emergency_suspended')::boolean,
+                                   false
+                               )
+                        FROM desired_resources AS policy
+                        WHERE policy.resource_type = 'external_provider_policy'
+                          AND NOT policy.deleted
+                          AND policy.body->>'provider_kind' = 'zulip'
+                        ORDER BY policy.generation DESC
+                        LIMIT 1
+                    ),
+                    false
+                ) AND EXISTS (
                     SELECT 1
                     FROM workspace_delivery_outbox AS delivery
                     JOIN desired_resources AS account
@@ -3315,6 +3365,10 @@ class RestAlchemyStore:
                      AND account.resource_uuid = delivery.account_uuid
                      AND account.generation = delivery.account_generation
                      AND NOT account.deleted
+                     AND COALESCE(
+                         (account.body->>'synchronization_enabled')::boolean,
+                         false
+                     )
                     LEFT JOIN desired_resources AS assignment
                       ON assignment.resource_type = 'external_chat_assignment'
                      AND assignment.resource_uuid = delivery.assignment_uuid
@@ -6633,55 +6687,121 @@ class RestAlchemyStore:
                         ),
                     )
 
-    def enqueue_observed_report(self, report: dict[str, object]) -> bool:
+    @staticmethod
+    def _enqueue_observed_report_in_session(
+        session: sessions.PgSQLSession,
+        report: dict[str, object],
+        *,
+        confirm_existing: bool,
+    ) -> bool:
+        previous = session.execute(
+            """
+            SELECT body, result_status,
+                   result_status = 'rejected'
+                   AND completed_at <=
+                       clock_timestamp() - interval '5 minutes'
+                       AS rejection_cooldown_elapsed
+            FROM (
+                SELECT body, result_status, completed_at
+                FROM observed_report_outbox
+                WHERE body->>'resource_type' = %s
+                  AND body->>'resource_uuid' = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                FOR UPDATE
+            ) AS latest
+            """,
+            (str(report["resource_type"]), str(report["resource_uuid"])),
+        ).fetchone()
+        if previous is not None:
+            previous_body = typing.cast(dict[str, object], previous["body"])
+            previous_semantic = {
+                key: value
+                for key, value in previous_body.items()
+                if key not in {"report_uuid", "observed_at"}
+            }
+            report_semantic = {
+                key: value
+                for key, value in report.items()
+                if key not in {"report_uuid", "observed_at"}
+            }
+            for semantic in (previous_semantic, report_semantic):
+                progress = semantic.get("progress")
+                if isinstance(progress, dict):
+                    semantic["progress"] = {
+                        key: value
+                        for key, value in progress.items()
+                        if key != "last_progress_at"
+                    }
+            if (
+                previous_semantic == report_semantic
+                and not previous["rejection_cooldown_elapsed"]
+            ):
+                return bool(
+                    confirm_existing
+                    and previous["result_status"] not in {"rejected", "stale"}
+                )
+        row = session.execute(
+            """
+            INSERT INTO observed_report_outbox (report_uuid, body)
+            VALUES (%s, %s)
+            ON CONFLICT (report_uuid) DO NOTHING
+            RETURNING report_uuid
+            """,
+            (str(report["report_uuid"]), json.dumps(report)),
+        ).fetchone()
+        return row is not None
+
+    def _enqueue_observed_report(
+        self,
+        report: dict[str, object],
+        *,
+        confirm_existing: bool,
+    ) -> bool:
         with self.session() as session:
-            previous = session.execute(
+            return self._enqueue_observed_report_in_session(
+                session,
+                report,
+                confirm_existing=confirm_existing,
+            )
+
+    def enqueue_observed_report(self, report: dict[str, object]) -> bool:
+        return self._enqueue_observed_report(report, confirm_existing=False)
+
+    def ensure_observed_report(self, report: dict[str, object]) -> bool:
+        """Ensure an equivalent report is still eligible to satisfy control."""
+        return self._enqueue_observed_report(report, confirm_existing=True)
+
+    def ensure_provider_event_catalog_report(
+        self,
+        report: dict[str, object],
+        account_uuid: str,
+        queue_id: str,
+        event_id: int,
+    ) -> bool:
+        """Atomically ensure a live catalog report and mark its journal event."""
+        with self.session() as session:
+            durable = self._enqueue_observed_report_in_session(
+                session,
+                report,
+                confirm_existing=True,
+            )
+            if not durable:
+                return False
+            marker = session.execute(
                 """
-                SELECT body FROM (
-                    SELECT body, result_status, completed_at
-                    FROM observed_report_outbox
-                    WHERE body->>'resource_type' = %s
-                      AND body->>'resource_uuid' = %s
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                ) AS latest
-                WHERE result_status IS DISTINCT FROM 'rejected'
-                   OR completed_at > clock_timestamp() - interval '5 minutes'
+                UPDATE zulip_provider_events
+                SET assignment_catalog_reported_at = COALESCE(
+                        assignment_catalog_reported_at,
+                        now()
+                    )
+                WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
+                  AND processing_state = 'pending'
+                RETURNING assignment_catalog_reported_at
                 """,
-                (str(report["resource_type"]), str(report["resource_uuid"])),
+                (account_uuid, queue_id, event_id),
             ).fetchone()
-            if previous is not None:
-                previous_body = typing.cast(dict[str, object], previous["body"])
-                previous_semantic = {
-                    key: value
-                    for key, value in previous_body.items()
-                    if key not in {"report_uuid", "observed_at"}
-                }
-                report_semantic = {
-                    key: value
-                    for key, value in report.items()
-                    if key not in {"report_uuid", "observed_at"}
-                }
-                for semantic in (previous_semantic, report_semantic):
-                    progress = semantic.get("progress")
-                    if isinstance(progress, dict):
-                        semantic["progress"] = {
-                            key: value
-                            for key, value in progress.items()
-                            if key != "last_progress_at"
-                        }
-                if previous_semantic == report_semantic:
-                    return False
-            row = session.execute(
-                """
-                INSERT INTO observed_report_outbox (report_uuid, body)
-                VALUES (%s, %s)
-                ON CONFLICT (report_uuid) DO NOTHING
-                RETURNING report_uuid
-                """,
-                (str(report["report_uuid"]), json.dumps(report)),
-            ).fetchone()
-            return row is not None
+            return marker is not None
 
     def pending_observed_reports(self, limit: int = 500) -> list[dict[str, object]]:
         with self.session() as session:
@@ -6706,15 +6826,51 @@ class RestAlchemyStore:
             )
             rows = session.execute(
                 """
-                WITH dependency_chats AS (
-                    SELECT DISTINCT
-                           account_uuid::text AS account_uuid,
-                           'channel:' || (body->'message'->>'stream_id')
-                               AS provider_chat_key
-                    FROM zulip_provider_events
-                    WHERE processing_state = 'pending'
-                      AND body->>'type' = 'message'
-                      AND body->'message'->>'stream_id' IS NOT NULL
+                WITH dependency_heads AS MATERIALIZED (
+                    SELECT journal.account_uuid, event.body
+                    FROM scheduler_accounts AS journal
+                    JOIN LATERAL (
+                        SELECT body
+                        FROM zulip_provider_events
+                        WHERE account_uuid = journal.account_uuid
+                          AND processing_state = 'pending'
+                        ORDER BY created_at, event_id, queue_id
+                        LIMIT 1
+                    ) AS event ON true
+                    WHERE event.body->>'type' = 'message'
+                ), dependency_chats AS (
+                    SELECT account_uuid::text AS account_uuid,
+                           CASE
+                               WHEN body->'message'->>'stream_id' IS NOT NULL
+                               THEN 'channel:' ||
+                                    (body->'message'->>'stream_id')
+                               WHEN jsonb_typeof(
+                                        body->'message'->'display_recipient'
+                                    ) = 'array'
+                               THEN CASE
+                                        WHEN jsonb_array_length(
+                                                 body->'message'
+                                                     ->'display_recipient'
+                                             ) = 2
+                                        THEN 'direct:'
+                                        ELSE 'group_direct:'
+                                    END || COALESCE(
+                                        (
+                                            SELECT string_agg(
+                                                participant->>'id',
+                                                ',' ORDER BY
+                                                (participant->>'id')::bigint
+                                            )
+                                            FROM jsonb_array_elements(
+                                                body->'message'
+                                                    ->'display_recipient'
+                                            ) AS participant
+                                            WHERE participant->>'id' ~ '^[0-9]+$'
+                                        ),
+                                        ''
+                                    )
+                           END AS provider_chat_key
+                    FROM dependency_heads
                 ), pending AS (
                     SELECT report.body, report.created_at, report.report_uuid,
                            dependency.account_uuid IS NOT NULL
@@ -6754,6 +6910,75 @@ class RestAlchemyStore:
             ).fetchall()
             return [typing.cast(dict[str, object], row["body"]) for row in rows]
 
+    @staticmethod
+    def _clear_unapplied_catalog_report_markers(
+        session: sessions.PgSQLSession,
+        report_uuid: str,
+    ) -> None:
+        """Allow dependency events to republish after an unapplied result."""
+        session.execute(
+            """
+            WITH unapplied_catalog AS (
+                SELECT body->'catalog'->>'external_account_uuid'
+                           AS account_uuid,
+                       body->'catalog'->'source'->>'provider_chat_key'
+                           AS provider_chat_key
+                FROM observed_report_outbox
+                WHERE report_uuid = %s
+                  AND body->>'resource_type' = 'external_chat_catalog'
+            ), event_messages AS (
+                SELECT event.account_uuid, event.queue_id, event.event_id,
+                       unapplied.provider_chat_key,
+                       CASE
+                           WHEN event.body->>'type' = 'message'
+                           THEN event.body->'message'
+                           WHEN event.body->>'type' = 'reaction'
+                           THEN event.provider_message_context
+                       END AS message
+                FROM zulip_provider_events AS event
+                JOIN unapplied_catalog AS unapplied
+                  ON unapplied.account_uuid = event.account_uuid::text
+                WHERE event.processing_state = 'pending'
+                  AND event.assignment_catalog_reported_at IS NOT NULL
+            ), matching_events AS (
+                SELECT account_uuid, queue_id, event_id
+                FROM event_messages
+                WHERE CASE
+                          WHEN message->>'stream_id' IS NOT NULL
+                          THEN 'channel:' || (message->>'stream_id')
+                          WHEN jsonb_typeof(message->'display_recipient') = 'array'
+                          THEN CASE
+                                   WHEN jsonb_array_length(
+                                            message->'display_recipient'
+                                        ) = 2
+                                   THEN 'direct:'
+                                   ELSE 'group_direct:'
+                               END || COALESCE(
+                                   (
+                                       SELECT string_agg(
+                                           participant->>'id',
+                                           ',' ORDER BY
+                                           (participant->>'id')::bigint
+                                       )
+                                       FROM jsonb_array_elements(
+                                           message->'display_recipient'
+                                       ) AS participant
+                                       WHERE participant->>'id' ~ '^[0-9]+$'
+                                   ),
+                                   ''
+                               )
+                      END = provider_chat_key
+            )
+            UPDATE zulip_provider_events AS event
+            SET assignment_catalog_reported_at = NULL
+            FROM matching_events AS matching
+            WHERE event.account_uuid = matching.account_uuid
+              AND event.queue_id = matching.queue_id
+              AND event.event_id = matching.event_id
+            """,
+            (report_uuid,),
+        )
+
     def apply_observed_report_results(self, results: list[dict[str, object]]) -> None:
         terminal_statuses = {"applied", "duplicate", "stale"}
         with self.session() as session:
@@ -6775,6 +7000,11 @@ class RestAlchemyStore:
                         """,
                         (status, report_uuid),
                     )
+                    if status in {"rejected", "stale"}:
+                        self._clear_unapplied_catalog_report_markers(
+                            session,
+                            report_uuid,
+                        )
                     continue
                 session.execute(
                     """

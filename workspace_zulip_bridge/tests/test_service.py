@@ -41,12 +41,16 @@ class SnapshotStore:
     def __init__(self, cursor):
         self.cursor = cursor
         self.installed = []
+        self.stale_recoveries = 0
 
     def control_cursor(self):
         return self.cursor
 
     def install_snapshot(self, resources, anchor):
         self.installed.append((resources, anchor))
+
+    def reset_stale_workspace_deliveries(self):
+        self.stale_recoveries += 1
 
 
 def _service(store, api):
@@ -275,6 +279,7 @@ def test_zb_control_001_snapshot_pages_are_collected_before_atomic_install():
     assert api.pages == [None, "page-2"]
     assert [resource["uuid"] for resource in store.installed[0][0]] == ["a", "b"]
     assert store.installed[0][1] == "anchor"
+    assert store.stale_recoveries == 1
 
 
 def test_zb_control_001_expired_cursor_does_not_install_empty_reset():
@@ -895,6 +900,37 @@ def test_run_recovers_interrupted_deliveries_before_starting_workers(monkeypatch
     assert len([name for name in started if "live-delivery" in name]) == 1
 
 
+def test_live_delivery_dependency_stall_updates_health_once_and_recovers():
+    health = []
+
+    class Store:
+        def mark_health(self, component, status, code=None):
+            health.append((component, status, code))
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance.LIVE_DELIVERY_STALL_THRESHOLD_SECONDS = 5.0
+
+    instance._record_live_delivery_stall(10.0)
+    instance._record_live_delivery_stall(14.9)
+    assert health == []
+
+    instance._record_live_delivery_stall(15.0)
+    instance._record_live_delivery_stall(20.0)
+    assert health == [
+        (
+            "provider_delivery",
+            "degraded",
+            "workspace_delivery_dependency_stalled",
+        )
+    ]
+
+    instance._clear_live_delivery_stall()
+    instance._clear_live_delivery_stall()
+    assert health[-1] == ("provider_delivery", "healthy", None)
+    assert len(health) == 2
+
+
 def test_background_heartbeat_lane_surfaces_unexpected_failure(monkeypatch):
     class StopHeartbeat(Exception):
         pass
@@ -1443,7 +1479,7 @@ def test_reaction_event_for_selected_chat_waits_for_message_mapping():
     instance = _delivery_service(store)
     catalog_events = []
     instance._queue_event_catalog = (
-        lambda requested, event, server_url: catalog_events.append(
+        lambda requested, event, server_url, marker=None: catalog_events.append(
             (requested, event, server_url)
         )
     )
@@ -1551,7 +1587,7 @@ def test_reaction_event_for_uncatalogued_chat_has_bounded_assignment_wait(
     instance = _delivery_service(store)
     catalog_events = []
     instance._queue_event_catalog = (
-        lambda requested, event, server_url: catalog_events.append(
+        lambda requested, event, server_url, marker=None: catalog_events.append(
             (requested, event, server_url)
         )
     )
@@ -1671,8 +1707,10 @@ def test_reaction_assignment_poll_reuses_persisted_message_context():
     instance = _delivery_service(store)
     fetches = []
     catalog_events = []
-    def queue_catalog(account, event, server):
+    def queue_catalog(account, event, server, marker=None):
         catalog_events.append((account, event, server))
+        if event.get("type") == "message" and marker is not None:
+            store.mark_provider_event_catalog_reported(*marker)
         return event.get("type") == "message"
 
     instance._queue_event_catalog = queue_catalog
@@ -1712,8 +1750,8 @@ def test_reaction_assignment_poll_reuses_persisted_message_context():
 
     assert instance.process_provider_journal() == 0
     assert fetches == [601]
-    assert len(catalog_events) == 3
-    assert catalog_events[-1][1]["type"] == "reaction"
+    assert len(catalog_events) == 2
+    assert catalog_events[-1][1]["type"] == "message"
     assert store.catalog_marks == [(account_uuid, "queue", 7)]
     assert [retry[-1] for retry in store.retried] == [
         "provider_chat_assignment_pending",
@@ -1777,13 +1815,15 @@ def test_reaction_catalog_publication_retries_row_before_durable_marker():
     catalog_attempts = []
     stop_before_durable = True
 
-    def queue_catalog(account, event, server):
+    def queue_catalog(account, event, server, marker=None):
         nonlocal stop_before_durable
         if event.get("type") != "message":
             return
         catalog_attempts.append((account, event, server))
         if stop_before_durable:
             raise RuntimeError("process stopped before durable catalog enqueue")
+        assert marker is not None
+        store.mark_provider_event_catalog_reported(*marker)
         return True
 
     instance._queue_event_catalog = queue_catalog
@@ -3623,7 +3663,7 @@ def test_suppressed_account_report_is_retried_after_cooldown(monkeypatch):
     assert account_uuid not in instance.provider_account_report_retry_after
 
 
-def test_observed_reports_can_resolve_a_pending_live_journal_dependency():
+def test_observed_reports_can_resolve_dependency_with_ready_live_delivery():
     calls = []
 
     class Store:
@@ -3631,8 +3671,8 @@ def test_observed_reports_can_resolve_a_pending_live_journal_dependency():
             return True
 
         def has_pending_workspace_deliveries(self, minimum, maximum):
-            calls.append((minimum, maximum))
-            return False
+            calls.append(("ready-deliveries", minimum, maximum))
+            return True
 
     instance = object.__new__(service.BridgeService)
     instance.store = Store()
@@ -3641,7 +3681,76 @@ def test_observed_reports_can_resolve_a_pending_live_journal_dependency():
     instance._set_control_lane_health = lambda *args: None
 
     assert instance._flush_observed_reports(1.0) == 1
-    assert calls == [(0, 0), "reports"]
+    assert calls == ["reports"]
+
+
+def test_message_catalog_is_published_once_across_assignment_retries(monkeypatch):
+    account_uuid = "00000000-0000-0000-0000-000000000001"
+    event = {
+        "id": 7,
+        "type": "message",
+        "message": {
+            "id": 601,
+            "type": "stream",
+            "stream_id": 42,
+            "display_recipient": "Engineering",
+            "subject": "New topic",
+        },
+    }
+
+    class Store(DeliveryStore):
+        def __init__(self, events):
+            super().__init__(events)
+            self.catalog_marks = []
+
+        def mark_provider_event_catalog_reported(
+            self, requested_account, queue_id, event_id
+        ):
+            self.catalog_marks.append((requested_account, queue_id, event_id))
+            return True
+
+    first_row = {
+        "account_uuid": account_uuid,
+        "queue_id": "queue",
+        "event_id": 7,
+        "assignment_catalog_reported_at": None,
+        "body": event,
+    }
+    store = Store([first_row])
+    instance = _delivery_service(store)
+    catalog_events = []
+    instance._queue_event_catalog = (
+        lambda requested, supplied, server_url, marker=None: (
+            catalog_events.append((requested, supplied, server_url))
+            or (store.mark_provider_event_catalog_reported(*marker) if marker else True)
+        )
+    )
+    monkeypatch.setattr(
+        instance,
+        "_event_records_with_pending_delete_recreations",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("provider_chat_assignment_pending")
+        ),
+    )
+
+    assert instance.process_provider_journal() == 0
+    assert len(catalog_events) == 1
+    assert store.catalog_marks == [(account_uuid, "queue", 7)]
+
+    store.events = [
+        {
+            **first_row,
+            "assignment_catalog_reported_at": datetime.datetime.now(datetime.UTC),
+            "processing_reason": "provider_chat_assignment_pending",
+        }
+    ]
+    assert instance.process_provider_journal() == 0
+    assert len(catalog_events) == 1
+    assert store.catalog_marks == [(account_uuid, "queue", 7)]
+    assert [retry[-1] for retry in store.retried] == [
+        "provider_chat_assignment_pending",
+        "provider_chat_assignment_pending",
+    ]
 
 
 def test_retryable_attachment_failure_reschedules_only_the_current_event(monkeypatch):
@@ -5558,6 +5667,7 @@ def test_incompatible_desired_batch_blocks_without_advancing_and_recovers():
             self.cursor = "cursor-1"
             self.blocked = None
             self.compatible = False
+            self.stale_recoveries = 0
 
         def control_cursor(self):
             return self.cursor
@@ -5572,6 +5682,9 @@ def test_incompatible_desired_batch_blocks_without_advancing_and_recovers():
 
         def clear_blocked_batch(self):
             self.blocked = None
+
+        def reset_stale_workspace_deliveries(self):
+            self.stale_recoveries += 1
 
         def mark_health(self, *args):
             pass
@@ -5589,6 +5702,7 @@ def test_incompatible_desired_batch_blocks_without_advancing_and_recovers():
     instance.control = Client()
     assert instance.synchronize_control() is False
     assert instance.store.cursor == "cursor-1"
+    assert instance.store.stale_recoveries == 0
     assert instance.store.blocked == {
         "cursor": "cursor-1",
         "next_cursor": "cursor-2",
@@ -5598,6 +5712,7 @@ def test_incompatible_desired_batch_blocks_without_advancing_and_recovers():
     assert instance.synchronize_control() is True
     assert instance.store.cursor == "cursor-2"
     assert instance.store.blocked is None
+    assert instance.store.stale_recoveries == 1
 
 
 def test_certificate_renewal_failure_is_degraded_without_stopping_message_work():

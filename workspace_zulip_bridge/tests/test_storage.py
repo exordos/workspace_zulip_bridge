@@ -120,10 +120,13 @@ def test_pending_workspace_delivery_probe_requires_current_account_and_assignmen
 
     assert store.has_pending_workspace_deliveries(0, 0)
     statement, parameters = session.statements[0]
-    assert "SELECT EXISTS" in statement
+    assert "AND EXISTS" in statement
     assert "workspace_delivery_outbox" in statement
     assert "JOIN desired_resources AS account" in statement
     assert "LEFT JOIN desired_resources AS assignment" in statement
+    assert "account.body->>'synchronization_enabled'" in statement
+    assert "policy.body->>'enabled'" in statement
+    assert "policy.body->>'emergency_suspended'" in statement
     assert "delivery.assignment_uuid IS NULL" in statement
     assert "OR assignment.resource_uuid IS NOT NULL" in statement
     assert parameters == (0, 0)

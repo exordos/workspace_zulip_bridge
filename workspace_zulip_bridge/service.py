@@ -212,6 +212,8 @@ class BridgeService:
     # runs across independent workers.
     BACKGROUND_LIVE_DELIVERY_WORKERS = 1
     LIVE_DELIVERY_BATCH_SIZE = 100
+    LIVE_DELIVERY_DEPENDENCY_RECHECK_SECONDS = 1.0
+    LIVE_DELIVERY_STALL_THRESHOLD_SECONDS = 300.0
     PROVIDER_JOURNAL_QUANTUM = 20
     PROVIDER_JOURNAL_WORKERS = 16
     PROVIDER_EVENT_FAILURE_MAX_ATTEMPTS = 5
@@ -352,6 +354,13 @@ class BridgeService:
             return False
         self.store.clear_blocked_batch()
         if changes:
+            reset_stale_deliveries = getattr(
+                self.store,
+                "reset_stale_workspace_deliveries",
+                None,
+            )
+            if callable(reset_stale_deliveries):
+                reset_stale_deliveries()
             self.control_state_dirty = True
             getattr(self, "initial_sync_ready_accounts", set()).clear()
             getattr(self, "initial_sync_probe_after", {}).clear()
@@ -387,6 +396,13 @@ class BridgeService:
                 raise ValueError("Control snapshot page cursor repeated")
             seen_page_cursors.add(page_cursor)
         self.store.install_snapshot(resources, str(session["anchor_cursor"]))
+        reset_stale_deliveries = getattr(
+            self.store,
+            "reset_stale_workspace_deliveries",
+            None,
+        )
+        if callable(reset_stale_deliveries):
+            reset_stale_deliveries()
         self.control_state_dirty = True
         getattr(self, "initial_sync_ready_accounts", set()).clear()
         getattr(self, "initial_sync_probe_after", {}).clear()
@@ -517,8 +533,9 @@ class BridgeService:
     def _flush_observed_reports(self, now: float) -> int:
         if now < getattr(self, "control_retry_after", 0.0):
             return 0
-        if self._ready_live_workspace_delivery_pending():
-            return 0
+        # Catalog reports can satisfy the assignment dependency blocking the
+        # live journal.  Delivery has its own worker, so a ready delivery must
+        # not hold the control-plane report behind it.
         try:
             sent = self.flush_observed_reports()
         except (httpx.TransportError, control.ControlRetryableError) as exc:
@@ -850,6 +867,8 @@ class BridgeService:
         phase: str,
         catalog: dict[str, object] | None = None,
         safe_error_code: str | None = None,
+        ensure_durable: bool = False,
+        provider_event_marker: tuple[str, str, int] | None = None,
     ) -> bool:
         observed_at = (
             datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
@@ -879,7 +898,30 @@ class BridgeService:
         if catalog is not None:
             report["catalog"] = catalog
         report["report_uuid"] = self._observed_report_uuid(report)
-        return self.store.enqueue_observed_report(report)
+        if ensure_durable:
+            if provider_event_marker is not None:
+                ensure_event_report = getattr(
+                    self.store,
+                    "ensure_provider_event_catalog_report",
+                    None,
+                )
+                if callable(ensure_event_report):
+                    return bool(ensure_event_report(report, *provider_event_marker))
+            ensure_report = getattr(self.store, "ensure_observed_report", None)
+            if callable(ensure_report):
+                durable = bool(ensure_report(report))
+            else:
+                durable = bool(self.store.enqueue_observed_report(report))
+            if durable and provider_event_marker is not None:
+                mark_reported = getattr(
+                    self.store,
+                    "mark_provider_event_catalog_reported",
+                    None,
+                )
+                if callable(mark_reported):
+                    return bool(mark_reported(*provider_event_marker))
+            return durable
+        return bool(self.store.enqueue_observed_report(report))
 
     def _queue_account_report(
         self,
@@ -1338,7 +1380,8 @@ class BridgeService:
         authoritative_participants: bool = False,
         provider_realm_uuid: str | None = None,
         provider_owner_user_id: str | None = None,
-    ) -> None:
+        provider_event_marker: tuple[str, str, int] | None = None,
+    ) -> bool:
         if provider_realm_uuid is None or provider_owner_user_id is None:
             cursor = self.store.provider_event_cursor(account_uuid)
             if cursor is None:
@@ -1419,7 +1462,7 @@ class BridgeService:
         external_chat_uuid = converter.stable_entity_uuid(
             account_uuid, "external_chat", chat_key
         )
-        self._queue_observed_report(
+        return self._queue_observed_report(
             "external_chat_catalog",
             external_chat_uuid,
             generation,
@@ -1445,6 +1488,8 @@ class BridgeService:
                 "topics": topics or [],
                 "capabilities": capabilities,
             },
+            ensure_durable=True,
+            provider_event_marker=provider_event_marker,
         )
 
     @staticmethod
@@ -1491,7 +1536,11 @@ class BridgeService:
         )
 
     def _queue_event_catalog(
-        self, account_uuid: str, event: dict[str, object], server_url: str
+        self,
+        account_uuid: str,
+        event: dict[str, object],
+        server_url: str,
+        provider_event_marker: tuple[str, str, int] | None = None,
     ) -> bool:
         account = self.store.account_resource(account_uuid)
         if account is None:
@@ -1543,7 +1592,7 @@ class BridgeService:
             else:
                 return False
             if display_name:
-                self._queue_catalog_report(
+                return self._queue_catalog_report(
                     account_uuid,
                     *common,
                     chat_key,
@@ -1562,8 +1611,8 @@ class BridgeService:
                             }
                         ]
                     ),
+                    provider_event_marker=provider_event_marker,
                 )
-                return True
             return False
         if event_type != "subscription":
             return False
@@ -1597,7 +1646,7 @@ class BridgeService:
             display_name = subscription.get("name")
             if not isinstance(stream_id, int) or not isinstance(display_name, str):
                 continue
-            self._queue_catalog_report(
+            catalog_changed = self._queue_catalog_report(
                 account_uuid,
                 *common,
                 f"channel:{stream_id}",
@@ -1605,8 +1654,7 @@ class BridgeService:
                 display_name,
                 server_url,
                 "delete" if operation == "remove" else "upsert",
-            )
-            catalog_changed = True
+            ) or catalog_changed
         return catalog_changed
 
     def _initial_sync_ready(self, account_uuid: str) -> bool:
@@ -2391,7 +2439,17 @@ class BridgeService:
                 continue
             try:
                 supported = str(event["type"]) in supported_types
-                self._queue_event_catalog(account_uuid, event, adapter.server_url)
+                if row.get("assignment_catalog_reported_at") is None:
+                    self._queue_event_catalog(
+                        account_uuid,
+                        event,
+                        adapter.server_url,
+                        (
+                            (account_uuid, queue_id, event_id)
+                            if event["type"] == "message"
+                            else None
+                        ),
+                    )
                 external_chat_uuid = uuid.UUID(int=0)
                 if event["type"] == "message":
                     message = typing.cast(dict[str, object], event["message"])
@@ -2490,30 +2548,17 @@ class BridgeService:
                                 # A reaction can be the first live event that
                                 # exposes an older direct chat omitted from
                                 # Zulip's registration snapshot. Publish it
-                                # once, then persist the publication boundary.
-                                # If the process stops before that marker, the
-                                # durable outbox deduplicates the safe retry.
-                                catalog_reported = self._queue_event_catalog(
+                                # once and persist the publication boundary in
+                                # the same storage transaction.
+                                self._queue_event_catalog(
                                     account_uuid,
                                     {
                                         "type": "message",
                                         "message": provider_message,
                                     },
                                     adapter.server_url,
+                                    (account_uuid, queue_id, event_id),
                                 )
-                                mark_catalog_reported = getattr(
-                                    self.store,
-                                    "mark_provider_event_catalog_reported",
-                                    None,
-                                )
-                                if catalog_reported and callable(
-                                    mark_catalog_reported
-                                ):
-                                    mark_catalog_reported(
-                                        account_uuid,
-                                        queue_id,
-                                        event_id,
-                                    )
                             raise
                         provider_timestamp = provider_message.get("timestamp")
                         provider_message_time = None
@@ -3385,6 +3430,31 @@ class BridgeService:
                 self.background_live_error = error
                 return
 
+    def _record_live_delivery_stall(self, now: float | None = None) -> None:
+        """Expose a durable dependency stall without hot-looping health writes."""
+        if now is None:
+            now = time.monotonic()
+        stalled_since = getattr(self, "live_delivery_stalled_since", None)
+        if stalled_since is None:
+            self.live_delivery_stalled_since = now
+            return
+        if getattr(self, "live_delivery_stall_reported", False):
+            return
+        if now - stalled_since < self.LIVE_DELIVERY_STALL_THRESHOLD_SECONDS:
+            return
+        self.store.mark_health(
+            "provider_delivery",
+            "degraded",
+            "workspace_delivery_dependency_stalled",
+        )
+        self.live_delivery_stall_reported = True
+
+    def _clear_live_delivery_stall(self) -> None:
+        if getattr(self, "live_delivery_stall_reported", False):
+            self.store.mark_health("provider_delivery", "healthy")
+        self.live_delivery_stalled_since = None
+        self.live_delivery_stall_reported = False
+
     def _run_background_live_delivery_lane(self) -> None:
         """Submit durable live records without racing Zulip journal conversion."""
         while True:
@@ -3395,6 +3465,7 @@ class BridgeService:
                     continue
                 pending = getattr(self.store, "has_pending_workspace_deliveries", None)
                 if callable(pending) and not pending(0, 0):
+                    self._clear_live_delivery_stall()
                     time.sleep(0.05)
                     continue
                 delivered = self.flush_provider_events(
@@ -3402,8 +3473,14 @@ class BridgeService:
                     maximum_priority=0,
                     limit=self._live_delivery_batch_size(),
                 )
-                if not delivered:
-                    time.sleep(0.05)
+                if delivered:
+                    self._clear_live_delivery_stall()
+                else:
+                    self._record_live_delivery_stall()
+                    # The cheap readiness probe intentionally ignores causal
+                    # dependencies.  Avoid hot-looping the full selector while
+                    # a read or reaction waits for its message mapping.
+                    time.sleep(self.LIVE_DELIVERY_DEPENDENCY_RECHECK_SECONDS)
             except (httpx.TransportError, provider_api.ProviderApiRetryableError):
                 self.store.mark_health(
                     "provider_api", "degraded", "provider_api_unavailable"
