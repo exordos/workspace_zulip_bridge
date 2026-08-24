@@ -860,6 +860,9 @@ def test_large_profile_scales_live_conversion_and_delivery_batches():
 
     assert instance._provider_journal_worker_count() == 16
     assert instance._live_delivery_batch_size() == 100
+    assert instance._history_worker_count() == 8
+    assert instance._history_delivery_batch_size(live_pending=False) == 100
+    assert instance._history_delivery_batch_size(live_pending=True) == 1
 
 
 def test_run_recovers_interrupted_deliveries_before_starting_workers(monkeypatch):
@@ -3584,6 +3587,7 @@ def test_tick_reconciles_global_backfill_state_once_not_once_per_account(
     instance.flush_provider_events = (
         lambda minimum_priority=0, maximum_priority=2, limit=100: 0
     )
+    instance._flush_history_events = lambda: (0, 20, True)
     instance.run_backfill_once = lambda: False
 
     assert not instance.tick()
@@ -4171,7 +4175,112 @@ def test_backfill_bounds_catalog_and_message_transactions(monkeypatch):
         )
         == 12
     )
-    assert store.transactions == 13
+    assert store.transactions == 4
+
+
+def test_backfill_uses_single_message_transactions_while_live_work_is_pending(
+    monkeypatch,
+):
+    class Store(DeliveryStore):
+        def __init__(self):
+            super().__init__()
+            self.transactions = 0
+
+        @contextlib.contextmanager
+        def transaction(self):
+            self.transactions += 1
+            yield
+
+    store = Store()
+    monkeypatch.setattr(
+        converter,
+        "event_records",
+        lambda *args, **kwargs: [
+            {
+                "record_uuid": f"record-{args[3]['message']['id']}",
+                "operation_uuid": f"operation-{args[3]['message']['id']}",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        converter, "provider_chat_reference", lambda message: ("channel", "channel:42")
+    )
+    instance = _delivery_service(store)
+    instance._live_workspace_delivery_pending = lambda: True
+
+    assert (
+        instance.enqueue_backfill(
+            "00000000-0000-0000-0000-000000000001",
+            "channel:42",
+            [{"id": value, "timestamp": value} for value in range(1, 13)],
+        )
+        == 12
+    )
+    assert store.transactions == 24
+
+
+def test_backfill_isolates_attachment_transfers_from_batched_transactions(
+    monkeypatch,
+):
+    class Store(DeliveryStore):
+        def __init__(self):
+            super().__init__()
+            self.current_transaction = None
+            self.completed_transactions = []
+
+        @contextlib.contextmanager
+        def transaction(self):
+            self.current_transaction = []
+            try:
+                yield
+            finally:
+                self.completed_transactions.append(self.current_transaction)
+                self.current_transaction = None
+
+    store = Store()
+
+    def records(*args, **kwargs):
+        message_id = int(args[3]["message"]["id"])
+        store.current_transaction.append(message_id)
+        return [
+            {
+                "record_uuid": f"record-{message_id}",
+                "operation_uuid": f"operation-{message_id}",
+            }
+        ]
+
+    monkeypatch.setattr(converter, "event_records", records)
+    monkeypatch.setattr(
+        converter, "provider_chat_reference", lambda message: ("channel", "channel:42")
+    )
+    instance = _delivery_service(store)
+    instance.file_client = object()
+    messages = [
+        {
+            "id": value,
+            "timestamp": value,
+            "content": (
+                "[report.pdf](/user_uploads/report.pdf)"
+                if value == 6
+                else f"message {value}"
+            ),
+        }
+        for value in range(1, 13)
+    ]
+
+    assert (
+        instance.enqueue_backfill(
+            "00000000-0000-0000-0000-000000000001",
+            "channel:42",
+            messages,
+        )
+        == 12
+    )
+    assert store.completed_transactions[-3:] == [
+        [12, 11, 10, 9, 8, 7],
+        [6],
+        [5, 4, 3, 2, 1],
+    ]
 
 
 def test_backfill_keeps_first_accepted_digest_for_repeated_history(monkeypatch):
@@ -4560,20 +4669,15 @@ def test_live_pending_probe_uses_cheap_outbox_exists_query():
     assert calls == [(0, 0)]
 
 
-def test_history_delivery_quantum_is_bounded_for_live_preemption():
+def test_idle_history_uses_full_large_profile_delivery_batch():
     calls = []
 
-    class Store:
-        def has_pending_provider_events(self):
-            return False
-
-        def pending_workspace_deliveries(self, **kwargs):
-            return []
-
     instance = object.__new__(service.BridgeService)
-    instance.store = Store()
     instance.provider_batch_size = 100
-    instance.flush_provider_events = lambda **kwargs: calls.append(kwargs) or 2
+    instance._live_workspace_delivery_pending = lambda: False
+    instance._flush_provider_events_locked = (
+        lambda **kwargs: calls.append(kwargs) or 100
+    )
     instance._run_history_quantum_once = lambda: False
 
     assert instance._run_history_lane_once()
@@ -4584,6 +4688,24 @@ def test_history_delivery_quantum_is_bounded_for_live_preemption():
             "limit": service.BridgeService.HISTORY_DELIVERY_BATCH_SIZE,
         }
     ]
+
+
+def test_provider_delivery_backoff_pauses_history_discovery(monkeypatch):
+    now = [10.0]
+    calls = []
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+
+    instance = object.__new__(service.BridgeService)
+    instance.provider_batch_size = 100
+    instance.provider_delivery_retry_after = now[0] + 30.0
+    instance._live_workspace_delivery_pending = lambda: False
+    instance._flush_provider_events_locked = lambda **kwargs: (_ for _ in ()).throw(
+        AssertionError("history delivery must remain paused during Provider backoff")
+    )
+    instance._run_history_quantum_once = lambda: calls.append("discovery") or True
+
+    assert not instance._run_history_lane_once()
+    assert calls == []
 
 
 def test_background_live_worker_does_not_race_dedicated_delivery_worker():
@@ -4621,14 +4743,18 @@ def test_history_workers_serialize_delivery_selection_and_submission():
     instance._live_workspace_delivery_pending = lambda: False
     instance._run_history_quantum_once = lambda: False
 
-    def flush_provider_events(**kwargs):
-        calls.append(kwargs)
+    def flush_history_events():
+        calls.append("history")
         if len(calls) == 1:
             first_delivery_started.set()
             assert release_first_delivery.wait(timeout=1.0)
-        return service.BridgeService.HISTORY_DELIVERY_BATCH_SIZE
+        return (
+            service.BridgeService.HISTORY_DELIVERY_BATCH_SIZE,
+            service.BridgeService.HISTORY_DELIVERY_BATCH_SIZE,
+            True,
+        )
 
-    instance.flush_provider_events = flush_provider_events
+    instance._flush_history_events = flush_history_events
 
     first_worker = threading.Thread(target=instance._run_history_lane_once)
     second_worker = threading.Thread(
@@ -4651,6 +4777,47 @@ def test_history_workers_serialize_delivery_selection_and_submission():
     assert not first_worker.is_alive()
     assert not second_worker.is_alive()
     assert len(calls) == 2
+
+
+def test_history_rechecks_live_work_after_waiting_for_provider_mutex(monkeypatch):
+    started = threading.Event()
+    live_pending = [False]
+    calls = []
+    result = []
+    now = [10.0]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+
+    instance = object.__new__(service.BridgeService)
+    instance.provider_batch_size = 100
+    instance.last_history_quantum = now[0] - 1.0
+    instance.provider_delivery_lock = threading.Lock()
+    instance._live_workspace_delivery_pending = lambda: live_pending[0]
+    instance._flush_provider_events_locked = (
+        lambda **kwargs: calls.append(kwargs) or 1
+    )
+
+    instance.provider_delivery_lock.acquire()
+
+    def flush_history():
+        started.set()
+        result.append(instance._flush_history_events())
+
+    worker = threading.Thread(target=flush_history)
+    worker.start()
+    assert started.wait(timeout=1.0)
+    live_pending[0] = True
+    instance.provider_delivery_lock.release()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert result == [(1, 1, True)]
+    assert calls == [
+        {
+            "minimum_priority": 2,
+            "maximum_priority": 2,
+            "limit": service.BridgeService.HISTORY_LIVE_DELIVERY_BATCH_SIZE,
+        }
+    ]
 
 
 def test_continuous_live_work_still_runs_bounded_history_quantum(tmp_path, monkeypatch):
@@ -4685,13 +4852,19 @@ def test_continuous_live_work_still_runs_bounded_history_quantum(tmp_path, monke
             calls.append(f"delivery:{minimum_priority}:{maximum_priority}:{limit}") or 0
         )
     )
+    instance._flush_history_events = lambda: (
+        calls.append(
+            f"delivery:2:2:{service.BridgeService.HISTORY_LIVE_DELIVERY_BATCH_SIZE}"
+        )
+        or (0, service.BridgeService.HISTORY_LIVE_DELIVERY_BATCH_SIZE, True)
+    )
     instance.run_backfill_once = lambda: calls.append("backfill") or True
 
     assert instance.tick()
     assert calls == [
         "live",
         "delivery:0:0:20",
-        f"delivery:2:2:{service.BridgeService.HISTORY_DELIVERY_BATCH_SIZE}",
+        f"delivery:2:2:{service.BridgeService.HISTORY_LIVE_DELIVERY_BATCH_SIZE}",
         "backfill",
     ]
 
@@ -4729,6 +4902,7 @@ def test_history_quantum_runs_in_the_main_service_thread(tmp_path, monkeypatch):
     instance.process_provider_journal = lambda: 0
     instance.flush_provider_results = lambda: 0
     instance.flush_provider_events = lambda **kwargs: 0
+    instance._flush_history_events = lambda: (0, 20, True)
 
     def history():
         history_threads.append(threading.get_ident())
@@ -4819,6 +4993,7 @@ def test_longpoll_persists_live_event_while_main_thread_runs_history(
     instance.process_provider_journal = lambda: 0
     instance.flush_provider_results = lambda: 0
     instance.flush_provider_events = lambda **kwargs: 0
+    instance._flush_history_events = lambda: (0, 20, True)
     instance._flush_observed_reports = lambda current: 0
 
     def history():
@@ -4874,11 +5049,17 @@ def test_full_history_delivery_batch_defers_more_provider_io(tmp_path, monkeypat
     instance.flush_provider_events = (
         lambda minimum_priority=0, maximum_priority=2, limit=100: (
             calls.append(f"delivery:{minimum_priority}:{maximum_priority}:{limit}")
-            or (
-                service.BridgeService.HISTORY_DELIVERY_BATCH_SIZE
-                if minimum_priority == 2
-                else 0
-            )
+            or 0
+        )
+    )
+    instance._flush_history_events = lambda: (
+        calls.append(
+            f"delivery:2:2:{service.BridgeService.HISTORY_DELIVERY_BATCH_SIZE}"
+        )
+        or (
+            service.BridgeService.HISTORY_DELIVERY_BATCH_SIZE,
+            service.BridgeService.HISTORY_DELIVERY_BATCH_SIZE,
+            True,
         )
     )
     instance.run_backfill_once = lambda: calls.append("backfill") or True
@@ -5084,7 +5265,7 @@ def test_background_history_lane_retries_database_conflict(monkeypatch):
     assert isinstance(instance.background_history_error, TerminalFailure)
 
 
-def test_background_history_lane_paces_successful_quanta(monkeypatch):
+def test_background_history_lane_yields_after_successful_quanta(monkeypatch):
     calls = []
     sleeps = []
 
@@ -5106,7 +5287,7 @@ def test_background_history_lane_paces_successful_quanta(monkeypatch):
     instance._run_background_history_lane()
 
     assert calls == ["history", "history"]
-    assert sleeps == [service.BridgeService.HISTORY_PROGRESS_DELAY_SECONDS]
+    assert sleeps == [service.BridgeService.HISTORY_PROGRESS_YIELD_SECONDS]
     assert isinstance(instance.background_history_error, TerminalFailure)
 
 
@@ -5204,6 +5385,7 @@ def test_provider_events_use_a_monotonic_two_second_schedule(tmp_path, monkeypat
     instance.flush_provider_events = (
         lambda minimum_priority=0, maximum_priority=2, limit=100: 0
     )
+    instance._flush_history_events = lambda: (0, 20, True)
     instance.run_backfill_once = lambda: False
 
     assert not instance.tick()
@@ -5291,6 +5473,7 @@ def test_control_transport_outage_retries_with_full_jitter_and_recovers(
     instance.flush_provider_events = (
         lambda minimum_priority=0, maximum_priority=2, limit=100: 0
     )
+    instance._flush_history_events = lambda: (0, 20, True)
     instance.run_backfill_once = lambda: False
 
     assert not instance.tick()
@@ -5570,6 +5753,7 @@ def test_report_success_cannot_clear_blocked_desired_feed_in_same_tick(
     instance.flush_provider_events = (
         lambda minimum_priority=0, maximum_priority=2, limit=100: 0
     )
+    instance._flush_history_events = lambda: (0, 20, True)
     instance.run_backfill_once = lambda: False
 
     assert instance.tick()

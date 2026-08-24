@@ -115,10 +115,26 @@ history page cannot leave a gap in live event capture. Account workers are
 isolated from one another and use bridge-owned durable retry/backoff after a
 provider error.
 
-Control-derived backfill jobs are reconciled in the main service thread once per
-service tick. Live operations and priority-0 Provider events are always
-processed first. At least once per second, one exact priority-2 history item
-receives a bounded delivery quantum even while live traffic remains continuous.
+Control-derived backfill jobs are reconciled by a profile-sized history pool.
+Large profiles use eight workers so independent account/chat pages can be
+fetched and converted concurrently. Idle history delivery fills the configured
+Provider batch, up to 100 events, and yields for 10 milliseconds between
+successful quanta instead of applying a fixed throughput delay. History catalog
+and outbox writes use ten-message transactions while idle. Messages that invoke
+the remote file-transfer path retain a dedicated single-message transaction.
+
+Live operations and priority-0 Provider events always take precedence. The
+history lane rechecks durable live work after acquiring the shared Provider HTTP
+mutex; when live work is waiting, history delivery and local conversion both
+fall back to one message per transaction and at most one priority-2 delivery per
+second. A live event that becomes durable after the check waits for no more than
+the already-started bounded Provider request.
+
+The 100-event batch removes the bridge-side ceiling for a 100 messages/second
+history target on large profiles. The sustained end-to-end rate still depends on
+Zulip history fetch latency and the Provider/backend/database round-trip.
+Retryable Provider delivery backoff pauses both history submission and new page
+discovery until the retry deadline, bounding the local outbox during an outage.
 Retryable history-fetch failures return the job to `pending` with a durable
 `available_at`, incremented retry count, safe error code, and exponential full
 jitter capped at 300 seconds. A worker restart therefore does not erase retry
