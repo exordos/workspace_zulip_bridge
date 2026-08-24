@@ -1478,10 +1478,8 @@ def test_reaction_event_for_selected_chat_waits_for_message_mapping():
     )
     instance = _delivery_service(store)
     catalog_events = []
-    instance._queue_event_catalog = (
-        lambda requested, event, server_url, marker=None: catalog_events.append(
-            (requested, event, server_url)
-        )
+    instance._queue_event_catalog = lambda requested, event, server_url, marker=None: (
+        catalog_events.append((requested, event, server_url))
     )
 
     class Adapter(ProviderAdapter):
@@ -1586,10 +1584,8 @@ def test_reaction_event_for_uncatalogued_chat_has_bounded_assignment_wait(
     )
     instance = _delivery_service(store)
     catalog_events = []
-    instance._queue_event_catalog = (
-        lambda requested, event, server_url, marker=None: catalog_events.append(
-            (requested, event, server_url)
-        )
+    instance._queue_event_catalog = lambda requested, event, server_url, marker=None: (
+        catalog_events.append((requested, event, server_url))
     )
 
     class Adapter(ProviderAdapter):
@@ -1689,9 +1685,7 @@ def test_reaction_assignment_poll_reuses_persisted_message_context():
             self.message_context = message_context
             return message_context
 
-        def mark_provider_event_catalog_reported(
-            self, account, queue, event_id
-        ):
+        def mark_provider_event_catalog_reported(self, account, queue, event_id):
             self.catalog_marks.append((account, queue, event_id))
             return True
 
@@ -1707,6 +1701,7 @@ def test_reaction_assignment_poll_reuses_persisted_message_context():
     instance = _delivery_service(store)
     fetches = []
     catalog_events = []
+
     def queue_catalog(account, event, server, marker=None):
         catalog_events.append((account, event, server))
         if event.get("type") == "message" and marker is not None:
@@ -1803,9 +1798,7 @@ def test_reaction_catalog_publication_retries_row_before_durable_marker():
         def account_settings(self, _account):
             return {"selection_mode": "all"}
 
-        def mark_provider_event_catalog_reported(
-            self, account, queue, event_id
-        ):
+        def mark_provider_event_catalog_reported(self, account, queue, event_id):
             self.catalog_marks.append((account, queue, event_id))
             return True
 
@@ -1842,7 +1835,7 @@ def test_reaction_catalog_publication_retries_row_before_durable_marker():
     assert store.catalog_marks == [(account_uuid, "queue", 7)]
     assert [retry[-1] for retry in store.retried] == [
         "provider_event_processing_failed",
-        "provider_chat_assignment_pending"
+        "provider_chat_assignment_pending",
     ]
 
 
@@ -1879,12 +1872,9 @@ def test_expired_reaction_mapping_wait_is_quarantined_after_assignment_exists():
                 "queue_id": "queue",
                 "event_id": 7,
                 "assignment_pending_since": (
-                    datetime.datetime.now(datetime.UTC)
-                    - datetime.timedelta(minutes=6)
+                    datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=6)
                 ),
-                "assignment_catalog_reported_at": datetime.datetime.now(
-                    datetime.UTC
-                ),
+                "assignment_catalog_reported_at": datetime.datetime.now(datetime.UTC),
                 "provider_message_context": {
                     "id": 601,
                     "type": "private",
@@ -2806,6 +2796,87 @@ def test_subscription_peer_event_invalidates_only_affected_channels():
 
     assert instance.store.invalidations == [
         (account_uuid, ["channel:42", "channel:43"])
+    ]
+
+
+def test_user_topic_event_catalog_is_durable_and_marks_dependency():
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+    marker = (account_uuid, "queue-1", 8)
+
+    class Store:
+        def __init__(self):
+            self.report = None
+            self.marker = None
+
+        def account_resource(self, requested):
+            assert requested == account_uuid
+            return {
+                "generation": 1,
+                "owner_user_uuid": "00000000-0000-4000-8000-000000000002",
+                "settings": {
+                    "default_project_id": ("00000000-0000-4000-8000-000000000003")
+                },
+            }
+
+        def provider_mapping(self, requested, entity_kind, provider_id):
+            assert (requested, entity_kind, provider_id) == (
+                account_uuid,
+                "stream",
+                "channel:42",
+            )
+            return {
+                "workspace_uuid": "00000000-0000-4000-8000-000000000004",
+                "metadata": {"name": "Engineering"},
+            }
+
+        def provider_event_cursor(self, requested):
+            assert requested == account_uuid
+            return {
+                "provider_realm_uuid": "00000000-0000-4000-8000-000000000005",
+                "provider_owner_user_id": "1",
+            }
+
+        def merge_catalog_topology(
+            self,
+            _account_uuid,
+            _chat_key,
+            participants,
+            topics,
+            *,
+            authoritative_participants=False,
+        ):
+            assert not authoritative_participants
+            return participants, topics
+
+        def ensure_provider_event_catalog_report(self, report, *supplied_marker):
+            self.report = report
+            self.marker = supplied_marker
+            return True
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+
+    assert instance._queue_event_catalog(
+        account_uuid,
+        {
+            "id": 8,
+            "type": "user_topic",
+            "stream_id": 42,
+            "topic_name": "Bridge",
+            "visibility_policy": 3,
+            "last_updated": 1_800_000_020,
+        },
+        "https://zulip.example.invalid",
+        marker,
+    )
+
+    assert instance.store.marker == marker
+    assert instance.store.report["catalog"]["topics"] == [
+        {
+            "provider_topic_id": "42:Bridge",
+            "name": "Bridge",
+            "is_default": False,
+        }
     ]
 
 
@@ -4390,14 +4461,12 @@ def test_unauthorized_catchup_account_is_quarantined_without_blocking_healthy():
         if account_uuid == unauthorized_uuid
         else type("Adapter", (), {"account_generation": 1})()
     )
-    instance._run_provider_queue_catchup = (
-        lambda account_uuid, _adapter: catchups.append(account_uuid) or True
+    instance._run_provider_queue_catchup = lambda account_uuid, _adapter: (
+        catchups.append(account_uuid) or True
     )
 
     assert instance.run_provider_catchup_once()
-    assert failures == [
-        (unauthorized_uuid, 1, "unauthorized_account", False)
-    ]
+    assert failures == [(unauthorized_uuid, 1, "unauthorized_account", False)]
     assert catchups == [healthy_uuid]
     assert successes == [(healthy_uuid, 1)]
     assert health == [
@@ -5713,6 +5782,228 @@ def test_incompatible_desired_batch_blocks_without_advancing_and_recovers():
     assert instance.store.cursor == "cursor-2"
     assert instance.store.blocked is None
     assert instance.store.stale_recoveries == 1
+
+
+def test_registration_notification_snapshots_are_persisted_in_provider_journal():
+    recorded = []
+
+    class Store:
+        def record_provider_event(self, account_uuid, queue_id, event):
+            recorded.append((account_uuid, queue_id, event))
+            return True
+
+        def provider_topic_mappings(self, _account_uuid):
+            return []
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    count = instance._record_registration_notification_snapshots(
+        "account-1",
+        "queue-1",
+        {
+            "user_settings": {"enable_stream_desktop_notifications": True},
+            "subscriptions": [
+                {
+                    "stream_id": 42,
+                    "is_muted": False,
+                    "desktop_notifications": True,
+                }
+            ],
+            "user_topics": [
+                {
+                    "stream_id": 42,
+                    "topic_name": "bridge",
+                    "visibility_policy": 3,
+                    "last_updated": 1_800_000_020,
+                }
+            ],
+        },
+    )
+
+    assert count == 2
+    assert [event[2]["id"] for event in recorded] == [-1, -2]
+    assert recorded[0][2]["type"] == "subscription"
+    assert recorded[0][2]["op"] == "notification_snapshot"
+    assert recorded[0][2]["enable_stream_desktop_notifications"] is True
+    assert isinstance(recorded[0][2]["observed_at"], float)
+    assert recorded[1][2] == {
+        "id": -2,
+        "type": "user_topic",
+        "stream_id": 42,
+        "topic_name": "bridge",
+        "visibility_policy": 3,
+        "last_updated": 1_800_000_020,
+    }
+
+
+def test_registration_synthesizes_default_for_missing_mapped_user_topic():
+    recorded = []
+
+    class Store:
+        def record_provider_event(self, account_uuid, queue_id, event):
+            recorded.append((account_uuid, queue_id, event))
+            return True
+
+        def provider_topic_mappings(self, _account_uuid):
+            return [
+                {
+                    "provider_id": "42:explicit",
+                    "metadata": {"notification_mode": "follow"},
+                },
+                {
+                    "provider_id": "42:reset",
+                    "metadata": {"notification_mode": "mute"},
+                },
+                {
+                    "provider_id": "99:unsubscribed",
+                    "metadata": {"notification_mode": "follow"},
+                },
+                {
+                    "provider_id": "direct:1,2:default",
+                    "metadata": {"notification_mode": "mute"},
+                },
+            ]
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+
+    count = instance._record_registration_notification_snapshots(
+        "account-1",
+        "queue-1",
+        {
+            "user_settings": {"enable_stream_desktop_notifications": True},
+            "subscriptions": [
+                {
+                    "stream_id": 42,
+                    "is_muted": False,
+                    "desktop_notifications": None,
+                }
+            ],
+            "user_topics": [
+                {
+                    "stream_id": 42,
+                    "topic_name": "explicit",
+                    "visibility_policy": 3,
+                    "last_updated": 1_800_000_020,
+                }
+            ],
+        },
+    )
+
+    assert count == 3
+    assert recorded[1][2]["topic_name"] == "explicit"
+    assert recorded[2][2]["topic_name"] == "reset"
+    assert recorded[2][2]["visibility_policy"] == 0
+    assert isinstance(recorded[2][2]["observed_at"], float)
+
+
+def test_live_global_notification_update_captures_current_subscriptions():
+    recorded = []
+
+    class Store:
+        def provider_event_cursor(self, _account_uuid):
+            return {"queue_id": "queue-1", "last_event_id": 7}
+
+        def account_resource(self, _account_uuid):
+            return None
+
+        def record_provider_event(self, account_uuid, queue_id, event):
+            recorded.append((account_uuid, queue_id, event))
+            return True
+
+        def update_provider_event_cursor(self, *_args):
+            return None
+
+    class Adapter:
+        server_url = "https://zulip.example.invalid"
+
+        def restore_queue(self, *_args):
+            return None
+
+        def events(self, *_args):
+            return [
+                {
+                    "id": 8,
+                    "type": "user_settings",
+                    "op": "update",
+                    "property": "enable_stream_desktop_notifications",
+                    "value": False,
+                }
+            ]
+
+        def notification_subscriptions(self):
+            return [
+                {
+                    "stream_id": 42,
+                    "is_muted": False,
+                    "desktop_notifications": None,
+                }
+            ]
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance.scheduler = type(
+        "Scheduler", (), {"reconcile_local_echo": lambda *args: None}
+    )()
+    instance._initial_sync_ready = lambda _account_uuid: False
+    instance._queue_account_report = lambda *_args: None
+
+    processed, error = instance._poll_provider_account("account-1", Adapter())
+
+    assert processed == 1
+    assert error is None
+    assert recorded[0][2]["subscriptions"] == [
+        {
+            "stream_id": 42,
+            "is_muted": False,
+            "desktop_notifications": None,
+        }
+    ]
+    assert isinstance(recorded[0][2]["observed_at"], float)
+
+
+def test_live_global_notification_snapshot_failure_keeps_event_unacknowledged():
+    cursor_updates = []
+
+    class Store:
+        def provider_event_cursor(self, _account_uuid):
+            return {"queue_id": "queue-1", "last_event_id": 7}
+
+        def account_resource(self, _account_uuid):
+            return None
+
+        def record_provider_event(self, *_args):
+            raise AssertionError("incomplete global event must not be persisted")
+
+        def update_provider_event_cursor(self, *args):
+            cursor_updates.append(args)
+
+    class Adapter:
+        def restore_queue(self, *_args):
+            return None
+
+        def events(self, *_args):
+            return [
+                {
+                    "id": 8,
+                    "type": "user_settings",
+                    "op": "update",
+                    "property": "enable_stream_desktop_notifications",
+                    "value": False,
+                }
+            ]
+
+        def notification_subscriptions(self):
+            raise zulip_adapter.ZulipOperationError("provider_unavailable", True)
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+
+    processed, error = instance._poll_provider_account("account-1", Adapter())
+
+    assert processed == 0
+    assert error is not None and error.code == "provider_unavailable"
+    assert cursor_updates == []
 
 
 def test_certificate_renewal_failure_is_degraded_without_stopping_message_work():

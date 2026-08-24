@@ -1627,9 +1627,7 @@ def test_message_snapshot_and_live_events_project_unicode_reaction_code():
         "user_uuid": converter.stable_entity_uuid(ACCOUNT_UUID, "identity", "3"),
         "emoji_name": "👍",
     }
-    assert snapshot_reaction["provider"]["entity_id"] == (
-        "601:3:unicode_emoji:1f44d"
-    )
+    assert snapshot_reaction["provider"]["entity_id"] == ("601:3:unicode_emoji:1f44d")
     assert snapshot_reaction["extensions"] == {
         "provider_badge": "zulip",
         "emoji_name": "thumbs_up",
@@ -1701,11 +1699,14 @@ def test_remove_reaction_without_active_mapping_is_ignored():
     )
 
     assert records == []
-    assert store.provider_mapping(
-        ACCOUNT_UUID,
-        "reaction",
-        "601:3:unicode_emoji:270d",
-    ) is None
+    assert (
+        store.provider_mapping(
+            ACCOUNT_UUID,
+            "reaction",
+            "601:3:unicode_emoji:270d",
+        )
+        is None
+    )
 
 
 def test_reaction_aliases_for_one_unicode_code_share_workspace_identity():
@@ -1759,9 +1760,7 @@ def test_reaction_aliases_for_one_unicode_code_share_workspace_identity():
         operation for operation in second if operation["kind"] == "reaction.upsert"
     )
     assert second_reaction["entity_uuid"] == first_reaction["entity_uuid"]
-    assert second_reaction["provider"]["entity_id"] == (
-        "601:3:unicode_emoji:1f44d"
-    )
+    assert second_reaction["provider"]["entity_id"] == ("601:3:unicode_emoji:1f44d")
     assert second_reaction["payload"]["emoji_name"] == "👍"
     assert second_reaction["extensions"]["emoji_name"] == "thumbs_up"
 
@@ -1805,16 +1804,13 @@ def test_legacy_reaction_mapping_cleanup_is_planned_without_early_mutation():
     )
     assert reaction["entity_uuid"] == legacy_uuid
     assert reaction["payload"]["emoji_name"] == "✍"
-    assert store.provider_mapping(
-        ACCOUNT_UUID, "reaction", "601:3:writing"
-    ) is not None
-    assert store.provider_mapping(
-        ACCOUNT_UUID, "reaction", "601:3:unicode_emoji:270d"
-    ) is None
+    assert store.provider_mapping(ACCOUNT_UUID, "reaction", "601:3:writing") is not None
+    assert (
+        store.provider_mapping(ACCOUNT_UUID, "reaction", "601:3:unicode_emoji:270d")
+        is None
+    )
     reaction_record = next(
-        record
-        for record in records
-        if record["operation"]["kind"] == "reaction.upsert"
+        record for record in records if record["operation"]["kind"] == "reaction.upsert"
     )
     plan = reaction_record["transport"]["reaction_mapping"]
     assert plan["workspace_uuid"] == legacy_uuid
@@ -1880,13 +1876,12 @@ def test_partial_reaction_migration_merges_aliases_by_type_and_code():
     assert operations[0]["payload"]["emoji_name"] == "writing_hand"
     assert operations[1]["entity_uuid"] == canonical_uuid
     assert operations[1]["payload"]["emoji_name"] == "✍"
-    assert store.provider_mapping(
-        ACCOUNT_UUID, "reaction", "601:3:writing_hand"
-    ) is not None
+    assert (
+        store.provider_mapping(ACCOUNT_UUID, "reaction", "601:3:writing_hand")
+        is not None
+    )
     reaction_record = next(
-        record
-        for record in records
-        if record["operation"]["kind"] == "reaction.upsert"
+        record for record in records if record["operation"]["kind"] == "reaction.upsert"
     )
     plan = reaction_record["transport"]["reaction_mapping"]
     assert plan["workspace_uuid"] == canonical_uuid
@@ -1954,9 +1949,7 @@ def test_backfill_reaction_uses_versioned_projection_operation_identity():
     )
 
     reaction = next(
-        record
-        for record in records
-        if record["operation"]["kind"] == "reaction.upsert"
+        record for record in records if record["operation"]["kind"] == "reaction.upsert"
     )
     reaction_index = records.index(reaction)
     source = (
@@ -1970,9 +1963,7 @@ def test_backfill_reaction_uses_versioned_projection_operation_identity():
         reaction_index,
     )
     message_record = next(
-        record
-        for record in records
-        if record["operation"]["kind"] == "message.create"
+        record for record in records if record["operation"]["kind"] == "message.create"
     )
     assert message_record["operation_uuid"] == converter.operation_uuid_for(
         ACCOUNT_UUID,
@@ -2703,6 +2694,276 @@ def test_subscription_rename_reuses_stream_uuid():
     assert operation["kind"] == "stream.upsert"
     assert operation["entity_uuid"] == mapping["workspace_uuid"]
     assert operation["payload"]["name"] == "Platform"
+
+
+def test_subscription_notification_updates_converge_and_drop_stale_events():
+    store = FakeStore()
+    snapshot = {
+        "id": -1,
+        "type": "subscription",
+        "op": "notification_snapshot",
+        "stream_id": 42,
+        "is_muted": False,
+        "desktop_notifications": False,
+        "enable_stream_desktop_notifications": True,
+        "observed_at": 1_800_000_000,
+    }
+
+    snapshot_operation = _operations(
+        converter.event_records(store, ACCOUNT_UUID, "queue", snapshot)
+    )[0]
+    assert snapshot_operation["kind"] == "stream.notification.update"
+    assert snapshot_operation["payload"]["notification_mode"] == "mentions_only"
+
+    mute_operation = _operations(
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "queue",
+            {
+                "id": 11,
+                "type": "subscription",
+                "op": "update",
+                "property": "is_muted",
+                "stream_id": 42,
+                "value": True,
+                "observed_at": 1_800_000_010,
+            },
+        )
+    )[0]
+    assert mute_operation["payload"]["notification_mode"] == "muted"
+
+    stale = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {**snapshot, "id": -2, "desktop_notifications": True},
+    )
+    assert stale == []
+    metadata = store.provider_mapping(ACCOUNT_UUID, "stream", "channel:42")["metadata"]
+    assert metadata["notification_mode"] == "muted"
+    assert metadata["notification_updated_at"] == "2027-01-15T08:00:10Z"
+
+
+def test_inherited_stream_notification_mode_tracks_global_setting():
+    store = FakeStore()
+    snapshot = {
+        "id": -1,
+        "type": "subscription",
+        "op": "notification_snapshot",
+        "stream_id": 42,
+        "is_muted": False,
+        "desktop_notifications": None,
+        "enable_stream_desktop_notifications": True,
+        "observed_at": 1_800_000_000,
+    }
+
+    initial = _operations(
+        converter.event_records(store, ACCOUNT_UUID, "queue", snapshot)
+    )
+    assert initial[0]["payload"]["notification_mode"] == "all_messages"
+
+    changed = _operations(
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "queue",
+            {
+                "id": 11,
+                "type": "user_settings",
+                "op": "update",
+                "property": "enable_stream_desktop_notifications",
+                "value": False,
+                "subscriptions": [
+                    {
+                        "stream_id": 42,
+                        "is_muted": False,
+                        "desktop_notifications": None,
+                    }
+                ],
+                "observed_at": 1_800_000_010,
+            },
+        )
+    )
+    assert changed[0]["payload"]["notification_mode"] == "mentions_only"
+
+
+@pytest.mark.parametrize(
+    ("is_muted", "desktop_notifications", "expected_mode"),
+    [(False, True, "all_messages"), (True, None, "muted")],
+)
+def test_global_notification_update_preserves_unaffected_stream_mode(
+    is_muted,
+    desktop_notifications,
+    expected_mode,
+):
+    store = FakeStore()
+    converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {
+            "id": -1,
+            "type": "subscription",
+            "op": "notification_snapshot",
+            "stream_id": 42,
+            "is_muted": is_muted,
+            "desktop_notifications": desktop_notifications,
+            "enable_stream_desktop_notifications": True,
+            "observed_at": 1_800_000_000,
+        },
+    )
+
+    records = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {
+            "id": 11,
+            "type": "user_settings",
+            "op": "update",
+            "property": "enable_stream_desktop_notifications",
+            "value": False,
+            "subscriptions": [
+                {
+                    "stream_id": 42,
+                    "is_muted": is_muted,
+                    "desktop_notifications": desktop_notifications,
+                }
+            ],
+            "observed_at": 1_800_000_010,
+        },
+    )
+
+    assert records == []
+    metadata = store.provider_mapping(ACCOUNT_UUID, "stream", "channel:42")["metadata"]
+    assert metadata["notification_mode"] == expected_mode
+    assert metadata["notification_global_desktop_notifications"] is False
+    assert metadata["notification_updated_at"] == "2027-01-15T08:00:00Z"
+    assert metadata["notification_global_updated_at"] == "2027-01-15T08:00:10Z"
+
+
+@pytest.mark.parametrize(
+    ("visibility_policy", "expected_mode"),
+    [(0, "default"), (1, "mute"), (2, "unmute"), (3, "follow")],
+)
+def test_user_topic_visibility_policy_maps_to_workspace_mode(
+    visibility_policy,
+    expected_mode,
+):
+    store = FakeStore()
+    event = {
+        "id": 12,
+        "type": "user_topic",
+        "stream_id": 42,
+        "topic_name": "bridge",
+        "visibility_policy": visibility_policy,
+        "last_updated": 1_800_000_020,
+    }
+
+    operations = _operations(
+        converter.event_records(store, ACCOUNT_UUID, "queue", event)
+    )
+
+    assert len(operations) == 1
+    assert operations[0]["kind"] == "topic.notification.update"
+    assert operations[0]["payload"]["notification_mode"] == expected_mode
+    assert operations[0]["payload"]["notification_updated_at"] == (
+        "2027-01-15T08:00:20Z"
+    )
+    metadata = store.provider_mapping(
+        ACCOUNT_UUID, "topic", "42:bridge"
+    )["metadata"]
+    assert metadata["notification_provider_updated_at"] == 1_800_000_020
+    assert (
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "queue",
+            {**event, "id": 13},
+        )
+        == []
+    )
+
+
+def test_user_topic_same_second_changes_advance_logical_timestamp():
+    store = FakeStore()
+    first = {
+        "id": 12,
+        "type": "user_topic",
+        "stream_id": 42,
+        "topic_name": "bridge",
+        "visibility_policy": 1,
+        "last_updated": 1_800_000_020,
+    }
+
+    first_operation = _operations(
+        converter.event_records(store, ACCOUNT_UUID, "queue", first)
+    )[0]
+    second_operation = _operations(
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "queue",
+            {**first, "id": 13, "visibility_policy": 3},
+        )
+    )[0]
+
+    assert first_operation["payload"]["notification_mode"] == "mute"
+    assert first_operation["payload"]["notification_updated_at"] == (
+        "2027-01-15T08:00:20Z"
+    )
+    assert second_operation["payload"]["notification_mode"] == "follow"
+    assert second_operation["payload"]["notification_updated_at"] == (
+        "2027-01-15T08:00:20.000001Z"
+    )
+    assert (
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "queue",
+            {**first, "id": 14, "visibility_policy": 3},
+        )
+        == []
+    )
+
+
+def test_registration_default_tombstone_clears_missing_user_topic_override():
+    store = FakeStore()
+    converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue-old",
+        {
+            "id": 12,
+            "type": "user_topic",
+            "stream_id": 42,
+            "topic_name": "bridge",
+            "visibility_policy": 1,
+            "last_updated": 1_800_000_010,
+        },
+    )
+
+    operation = _operations(
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "queue-new",
+            {
+                "id": -1,
+                "type": "user_topic",
+                "stream_id": 42,
+                "topic_name": "bridge",
+                "visibility_policy": 0,
+                "observed_at": 1_800_000_020.5,
+            },
+        )
+    )[0]
+
+    assert operation["payload"]["notification_mode"] == "default"
+    assert operation["payload"]["notification_updated_at"] == (
+        "2027-01-15T08:00:20.500000Z"
+    )
 
 
 def test_newest_first_uses_timestamp_then_numeric_message_id():

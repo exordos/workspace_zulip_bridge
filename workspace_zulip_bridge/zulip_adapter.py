@@ -82,6 +82,17 @@ class ZulipClient(typing.Protocol):
 
     def update_message_flags(self, request: dict[str, object]) -> dict[str, object]: ...
 
+    def update_subscription_settings(
+        self, subscription_data: list[dict[str, object]]
+    ) -> dict[str, object]: ...
+
+    def call_endpoint(
+        self,
+        url: str,
+        method: str = "GET",
+        request: dict[str, object] | None = None,
+    ) -> dict[str, object]: ...
+
     def add_subscriptions(
         self, streams: list[dict[str, object]], **kwargs: object
     ) -> dict[str, object]: ...
@@ -337,6 +348,35 @@ class OfficialZulipAdapter:
             raise ZulipOperationError("not_found", False)
         return topic_provider_id[len(prefix) :]
 
+    @staticmethod
+    def _notification_time(value: object) -> datetime.datetime:
+        if not isinstance(value, str):
+            raise ZulipOperationError("invalid_record", False)
+        try:
+            parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ZulipOperationError("invalid_record", False) from exc
+        if parsed.tzinfo is None:
+            raise ZulipOperationError("invalid_record", False)
+        return parsed.astimezone(datetime.UTC)
+
+    def _notification_operation_is_stale(
+        self,
+        entity_kind: str,
+        entity_uuid: object,
+        notification_updated_at: object,
+    ) -> bool:
+        mapping = self._workspace_mapping(entity_kind, entity_uuid)
+        metadata = mapping.get("metadata")
+        if not isinstance(metadata, dict):
+            return False
+        provider_updated_at = metadata.get("notification_updated_at")
+        if not isinstance(provider_updated_at, str):
+            return False
+        return self._notification_time(provider_updated_at) > self._notification_time(
+            notification_updated_at
+        )
+
     def _message_target(
         self, operation: dict[str, object]
     ) -> tuple[dict[str, object], str]:
@@ -557,11 +597,15 @@ class OfficialZulipAdapter:
                 "update_message_flags",
                 "reaction",
                 "subscription",
+                "user_topic",
+                "user_settings",
                 "realm_user",
             ],
             "fetch_event_types": [
                 "message",
                 "subscription",
+                "user_topic",
+                "user_settings",
                 "realm_user",
                 "realm",
                 "recent_private_conversations",
@@ -629,6 +673,21 @@ class OfficialZulipAdapter:
             for member in registered_users
         ):
             raise ZulipOperationError("invalid_record", False)
+        user_topics = result.get("user_topics", [])
+        if not isinstance(user_topics, list) or not all(
+            isinstance(topic, dict)
+            and isinstance(topic.get("stream_id"), int)
+            and isinstance(topic.get("topic_name"), str)
+            and isinstance(topic.get("visibility_policy"), int)
+            and isinstance(topic.get("last_updated"), int)
+            for topic in user_topics
+        ):
+            raise ZulipOperationError("invalid_record", False)
+        user_settings = result.get("user_settings")
+        if not isinstance(user_settings, dict) or not isinstance(
+            user_settings.get("enable_stream_desktop_notifications"), bool
+        ):
+            raise ZulipOperationError("invalid_record", False)
         realm_users.update(
             {
                 int(member["user_id"]): member
@@ -677,6 +736,7 @@ class OfficialZulipAdapter:
         except PROVIDER_NETWORK_ERRORS as exc:
             raise ZulipOperationError("provider_unavailable", True) from exc
         result["subscriptions"] = subscriptions
+        result["user_topics"] = user_topics
         result["realm_users"] = [
             realm_users[user_id] for user_id in sorted(realm_users)
         ]
@@ -687,6 +747,27 @@ class OfficialZulipAdapter:
             int(result["last_event_id"]),
             result,
         )
+
+    def notification_subscriptions(self) -> list[dict[str, object]]:
+        """Return the current per-stream notification overrides."""
+        try:
+            subscriptions = _successful(
+                self.client.get_subscriptions({"include_subscribers": False})
+            ).get("subscriptions")
+        except PROVIDER_NETWORK_ERRORS as exc:
+            raise ZulipOperationError("provider_unavailable", True) from exc
+        if not isinstance(subscriptions, list) or not all(
+            isinstance(subscription, dict)
+            and isinstance(subscription.get("stream_id"), int)
+            and isinstance(subscription.get("is_muted"), bool)
+            and (
+                subscription.get("desktop_notifications") is None
+                or isinstance(subscription.get("desktop_notifications"), bool)
+            )
+            for subscription in subscriptions
+        ):
+            raise ZulipOperationError("invalid_record", False)
+        return typing.cast(list[dict[str, object]], subscriptions)
 
     def channel_catalog(self, provider_chat_key: str) -> dict[str, object]:
         return self.channel_catalogs([provider_chat_key])
@@ -1487,6 +1568,71 @@ class OfficialZulipAdapter:
             }
             _successful(self.client.update_message_flags(request))
             return str(max(provider_ids)), None
+        if kind == "stream.notification.update":
+            stream_mapping = self._workspace_mapping("stream", operation["entity_uuid"])
+            if self._notification_operation_is_stale(
+                "stream",
+                operation["entity_uuid"],
+                payload["notification_updated_at"],
+            ):
+                return str(stream_mapping["provider_id"]), None
+            chat_key = provider.get("chat_id")
+            stream_id = self._channel_id(chat_key)
+            mode = str(payload["notification_mode"])
+            if mode not in {"all_messages", "mentions_only", "muted"}:
+                raise ZulipOperationError("invalid_record", False)
+            subscription_data: list[dict[str, object]] = []
+            if mode != "muted":
+                subscription_data.append(
+                    {
+                        "stream_id": stream_id,
+                        "property": "desktop_notifications",
+                        "value": mode == "all_messages",
+                    }
+                )
+            subscription_data.append(
+                {
+                    "stream_id": stream_id,
+                    "property": "is_muted",
+                    "value": mode == "muted",
+                }
+            )
+            _successful(self.client.update_subscription_settings(subscription_data))
+            return str(stream_mapping["provider_id"]), None
+        if kind == "topic.notification.update":
+            topic_mapping = self._workspace_mapping("topic", operation["entity_uuid"])
+            if self._notification_operation_is_stale(
+                "topic",
+                operation["entity_uuid"],
+                payload["notification_updated_at"],
+            ):
+                return str(topic_mapping["provider_id"]), None
+            chat_key = provider.get("chat_id")
+            if not isinstance(chat_key, str):
+                raise ZulipOperationError("invalid_record", False)
+            visibility_policy = {
+                "default": 0,
+                "mute": 1,
+                "unmute": 2,
+                "follow": 3,
+            }.get(str(payload["notification_mode"]))
+            if visibility_policy is None:
+                raise ZulipOperationError("invalid_record", False)
+            _successful(
+                self.client.call_endpoint(
+                    url="user_topics",
+                    method="POST",
+                    request={
+                        "stream_id": self._channel_id(chat_key),
+                        "topic": self._topic_name(
+                            chat_key,
+                            operation["entity_uuid"],
+                        ),
+                        "visibility_policy": visibility_policy,
+                    },
+                )
+            )
+            return str(topic_mapping["provider_id"]), None
         if kind in {"membership.add", "membership.remove"}:
             chat_key = provider.get("chat_id")
             provider_channel_id = self._channel_id(chat_key)

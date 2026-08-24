@@ -128,6 +128,32 @@ def test_provider_membership_lease_resolves_target_identity(kind):
     assert record["operation"]["provider"]["chat_id"] == "channel:42"
 
 
+@pytest.mark.parametrize(
+    ("kind", "entity_uuid"),
+    [
+        ("stream.notification.update", STREAM_UUID),
+        ("topic.notification.update", TOPIC_UUID),
+    ],
+)
+def test_provider_notification_lease_preserves_lww_timestamp(kind, entity_uuid):
+    leased = _lease(kind)
+    leased["required_capability"] = "messenger.notification.write"
+    leased["payload"] = {
+        "uuid": entity_uuid,
+        "stream_uuid": STREAM_UUID,
+        "user_uuid": ACCOUNT_UUID,
+        "notification_mode": "muted" if kind.startswith("stream.") else "mute",
+        "notification_updated_at": "2026-08-23T12:30:00Z",
+    }
+
+    record = provider_protocol.leased_operation_record(Store(), leased)
+
+    assert record["operation"]["kind"] == kind
+    assert record["operation"]["entity_uuid"] == entity_uuid
+    assert record["operation"]["occurred_at"] == "2026-08-23T12:30:00Z"
+    assert record["operation"]["provider"]["chat_id"] == "channel:42"
+
+
 @pytest.mark.parametrize("kind", ["message.update", "message.delete"])
 def test_provider_message_mutation_defers_missing_create_mapping(kind):
     leased = _lease(kind)

@@ -139,9 +139,9 @@ def test_provider_account_breaker_survives_restart_and_reopens_on_generation(
     assert raced["provider_error_code"] == "unauthorized_account"
     assert postgres_store.eligible_account_uuids() == [healthy_uuid]
     assert not postgres_store.record_provider_account_success(blocked_uuid, 1)
-    assert [str(row["account_uuid"]) for row in postgres_store.pending_provider_events()] == [
-        healthy_uuid
-    ]
+    assert [
+        str(row["account_uuid"]) for row in postgres_store.pending_provider_events()
+    ] == [healthy_uuid]
 
     restarted = storage.RestAlchemyStore(migrated_postgres_dsn)
     for _ in range(100):
@@ -578,6 +578,109 @@ def test_desired_assignment_can_replace_provider_id_for_workspace_uuid(
     assert postgres_store.control_cursor() == "cursor-2"
 
 
+def test_assignment_rematerialization_preserves_notification_mapping_state(
+    postgres_store,
+):
+    account_uuid = str(uuid.uuid4())
+    assignment_uuid = str(uuid.uuid4())
+    project_uuid = str(uuid.uuid4())
+    stream_uuid = str(uuid.uuid4())
+    topic_uuid = str(uuid.uuid4())
+
+    def change(generation, stream_name, topic_name):
+        resource = {
+            "resource_type": "external_chat_assignment",
+            "uuid": assignment_uuid,
+            "generation": generation,
+            "external_account_uuid": account_uuid,
+            "project_id": project_uuid,
+            "provider_chat": {
+                "provider_chat_key": "channel:42",
+                "chat_type": "channel",
+            },
+            "workspace_projection": {
+                "stream": {
+                    "uuid": stream_uuid,
+                    "name": stream_name,
+                    "description": "",
+                    "private": False,
+                    "default_topic_uuid": None,
+                },
+                "participants": [],
+                "topics": [
+                    {
+                        "topic_uuid": topic_uuid,
+                        "provider_topic_id": "42:topic",
+                        "name": topic_name,
+                        "is_default": False,
+                    }
+                ],
+            },
+        }
+        return {
+            "change_uuid": str(uuid.uuid4()),
+            "sequence": generation,
+            "resource_type": "external_chat_assignment",
+            "resource_uuid": assignment_uuid,
+            "operation": "upsert",
+            "generation": generation,
+            "required_capabilities": {},
+            "resource": resource,
+        }
+
+    postgres_store.apply_desired_changes(
+        [change(1, "Engineering", "topic")],
+        "cursor-1",
+    )
+    stream = postgres_store.provider_mapping(account_uuid, "stream", "channel:42")
+    topic = postgres_store.provider_mapping(account_uuid, "topic", "42:topic")
+    assert stream is not None
+    assert topic is not None
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "stream",
+        "channel:42",
+        str(stream["workspace_uuid"]),
+        {
+            **stream["metadata"],
+            "notification_mode": "all_messages",
+            "notification_updated_at": "2026-08-24T08:00:00Z",
+            "notification_global_desktop_notifications": True,
+        },
+    )
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "topic",
+        "42:topic",
+        str(topic["workspace_uuid"]),
+        {
+            **topic["metadata"],
+            "notification_mode": "follow",
+            "notification_provider_updated_at": 1_800_000_020,
+            "notification_updated_at": "2027-01-15T08:00:20Z",
+        },
+    )
+
+    postgres_store.apply_desired_changes(
+        [change(2, "Platform", "renamed topic")],
+        "cursor-2",
+    )
+
+    stream = postgres_store.provider_mapping(account_uuid, "stream", "channel:42")
+    topic = postgres_store.provider_mapping(account_uuid, "topic", "42:topic")
+    assert stream is not None
+    assert topic is not None
+    assert stream["metadata"]["name"] == "Platform"
+    assert stream["metadata"]["notification_mode"] == "all_messages"
+    assert stream["metadata"]["notification_global_desktop_notifications"] is True
+    assert topic["metadata"]["name"] == "renamed topic"
+    assert topic["metadata"]["notification_mode"] == "follow"
+    assert topic["metadata"]["notification_provider_updated_at"] == 1_800_000_020
+    assert postgres_store.provider_topic_mappings(account_uuid) == [
+        {"provider_id": "42:topic", "metadata": topic["metadata"]}
+    ]
+
+
 def test_assignment_projection_repair_restores_mapping_and_wakes_event(
     postgres_store,
 ):
@@ -979,16 +1082,22 @@ def test_provider_topic_rename_is_idempotent_when_target_mapping_already_exists(
     assert str(renamed["workspace_uuid"]) == target_workspace_uuid
     assert renamed["provider_revision"] == "2"
     assert renamed["metadata"] == target_metadata
-    assert str(
-        postgres_store.provider_mapping(account_uuid, "topic", "42:TopicA")[
-            "workspace_uuid"
-        ]
-    ) == source_workspace_uuid
-    assert str(
-        postgres_store.provider_mapping(account_uuid, "topic", "42:TopicB")[
-            "workspace_uuid"
-        ]
-    ) == target_workspace_uuid
+    assert (
+        str(
+            postgres_store.provider_mapping(account_uuid, "topic", "42:TopicA")[
+                "workspace_uuid"
+            ]
+        )
+        == source_workspace_uuid
+    )
+    assert (
+        str(
+            postgres_store.provider_mapping(account_uuid, "topic", "42:TopicB")[
+                "workspace_uuid"
+            ]
+        )
+        == target_workspace_uuid
+    )
 
 
 def test_provider_topic_rename_reactivates_tombstoned_target_mapping(postgres_store):
@@ -1045,16 +1154,22 @@ def test_provider_topic_rename_reactivates_tombstoned_target_mapping(postgres_st
     assert str(renamed["workspace_uuid"]) == target_workspace_uuid
     assert renamed["provider_revision"] == "3"
     assert renamed["metadata"] == {**metadata, "name": "TopicA"}
-    assert str(
-        postgres_store.provider_mapping(account_uuid, "topic", "42:TopicA")[
-            "workspace_uuid"
-        ]
-    ) == source_workspace_uuid
-    assert str(
-        postgres_store.provider_mapping(account_uuid, "topic", "42:TopicB")[
-            "workspace_uuid"
-        ]
-    ) == target_workspace_uuid
+    assert (
+        str(
+            postgres_store.provider_mapping(account_uuid, "topic", "42:TopicA")[
+                "workspace_uuid"
+            ]
+        )
+        == source_workspace_uuid
+    )
+    assert (
+        str(
+            postgres_store.provider_mapping(account_uuid, "topic", "42:TopicB")[
+                "workspace_uuid"
+            ]
+        )
+        == target_workspace_uuid
+    )
 
 
 def test_provider_event_records_are_enqueued_atomically(postgres_store):
@@ -1249,8 +1364,16 @@ def test_rejected_observed_report_retries_after_cooldown(postgres_store):
     assert postgres_store.pending_observed_reports() == [retry]
 
 
-@pytest.mark.parametrize("event_kind", ["message", "reaction"])
-@pytest.mark.parametrize("chat_kind", ["channel", "direct"])
+@pytest.mark.parametrize(
+    ("event_kind", "chat_kind"),
+    [
+        ("message", "channel"),
+        ("message", "direct"),
+        ("reaction", "channel"),
+        ("reaction", "direct"),
+        ("user_topic", "channel"),
+    ],
+)
 @pytest.mark.parametrize("terminal_status", ["rejected", "stale"])
 def test_unapplied_catalog_report_releases_event_marker_and_republishes(
     postgres_store,
@@ -1279,10 +1402,10 @@ def test_unapplied_catalog_report_releases_event_marker_and_republishes(
             "timestamp": 1_800_000_000,
         }
     )
-    provider_event = (
-        {"id": 7, "type": "message", "message": provider_message}
-        if event_kind == "message"
-        else {
+    if event_kind == "message":
+        provider_event = {"id": 7, "type": "message", "message": provider_message}
+    elif event_kind == "reaction":
+        provider_event = {
             "id": 7,
             "type": "reaction",
             "message_id": 701,
@@ -1292,23 +1415,46 @@ def test_unapplied_catalog_report_releases_event_marker_and_republishes(
             "reaction_type": "unicode_emoji",
             "op": "add",
         }
-    )
+    else:
+        provider_event = {
+            "id": 7,
+            "type": "user_topic",
+            "stream_id": 77,
+            "topic_name": "New dependency",
+            "visibility_policy": 3,
+            "last_updated": 1_800_000_000,
+        }
     assert postgres_store.record_provider_event(
         account_uuid,
         "queue",
         provider_event,
     )
     if event_kind == "reaction":
-        assert postgres_store.cache_provider_event_message_context(
+        assert (
+            postgres_store.cache_provider_event_message_context(
+                account_uuid,
+                "queue",
+                7,
+                provider_message,
+            )
+            == provider_message
+        )
+    if event_kind == "user_topic":
+        postgres_store.remember_provider_mapping(
             account_uuid,
-            "queue",
-            7,
-            provider_message,
-        ) == provider_message
+            "stream",
+            "channel:77",
+            str(uuid.uuid4()),
+            {"name": "Operations"},
+        )
 
     instance = object.__new__(service.BridgeService)
     instance.store = postgres_store
-    catalog_event = {"id": 7, "type": "message", "message": provider_message}
+    catalog_event = (
+        provider_event
+        if event_kind == "user_topic"
+        else {"id": 7, "type": "message", "message": provider_message}
+    )
 
     def publish_catalog() -> bool:
         return instance._queue_event_catalog(
@@ -1669,6 +1815,43 @@ def test_pending_observed_reports_prioritize_live_message_dependency(postgres_st
     assert pending[0]["catalog"]["source"]["provider_chat_key"] == "channel:1"
 
 
+def test_pending_observed_reports_prioritize_live_user_topic_dependency(
+    postgres_store,
+):
+    account_uuid = str(uuid.uuid4())
+    reports = {}
+    for chat_id in (2, 1):
+        report = {
+            "report_uuid": str(uuid.uuid4()),
+            "resource_type": "external_chat_catalog",
+            "resource_uuid": str(uuid.uuid4()),
+            "observed_generation": 1,
+            "status": "ready",
+            "observed_at": datetime.datetime.now(datetime.UTC).isoformat(),
+            "catalog": {
+                "external_account_uuid": account_uuid,
+                "source": {"provider_chat_key": f"channel:{chat_id}"},
+            },
+        }
+        reports[chat_id] = report
+        assert postgres_store.enqueue_observed_report(report)
+
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        {
+            "id": 1,
+            "type": "user_topic",
+            "stream_id": 1,
+            "topic_name": "New dependency",
+            "visibility_policy": 3,
+            "last_updated": 1_800_000_000,
+        },
+    )
+
+    assert postgres_store.pending_observed_reports(limit=1) == [reports[1]]
+
+
 def test_pending_observed_reports_prioritize_direct_fifo_head(postgres_store):
     account_uuid = str(uuid.uuid4())
     reports = {}
@@ -1711,9 +1894,7 @@ def test_pending_observed_reports_prioritize_direct_fifo_head(postgres_store):
         },
     )
 
-    assert postgres_store.pending_observed_reports(limit=1) == [
-        reports["direct:9,11"]
-    ]
+    assert postgres_store.pending_observed_reports(limit=1) == [reports["direct:9,11"]]
 
 
 def test_observed_report_hot_queries_use_migration_indexes(postgres_store):
@@ -3025,9 +3206,7 @@ def test_channel_move_updates_primary_and_alias_message_context(postgres_store):
         },
     )
     move = next(
-        record
-        for record in records
-        if record["operation"]["kind"] == "message.update"
+        record for record in records if record["operation"]["kind"] == "message.update"
     )
     with postgres_store.session() as session:
         postgres_store._persist_committed_mapping(session, move, None, "3")
@@ -3044,9 +3223,7 @@ def test_channel_move_updates_primary_and_alias_message_context(postgres_store):
 def test_pending_channel_move_routes_followup_edit_before_result_commit(
     postgres_store,
 ):
-    account_uuid, source_project_uuid = _insert_account_and_assignment(
-        postgres_store
-    )
+    account_uuid, source_project_uuid = _insert_account_and_assignment(postgres_store)
     source_stream_uuid, source_topic_uuid, author_uuid = (
         _materialize_channel_projection(
             postgres_store, account_uuid, source_project_uuid
@@ -3115,9 +3292,7 @@ def test_pending_channel_move_routes_followup_edit_before_result_commit(
         "propagate_mode": "change_one",
         "edit_timestamp": 1_700_000_013,
     }
-    assert postgres_store.record_provider_event(
-        account_uuid, queue_id, move_event
-    )
+    assert postgres_store.record_provider_event(account_uuid, queue_id, move_event)
     move_records = converter.event_records(
         postgres_store,
         account_uuid,
@@ -3195,9 +3370,7 @@ def test_pending_channel_move_routes_followup_edit_before_result_commit(
 def test_pending_message_context_uses_lane_sequence_across_provider_queues(
     postgres_store,
 ):
-    account_uuid, source_project_uuid = _insert_account_and_assignment(
-        postgres_store
-    )
+    account_uuid, source_project_uuid = _insert_account_and_assignment(postgres_store)
     source_stream_uuid, source_topic_uuid, author_uuid = (
         _materialize_channel_projection(
             postgres_store, account_uuid, source_project_uuid
@@ -3327,22 +3500,18 @@ def test_pending_message_context_uses_lane_sequence_across_provider_queues(
 def test_selected_move_then_unselected_move_deletes_pending_destination(
     postgres_store,
 ):
-    account_uuid, source_project_uuid = _insert_account_and_assignment(
-        postgres_store
-    )
+    account_uuid, source_project_uuid = _insert_account_and_assignment(postgres_store)
     source_stream_uuid, source_topic_uuid, author_uuid = (
         _materialize_channel_projection(
             postgres_store, account_uuid, source_project_uuid
         )
     )
     destination_project_uuid = str(uuid.uuid4())
-    destination_stream_uuid, destination_topic_uuid = (
-        _materialize_destination_channel(
-            postgres_store,
-            account_uuid,
-            destination_project_uuid,
-            43,
-        )
+    destination_stream_uuid, destination_topic_uuid = _materialize_destination_channel(
+        postgres_store,
+        account_uuid,
+        destination_project_uuid,
+        43,
     )
     _insert_channel_assignment(
         postgres_store,
@@ -3429,9 +3598,7 @@ def test_selected_move_then_unselected_move_deletes_pending_destination(
         "replacement-provider-queue",
         leave_event,
     )
-    assert [record["operation"]["kind"] for record in delete] == [
-        "message.delete"
-    ]
+    assert [record["operation"]["kind"] for record in delete] == ["message.delete"]
     assert delete[0]["project_uuid"] == destination_project_uuid
     assert delete[0]["causal_lane"] == causal_lane
     assert delete[0]["operation"]["provider"]["chat_id"] == "channel:43"
@@ -3495,9 +3662,7 @@ def test_channel_move_to_unselected_destination_retires_message_mapping(
         queue_id,
         event,
     )
-    assert [record["operation"]["kind"] for record in records] == [
-        "message.delete"
-    ]
+    assert [record["operation"]["kind"] for record in records] == ["message.delete"]
     records = postgres_store.prepare_provider_event_records(
         account_uuid,
         queue_id,
@@ -3517,19 +3682,22 @@ def test_channel_move_to_unselected_destination_retires_message_mapping(
         "deleted": True,
         "causal_lane": f"chat:{account_uuid}:{stream_uuid}",
     }
-    assert converter.event_records(
-        postgres_store,
-        account_uuid,
-        "provider-message-update:601",
-        {
-            "id": 706,
-            "type": "update_message",
-            "message_id": 601,
-            "stream_id": 43,
-            "content": "must not resurrect",
-            "edit_timestamp": 1_700_000_016,
-        },
-    ) == []
+    assert (
+        converter.event_records(
+            postgres_store,
+            account_uuid,
+            "provider-message-update:601",
+            {
+                "id": 706,
+                "type": "update_message",
+                "message_id": 601,
+                "stream_id": 43,
+                "content": "must not resurrect",
+                "edit_timestamp": 1_700_000_016,
+            },
+        )
+        == []
+    )
 
     postgres_store.accept_result(_committed_result(records[0]))
 
@@ -4003,8 +4171,7 @@ def test_grouped_selected_return_skips_missing_tombstone_and_moves_remaining_mes
         destination_topic_uuid
     )
     assert not any(
-        record["operation"]["kind"] == "message.create"
-        for record in converted_records
+        record["operation"]["kind"] == "message.create" for record in converted_records
     )
 
     with postgres_store.session() as session:
@@ -5129,12 +5296,15 @@ def test_provider_assignment_context_survives_intervening_retry_reason(postgres_
         "display_recipient": "Engineering",
         "timestamp": 1_800_000_000,
     }
-    assert postgres_store.cache_provider_event_message_context(
-        account_uuid,
-        "queue",
-        1,
-        message_context,
-    ) == message_context
+    assert (
+        postgres_store.cache_provider_event_message_context(
+            account_uuid,
+            "queue",
+            1,
+            message_context,
+        )
+        == message_context
+    )
 
     postgres_store.retry_provider_event(
         account_uuid,

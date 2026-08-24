@@ -688,6 +688,11 @@ class BridgeService:
                         registration,
                         getattr(adapter, "server_url", ""),
                     )
+                    self._record_registration_notification_snapshots(
+                        account_uuid,
+                        queue_id,
+                        registration,
+                    )
             else:
                 queue_id = str(cursor["queue_id"])
                 last_event_id = int(cursor["last_event_id"])
@@ -711,7 +716,36 @@ class BridgeService:
         for event in events:
             event_id = int(event["id"])
             if event.get("type") != "heartbeat":
-                self.store.record_provider_event(account_uuid, queue_id, event)
+                persisted_event = event
+                if (
+                    event.get("type") == "user_settings"
+                    and event.get("op") == "update"
+                    and event.get("property") == "enable_stream_desktop_notifications"
+                ):
+                    try:
+                        subscriptions = adapter.notification_subscriptions()
+                    except zulip_adapter.ZulipOperationError as exc:
+                        return processed, exc
+                    persisted_event = dict(event)
+                    persisted_event["subscriptions"] = subscriptions
+                    persisted_event["observed_at"] = datetime.datetime.now(
+                        datetime.UTC
+                    ).timestamp()
+                if (
+                    event.get("type") == "subscription"
+                    and event.get("op") == "update"
+                    and event.get("property") in {"is_muted", "desktop_notifications"}
+                    and event.get("observed_at") is None
+                ):
+                    persisted_event = dict(event)
+                    persisted_event["observed_at"] = datetime.datetime.now(
+                        datetime.UTC
+                    ).timestamp()
+                self.store.record_provider_event(
+                    account_uuid,
+                    queue_id,
+                    persisted_event,
+                )
                 local_id = event.get("local_message_id")
                 message = event.get("message")
                 if local_id is not None and isinstance(message, dict):
@@ -733,6 +767,98 @@ class BridgeService:
         if initial_sync_ready:
             self._queue_ready_assignment_reports(account_uuid)
         return processed, None
+
+    def _record_registration_notification_snapshots(
+        self,
+        account_uuid: str,
+        queue_id: str,
+        registration: dict[str, object],
+    ) -> int:
+        observed_at = datetime.datetime.now(datetime.UTC).timestamp()
+        snapshots: list[dict[str, object]] = []
+        user_settings = registration.get("user_settings")
+        global_desktop_notifications = (
+            user_settings.get("enable_stream_desktop_notifications")
+            if isinstance(user_settings, dict)
+            else None
+        )
+        if not isinstance(global_desktop_notifications, bool):
+            return 0
+        for subscription in typing.cast(
+            list[dict[str, object]], registration.get("subscriptions", [])
+        ):
+            stream_id = subscription.get("stream_id")
+            is_muted = subscription.get("is_muted")
+            desktop_notifications = subscription.get("desktop_notifications")
+            if (
+                not isinstance(stream_id, int)
+                or not isinstance(is_muted, bool)
+                or (
+                    desktop_notifications is not None
+                    and not isinstance(desktop_notifications, bool)
+                )
+            ):
+                continue
+            snapshots.append(
+                {
+                    "type": "subscription",
+                    "op": "notification_snapshot",
+                    "stream_id": stream_id,
+                    "is_muted": is_muted,
+                    "desktop_notifications": desktop_notifications,
+                    "enable_stream_desktop_notifications": (
+                        global_desktop_notifications
+                    ),
+                    "observed_at": observed_at,
+                }
+            )
+        user_topics = typing.cast(
+            list[dict[str, object]], registration.get("user_topics", [])
+        )
+        snapshots.extend({"type": "user_topic", **topic} for topic in user_topics)
+        explicit_topic_ids = {
+            converter.channel_topic_provider_id(
+                int(topic["stream_id"]), str(topic["topic_name"])
+            )
+            for topic in user_topics
+        }
+        subscribed_stream_ids = {
+            int(subscription["stream_id"])
+            for subscription in typing.cast(
+                list[dict[str, object]], registration.get("subscriptions", [])
+            )
+            if isinstance(subscription.get("stream_id"), int)
+        }
+        for mapping in self.store.provider_topic_mappings(account_uuid):
+            provider_topic_id = str(mapping["provider_id"])
+            raw_stream_id, separator, topic_name = provider_topic_id.partition(":")
+            if not separator or not raw_stream_id.isdigit() or not topic_name:
+                continue
+            stream_id = int(raw_stream_id)
+            if (
+                stream_id not in subscribed_stream_ids
+                or provider_topic_id in explicit_topic_ids
+            ):
+                continue
+            # Zulip omits inherited/default topics from user_topics. Recreate
+            # those authoritative tombstones for every mapped topic so a queue
+            # replacement cannot retain an older mute/follow override forever.
+            snapshots.append(
+                {
+                    "type": "user_topic",
+                    "stream_id": stream_id,
+                    "topic_name": topic_name,
+                    "visibility_policy": 0,
+                    "observed_at": observed_at,
+                }
+            )
+        inserted = 0
+        for index, snapshot in enumerate(snapshots, start=1):
+            event = {"id": -index, **snapshot}
+            inserted += int(
+                self.store.record_provider_event(account_uuid, queue_id, event)
+            )
+        return inserted
 
     def _ensure_provider_poll_state(self) -> None:
         """Initialize account-thread state for normal and lightweight test instances."""
@@ -1451,6 +1577,7 @@ class BridgeService:
             common_capabilities.update(
                 {
                     "messenger.membership.write",
+                    "messenger.notification.write",
                     "messenger.stream.rename",
                     "messenger.topic.rename",
                 }
@@ -1525,9 +1652,7 @@ class BridgeService:
         }
 
     @classmethod
-    def _reaction_assignment_wait_expired(
-        cls, row: dict[str, object]
-    ) -> bool:
+    def _reaction_assignment_wait_expired(cls, row: dict[str, object]) -> bool:
         pending_since = row.get("assignment_pending_since")
         return (
             isinstance(pending_since, datetime.datetime)
@@ -1614,6 +1739,38 @@ class BridgeService:
                     provider_event_marker=provider_event_marker,
                 )
             return False
+        if event_type == "user_topic":
+            stream_id = event.get("stream_id")
+            raw_topic_name = event.get("topic_name")
+            if not isinstance(stream_id, int) or not isinstance(raw_topic_name, str):
+                return False
+            chat_key = f"channel:{stream_id}"
+            mapping = self.store.provider_mapping(account_uuid, "stream", chat_key)
+            if mapping is None:
+                return False
+            metadata = mapping.get("metadata")
+            display_name = metadata.get("name") if isinstance(metadata, dict) else None
+            if not isinstance(display_name, str) or not display_name:
+                return False
+            topic_name = converter.channel_topic_name(raw_topic_name)
+            return self._queue_catalog_report(
+                account_uuid,
+                *common,
+                chat_key,
+                "channel",
+                display_name,
+                server_url,
+                topics=[
+                    {
+                        "provider_topic_id": converter.channel_topic_provider_id(
+                            stream_id, topic_name
+                        ),
+                        "name": topic_name,
+                        "is_default": converter.is_empty_channel_topic(raw_topic_name),
+                    }
+                ],
+                provider_event_marker=provider_event_marker,
+            )
         if event_type != "subscription":
             return False
         operation = str(event.get("op"))
@@ -1646,15 +1803,18 @@ class BridgeService:
             display_name = subscription.get("name")
             if not isinstance(stream_id, int) or not isinstance(display_name, str):
                 continue
-            catalog_changed = self._queue_catalog_report(
-                account_uuid,
-                *common,
-                f"channel:{stream_id}",
-                "channel",
-                display_name,
-                server_url,
-                "delete" if operation == "remove" else "upsert",
-            ) or catalog_changed
+            catalog_changed = (
+                self._queue_catalog_report(
+                    account_uuid,
+                    *common,
+                    f"channel:{stream_id}",
+                    "channel",
+                    display_name,
+                    server_url,
+                    "delete" if operation == "remove" else "upsert",
+                )
+                or catalog_changed
+            )
         return catalog_changed
 
     def _initial_sync_ready(self, account_uuid: str) -> bool:
@@ -2140,8 +2300,7 @@ class BridgeService:
         cached_context = row.get("provider_message_context")
         if (
             isinstance(cached_context, dict)
-            and cached_context.get("context_kind")
-            == "pending_delete_recreations"
+            and cached_context.get("context_kind") == "pending_delete_recreations"
         ):
             return self._validated_pending_delete_recreations(
                 cached_context,
@@ -2410,6 +2569,8 @@ class BridgeService:
             "update_message_flags",
             "reaction",
             "subscription",
+            "user_topic",
+            "user_settings",
             "realm_user",
         }
         for row in rows:
@@ -2446,7 +2607,7 @@ class BridgeService:
                         adapter.server_url,
                         (
                             (account_uuid, queue_id, event_id)
-                            if event["type"] == "message"
+                            if event["type"] in {"message", "user_topic"}
                             else None
                         ),
                     )
@@ -2513,9 +2674,7 @@ class BridgeService:
                                 dict[str, object], cached_message
                             )
                         else:
-                            fetched_message = adapter.message_by_id(
-                                provider_message_id
-                            )
+                            fetched_message = adapter.message_by_id(provider_message_id)
                             if fetched_message is None:
                                 raise ValueError("provider_message_not_found")
                             provider_message = self._reaction_message_context(
@@ -2738,14 +2897,11 @@ class BridgeService:
                     if raw_ids is None and event.get("message_id") is not None:
                         raw_ids = [event["message_id"]]
                     deleted_message_ids = [
-                        str(value)
-                        for value in typing.cast(list[object], raw_ids or [])
+                        str(value) for value in typing.cast(list[object], raw_ids or [])
                     ]
                 if records and event_enqueued_atomically:
                     pass
-                elif records and hasattr(
-                    self.store, "mark_provider_event_delivering"
-                ):
+                elif records and hasattr(self.store, "mark_provider_event_delivering"):
                     self.store.mark_provider_event_delivering(
                         account_uuid, queue_id, event_id
                     )
@@ -3203,9 +3359,7 @@ class BridgeService:
             progressed |= self._run_heartbeat(now)
         progressed |= self._run_control_poll(now)
         store = getattr(self, "store", None)
-        last_history_lease_reap = getattr(
-            self, "last_history_lease_reap", 0.0
-        )
+        last_history_lease_reap = getattr(self, "last_history_lease_reap", 0.0)
         if (
             store is not None
             and hasattr(store, "reap_expired_history_leases")
