@@ -2513,6 +2513,22 @@ class RestAlchemyStore:
                 """,
             (origin, causal_lane),
         ).fetchone()
+        existing = session.execute(
+            """
+            SELECT lane_sequence, predecessor_operation_uuid
+            FROM producer_operations WHERE operation_uuid = %s
+            """,
+            (operation_uuid,),
+        ).fetchone()
+        if existing is not None:
+            record["sequence"] = int(existing["lane_sequence"])
+            record["predecessor_operation_uuid"] = (
+                None
+                if existing["predecessor_operation_uuid"] is None
+                else str(existing["predecessor_operation_uuid"])
+            )
+            record["operation_sha256"] = canonical.operation_digest(record)
+            return
         sequence = int(counter["last_sequence"]) + 1
         predecessor = counter["last_operation_uuid"]
         session.execute(

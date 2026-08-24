@@ -3004,6 +3004,22 @@ def test_provider_identity_replay_keeps_first_accepted_record(postgres_store):
         postgres_store.enqueue_workspace_delivery(changed_payload, 0, "queue", 7)
 
 
+def test_prepared_replay_reuses_a_concurrently_allocated_lane(postgres_store):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    record = _provider_record(account_uuid, project_uuid)
+    prepared_replay = json.loads(json.dumps(record))
+
+    assert postgres_store.enqueue_workspace_delivery(record, 2)
+    assert not postgres_store.enqueue_workspace_delivery(prepared_replay, 2)
+
+    assert prepared_replay["sequence"] == record["sequence"]
+    assert (
+        prepared_replay["predecessor_operation_uuid"]
+        == record["predecessor_operation_uuid"]
+    )
+    assert prepared_replay["operation_sha256"] == record["operation_sha256"]
+
+
 def test_outbound_commit_suppresses_queue_loss_history_duplicate(postgres_store):
     account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
     stream_uuid, topic_uuid, author_uuid = _materialize_channel_projection(
