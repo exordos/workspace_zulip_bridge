@@ -6327,11 +6327,14 @@ class RestAlchemyStore:
             session.execute(
                 """
                 UPDATE zulip_queue_catchup_jobs
-                SET seen_provider_message_ids = (
-                        SELECT jsonb_agg(DISTINCT value)
-                        FROM jsonb_array_elements(
-                            seen_provider_message_ids || %s::jsonb
-                        ) AS values(value)
+                SET seen_provider_message_ids = COALESCE(
+                        (
+                            SELECT jsonb_agg(DISTINCT value)
+                            FROM jsonb_array_elements(
+                                seen_provider_message_ids || %s::jsonb
+                            ) AS values(value)
+                        ),
+                        '[]'::jsonb
                     ),
                     next_anchor = %s,
                     page_count = page_count + 1,

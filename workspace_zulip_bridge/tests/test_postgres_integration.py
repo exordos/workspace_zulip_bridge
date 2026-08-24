@@ -2910,6 +2910,34 @@ def test_queue_loss_catchup_completes_without_a_safe_error(postgres_store):
     assert postgres_store.provider_catchup_ready(account_uuid)
 
 
+def test_queue_loss_catchup_accepts_an_empty_provider_page(postgres_store):
+    account_uuid, _ = _insert_account_and_assignment(postgres_store)
+    postgres_store.begin_provider_queue_catchup(account_uuid)
+
+    postgres_store.advance_provider_catchup(
+        account_uuid,
+        "channel:42",
+        [],
+        None,
+        True,
+    )
+
+    with postgres_store.session() as session:
+        row = session.execute(
+            """
+            SELECT seen_provider_message_ids, page_count, state
+            FROM zulip_queue_catchup_jobs
+            WHERE account_uuid = %s AND provider_chat_key = 'channel:42'
+            """,
+            (account_uuid,),
+        ).fetchone()
+    assert row == {
+        "seen_provider_message_ids": [],
+        "page_count": 1,
+        "state": "complete",
+    }
+
+
 def test_account_global_identity_delivery_uses_account_generation(postgres_store):
     account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
     record = _provider_record(
