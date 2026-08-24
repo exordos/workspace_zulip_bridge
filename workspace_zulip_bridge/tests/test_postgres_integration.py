@@ -1782,6 +1782,177 @@ def test_pending_observed_reports_prioritize_account_control_state(postgres_stor
     assert postgres_store.pending_observed_reports(limit=1) == [account_report]
 
 
+def test_pending_observed_reports_prioritize_chat_materialization_over_status(
+    postgres_store,
+):
+    account_uuid = str(uuid.uuid4())
+    status_report = {
+        "report_uuid": str(uuid.uuid4()),
+        "resource_type": "external_chat_assignment",
+        "resource_uuid": str(uuid.uuid4()),
+        "observed_generation": 1,
+        "status": "backfill",
+        "observed_at": datetime.datetime.now(datetime.UTC).isoformat(),
+    }
+    materialization_report = {
+        "report_uuid": str(uuid.uuid4()),
+        "resource_type": "external_chat_catalog",
+        "resource_uuid": str(uuid.uuid4()),
+        "observed_generation": 1,
+        "status": "ready",
+        "observed_at": datetime.datetime.now(datetime.UTC).isoformat(),
+        "catalog": {
+            "operation": "upsert",
+            "external_account_uuid": account_uuid,
+            "source": {"provider_chat_key": "direct:9,15"},
+        },
+    }
+    assert postgres_store.enqueue_observed_report(status_report)
+    assert postgres_store.enqueue_observed_report(materialization_report)
+
+    assert postgres_store.has_pending_chat_materializations()
+    assert postgres_store.pending_observed_reports(limit=1) == [
+        materialization_report
+    ]
+
+    postgres_store.apply_observed_report_results(
+        [
+            {
+                "report_uuid": materialization_report["report_uuid"],
+                "status": "applied",
+            }
+        ]
+    )
+
+    assert not postgres_store.has_pending_chat_materializations()
+
+
+def test_deferred_chat_materialization_remains_in_delivery_gate(postgres_store):
+    materialization_report = {
+        "report_uuid": str(uuid.uuid4()),
+        "resource_type": "external_chat_catalog",
+        "resource_uuid": str(uuid.uuid4()),
+        "observed_generation": 1,
+        "status": "ready",
+        "observed_at": datetime.datetime.now(datetime.UTC).isoformat(),
+        "catalog": {
+            "operation": "upsert",
+            "external_account_uuid": str(uuid.uuid4()),
+            "source": {"provider_chat_key": "direct:9,15"},
+        },
+    }
+    assert postgres_store.enqueue_observed_report(materialization_report)
+
+    postgres_store.apply_observed_report_results(
+        [
+            {
+                "report_uuid": materialization_report["report_uuid"],
+                "status": "rejected",
+                "safe_error": {"retryable": True},
+            }
+        ]
+    )
+
+    with postgres_store.session() as session:
+        deferred = session.execute(
+            """
+            SELECT completed_at IS NULL AS incomplete,
+                   available_at > now() AS deferred,
+                   attempts
+            FROM observed_report_outbox
+            WHERE report_uuid = %s
+            """,
+            (materialization_report["report_uuid"],),
+        ).fetchone()
+
+    assert deferred == {"incomplete": True, "deferred": True, "attempts": 1}
+    assert postgres_store.pending_observed_reports() == []
+    assert postgres_store.has_pending_chat_materializations()
+
+    postgres_store.apply_observed_report_results(
+        [
+            {
+                "report_uuid": materialization_report["report_uuid"],
+                "status": "applied",
+            }
+        ]
+    )
+    assert not postgres_store.has_pending_chat_materializations()
+
+
+def test_concurrent_chat_materialization_commit_blocks_delivery_selection(
+    postgres_store,
+):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    _enable_zulip_provider(postgres_store)
+    delivery = _provider_record(account_uuid, project_uuid)
+    materialization_report = {
+        "report_uuid": str(uuid.uuid4()),
+        "resource_type": "external_chat_catalog",
+        "resource_uuid": str(uuid.uuid4()),
+        "observed_generation": 1,
+        "status": "ready",
+        "observed_at": datetime.datetime.now(datetime.UTC).isoformat(),
+        "catalog": {
+            "operation": "upsert",
+            "external_account_uuid": account_uuid,
+            "source": {"provider_chat_key": "channel:42"},
+        },
+    }
+    gate_checked = threading.Event()
+    producer_committed = threading.Event()
+    selected: list[dict[str, object]] = []
+    failures: list[BaseException] = []
+
+    def select_after_stale_gate_check() -> None:
+        try:
+            assert not postgres_store.has_pending_chat_materializations()
+            gate_checked.set()
+            assert producer_committed.wait(timeout=2.0)
+            selected.extend(
+                postgres_store.pending_workspace_deliveries(
+                    minimum_priority=0,
+                    maximum_priority=0,
+                )
+            )
+        except BaseException as error:
+            failures.append(error)
+
+    def produce_materialization_and_delivery() -> None:
+        try:
+            assert gate_checked.wait(timeout=2.0)
+            assert postgres_store.enqueue_observed_report(materialization_report)
+            assert postgres_store.enqueue_workspace_delivery(delivery, 0)
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            producer_committed.set()
+
+    selector = threading.Thread(target=select_after_stale_gate_check)
+    producer = threading.Thread(target=produce_materialization_and_delivery)
+    selector.start()
+    producer.start()
+    selector.join(timeout=2.0)
+    producer.join(timeout=2.0)
+
+    assert not selector.is_alive()
+    assert not producer.is_alive()
+    assert failures == []
+    assert postgres_store.has_pending_chat_materializations()
+    assert not postgres_store.has_pending_workspace_deliveries(0, 0)
+    assert selected == []
+
+    postgres_store.apply_observed_report_results(
+        [
+            {
+                "report_uuid": materialization_report["report_uuid"],
+                "status": "applied",
+            }
+        ]
+    )
+    assert postgres_store.pending_workspace_deliveries(0, 0) == [delivery]
+
+
 def test_pending_observed_reports_prioritize_live_message_dependency(postgres_store):
     account_uuid = str(uuid.uuid4())
     queue_id = "live-priority"
@@ -1909,6 +2080,20 @@ def test_observed_report_hot_queries_use_migration_indexes(postgres_store):
         "observed_at": datetime.datetime.now(datetime.UTC).isoformat(),
     }
     assert postgres_store.enqueue_observed_report(report)
+    materialization_report = {
+        "report_uuid": str(uuid.uuid4()),
+        "resource_type": "external_chat_catalog",
+        "resource_uuid": str(uuid.uuid4()),
+        "observed_generation": 1,
+        "status": "ready",
+        "observed_at": datetime.datetime.now(datetime.UTC).isoformat(),
+        "catalog": {
+            "operation": "upsert",
+            "external_account_uuid": catalog_account_uuid,
+            "source": {"provider_chat_key": "direct:9,15"},
+        },
+    }
+    assert postgres_store.enqueue_observed_report(materialization_report)
 
     with postgres_store.session() as session:
         session.execute(
@@ -1989,6 +2174,20 @@ def test_observed_report_hot_queries_use_migration_indexes(postgres_store):
             ORDER BY created_at LIMIT 500
             """,
         )
+        materialization_plan = _explain_text(
+            session,
+            """
+            SELECT 1 FROM observed_report_outbox AS report
+            WHERE report.completed_at IS NULL
+              AND report.body->>'resource_type' = 'external_chat_catalog'
+              AND report.body->>'status' = 'ready'
+              AND COALESCE(
+                  report.body->'catalog'->>'operation',
+                  'upsert'
+              ) = 'upsert'
+            LIMIT 1
+            """,
+        )
         catalog_readiness_plan = _explain_text(
             session,
             """
@@ -2005,6 +2204,10 @@ def test_observed_report_hot_queries_use_migration_indexes(postgres_store):
     assert "observed_report_outbox_resource_latest_idx" in dedup_plan
     assert "observed_report_outbox_pending_order_idx" in pending_rank_plan
     assert "observed_report_outbox_pending_order_idx" in pending_order_plan
+    assert (
+        "observed_report_outbox_chat_materialization_idx"
+        in materialization_plan
+    )
     assert "observed_report_outbox_catalog_readiness_idx" in catalog_readiness_plan
 
 

@@ -75,11 +75,12 @@ def test_migrations_have_one_versioned_dependency_chain():
         "0018-persist-reaction-assignment-context-372258.py",
         "0019-fair-provider-journal-scheduling-5e3926.py",
         "0020-refresh-Zulip-notification-queues-93df4e.py",
+        "0021-index-pending-chat-materializations-dcdd12.py",
     ]
     assert engine.get_latest_migration() == (
-        "0020-refresh-Zulip-notification-queues-93df4e.py"
+        "0021-index-pending-chat-materializations-dcdd12.py"
     )
-    assert len({step["uuid"] for step in all_migrations.values()}) == 21
+    assert len({step["uuid"] for step in all_migrations.values()}) == 22
     assert all_migrations["0001-add-Zulip-provider-scheduler-state-143113.py"][
         "depends"
     ] == ["0000-initialize-bridge-operational-state-18f707.py"]
@@ -140,6 +141,9 @@ def test_migrations_have_one_versioned_dependency_chain():
     assert all_migrations["0020-refresh-Zulip-notification-queues-93df4e.py"][
         "depends"
     ] == ["0019-fair-provider-journal-scheduling-5e3926.py"]
+    assert all_migrations["0021-index-pending-chat-materializations-dcdd12.py"][
+        "depends"
+    ] == ["0020-refresh-Zulip-notification-queues-93df4e.py"]
 
 
 def test_notification_queue_refresh_preserves_live_message_gap():
@@ -525,6 +529,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                       'workspace_delivery_outbox_pending_dependency_idx',
                       'observed_report_outbox_resource_latest_idx',
                       'observed_report_outbox_pending_order_idx',
+                      'observed_report_outbox_chat_materialization_idx',
                       'observed_report_outbox_catalog_readiness_idx',
                       'desired_resources_selected_assignment_account_idx',
                       'workspace_delivery_outbox_initial_backfill_idx',
@@ -551,12 +556,13 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                   AND indexname = 'zulip_provider_events_account_head_idx'
                 """
             ).fetchone()
-            assert applied["count"] == 21
+            assert applied["count"] == 22
             assert [row["indexname"] for row in indexes] == [
                 "bridge_operations_active_local_echo_idx",
                 "desired_resources_assignment_chat_idx",
                 "desired_resources_selected_assignment_account_idx",
                 "observed_report_outbox_catalog_readiness_idx",
+                "observed_report_outbox_chat_materialization_idx",
                 "observed_report_outbox_pending_order_idx",
                 "observed_report_outbox_resource_latest_idx",
                 "scheduler_accounts_provider_ready_idx",
@@ -603,7 +609,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
             provider_cursor_count = session.execute(
                 "SELECT count(*) AS count FROM zulip_event_cursors"
             ).fetchone()
-            assert applied["count"] == 21
+            assert applied["count"] == 22
             assert cursor["control_cursor"] == "preserved"
             assert provider_cursor_count["count"] == 0
     finally:
