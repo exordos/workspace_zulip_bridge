@@ -4704,6 +4704,34 @@ def test_live_pending_probe_uses_cheap_outbox_exists_query():
     assert calls == [(0, 0)]
 
 
+def test_chat_materialization_preempts_live_and_history_message_delivery():
+    calls = []
+
+    class Store:
+        def has_pending_chat_materializations(self):
+            calls.append("materialization")
+            return True
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance.provider_batch_size = 100
+    instance._live_workspace_delivery_pending = lambda: False
+    instance._provider_delivery_delay = lambda: 0.0
+    instance._flush_provider_events_locked = (
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("messages must wait for chat materialization")
+        )
+    )
+
+    assert instance.flush_provider_events(0, 0, 20) == 0
+    assert instance._flush_history_events() == (
+        0,
+        service.BridgeService.HISTORY_DELIVERY_BATCH_SIZE,
+        False,
+    )
+    assert calls == ["materialization", "materialization"]
+
+
 def test_idle_history_uses_full_large_profile_delivery_batch():
     calls = []
 

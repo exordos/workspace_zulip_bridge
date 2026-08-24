@@ -132,6 +132,22 @@ def test_pending_workspace_delivery_probe_requires_current_account_and_assignmen
     assert parameters == (0, 0)
 
 
+def test_pending_chat_materialization_probe_includes_deferred_upserts():
+    session = Session(({"pending": True},))
+    store = _store_with_session(session)
+
+    assert store.has_pending_chat_materializations()
+    statement, parameters = session.statements[0]
+    assert "observed_report_outbox" in statement
+    assert "report.completed_at IS NULL" in statement
+    assert "report.available_at" not in statement
+    assert "'external_chat_catalog'" in statement
+    assert "report.body->>'status' = 'ready'" in statement
+    assert "report.body->'catalog'->>'operation'" in statement
+    assert "'upsert'" in statement
+    assert parameters is None
+
+
 def _desired_change():
     resource_uuid = str(uuid.uuid4())
     return {

@@ -565,6 +565,11 @@ class BridgeService:
             return False
         return bool(pending(minimum_priority=0, maximum_priority=0, limit=1))
 
+    def _chat_materialization_pending(self) -> bool:
+        store = getattr(self, "store", None)
+        pending = getattr(store, "has_pending_chat_materializations", None)
+        return bool(callable(pending) and pending())
+
     def poll_provider_operations(self) -> int:
         """Lease Workspace-to-Zulip operations from the private HTTP data plane."""
         request_uuid = self.provider_lease_request_uuid or uuid.uuid4()
@@ -3304,6 +3309,8 @@ class BridgeService:
         limit: int = 100,
     ) -> int:
         with self._provider_delivery_mutex():
+            if self._chat_materialization_pending():
+                return 0
             if self._provider_delivery_delay() > 0:
                 return 0
             return self._flush_provider_events_locked(
@@ -3317,6 +3324,8 @@ class BridgeService:
         with self._provider_delivery_mutex():
             live_pending = self._live_workspace_delivery_pending()
             history_batch_size = self._history_delivery_batch_size(live_pending)
+            if self._chat_materialization_pending():
+                return 0, history_batch_size, False
             if live_pending and not self._claim_history_quantum():
                 return 0, history_batch_size, False
             if self._provider_delivery_delay() > 0:
@@ -3706,6 +3715,10 @@ class BridgeService:
                 retry_delay = self._provider_delivery_delay()
                 if retry_delay > 0:
                     time.sleep(min(retry_delay, 1.0))
+                    continue
+                if self._chat_materialization_pending():
+                    self._clear_live_delivery_stall()
+                    time.sleep(0.05)
                     continue
                 pending = getattr(self.store, "has_pending_workspace_deliveries", None)
                 if callable(pending) and not pending(0, 0):

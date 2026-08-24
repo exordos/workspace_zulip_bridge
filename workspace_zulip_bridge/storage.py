@@ -3188,6 +3188,18 @@ class RestAlchemyStore:
                               ),
                               false
                           )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM observed_report_outbox AS report
+                          WHERE report.completed_at IS NULL
+                            AND report.body->>'resource_type' =
+                                'external_chat_catalog'
+                            AND report.body->>'status' = 'ready'
+                            AND COALESCE(
+                                report.body->'catalog'->>'operation',
+                                'upsert'
+                            ) = 'upsert'
+                      )
                       AND delivery.sent_at IS NULL
                       AND (
                           delivery.submission_state IN ('pending', 'ambiguous')
@@ -3364,7 +3376,7 @@ class RestAlchemyStore:
         minimum_priority: int = 0,
         maximum_priority: int = 2,
     ) -> bool:
-        """Probe ready delivery work without running dependency projection SQL."""
+        """Probe ready delivery work behind the global materialization gate."""
         if not 0 <= minimum_priority <= maximum_priority <= 2:
             raise ValueError("Invalid workspace delivery priority range")
         with self.session() as session:
@@ -3388,6 +3400,17 @@ class RestAlchemyStore:
                         LIMIT 1
                     ),
                     false
+                ) AND NOT EXISTS (
+                    SELECT 1
+                    FROM observed_report_outbox AS report
+                    WHERE report.completed_at IS NULL
+                      AND report.body->>'resource_type' =
+                          'external_chat_catalog'
+                      AND report.body->>'status' = 'ready'
+                      AND COALESCE(
+                          report.body->'catalog'->>'operation',
+                          'upsert'
+                      ) = 'upsert'
                 ) AND EXISTS (
                     SELECT 1
                     FROM workspace_delivery_outbox AS delivery
@@ -6910,6 +6933,13 @@ class RestAlchemyStore:
                     FROM dependency_heads
                 ), pending AS (
                     SELECT report.body, report.created_at, report.report_uuid,
+                           report.body->>'resource_type' =
+                               'external_chat_catalog'
+                           AND report.body->>'status' = 'ready'
+                           AND COALESCE(
+                               report.body->'catalog'->>'operation',
+                               'upsert'
+                           ) = 'upsert' AS chat_materialization,
                            dependency.account_uuid IS NOT NULL
                                AS live_dependency,
                            row_number() OVER (
@@ -6923,6 +6953,15 @@ class RestAlchemyStore:
                                    report.body->>'resource_uuid'
                                )
                                ORDER BY
+                                   (
+                                       report.body->>'resource_type' =
+                                           'external_chat_catalog'
+                                       AND report.body->>'status' = 'ready'
+                                       AND COALESCE(
+                                           report.body->'catalog'->>'operation',
+                                           'upsert'
+                                       ) = 'upsert'
+                                   ) DESC,
                                    (dependency.account_uuid IS NOT NULL) DESC,
                                    report.created_at,
                                    report.report_uuid
@@ -6939,13 +6978,35 @@ class RestAlchemyStore:
                 SELECT body FROM pending
                 ORDER BY
                          (body->>'resource_type' = 'external_account') DESC,
-                         account_position, live_dependency DESC,
+                         chat_materialization DESC, live_dependency DESC,
+                         account_position,
                          created_at, report_uuid
                 LIMIT %s
                 """,
                 (limit,),
             ).fetchall()
             return [typing.cast(dict[str, object], row["body"]) for row in rows]
+
+    def has_pending_chat_materializations(self) -> bool:
+        """Return whether an incomplete catalog upsert blocks message delivery."""
+        with self.session() as session:
+            row = session.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM observed_report_outbox AS report
+                    WHERE report.completed_at IS NULL
+                      AND report.body->>'resource_type' =
+                          'external_chat_catalog'
+                      AND report.body->>'status' = 'ready'
+                      AND COALESCE(
+                          report.body->'catalog'->>'operation',
+                          'upsert'
+                      ) = 'upsert'
+                ) AS pending
+                """
+            ).fetchone()
+            return bool(row and row["pending"])
 
     @staticmethod
     def _clear_unapplied_catalog_report_markers(
