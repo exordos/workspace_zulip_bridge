@@ -198,11 +198,12 @@ class BridgeService:
     # catalogs are still drained continuously, while a completed response can
     # wake assignment-dependent live events after every small batch.
     OBSERVED_REPORT_BATCH_SIZE = 20
-    # Amortize the dependency projection query over a bounded batch. History
-    # remains on independent workers and provider-sequence checks keep an
-    # overlapping live message authoritative.
-    HISTORY_DELIVERY_BATCH_SIZE = 20
-    BACKGROUND_HISTORY_WORKERS = 2
+    # Idle history uses the full large-profile Provider batch. Once live work is
+    # durable, history drops to one event per second so people can keep chatting
+    # while the import continues in the background.
+    HISTORY_DELIVERY_BATCH_SIZE = 100
+    HISTORY_LIVE_DELIVERY_BATCH_SIZE = 1
+    BACKGROUND_HISTORY_WORKERS = 8
     BACKGROUND_LIVE_WORKERS = 1
     # The main live lane owns journal conversion and outbound provider work.
     # Additional workers only submit already-durable Workspace deliveries, so
@@ -223,9 +224,9 @@ class BridgeService:
     # from retry backoff so provider failures cannot restart this deadline.
     REACTION_CHAT_ASSIGNMENT_TIMEOUT = datetime.timedelta(minutes=5)
     PARTICIPANT_SYNC_BATCH_SIZE = 50
-    # History conversion touches shared stream/topic/identity mappings. Commit
-    # each message so live events never wait behind a multi-message lock set.
-    BACKFILL_ENQUEUE_TRANSACTION_MESSAGES = 1
+    # Amortize transaction setup while keeping each history lock set short. The
+    # effective size falls back to one as soon as live work becomes durable.
+    BACKFILL_ENQUEUE_TRANSACTION_MESSAGES = 10
     RETRYABLE_DATABASE_CONFLICT_CODES = frozenset({"40001", "40P01"})
     PROVIDER_POLL_INTERVAL_SECONDS = 2.0
     ACCOUNT_STATE_RECHECK_INTERVAL_SECONDS = 30.0
@@ -234,7 +235,7 @@ class BridgeService:
     # recovery guard for state left behind by a prior process interruption.
     CONTROL_STATE_RECONCILE_INTERVAL_SECONDS = 60.0
     HISTORY_QUANTUM_INTERVAL_SECONDS = 1.0
-    HISTORY_PROGRESS_DELAY_SECONDS = 2.0
+    HISTORY_PROGRESS_YIELD_SECONDS = 0.01
     TERMINAL_STATE_PRUNE_INTERVAL_SECONDS = 10.0
     HISTORY_LEASE_REAP_INTERVAL_SECONDS = 30.0
     PROVIDER_DELIVERY_RETRY_BASE_SECONDS = 1.0
@@ -2932,6 +2933,59 @@ class BridgeService:
         configured_batch = max(1, int(getattr(self, "provider_batch_size", 20)))
         return min(self.LIVE_DELIVERY_BATCH_SIZE, configured_batch)
 
+    def _history_worker_count(self) -> int:
+        """Scale history discovery without oversubscribing small deployments."""
+        configured_batch = max(1, int(getattr(self, "provider_batch_size", 20)))
+        return max(
+            2,
+            min(self.BACKGROUND_HISTORY_WORKERS, (configured_batch + 9) // 10),
+        )
+
+    def _history_delivery_batch_size(self, live_pending: bool) -> int:
+        configured_batch = max(1, int(getattr(self, "provider_batch_size", 20)))
+        ceiling = (
+            self.HISTORY_LIVE_DELIVERY_BATCH_SIZE
+            if live_pending
+            else self.HISTORY_DELIVERY_BATCH_SIZE
+        )
+        return min(ceiling, configured_batch)
+
+    def _history_message_uses_file_transfer(
+        self, message: dict[str, object]
+    ) -> bool:
+        return (
+            getattr(self, "file_client", None) is not None
+            and "/user_uploads/" in str(message.get("content", ""))
+        )
+
+    def _backfill_message_chunks(
+        self,
+        messages: list[dict[str, object]],
+        *,
+        isolate_file_transfers: bool = False,
+    ) -> typing.Iterator[list[dict[str, object]]]:
+        offset = 0
+        while offset < len(messages):
+            transaction_size = (
+                1
+                if self._live_workspace_delivery_pending()
+                else self.BACKFILL_ENQUEUE_TRANSACTION_MESSAGES
+            )
+            chunk_end = min(len(messages), offset + transaction_size)
+            if isolate_file_transfers:
+                if self._history_message_uses_file_transfer(messages[offset]):
+                    chunk_end = offset + 1
+                else:
+                    for candidate in range(offset + 1, chunk_end):
+                        if self._history_message_uses_file_transfer(
+                            messages[candidate]
+                        ):
+                            chunk_end = candidate
+                            break
+            chunk = messages[offset:chunk_end]
+            yield chunk
+            offset += len(chunk)
+
     def enqueue_backfill(
         self,
         account_uuid: str,
@@ -2958,22 +3012,25 @@ class BridgeService:
         self.backfill_topic_cache = topic_cache
         ordered_messages = converter.newest_first(messages)
         transaction = getattr(self.store, "transaction", contextlib.nullcontext)
-        with transaction():
-            for message in ordered_messages:
-                self._queue_event_catalog(
-                    account_uuid,
-                    {
-                        "id": int(message["id"]),
-                        "type": "message",
-                        "message": message,
-                    },
-                    adapter.server_url,
-                )
-        transaction_size = self.BACKFILL_ENQUEUE_TRANSACTION_MESSAGES
-        for offset in range(0, len(ordered_messages), transaction_size):
+        for message_chunk in self._backfill_message_chunks(ordered_messages):
+            with transaction():
+                for message in message_chunk:
+                    self._queue_event_catalog(
+                        account_uuid,
+                        {
+                            "id": int(message["id"]),
+                            "type": "message",
+                            "message": message,
+                        },
+                        adapter.server_url,
+                    )
+        for message_chunk in self._backfill_message_chunks(
+            ordered_messages,
+            isolate_file_transfers=True,
+        ):
             durable_topic_cache_keys = set()
             with transaction():
-                for message in ordered_messages[offset : offset + transaction_size]:
+                for message in message_chunk:
                     event = {
                         "id": int(message["id"]),
                         "type": "message",
@@ -3208,23 +3265,45 @@ class BridgeService:
             self.provider_delivery_retry_attempts = 0
             self.provider_delivery_retry_after = 0.0
 
+    def _provider_delivery_mutex(self) -> threading.Lock:
+        lock = getattr(self, "provider_delivery_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self.provider_delivery_lock = lock
+        return lock
+
     def flush_provider_events(
         self,
         minimum_priority: int = 0,
         maximum_priority: int = 2,
         limit: int = 100,
     ) -> int:
-        lock = getattr(self, "provider_delivery_lock", None)
-        if lock is None:
-            lock = threading.Lock()
-            self.provider_delivery_lock = lock
-        with lock:
+        with self._provider_delivery_mutex():
             if self._provider_delivery_delay() > 0:
                 return 0
             return self._flush_provider_events_locked(
                 minimum_priority=minimum_priority,
                 maximum_priority=maximum_priority,
                 limit=limit,
+            )
+
+    def _flush_history_events(self) -> tuple[int, int, bool]:
+        """Submit history only after rechecking live work under the HTTP mutex."""
+        with self._provider_delivery_mutex():
+            live_pending = self._live_workspace_delivery_pending()
+            history_batch_size = self._history_delivery_batch_size(live_pending)
+            if live_pending and not self._claim_history_quantum():
+                return 0, history_batch_size, False
+            if self._provider_delivery_delay() > 0:
+                return 0, history_batch_size, False
+            return (
+                self._flush_provider_events_locked(
+                    minimum_priority=2,
+                    maximum_priority=2,
+                    limit=history_batch_size,
+                ),
+                history_batch_size,
+                True,
             )
 
     def _flush_provider_events_locked(
@@ -3475,36 +3554,22 @@ class BridgeService:
 
     def _run_history_lane_once(self) -> bool:
         """Drain one durable history batch, then discover at most one page."""
-        if (
-            self._live_workspace_delivery_pending()
-            and not self._claim_history_quantum()
-        ):
-            return False
-        history_batch_size = max(
-            1,
-            min(
-                int(
-                    getattr(
-                        self,
-                        "provider_batch_size",
-                        self.HISTORY_DELIVERY_BATCH_SIZE,
-                    )
-                ),
-                self.HISTORY_DELIVERY_BATCH_SIZE,
-            ),
-        )
         history_delivered = 0
+        history_batch_size = 1
+        history_permitted = False
         history_delivery_lock = getattr(self, "history_delivery_lock", None)
         if history_delivery_lock is None:
             history_delivery_lock = threading.Lock()
             self.history_delivery_lock = history_delivery_lock
         with history_delivery_lock:
             try:
-                history_delivered = self.flush_provider_events(
-                    minimum_priority=2,
-                    maximum_priority=2,
-                    limit=history_batch_size,
-                )
+                (
+                    history_delivered,
+                    history_batch_size,
+                    history_permitted,
+                ) = self._flush_history_events()
+                if not history_permitted:
+                    return False
             except (httpx.TransportError, provider_api.ProviderApiRetryableError):
                 self.store.mark_health(
                     "provider_api", "degraded", "provider_api_unavailable"
@@ -3550,9 +3615,9 @@ class BridgeService:
         while True:
             try:
                 if self._run_history_lane_once():
-                    # Bound background SQL/HTTP pressure while retaining a much
-                    # larger history quantum than the original two-row loop.
-                    time.sleep(self.HISTORY_PROGRESS_DELAY_SECONDS)
+                    # Let live threads acquire the GIL and shared Provider mutex
+                    # between otherwise continuous idle-history batches.
+                    time.sleep(self.HISTORY_PROGRESS_YIELD_SECONDS)
                 else:
                     time.sleep(0.5)
             except Exception as error:
@@ -3682,7 +3747,7 @@ class BridgeService:
             ).start()
         self.background_history_enabled = True
         self.background_history_error = None
-        for worker_index in range(self.BACKGROUND_HISTORY_WORKERS):
+        for worker_index in range(self._history_worker_count()):
             threading.Thread(
                 target=self._run_background_history_lane,
                 name=f"workspace-zulip-history-{worker_index}",

@@ -99,8 +99,13 @@ The current implementation provides:
   durable event and cursor capture independent from history synchronization;
 - extended idle queue lifetimes on compatible Zulip servers, preserving durable
   queue cursors across quiet periods without ten-minute recovery churn;
-- live/retry/backfill scheduling with hard live priority, bounded history
-  delivery batches, and history synchronization in the main service thread;
+- live/retry/backfill scheduling with hard live priority and adaptive history
+  throughput: large profiles use up to eight discovery workers and 100-event
+  idle delivery batches, then fall back to one history event per second while
+  durable live traffic is waiting;
+- ten-message history transactions during idle import, with an adaptive
+  one-message fallback while live work is pending or the message transfers a
+  file;
 - exact owner read/unread projection from both Zulip message snapshots and live
   flag events, ordered after the corresponding Workspace message projection;
 - automatic removal of queue-recovery jobs when their chats are deselected, so
