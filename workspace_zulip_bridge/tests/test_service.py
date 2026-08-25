@@ -2989,6 +2989,7 @@ def test_catalog_reports_accumulate_full_replacement_topology():
                     "provider_user_id": user_id,
                     "display_name": f"User {user_id}",
                     "is_owner": False,
+                    "_provider_active": False,
                 },
             ],
             topics=[
@@ -3012,6 +3013,22 @@ def test_catalog_reports_accumulate_full_replacement_topology():
         "42:T1",
         "42:T2",
     }
+    assert all("_provider_active" not in value for value in final["participants"])
+    assert instance.store.participants["4"]["_provider_active"] is False
+
+
+def test_catalog_participant_retains_provider_activity_as_local_metadata():
+    participant = service.BridgeService._catalog_participant(
+        {
+            "user_id": 7,
+            "full_name": "Unavailable Zulip user (ID 7)",
+            "email": None,
+            "is_active": False,
+        },
+        False,
+    )
+
+    assert participant["_provider_active"] is False
 
 
 def test_catalog_report_repairs_authenticated_owner_in_persisted_topology():

@@ -56,6 +56,30 @@ class PendingMessageMappingStore(Store):
         return super().workspace_mapping(account_uuid, kind, workspace_uuid)
 
 
+class TombstonedIdentityStore(Store):
+    def workspace_mapping(self, account_uuid, kind, workspace_uuid):
+        if kind == "identity":
+            return None
+        return super().workspace_mapping(account_uuid, kind, workspace_uuid)
+
+    def tombstoned_workspace_mapping(self, account_uuid, kind, workspace_uuid):
+        assert (account_uuid, kind, workspace_uuid) == (
+            ACCOUNT_UUID,
+            "identity",
+            ACCOUNT_UUID,
+        )
+        mapping = super().workspace_mapping(account_uuid, kind, workspace_uuid)
+        return {
+            **mapping,
+            "metadata": {
+                "display_name": "Unavailable Zulip user (ID 42)",
+                "email": None,
+                "avatar_urn": None,
+                "active": False,
+            },
+        }
+
+
 def _lease(kind="message.create"):
     return {
         "provider_operation_uuid": str(uuid.uuid4()),
@@ -198,6 +222,23 @@ def test_zulip_record_adapts_to_atomic_provider_event_resource():
     }
 
 
+def test_provider_message_event_reuses_tombstoned_author_profile():
+    record = provider_protocol.leased_operation_record(Store(), _lease())
+    record["origin"] = "zulip"
+    record["operation_uuid"] = str(uuid.uuid4())
+    record["operation"]["provider"]["entity_id"] = "101"
+
+    event = provider_protocol.event_payload(TombstonedIdentityStore(), record)
+
+    assert event["payload"]["resource"]["author_identity"] == {
+        "provider_external_id": "42",
+        "display_name": "Unavailable Zulip user (ID 42)",
+        "email": None,
+        "avatar_urn": None,
+        "active": False,
+    }
+
+
 def test_topic_only_message_update_preserves_move_in_provider_event():
     destination_topic_uuid = str(uuid.uuid4())
     record = provider_protocol.leased_operation_record(Store(), _lease())
@@ -336,6 +377,41 @@ def test_provider_reaction_event_includes_actor_identity_and_delete_selector():
     assert resource["provider_metadata"]["emoji_name"] == "thumbs_up"
     assert resource["provider_metadata"]["emoji_code"] == "1f44d"
     assert resource["user_identity"]["provider_external_id"] == "42"
+
+
+def test_provider_reaction_event_reuses_tombstoned_actor_profile():
+    record = provider_protocol.leased_operation_record(Store(), _lease())
+    record["origin"] = "zulip"
+    record["operation_uuid"] = str(uuid.uuid4())
+    record["operation"].update(
+        {
+            "kind": "reaction.upsert",
+            "entity_uuid": REACTION_UUID,
+            "provider": {
+                "kind": "zulip",
+                "chat_id": "channel:42",
+                "entity_id": "101:42:unicode_emoji:1f44d",
+                "revision": None,
+            },
+            "payload": {
+                "stream_uuid": STREAM_UUID,
+                "topic_uuid": TOPIC_UUID,
+                "message_uuid": MESSAGE_UUID,
+                "user_uuid": ACCOUNT_UUID,
+                "emoji_name": "👍",
+            },
+        }
+    )
+
+    event = provider_protocol.event_payload(TombstonedIdentityStore(), record)
+
+    assert event["payload"]["resource"]["user_identity"] == {
+        "provider_external_id": "42",
+        "display_name": "Unavailable Zulip user (ID 42)",
+        "email": None,
+        "avatar_urn": None,
+        "active": False,
+    }
 
 
 def test_unknown_provider_mutation_fails_closed_instead_of_being_discarded():

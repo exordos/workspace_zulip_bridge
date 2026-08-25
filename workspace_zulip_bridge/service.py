@@ -1432,13 +1432,16 @@ class BridgeService:
         provider_user_id = person.get("user_id", person.get("id"))
         if not isinstance(provider_user_id, int):
             raise ValueError("Invalid Zulip catalog participant")
-        return {
+        participant = {
             "provider_user_id": str(provider_user_id),
             "display_name": str(person.get("full_name", provider_user_id)),
             "email": person.get("email"),
             "avatar_urn": None,
             "is_owner": is_owner,
         }
+        if isinstance(person.get("is_active"), bool):
+            participant["_provider_active"] = person["is_active"]
+        return participant
 
     def _catalog_participants_with_owner(
         self,
@@ -1590,6 +1593,20 @@ class BridgeService:
         external_chat_uuid = converter.stable_entity_uuid(
             account_uuid, "external_chat", chat_key
         )
+        report_participants = [
+            {
+                name: participant.get(name)
+                for name in (
+                    "provider_user_id",
+                    "display_name",
+                    "email",
+                    "avatar_urn",
+                    "is_owner",
+                )
+                if name in participant
+            }
+            for participant in participants or []
+        ]
         return self._queue_observed_report(
             "external_chat_catalog",
             external_chat_uuid,
@@ -1612,7 +1629,7 @@ class BridgeService:
                 },
                 "display_name": display_name,
                 "description": "",
-                "participants": participants or [],
+                "participants": report_participants,
                 "topics": topics or [],
                 "capabilities": capabilities,
             },

@@ -216,6 +216,32 @@ def test_workspace_mapping_prefers_active_alias_over_stale_primary_mapping():
     )
 
 
+def test_tombstoned_workspace_mapping_retains_identity_profile_for_delivery():
+    row = {
+        "workspace_uuid": uuid.uuid4(),
+        "provider_id": "42",
+        "provider_revision": None,
+        "metadata": {"display_name": "Former User", "active": False},
+    }
+    session = Session((row,))
+    store = _store_with_session(session)
+    account_uuid = str(uuid.uuid4())
+    workspace_uuid = str(row["workspace_uuid"])
+
+    assert (
+        store.tombstoned_workspace_mapping(
+            account_uuid,
+            "identity",
+            workspace_uuid,
+        )
+        == row
+    )
+    statement, parameters = session.statements[0]
+    assert "workspace_uuid = %s AND deleted" in statement
+    assert "ORDER BY updated_at DESC" in statement
+    assert parameters == (account_uuid, "identity", workspace_uuid)
+
+
 def test_accepted_provider_message_context_uses_immutable_delivery_record():
     context = {
         "project_uuid": str(uuid.uuid4()),
@@ -359,6 +385,37 @@ def test_catalog_participants_merge_is_monotonic_and_enriches_placeholders():
             "is_owner": True,
         },
         current[0],
+    ]
+
+
+def test_catalog_participants_refresh_local_provider_activity():
+    current = [
+        {
+            "provider_user_id": "20",
+            "display_name": "Unavailable Zulip user (ID 20)",
+            "is_owner": False,
+            "_provider_active": False,
+        }
+    ]
+    observed = [
+        {
+            "provider_user_id": "20",
+            "display_name": "Restored User",
+            "is_owner": False,
+            "_provider_active": True,
+        }
+    ]
+
+    assert storage._merge_catalog_participants(
+        current,
+        observed,
+        authoritative=True,
+    ) == [
+        {
+            **current[0],
+            "display_name": "Restored User",
+            "_provider_active": True,
+        }
     ]
 
 
@@ -1291,7 +1348,18 @@ def test_provider_topic_rename_returns_existing_target_without_mutating_source()
 
 
 def test_workspace_projection_contract_materializes_first_outbound_mappings():
-    session = Session()
+    session = Session(
+        (
+            {
+                "participants": [
+                    {
+                        "provider_user_id": "2",
+                        "_provider_active": False,
+                    }
+                ]
+            },
+        )
+    )
     account_uuid = str(uuid.uuid4())
     stream_uuid = str(uuid.uuid4())
     topic_uuid = str(uuid.uuid4())
@@ -1345,13 +1413,14 @@ def test_workspace_projection_contract_materializes_first_outbound_mappings():
 
     storage.RestAlchemyStore._materialize_workspace_projection(session, assignment)
 
-    assert len(session.statements) == 11
+    assert len(session.statements) == 12
     inserts = [
         parameters
         for statement, parameters in session.statements
         if "INSERT INTO provider_mappings" in statement
     ]
     identity_parameters = inserts[0]
+    peer_identity_parameters = inserts[1]
     stream_parameters = inserts[2]
     topic_parameters = inserts[3]
     assert identity_parameters[:4] == (
@@ -1360,6 +1429,8 @@ def test_workspace_projection_contract_materializes_first_outbound_mappings():
         owner_uuid,
         "1",
     )
+    assert json.loads(identity_parameters[4])["active"] is True
+    assert json.loads(peer_identity_parameters[4])["active"] is False
     assert stream_parameters[:4] == (
         account_uuid,
         "stream",
@@ -1387,7 +1458,7 @@ def test_exact_backend_assignment_fixture_materializes_owned_topology():
     )
     session = Session()
     storage.RestAlchemyStore._materialize_workspace_projection(session, fixture)
-    assert len(session.statements) == 16
+    assert len(session.statements) == 17
     materialized = []
     for statement, parameters in session.statements:
         if "INSERT INTO provider_mappings" not in statement:

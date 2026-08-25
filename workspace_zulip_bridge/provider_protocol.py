@@ -240,6 +240,20 @@ def result_payload(result: dict[str, object]) -> dict[str, object]:
     return payload
 
 
+def _event_identity_mapping(
+    store,
+    account_uuid: str,
+    workspace_uuid: str,
+) -> dict[str, object] | None:
+    mapping = store.workspace_mapping(account_uuid, "identity", workspace_uuid)
+    if mapping is not None:
+        return mapping
+    tombstone_reader = getattr(store, "tombstoned_workspace_mapping", None)
+    if not callable(tombstone_reader):
+        return None
+    return tombstone_reader(account_uuid, "identity", workspace_uuid)
+
+
 def event_payload(store, record: dict[str, object]) -> dict[str, object] | None:
     operation = typing.cast(dict[str, object], record["operation"])
     operation_kind = str(operation["kind"])
@@ -282,9 +296,9 @@ def event_payload(store, record: dict[str, object]) -> dict[str, object] | None:
                 record,
             )
         if kind == "message.upsert" and "user_uuid" in resource:
-            author = store.workspace_mapping(
+            author = _event_identity_mapping(
+                store,
                 account_uuid,
-                "identity",
                 str(resource["user_uuid"]),
             )
             if author is not None:
@@ -306,9 +320,9 @@ def event_payload(store, record: dict[str, object]) -> dict[str, object] | None:
             if relation in payload:
                 resource[relation] = payload[relation]
     if kind.startswith("reaction.") and "user_uuid" in resource:
-        actor = store.workspace_mapping(
+        actor = _event_identity_mapping(
+            store,
             account_uuid,
-            "identity",
             str(resource["user_uuid"]),
         )
         if actor is not None:

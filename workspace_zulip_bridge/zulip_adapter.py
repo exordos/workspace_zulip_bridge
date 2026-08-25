@@ -16,6 +16,7 @@ from workspace_zulip_bridge import emoji, file_api, markdown_conversion
 
 MAX_PROVIDER_FILE_BYTES = 52_428_800
 PROVIDER_QUEUE_IDLE_TIMEOUT_SECONDS = 43_200
+UNAVAILABLE_USER_DISPLAY_NAME = "Unavailable Zulip user"
 # History runs in the main service thread. Keep each provider quantum small so
 # already captured live events return to delivery promptly between pages.
 # Zulip's message endpoint is paginated server-side. A production backfill
@@ -294,6 +295,47 @@ class OfficialZulipAdapter:
         self._user_id: int | None = None
         self._registration_snapshot: dict[str, object] | None = None
         self._prepared_operation_uuid: str | None = None
+
+    @staticmethod
+    def _unavailable_user(user_id: int) -> dict[str, object]:
+        return {
+            "user_id": user_id,
+            "full_name": f"{UNAVAILABLE_USER_DISPLAY_NAME} (ID {user_id})",
+            "email": None,
+            "avatar_url": None,
+            "is_active": False,
+        }
+
+    def _hydrate_referenced_users(
+        self,
+        users: dict[int, dict[str, object]],
+        referenced_user_ids: set[int],
+    ) -> dict[int, dict[str, object]]:
+        try:
+            for user_id in sorted(referenced_user_ids - set(users)):
+                try:
+                    user = _successful(self.client.get_user_by_id(user_id)).get(
+                        "user"
+                    )
+                except ZulipOperationError as exc:
+                    # Restored and long-lived realms can retain references to
+                    # users that the provider directory no longer exposes.
+                    # Zulip reports this case as generic BAD_REQUEST, so retain
+                    # the stable provider identity with an explicit unavailable
+                    # profile instead of silently dropping the participant.
+                    if exc.code != "bad_request":
+                        raise
+                    user = self._unavailable_user(user_id)
+                if (
+                    not isinstance(user, dict)
+                    or user.get("user_id") != user_id
+                    or not isinstance(user.get("full_name"), str)
+                ):
+                    raise ZulipOperationError("invalid_record", False)
+                users[user_id] = user
+        except PROVIDER_NETWORK_ERRORS as exc:
+            raise ZulipOperationError("provider_unavailable", True) from exc
+        return users
 
     def _provider_mapping(
         self, entity_kind: str, provider_id: object
@@ -719,27 +761,7 @@ class OfficialZulipAdapter:
                 )
                 if isinstance(user_id, int)
             )
-        try:
-            for user_id in sorted(referenced_user_ids - set(realm_users)):
-                try:
-                    user = _successful(self.client.get_user_by_id(user_id)).get("user")
-                except ZulipOperationError as exc:
-                    # Restored and long-lived realms can retain subscriber IDs
-                    # for users that no longer exist. Zulip exposes this case as
-                    # the generic BAD_REQUEST code, so it cannot be distinguished
-                    # more narrowly through the official client response.
-                    if exc.code == "bad_request":
-                        continue
-                    raise
-                if (
-                    not isinstance(user, dict)
-                    or user.get("user_id") != user_id
-                    or not isinstance(user.get("full_name"), str)
-                ):
-                    raise ZulipOperationError("invalid_record", False)
-                realm_users[user_id] = user
-        except PROVIDER_NETWORK_ERRORS as exc:
-            raise ZulipOperationError("provider_unavailable", True) from exc
+        self._hydrate_referenced_users(realm_users, referenced_user_ids)
         result["subscriptions"] = subscriptions
         result["user_topics"] = user_topics
         result["realm_users"] = [
@@ -824,9 +846,24 @@ class OfficialZulipAdapter:
             ):
                 raise ZulipOperationError("invalid_record", False)
             selected_subscriptions.append(subscription)
+        referenced_user_ids = {
+            int(user_id)
+            for subscription in selected_subscriptions
+            for user_id in typing.cast(list[int], subscription["subscribers"])
+        }
+        referenced_user_ids.add(int(profile["user_id"]))
+        realm_users = self._hydrate_referenced_users(
+            {
+                int(member["user_id"]): member
+                for member in typing.cast(list[dict[str, object]], members)
+            },
+            referenced_user_ids,
+        )
         return {
             "subscriptions": selected_subscriptions,
-            "realm_users": members,
+            "realm_users": [
+                realm_users[user_id] for user_id in sorted(realm_users)
+            ],
             "user_id": profile["user_id"],
         }
 

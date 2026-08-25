@@ -846,6 +846,17 @@ def _legacy_reaction_provider_id(
     )
 
 
+def _unavailable_zulip_identity_metadata(
+    provider_user_id: str,
+) -> dict[str, object]:
+    return {
+        "display_name": f"Unavailable Zulip user (ID {provider_user_id})",
+        "email": None,
+        "avatar_urn": None,
+        "active": False,
+    }
+
+
 def _reaction_operations(
     store: ConversionStore,
     account_uuid: str,
@@ -921,12 +932,7 @@ def _reaction_operations(
     if existing is None:
         return []
     if identity is None:
-        identity_metadata = {
-            "display_name": f"Zulip user {provider_user_id}",
-            "email": None,
-            "avatar_urn": None,
-            "active": True,
-        }
+        identity_metadata = _unavailable_zulip_identity_metadata(provider_user_id)
         store.remember_provider_mapping(
             account_uuid,
             "identity",
