@@ -3194,6 +3194,10 @@ class RestAlchemyStore:
                           WHERE report.completed_at IS NULL
                             AND report.body->>'resource_type' =
                                 'external_chat_catalog'
+                            -- Workspace preserves the catalog resource UUID as
+                            -- the external_chat_assignment UUID.
+                            AND report.body->>'resource_uuid' =
+                                delivery.assignment_uuid::text
                             AND report.body->>'status' = 'ready'
                             AND COALESCE(
                                 report.body->'catalog'->>'operation',
@@ -3376,7 +3380,7 @@ class RestAlchemyStore:
         minimum_priority: int = 0,
         maximum_priority: int = 2,
     ) -> bool:
-        """Probe ready delivery work behind the global materialization gate."""
+        """Probe delivery work whose own chat materialization is complete."""
         if not 0 <= minimum_priority <= maximum_priority <= 2:
             raise ValueError("Invalid workspace delivery priority range")
         with self.session() as session:
@@ -3400,17 +3404,6 @@ class RestAlchemyStore:
                         LIMIT 1
                     ),
                     false
-                ) AND NOT EXISTS (
-                    SELECT 1
-                    FROM observed_report_outbox AS report
-                    WHERE report.completed_at IS NULL
-                      AND report.body->>'resource_type' =
-                          'external_chat_catalog'
-                      AND report.body->>'status' = 'ready'
-                      AND COALESCE(
-                          report.body->'catalog'->>'operation',
-                          'upsert'
-                      ) = 'upsert'
                 ) AND EXISTS (
                     SELECT 1
                     FROM workspace_delivery_outbox AS delivery
@@ -3435,6 +3428,22 @@ class RestAlchemyStore:
                      )
                     WHERE delivery.sent_at IS NULL
                       AND delivery.priority BETWEEN %s AND %s
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM observed_report_outbox AS report
+                          WHERE report.completed_at IS NULL
+                            AND report.body->>'resource_type' =
+                                'external_chat_catalog'
+                            -- Workspace preserves the catalog resource UUID as
+                            -- the external_chat_assignment UUID.
+                            AND report.body->>'resource_uuid' =
+                                delivery.assignment_uuid::text
+                            AND report.body->>'status' = 'ready'
+                            AND COALESCE(
+                                report.body->'catalog'->>'operation',
+                                'upsert'
+                            ) = 'upsert'
+                      )
                       AND (
                           delivery.assignment_uuid IS NULL
                           OR assignment.resource_uuid IS NOT NULL
@@ -6988,7 +6997,7 @@ class RestAlchemyStore:
             return [typing.cast(dict[str, object], row["body"]) for row in rows]
 
     def has_pending_chat_materializations(self) -> bool:
-        """Return whether an incomplete catalog upsert blocks message delivery."""
+        """Return whether any incomplete catalog upsert is waiting."""
         with self.session() as session:
             row = session.execute(
                 """

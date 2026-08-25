@@ -129,6 +129,8 @@ def test_pending_workspace_delivery_probe_requires_current_account_and_assignmen
     assert "policy.body->>'emergency_suspended'" in statement
     assert "delivery.assignment_uuid IS NULL" in statement
     assert "OR assignment.resource_uuid IS NOT NULL" in statement
+    assert "report.body->>'resource_uuid'" in statement
+    assert "delivery.assignment_uuid::text" in statement
     assert parameters == (0, 0)
 
 
@@ -622,6 +624,8 @@ def test_workspace_delivery_outbox_orders_live_before_backfill():
     assert "jsonb_array_elements_text" in statement
     assert "workspace_delivery_state" in statement
     assert "provider_mappings AS message_mapping" in statement
+    assert "report.body->>'resource_uuid'" in statement
+    assert "delivery.assignment_uuid::text" in statement
     assert "message_mapping.workspace_uuid::text" not in statement
     assert "read_message.message_uuid::uuid" in statement
     assert ")::uuid" in statement
