@@ -1757,6 +1757,190 @@ def test_reaction_assignment_poll_reuses_persisted_message_context():
     ]
 
 
+def test_selected_reaction_is_reselected_after_provisional_lane_resolves():
+    account_uuid = "00000000-0000-0000-0000-000000000001"
+    reaction = {
+        "id": 7,
+        "type": "reaction",
+        "op": "add",
+        "message_id": 601,
+        "user_id": 3,
+        "emoji_name": "thumbs_up",
+        "emoji_code": "1f44d",
+        "reaction_type": "unicode_emoji",
+    }
+
+    class Store(DeliveryStore):
+        def __init__(self):
+            super().__init__(
+                [
+                    {
+                        "account_uuid": account_uuid,
+                        "queue_id": "queue",
+                        "event_id": 7,
+                        "causal_lane": "message:601",
+                        "body": reaction,
+                    }
+                ]
+            )
+            self.message_context = None
+            self.lane_refreshes = []
+
+        def provider_mapping(self, *_args):
+            return None
+
+        def cache_provider_event_message_context(
+            self, _account, _queue, _event, message_context
+        ):
+            self.message_context = message_context
+            return message_context
+
+        def refresh_provider_event_causal_lane(
+            self, account, queue, event_id, event
+        ):
+            self.lane_refreshes.append((account, queue, event_id, event))
+            return "channel:42"
+
+    store = Store()
+    instance = _delivery_service(store)
+    instance._queue_event_catalog = lambda *_args, **_kwargs: False
+
+    class Adapter(ProviderAdapter):
+        def message_by_id(self, provider_message_id):
+            return {
+                "id": provider_message_id,
+                "type": "stream",
+                "stream_id": 42,
+                "display_recipient": "Engineering",
+                "timestamp": 1_800_000_000,
+            }
+
+    instance.provider_adapters = lambda _account_uuid: Adapter()
+
+    assert instance.process_provider_journal() == 0
+    assert store.message_context is not None
+    assert store.lane_refreshes == [
+        (account_uuid, "queue", 7, reaction),
+    ]
+    assert store.enqueued == []
+    assert store.processed == []
+    assert store.retried == []
+
+
+def test_selected_event_rechecks_provisional_lane_after_conversion():
+    account_uuid = "00000000-0000-0000-0000-000000000001"
+    event = {
+        "id": 7,
+        "type": "update_message",
+        "message_id": 601,
+        "content": "edited",
+    }
+
+    class Store(DeliveryStore):
+        def __init__(self):
+            super().__init__(
+                [
+                    {
+                        "account_uuid": account_uuid,
+                        "queue_id": "queue",
+                        "event_id": 7,
+                        "causal_lane": "message:601",
+                        "body": event,
+                    }
+                ]
+            )
+            self.mapping_committed = False
+            self.lane_refreshes = []
+
+        def provider_mapping(self, *_args):
+            return None
+
+        def refresh_provider_event_causal_lane(
+            self, account, queue, event_id, provider_event
+        ):
+            self.lane_refreshes.append(
+                (account, queue, event_id, provider_event)
+            )
+            return "channel:42" if self.mapping_committed else "message:601"
+
+    store = Store()
+    instance = _delivery_service(store)
+    instance._queue_event_catalog = lambda *_args, **_kwargs: False
+
+    def convert_after_mapping_commit(*_args, **_kwargs):
+        store.mapping_committed = True
+        return [{"record_uuid": "record"}]
+
+    instance._event_records_with_pending_delete_recreations = (
+        convert_after_mapping_commit
+    )
+
+    assert instance.process_provider_journal() == 0
+    assert store.lane_refreshes == [
+        (account_uuid, "queue", 7, event),
+        (account_uuid, "queue", 7, event),
+    ]
+    assert store.enqueued == []
+    assert store.processed == []
+    assert store.retried == []
+
+
+def test_empty_event_uses_atomic_lane_finalization():
+    account_uuid = "00000000-0000-0000-0000-000000000001"
+    event = {
+        "id": 7,
+        "type": "update_message",
+        "message_id": 601,
+        "content": "edited",
+    }
+
+    class Store(DeliveryStore):
+        def __init__(self):
+            super().__init__(
+                [
+                    {
+                        "account_uuid": account_uuid,
+                        "queue_id": "queue",
+                        "event_id": 7,
+                        "causal_lane": "message:601",
+                        "body": event,
+                    }
+                ]
+            )
+            self.atomic_finalizations = []
+
+        def provider_mapping(self, *_args):
+            return None
+
+        def refresh_provider_event_causal_lane(self, *_args):
+            return "message:601"
+
+        def finalize_provider_event_if_lane_current(self, *args):
+            self.atomic_finalizations.append(args)
+            return False
+
+    store = Store()
+    instance = _delivery_service(store)
+    instance._queue_event_catalog = lambda *_args, **_kwargs: False
+    instance._event_records_with_pending_delete_recreations = (
+        lambda *_args, **_kwargs: []
+    )
+
+    assert instance.process_provider_journal() == 0
+    assert store.atomic_finalizations == [
+        (
+            account_uuid,
+            "queue",
+            7,
+            event,
+            "message:601",
+            True,
+            [],
+        )
+    ]
+    assert store.processed == []
+
+
 def test_reaction_catalog_publication_retries_row_before_durable_marker():
     account_uuid = "00000000-0000-0000-0000-000000000001"
     reaction = {
@@ -6078,7 +6262,13 @@ def test_registration_notification_snapshots_are_persisted_in_provider_journal()
                     "topic_name": "bridge",
                     "visibility_policy": 3,
                     "last_updated": 1_800_000_020,
-                }
+                },
+                {
+                    "stream_id": 12,
+                    "topic_name": "unsubscribed",
+                    "visibility_policy": 1,
+                    "last_updated": 1_800_000_021,
+                },
             ],
         },
     )

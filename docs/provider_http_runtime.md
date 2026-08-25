@@ -115,6 +115,19 @@ history page cannot leave a gap in live event capture. Account workers are
 isolated from one another and use bridge-owned durable retry/backoff after a
 provider error.
 
+The durable provider journal preserves FIFO within each causal chat lane instead
+of making one account-wide head block every unrelated chat. Message, topic,
+single-channel subscription, and resolved message-derived events use their
+provider chat as the lane. Account settings and identities use dedicated
+account-scoped lanes. Multi-channel subscription changes, cross-channel message
+moves, and unknown event shapes remain conservative account-wide barriers. A
+deferred or retrying lane head can therefore hold only dependent work; another
+ready lane for the same account can continue. The scheduler derives active lanes
+from the durable journal, so cleanup of optional lane-fairness metadata cannot
+hide pending work. It persists both account and lane fairness timestamps, and the
+downstream Provider outbox retains its existing causal-lane sequencing and
+idempotency boundaries.
+
 Control-derived backfill jobs are reconciled by a profile-sized history pool.
 Large profiles use eight workers so independent account/chat pages can be
 fetched and converted concurrently. Idle history delivery fills the configured

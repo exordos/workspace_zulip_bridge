@@ -76,11 +76,12 @@ def test_migrations_have_one_versioned_dependency_chain():
         "0019-fair-provider-journal-scheduling-5e3926.py",
         "0020-refresh-Zulip-notification-queues-93df4e.py",
         "0021-index-pending-chat-materializations-dcdd12.py",
+        "0022-isolate-provider-journal-causal-lanes-3ae83f.py",
     ]
     assert engine.get_latest_migration() == (
-        "0021-index-pending-chat-materializations-dcdd12.py"
+        "0022-isolate-provider-journal-causal-lanes-3ae83f.py"
     )
-    assert len({step["uuid"] for step in all_migrations.values()}) == 22
+    assert len({step["uuid"] for step in all_migrations.values()}) == 23
     assert all_migrations["0001-add-Zulip-provider-scheduler-state-143113.py"][
         "depends"
     ] == ["0000-initialize-bridge-operational-state-18f707.py"]
@@ -144,6 +145,42 @@ def test_migrations_have_one_versioned_dependency_chain():
     assert all_migrations["0021-index-pending-chat-materializations-dcdd12.py"][
         "depends"
     ] == ["0020-refresh-Zulip-notification-queues-93df4e.py"]
+    assert all_migrations["0022-isolate-provider-journal-causal-lanes-3ae83f.py"][
+        "depends"
+    ] == ["0021-index-pending-chat-materializations-dcdd12.py"]
+
+
+def test_provider_journal_lane_migration_backfills_and_indexes_scheduler():
+    migration_path = MIGRATIONS / "0022-isolate-provider-journal-causal-lanes-3ae83f.py"
+    spec = importlib.util.spec_from_file_location(
+        "provider_journal_causal_lanes", migration_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class Session:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, statement):
+            self.statements.append(statement)
+
+    session = Session()
+    module.migration_step.upgrade(session)
+
+    assert len(session.statements) == 1
+    statement = session.statements[0]
+    assert "ADD COLUMN IF NOT EXISTS causal_lane text" in statement
+    assert "event_type = 'user_topic'" in statement
+    assert "scoped_stream_events" in statement
+    assert "CREATE TABLE IF NOT EXISTS scheduler_provider_event_lanes" in statement
+    assert "zulip_provider_events_lane_head_idx" in statement
+    assert "zulip_provider_events_global_head_idx" in statement
+    assert "zulip_provider_message_context_inflight_idx" in statement
+
+    module.migration_step.downgrade(session)
+    assert len(session.statements) == 2
 
 
 def test_notification_queue_refresh_preserves_live_message_gap():
@@ -544,7 +581,10 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                       'zulip_participant_sync_account_claim_idx',
                       'zulip_backfill_jobs_account_claim_idx',
                       'scheduler_accounts_provider_ready_idx',
-                      'zulip_provider_events_account_head_idx'
+                      'zulip_provider_events_account_head_idx',
+                      'zulip_provider_events_lane_head_idx',
+                      'zulip_provider_events_global_head_idx',
+                      'zulip_provider_message_context_inflight_idx'
                   )
                 ORDER BY indexname
                 """
@@ -556,7 +596,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                   AND indexname = 'zulip_provider_events_account_head_idx'
                 """
             ).fetchone()
-            assert applied["count"] == 22
+            assert applied["count"] == 23
             assert [row["indexname"] for row in indexes] == [
                 "bridge_operations_active_local_echo_idx",
                 "desired_resources_assignment_chat_idx",
@@ -574,8 +614,11 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                 "zulip_backfill_jobs_account_claim_idx",
                 "zulip_participant_sync_account_claim_idx",
                 "zulip_provider_events_account_head_idx",
+                "zulip_provider_events_global_head_idx",
+                "zulip_provider_events_lane_head_idx",
                 "zulip_provider_events_pending_order_idx",
                 "zulip_provider_events_terminal_created_idx",
+                "zulip_provider_message_context_inflight_idx",
                 "zulip_provider_message_events_inflight_idx",
                 "zulip_provider_message_events_local_echo_idx",
             ]
@@ -609,7 +652,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
             provider_cursor_count = session.execute(
                 "SELECT count(*) AS count FROM zulip_event_cursors"
             ).fetchone()
-            assert applied["count"] == 22
+            assert applied["count"] == 23
             assert cursor["control_cursor"] == "preserved"
             assert provider_cursor_count["count"] == 0
     finally:

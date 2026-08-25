@@ -5573,6 +5573,281 @@ def test_pending_provider_probe_waits_for_each_accounts_head(postgres_store):
     assert postgres_store.has_pending_provider_events()
 
 
+def test_provider_journal_backoff_blocks_only_its_causal_lane(postgres_store):
+    account_uuid = str(uuid.uuid4())
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        {
+            "id": 1,
+            "type": "user_topic",
+            "stream_id": 12,
+            "topic_name": "Unavailable",
+            "visibility_policy": 1,
+            "last_updated": 1_800_000_001,
+        },
+    )
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        {
+            "id": 2,
+            "type": "user_topic",
+            "stream_id": 12,
+            "topic_name": "Still blocked",
+            "visibility_policy": 1,
+            "last_updated": 1_800_000_002,
+        },
+    )
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        {
+            "id": 3,
+            "type": "message",
+            "message": {
+                "id": 603,
+                "type": "stream",
+                "stream_id": 42,
+            },
+        },
+    )
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_provider_events
+            SET available_at = CASE event_id
+                    WHEN 1 THEN now() + interval '5 minutes'
+                    ELSE now()
+                END,
+                created_at = now() - (4 - event_id) * interval '1 minute'
+            WHERE account_uuid = %s AND queue_id = 'queue'
+            """,
+            (account_uuid,),
+        )
+
+    assert postgres_store.has_pending_provider_events()
+    pending = postgres_store.pending_provider_events()
+    assert [event["event_id"] for event in pending] == [3]
+    assert pending[0]["causal_lane"] == "channel:42"
+
+    postgres_store.mark_provider_event_processed(
+        account_uuid, "queue", 3, supported=True
+    )
+
+    assert not postgres_store.has_pending_provider_events()
+    assert postgres_store.pending_provider_events() == []
+
+
+def test_provider_journal_missing_lane_metadata_does_not_hide_event(postgres_store):
+    account_uuid = str(uuid.uuid4())
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        {
+            "id": 1,
+            "type": "message",
+            "message": {
+                "id": 603,
+                "type": "stream",
+                "stream_id": 42,
+            },
+        },
+    )
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            DELETE FROM scheduler_provider_event_lanes
+            WHERE account_uuid = %s AND causal_lane = 'channel:42'
+            """,
+            (account_uuid,),
+        )
+
+    assert postgres_store.has_pending_provider_events()
+    pending = postgres_store.pending_provider_events()
+    assert [event["event_id"] for event in pending] == [1]
+
+    with postgres_store.session() as session:
+        lane = session.execute(
+            """
+            SELECT last_provider_event_dispatched_at IS NOT NULL AS dispatched
+            FROM scheduler_provider_event_lanes
+            WHERE account_uuid = %s AND causal_lane = 'channel:42'
+            """,
+            (account_uuid,),
+        ).fetchone()
+    assert lane == {"dispatched": True}
+
+
+def test_provider_journal_global_event_remains_an_account_barrier(postgres_store):
+    account_uuid = str(uuid.uuid4())
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        {"id": 1, "type": "future_account_event"},
+    )
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        {
+            "id": 2,
+            "type": "message",
+            "message": {
+                "id": 602,
+                "type": "stream",
+                "stream_id": 42,
+            },
+        },
+    )
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_provider_events
+            SET available_at = CASE event_id
+                    WHEN 1 THEN now() + interval '5 minutes'
+                    ELSE now()
+                END,
+                created_at = now() - (3 - event_id) * interval '1 minute'
+            WHERE account_uuid = %s AND queue_id = 'queue'
+            """,
+            (account_uuid,),
+        )
+
+    assert not postgres_store.has_pending_provider_events()
+    assert postgres_store.pending_provider_events() == []
+
+
+def test_provider_journal_multistream_subscription_is_a_global_barrier(
+    postgres_store,
+):
+    account_uuid = str(uuid.uuid4())
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        {
+            "id": 1,
+            "type": "subscription",
+            "op": "peer_add",
+            "stream_ids": [42, 43],
+        },
+    )
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        {
+            "id": 2,
+            "type": "message",
+            "message": {
+                "id": 602,
+                "type": "stream",
+                "stream_id": 42,
+            },
+        },
+    )
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_provider_events
+            SET available_at = CASE event_id
+                    WHEN 1 THEN now() + interval '5 minutes'
+                    ELSE now()
+                END,
+                created_at = now() - (3 - event_id) * interval '1 minute'
+            WHERE account_uuid = %s AND queue_id = 'queue'
+            """,
+            (account_uuid,),
+        )
+        subscription = session.execute(
+            """
+            SELECT causal_lane
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = 'queue' AND event_id = 1
+            """,
+            (account_uuid,),
+        ).fetchone()
+
+    assert subscription["causal_lane"] is None
+    assert not postgres_store.has_pending_provider_events()
+    assert postgres_store.pending_provider_events() == []
+
+
+def test_provider_journal_global_event_waits_for_every_earlier_lane(postgres_store):
+    account_uuid = str(uuid.uuid4())
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        {
+            "id": 1,
+            "type": "message",
+            "message": {
+                "id": 601,
+                "type": "stream",
+                "stream_id": 42,
+            },
+        },
+    )
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        {"id": 2, "type": "future_account_event"},
+    )
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_provider_events
+            SET available_at = CASE event_id
+                    WHEN 1 THEN now() + interval '5 minutes'
+                    ELSE now()
+                END,
+                created_at = now() - (3 - event_id) * interval '1 minute'
+            WHERE account_uuid = %s AND queue_id = 'queue'
+            """,
+            (account_uuid,),
+        )
+
+    assert not postgres_store.has_pending_provider_events()
+    assert postgres_store.pending_provider_events() == []
+
+
+def test_provider_journal_cross_stream_move_remains_a_global_barrier(postgres_store):
+    account_uuid = str(uuid.uuid4())
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        {
+            "id": 1,
+            "type": "message",
+            "message": {
+                "id": 601,
+                "type": "stream",
+                "stream_id": 42,
+            },
+        },
+    )
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        {
+            "id": 2,
+            "type": "update_message",
+            "message_id": 601,
+            "stream_id": 42,
+            "new_stream_id": 43,
+        },
+    )
+    with postgres_store.session() as session:
+        event = session.execute(
+            """
+            SELECT causal_lane
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = 'queue' AND event_id = 2
+            """,
+            (account_uuid,),
+        ).fetchone()
+
+    assert event["causal_lane"] is None
+
+
 def test_pending_provider_events_include_retry_count(postgres_store):
     account_uuid = str(uuid.uuid4())
     assert postgres_store.record_provider_event(
@@ -5620,13 +5895,90 @@ def test_pending_provider_events_rotate_beyond_one_quantum(postgres_store):
     assert set(account_uuids) == first_accounts | second_accounts
 
 
+def test_full_provider_journal_selector_disables_jit_on_fresh_statistics(
+    postgres_store,
+):
+    account_uuid, _project_uuid = _insert_account_and_assignment(postgres_store)
+    _enable_zulip_provider(postgres_store)
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            INSERT INTO zulip_provider_events (
+                account_uuid, queue_id, event_id, event_type, body,
+                causal_lane, created_at
+            )
+            SELECT
+                %s,
+                'selector-load',
+                sample,
+                'update_message',
+                jsonb_build_object(
+                    'id', sample,
+                    'type', 'update_message',
+                    'message_id', 100000 + sample
+                ),
+                'channel:' || (sample %% 180)::text,
+                now() + sample * interval '1 microsecond'
+            FROM generate_series(1, 22500) AS sample
+            """,
+            (account_uuid,),
+        )
+        session.execute(
+            """
+            INSERT INTO scheduler_provider_event_lanes (
+                account_uuid, causal_lane
+            )
+            SELECT DISTINCT account_uuid, causal_lane
+            FROM zulip_provider_events
+            WHERE account_uuid = %s
+            ON CONFLICT (account_uuid, causal_lane) DO NOTHING
+            """,
+            (account_uuid,),
+        )
+
+    with postgres_store.transaction() as session:
+        session.execute("SET LOCAL jit = on")
+        session.execute("SET LOCAL jit_above_cost = 0")
+        selected = postgres_store.pending_provider_events(limit=20)
+        jit = session.execute("SHOW jit").fetchone()
+    assert len(selected) == 1
+    assert str(selected[0]["account_uuid"]) == account_uuid
+    assert jit == {"jit": "off"}
+
+    with postgres_store.transaction() as session:
+        session.execute("SET LOCAL jit = on")
+        session.execute("SET LOCAL jit_above_cost = 0")
+        assert postgres_store.has_pending_provider_events()
+        jit = session.execute("SHOW jit").fetchone()
+    assert jit == {"jit": "off"}
+
+
 def test_provider_assignment_context_survives_intervening_retry_reason(postgres_store):
     account_uuid = str(uuid.uuid4())
     assert postgres_store.record_provider_event(
         account_uuid,
         "queue",
-        {"id": 1, "type": "reaction"},
+        {"id": 1, "type": "reaction", "message_id": 601},
     )
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        {"id": 2, "type": "reaction", "message_id": 601},
+    )
+    with postgres_store.session() as session:
+        initial_events = session.execute(
+            """
+            SELECT event_id, causal_lane
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = 'queue'
+            ORDER BY event_id
+            """,
+            (account_uuid,),
+        ).fetchall()
+    assert [(row["event_id"], row["causal_lane"]) for row in initial_events] == [
+        (1, "message:601"),
+        (2, "message:601"),
+    ]
     message_context = {
         "id": 601,
         "type": "stream",
@@ -5642,6 +5994,11 @@ def test_provider_assignment_context_survives_intervening_retry_reason(postgres_
             message_context,
         )
         == message_context
+    )
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        {"id": 3, "type": "reaction", "message_id": 601},
     )
 
     postgres_store.retry_provider_event(
@@ -5663,9 +6020,18 @@ def test_provider_assignment_context_survives_intervening_retry_reason(postgres_
     )
 
     with postgres_store.session() as session:
+        causal_lanes = session.execute(
+            """
+            SELECT event_id, causal_lane
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = 'queue'
+            ORDER BY event_id
+            """,
+            (account_uuid,),
+        ).fetchall()
         event = session.execute(
             """
-            SELECT retry_count, processing_reason,
+            SELECT retry_count, processing_reason, causal_lane,
                    assignment_pending_since, assignment_catalog_reported_at,
                    provider_message_context
             FROM zulip_provider_events
@@ -5673,8 +6039,14 @@ def test_provider_assignment_context_survives_intervening_retry_reason(postgres_
             """,
             (account_uuid,),
         ).fetchone()
+    assert [(row["event_id"], row["causal_lane"]) for row in causal_lanes] == [
+        (1, "channel:42"),
+        (2, "channel:42"),
+        (3, "channel:42"),
+    ]
     assert event["retry_count"] == 2
     assert event["processing_reason"] == "rate_limit_hit"
+    assert event["causal_lane"] == "channel:42"
     assert event["assignment_pending_since"] is not None
     assert event["assignment_catalog_reported_at"] is not None
     assert event["provider_message_context"] == message_context
@@ -5718,6 +6090,499 @@ def test_provider_assignment_context_survives_intervening_retry_reason(postgres_
         "retry_count": 2,
         "processing_reason": "provider_event_processing_failed",
     }
+
+
+@pytest.mark.parametrize("resolution_source", ["message_context", "mapping"])
+def test_resolved_provisional_lane_is_reselected_behind_older_head(
+    postgres_store,
+    resolution_source,
+):
+    account_uuid = str(uuid.uuid4())
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        {
+            "id": 1,
+            "type": "message",
+            "message": {
+                "id": 600,
+                "type": "stream",
+                "stream_id": 42,
+            },
+        },
+    )
+    reaction = {
+        "id": 2,
+        "type": "reaction",
+        "message_id": 601,
+        "user_id": 3,
+        "emoji_name": "thumbs_up",
+        "emoji_code": "1f44d",
+        "reaction_type": "unicode_emoji",
+        "op": "add",
+    }
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        reaction,
+    )
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_provider_events
+            SET available_at = CASE event_id
+                    WHEN 1 THEN now() + interval '5 minutes'
+                    ELSE now()
+                END,
+                created_at = now() - (3 - event_id) * interval '1 minute'
+            WHERE account_uuid = %s AND queue_id = 'queue'
+            """,
+            (account_uuid,),
+        )
+
+    selected = postgres_store.pending_provider_events()
+    assert [row["event_id"] for row in selected] == [2]
+    assert selected[0]["causal_lane"] == "message:601"
+
+    if resolution_source == "message_context":
+        postgres_store.cache_provider_event_message_context(
+            account_uuid,
+            "queue",
+            2,
+            {
+                "id": 601,
+                "type": "stream",
+                "stream_id": 42,
+                "display_recipient": "Engineering",
+                "timestamp": 1_800_000_000,
+            },
+        )
+    else:
+        postgres_store.remember_provider_mapping(
+            account_uuid,
+            "message",
+            "601",
+            str(uuid.uuid4()),
+            {"chat_key": "channel:42"},
+        )
+    assert (
+        postgres_store.refresh_provider_event_causal_lane(
+            account_uuid,
+            "queue",
+            2,
+            reaction,
+        )
+        == "channel:42"
+    )
+
+    assert not postgres_store.has_pending_provider_events()
+    assert postgres_store.pending_provider_events() == []
+
+
+def test_provider_journal_rechecks_lane_after_conversion_mapping_race(
+    postgres_store,
+):
+    account_uuid, _project_uuid = _insert_account_and_assignment(postgres_store)
+    _enable_zulip_provider(postgres_store)
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        {
+            "id": 1,
+            "type": "message",
+            "message": {
+                "id": 600,
+                "type": "stream",
+                "stream_id": 42,
+            },
+        },
+    )
+    update_event = {
+        "id": 2,
+        "type": "update_message",
+        "message_id": 601,
+        "content": "edited",
+    }
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        update_event,
+    )
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_provider_events
+            SET available_at = CASE event_id
+                    WHEN 1 THEN now() + interval '5 minutes'
+                    ELSE now()
+                END,
+                created_at = now() - (3 - event_id) * interval '1 minute'
+            WHERE account_uuid = %s AND queue_id = 'queue'
+            """,
+            (account_uuid,),
+        )
+
+    selected = postgres_store.pending_provider_events()
+    assert [row["event_id"] for row in selected] == [2]
+    assert selected[0]["causal_lane"] == "message:601"
+
+    class Adapter:
+        server_url = "https://zulip.example.invalid"
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = postgres_store
+    instance.file_client = None
+    instance.provider_adapters = lambda _account_uuid: Adapter()
+    instance._queue_event_catalog = lambda *_args, **_kwargs: False
+
+    def convert_after_mapping_commit(*_args, **_kwargs):
+        postgres_store.remember_provider_mapping(
+            account_uuid,
+            "message",
+            "601",
+            str(uuid.uuid4()),
+            {"chat_key": "channel:42"},
+        )
+        return [{"record_uuid": str(uuid.uuid4())}]
+
+    instance._event_records_with_pending_delete_recreations = (
+        convert_after_mapping_commit
+    )
+
+    assert instance.process_provider_journal(selected) == 0
+
+    with postgres_store.session() as session:
+        provider_event = session.execute(
+            """
+            SELECT processing_state, causal_lane, prepared_records
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = 'queue' AND event_id = 2
+            """,
+            (account_uuid,),
+        ).fetchone()
+        delivery_count = session.execute(
+            """
+            SELECT count(*) AS count
+            FROM workspace_delivery_outbox
+            WHERE account_uuid = %s AND provider_queue_id = 'queue'
+              AND provider_event_id = 2
+            """,
+            (account_uuid,),
+        ).fetchone()["count"]
+    assert provider_event == {
+        "processing_state": "pending",
+        "causal_lane": "channel:42",
+        "prepared_records": None,
+    }
+    assert delivery_count == 0
+    assert not postgres_store.has_pending_provider_events()
+
+
+def test_provider_journal_terminalization_rechecks_lane_after_refresh_race(
+    postgres_store,
+):
+    account_uuid, _project_uuid = _insert_account_and_assignment(postgres_store)
+    _enable_zulip_provider(postgres_store)
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        {
+            "id": 1,
+            "type": "message",
+            "message": {
+                "id": 600,
+                "type": "stream",
+                "stream_id": 42,
+            },
+        },
+    )
+    update_event = {
+        "id": 2,
+        "type": "update_message",
+        "message_id": 601,
+        "content": "edited",
+    }
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        update_event,
+    )
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_provider_events
+            SET available_at = CASE event_id
+                    WHEN 1 THEN now() + interval '5 minutes'
+                    ELSE now()
+                END,
+                created_at = now() - (3 - event_id) * interval '1 minute'
+            WHERE account_uuid = %s AND queue_id = 'queue'
+            """,
+            (account_uuid,),
+        )
+
+    selected = postgres_store.pending_provider_events()
+    assert [row["event_id"] for row in selected] == [2]
+    assert selected[0]["causal_lane"] == "message:601"
+
+    class Adapter:
+        server_url = "https://zulip.example.invalid"
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = postgres_store
+    instance.file_client = None
+    instance.provider_adapters = lambda _account_uuid: Adapter()
+    instance._queue_event_catalog = lambda *_args, **_kwargs: False
+    instance._event_records_with_pending_delete_recreations = (
+        lambda *_args, **_kwargs: []
+    )
+
+    refresh = postgres_store.refresh_provider_event_causal_lane
+    refresh_count = 0
+
+    def refresh_then_commit_mapping(*args):
+        nonlocal refresh_count
+        lane = refresh(*args)
+        refresh_count += 1
+        if refresh_count == 2:
+            postgres_store.remember_provider_mapping(
+                account_uuid,
+                "message",
+                "601",
+                str(uuid.uuid4()),
+                {"chat_key": "channel:42"},
+            )
+        return lane
+
+    postgres_store.refresh_provider_event_causal_lane = refresh_then_commit_mapping
+
+    assert instance.process_provider_journal(selected) == 0
+    assert refresh_count == 2
+
+    with postgres_store.session() as session:
+        provider_event = session.execute(
+            """
+            SELECT processing_state, causal_lane, prepared_records
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = 'queue' AND event_id = 2
+            """,
+            (account_uuid,),
+        ).fetchone()
+        delivery_count = session.execute(
+            """
+            SELECT count(*) AS count
+            FROM workspace_delivery_outbox
+            WHERE account_uuid = %s AND provider_queue_id = 'queue'
+              AND provider_event_id = 2
+            """,
+            (account_uuid,),
+        ).fetchone()["count"]
+    assert provider_event == {
+        "processing_state": "pending",
+        "causal_lane": "channel:42",
+        "prepared_records": None,
+    }
+    assert delivery_count == 0
+    assert not postgres_store.has_pending_provider_events()
+
+
+def test_provider_journal_guard_rechecks_resolved_lane_after_mapping_move(
+    postgres_store,
+):
+    account_uuid, _project_uuid = _insert_account_and_assignment(postgres_store)
+    _enable_zulip_provider(postgres_store)
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "message",
+        "601",
+        str(uuid.uuid4()),
+        {"chat_key": "channel:42"},
+    )
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        {
+            "id": 1,
+            "type": "message",
+            "message": {
+                "id": 600,
+                "type": "stream",
+                "stream_id": 43,
+            },
+        },
+    )
+    update_event = {
+        "id": 2,
+        "type": "update_message",
+        "message_id": 601,
+        "content": "edited after move",
+    }
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        update_event,
+    )
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_provider_events
+            SET available_at = CASE event_id
+                    WHEN 1 THEN now() + interval '5 minutes'
+                    ELSE now()
+                END,
+                created_at = now() - (3 - event_id) * interval '1 minute'
+            WHERE account_uuid = %s AND queue_id = 'queue'
+            """,
+            (account_uuid,),
+        )
+
+    selected = postgres_store.pending_provider_events()
+    assert [row["event_id"] for row in selected] == [2]
+    assert selected[0]["causal_lane"] == "channel:42"
+
+    class Adapter:
+        server_url = "https://zulip.example.invalid"
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = postgres_store
+    instance.file_client = None
+    instance.provider_adapters = lambda _account_uuid: Adapter()
+    instance._queue_event_catalog = lambda *_args, **_kwargs: False
+    instance._event_records_with_pending_delete_recreations = (
+        lambda *_args, **_kwargs: [{"record_uuid": str(uuid.uuid4())}]
+    )
+
+    refresh = postgres_store.refresh_provider_event_causal_lane
+    refresh_count = 0
+
+    def refresh_then_move_mapping(*args):
+        nonlocal refresh_count
+        lane = refresh(*args)
+        refresh_count += 1
+        if refresh_count == 2:
+            postgres_store.remember_provider_mapping(
+                account_uuid,
+                "message",
+                "601",
+                str(uuid.uuid4()),
+                {"chat_key": "channel:43"},
+            )
+        return lane
+
+    postgres_store.refresh_provider_event_causal_lane = refresh_then_move_mapping
+
+    assert instance.process_provider_journal(selected) == 0
+    assert refresh_count == 2
+
+    with postgres_store.session() as session:
+        provider_event = session.execute(
+            """
+            SELECT processing_state, causal_lane, prepared_records
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = 'queue' AND event_id = 2
+            """,
+            (account_uuid,),
+        ).fetchone()
+        delivery_count = session.execute(
+            """
+            SELECT count(*) AS count
+            FROM workspace_delivery_outbox
+            WHERE account_uuid = %s AND provider_queue_id = 'queue'
+              AND provider_event_id = 2
+            """,
+            (account_uuid,),
+        ).fetchone()["count"]
+    assert provider_event == {
+        "processing_state": "pending",
+        "causal_lane": "channel:43",
+        "prepared_records": None,
+    }
+    assert delivery_count == 0
+    assert not postgres_store.has_pending_provider_events()
+
+
+def test_provider_journal_guard_resolves_grouped_global_lane_before_finalize(
+    postgres_store,
+):
+    account_uuid, _project_uuid = _insert_account_and_assignment(postgres_store)
+    _enable_zulip_provider(postgres_store)
+    flags_event = {
+        "id": 1,
+        "type": "update_message_flags",
+        "message_ids": [601, 602],
+        "flag": "read",
+        "op": "add",
+    }
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        flags_event,
+    )
+    selected = postgres_store.pending_provider_events()
+    assert [row["event_id"] for row in selected] == [1]
+    assert selected[0]["causal_lane"] is None
+
+    class Adapter:
+        server_url = "https://zulip.example.invalid"
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = postgres_store
+    instance.file_client = None
+    instance.provider_adapters = lambda _account_uuid: Adapter()
+    instance._queue_event_catalog = lambda *_args, **_kwargs: False
+    instance._event_records_with_pending_delete_recreations = (
+        lambda *_args, **_kwargs: []
+    )
+
+    refresh = postgres_store.refresh_provider_event_causal_lane
+    refresh_count = 0
+
+    def refresh_then_commit_mappings(*args):
+        nonlocal refresh_count
+        lane = refresh(*args)
+        refresh_count += 1
+        if refresh_count == 2:
+            for provider_message_id in ("601", "602"):
+                postgres_store.remember_provider_mapping(
+                    account_uuid,
+                    "message",
+                    provider_message_id,
+                    str(uuid.uuid4()),
+                    {"chat_key": "channel:42"},
+                )
+        return lane
+
+    postgres_store.refresh_provider_event_causal_lane = (
+        refresh_then_commit_mappings
+    )
+
+    assert instance.process_provider_journal(selected) == 0
+    assert refresh_count == 2
+
+    with postgres_store.session() as session:
+        provider_event = session.execute(
+            """
+            SELECT processing_state, causal_lane, prepared_records
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = 'queue' AND event_id = 1
+            """,
+            (account_uuid,),
+        ).fetchone()
+        delivery_count = session.execute(
+            """
+            SELECT count(*) AS count
+            FROM workspace_delivery_outbox
+            WHERE account_uuid = %s AND provider_queue_id = 'queue'
+              AND provider_event_id = 1
+            """,
+            (account_uuid,),
+        ).fetchone()["count"]
+    assert provider_event == {
+        "processing_state": "pending",
+        "causal_lane": "channel:42",
+        "prepared_records": None,
+    }
+    assert delivery_count == 0
 
 
 def test_assignment_retry_uses_bounded_exponential_backoff(postgres_store):
