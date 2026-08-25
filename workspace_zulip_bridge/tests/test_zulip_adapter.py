@@ -419,6 +419,23 @@ def test_selected_channel_catalog_batches_account_snapshot_requests():
     assert client.profile_requests == 1
 
 
+def test_selected_channel_catalog_marks_missing_subscriber_unavailable():
+    client = FakeClient()
+    client.subscriptions[0]["subscribers"].append(3)
+    adapter = _adapter(client)
+
+    catalog = adapter.channel_catalog("channel:42")
+
+    assert catalog["realm_users"][-1] == {
+        "user_id": 3,
+        "full_name": "Unavailable Zulip user (ID 3)",
+        "email": None,
+        "avatar_url": None,
+        "is_active": False,
+    }
+    assert client.user_requests == [(3, {})]
+
+
 @pytest.mark.parametrize("chat_kind", ["channel", "personal_dm", "group_dm"])
 def test_zb_msg_001_message_mapping_uses_official_client_semantics(chat_kind):
     client = FakeClient()
@@ -1759,7 +1776,7 @@ def test_registration_hydrates_referenced_user_missing_from_bulk_directory():
     assert client.user_requests == [(3, {})]
 
 
-def test_registration_skips_referenced_user_absent_from_provider_directory():
+def test_registration_marks_referenced_user_absent_from_directory_unavailable():
     client = FakeClient()
     original_get_subscriptions = client.get_subscriptions
 
@@ -1775,7 +1792,13 @@ def test_registration_skips_referenced_user_absent_from_provider_directory():
     snapshot = adapter.take_registration_snapshot()
 
     assert snapshot is not None
-    assert [user["user_id"] for user in snapshot["realm_users"]] == [1, 2]
+    assert snapshot["realm_users"][-1] == {
+        "user_id": 3,
+        "full_name": "Unavailable Zulip user (ID 3)",
+        "email": None,
+        "avatar_url": None,
+        "is_active": False,
+    }
     assert client.user_requests == [(3, {})]
 
 

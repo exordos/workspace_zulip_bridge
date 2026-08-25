@@ -1804,6 +1804,51 @@ def test_remove_reaction_without_active_mapping_is_ignored():
     )
 
 
+def test_reaction_from_unknown_user_creates_explicit_unavailable_identity():
+    class MissingIdentityStore(FakeStore):
+        def provider_mapping(self, account_uuid, entity_kind, provider_id):
+            if entity_kind == "identity" and provider_id == "99":
+                return self.mappings.get((entity_kind, provider_id))
+            return super().provider_mapping(account_uuid, entity_kind, provider_id)
+
+    store = MissingIdentityStore()
+    converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {"id": 10, "type": "message", "message": _stream_message()},
+    )
+
+    operations = _operations(
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "queue",
+            {
+                "id": 11,
+                "type": "reaction",
+                "op": "add",
+                "message_id": 601,
+                "user_id": 99,
+                "emoji_name": "eyes",
+                "emoji_code": "1f440",
+                "reaction_type": "unicode_emoji",
+            },
+        )
+    )
+
+    identity = next(
+        operation for operation in operations if operation["kind"] == "identity.upsert"
+    )
+    assert identity["provider"]["entity_id"] == "99"
+    assert identity["payload"] == {
+        "display_name": "Unavailable Zulip user (ID 99)",
+        "email": None,
+        "avatar_urn": None,
+        "active": False,
+    }
+
+
 def test_reaction_aliases_for_one_unicode_code_share_workspace_identity():
     store = FakeStore()
     converter.event_records(

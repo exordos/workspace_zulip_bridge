@@ -81,6 +81,8 @@ def _merge_catalog_participants(
             continue
         merged = dict(prior)
         merged["is_owner"] = bool(prior.get("is_owner")) or bool(value.get("is_owner"))
+        if isinstance(value.get("_provider_active"), bool):
+            merged["_provider_active"] = value["_provider_active"]
         for name in ("email", "avatar_urn"):
             if not merged.get(name) and value.get(name):
                 merged[name] = value[name]
@@ -786,6 +788,28 @@ class RestAlchemyStore:
             or not isinstance(topics, list)
         ):
             raise ValueError("Invalid workspace projection mapping")
+        catalog_state = session.execute(
+            """
+            SELECT participants
+            FROM external_chat_catalog_state
+            WHERE account_uuid = %s AND provider_chat_key = %s
+            """,
+            (account_uuid, chat_key),
+        ).fetchone()
+        catalog_participants = (
+            catalog_state.get("participants", [])
+            if isinstance(catalog_state, dict)
+            else []
+        )
+        if not isinstance(catalog_participants, list):
+            catalog_participants = []
+        provider_activity = {
+            str(participant["provider_user_id"]): participant["_provider_active"]
+            for participant in catalog_participants
+            if isinstance(participant, dict)
+            and participant.get("provider_user_id") is not None
+            and isinstance(participant.get("_provider_active"), bool)
+        }
         participant_uuids: list[str] = []
         for raw_participant in participants:
             if not isinstance(raw_participant, dict):
@@ -802,7 +826,9 @@ class RestAlchemyStore:
                     "display_name": raw_participant["display_name"],
                     "email": raw_participant.get("email"),
                     "avatar_urn": raw_participant.get("avatar_urn"),
-                    "active": True,
+                    "active": provider_activity.get(
+                        str(raw_participant["provider_user_id"]), True
+                    ),
                     "role": raw_participant["role"],
                 },
             )
@@ -1336,6 +1362,23 @@ class RestAlchemyStore:
                     entity_kind,
                     workspace_uuid,
                 ),
+            ).fetchone()
+
+    def tombstoned_workspace_mapping(
+        self, account_uuid: str, entity_kind: str, workspace_uuid: str
+    ) -> dict[str, object] | None:
+        """Return retained mapping data without restoring active projection state."""
+        with self.session() as session:
+            return session.execute(
+                """
+                SELECT workspace_uuid, provider_id, provider_revision, metadata
+                FROM provider_mappings
+                WHERE account_uuid = %s AND entity_kind = %s
+                  AND workspace_uuid = %s AND deleted
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (account_uuid, entity_kind, workspace_uuid),
             ).fetchone()
 
     def topic_message_mapping(
