@@ -69,11 +69,15 @@ def test_pending_provider_event_probe_checks_ready_and_delivering_live_rows():
     store = _store_with_session(session)
 
     assert store.has_pending_provider_events()
-    statement, parameters = session.statements[0]
-    assert "processing_state IN ('pending', 'delivering')" in statement
+    assert session.statements[0] == ("SET LOCAL jit = off", None)
+    statement, parameters = session.statements[1]
+    assert "processing_state" in statement
+    assert "'pending', 'delivering'" in statement
     assert "JOIN LATERAL" in statement
+    assert "SELECT DISTINCT event.causal_lane" in statement
+    assert "barrier.causal_lane IS NULL" in statement
     assert "journal.account_uuid" in statement
-    assert "ORDER BY created_at, event_id, queue_id" in statement
+    assert "ORDER BY event.created_at" in statement
     assert "processing_state = 'delivering'" in statement
     assert "processing_state = 'pending'" in statement
     assert "event.available_at <= now()" in statement
@@ -92,13 +96,119 @@ def test_pending_provider_events_claim_fair_account_heads():
     assert store.pending_provider_events(limit=20) == [
         {"account_uuid": "account", "event_id": 7}
     ]
-    statement, parameters = session.statements[0]
+    assert session.statements[0] == ("SET LOCAL jit = off", None)
+    statement, parameters = session.statements[1]
     assert "JOIN LATERAL" in statement
+    assert "SELECT DISTINCT event.causal_lane" in statement
+    assert "barrier.causal_lane IS NULL" in statement
+    assert "global_event.causal_lane" in statement
     assert "last_provider_event_dispatched_at NULLS FIRST" in statement
     assert "FOR UPDATE OF journal SKIP LOCKED" in statement
     assert "UPDATE scheduler_accounts AS journal" in statement
+    assert "INSERT INTO scheduler_provider_event_lanes" in statement
+    assert "ON CONFLICT (account_uuid, causal_lane) DO UPDATE" in statement
     assert "ORDER BY event.created_at, event.event_id, event.queue_id" in statement
     assert parameters == (20,)
+
+
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [
+        (
+            {
+                "type": "message",
+                "message": {"type": "stream", "stream_id": 42},
+            },
+            "channel:42",
+        ),
+        (
+            {
+                "type": "message",
+                "message": {
+                    "type": "private",
+                    "display_recipient": [{"id": 3}, {"id": 1}, {"id": 2}],
+                },
+            },
+            "group_direct:1,2,3",
+        ),
+        (
+            {
+                "type": "message",
+                "message": {
+                    "type": "private",
+                    "display_recipient": [{"id": 7}],
+                },
+            },
+            "group_direct:7",
+        ),
+        ({"type": "user_topic", "stream_id": 43}, "channel:43"),
+        (
+            {
+                "type": "subscription",
+                "op": "peer_add",
+                "stream_ids": [44],
+            },
+            "channel:44",
+        ),
+        (
+            {
+                "type": "subscription",
+                "op": "peer_add",
+                "stream_ids": [44, 45],
+            },
+            None,
+        ),
+        (
+            {"type": "realm_user", "person": {"user_id": 7}},
+            "identity:7",
+        ),
+        (
+            {
+                "type": "update_message",
+                "message_id": 601,
+                "stream_id": 42,
+                "new_stream_id": 43,
+            },
+            None,
+        ),
+    ],
+)
+def test_provider_event_static_causal_lane(event, expected):
+    assert storage._provider_event_static_causal_lane(event) == expected
+
+
+def test_cross_stream_message_move_requires_account_barrier():
+    assert storage._provider_event_requires_account_barrier(
+        {
+            "type": "update_message",
+            "message_id": 601,
+            "stream_id": 42,
+            "new_stream_id": 43,
+        }
+    )
+
+
+def test_provider_event_causal_lane_skips_sources_when_mappings_are_complete():
+    session = Session(
+        (
+            {"provider_id": "601", "causal_lane": "channel:42"},
+            {"provider_id": "602", "causal_lane": "channel:42"},
+        )
+    )
+
+    assert (
+        storage.RestAlchemyStore._provider_event_causal_lane(
+            session,
+            "account",
+            {
+                "type": "update_message_flags",
+                "message_ids": [601, 602],
+            },
+        )
+        == "channel:42"
+    )
+    assert len(session.statements) == 1
+    assert "FROM provider_mappings" in session.statements[0][0]
 
 
 def test_eligible_accounts_are_generation_bound_and_backoff_aware():
@@ -1123,6 +1233,39 @@ def test_delete_tombstone_and_provider_journal_finalize_share_one_transaction():
     assert "processing_state = 'pending'" in session.statements[1][0]
 
 
+def test_lane_aware_finalization_locks_mapping_before_refresh_and_update():
+    class LaneFinalizationSession(Session):
+        def execute(self, statement, parameters=None):
+            self.statements.append((statement, parameters))
+            if "SELECT causal_lane" in statement and "FOR UPDATE" in statement:
+                return Result(({"causal_lane": "message:601"},))
+            if "RETURNING event_id" in statement:
+                return Result(({"event_id": 7},))
+            return Result()
+
+    session = LaneFinalizationSession()
+    store = _store_with_session(session)
+
+    assert store.finalize_provider_event_if_lane_current(
+        "account",
+        "queue",
+        7,
+        {"type": "update_message", "message_id": 601},
+        "message:601",
+        True,
+        [],
+    )
+
+    lock_statement, lock_parameters = session.statements[0]
+    assert "pg_advisory_xact_lock" in lock_statement
+    assert lock_parameters == (
+        storage._provider_mapping_lock_key("account", "message", "601"),
+    )
+    assert "FOR UPDATE" in session.statements[1][0]
+    assert "FROM provider_mappings" in session.statements[2][0]
+    assert "UPDATE zulip_provider_events" in session.statements[-1][0]
+
+
 def test_stale_result_cannot_replace_terminal_result():
     session = SharedDeliverySession()
     store = _store_with_session(session)
@@ -1597,11 +1740,73 @@ def test_committed_message_mapping_preserves_workspace_alias():
         },
     }
     storage.RestAlchemyStore._persist_committed_mapping(session, record, "99", None)
+    lock_statement, lock_parameters = session.statements[0]
+    assert "pg_advisory_xact_lock" in lock_statement
+    assert lock_parameters == (
+        storage._provider_mapping_lock_key(record["account_uuid"], "message", "99"),
+    )
     assert (
         "ON CONFLICT (account_uuid, entity_kind, provider_id)"
-        in session.statements[0][0]
+        in session.statements[1][0]
     )
-    assert "INSERT INTO provider_mapping_aliases" in session.statements[1][0]
+    assert "INSERT INTO provider_mapping_aliases" in session.statements[2][0]
+
+
+def test_committed_message_update_mapping_uses_provider_mapping_lock():
+    session = Session()
+    record = {
+        "account_uuid": str(uuid.uuid4()),
+        "project_uuid": str(uuid.uuid4()),
+        "operation": {
+            "kind": "message.update",
+            "entity_uuid": str(uuid.uuid4()),
+            "provider": {
+                "chat_id": "channel:43",
+                "entity_id": "601",
+            },
+            "payload": {
+                "stream_uuid": str(uuid.uuid4()),
+                "topic_uuid": str(uuid.uuid4()),
+            },
+            "extensions": {},
+        },
+    }
+
+    storage.RestAlchemyStore._persist_committed_mapping(
+        session,
+        record,
+        "601",
+        None,
+    )
+
+    lock_statement, lock_parameters = session.statements[0]
+    assert "pg_advisory_xact_lock" in lock_statement
+    assert lock_parameters == (
+        storage._provider_mapping_lock_key(
+            record["account_uuid"], "message", "601"
+        ),
+    )
+    assert "UPDATE provider_mappings" in session.statements[1][0]
+
+
+def test_remembered_message_mapping_uses_provider_mapping_lock():
+    session = Session()
+    store = _store_with_session(session)
+
+    store.remember_provider_mapping(
+        "account",
+        "message",
+        "601",
+        str(uuid.uuid4()),
+        {"chat_key": "channel:42"},
+    )
+
+    lock_statement, lock_parameters = session.statements[0]
+    assert "pg_advisory_xact_lock" in lock_statement
+    assert lock_parameters == (
+        storage._provider_mapping_lock_key("account", "message", "601"),
+    )
+    assert "INSERT INTO provider_mappings" in session.statements[1][0]
 
 
 def test_committed_reaction_mapping_preserves_workspace_identity():

@@ -813,22 +813,26 @@ class BridgeService:
                     "observed_at": observed_at,
                 }
             )
-        user_topics = typing.cast(
-            list[dict[str, object]], registration.get("user_topics", [])
-        )
-        snapshots.extend({"type": "user_topic", **topic} for topic in user_topics)
-        explicit_topic_ids = {
-            converter.channel_topic_provider_id(
-                int(topic["stream_id"]), str(topic["topic_name"])
-            )
-            for topic in user_topics
-        }
         subscribed_stream_ids = {
             int(subscription["stream_id"])
             for subscription in typing.cast(
                 list[dict[str, object]], registration.get("subscriptions", [])
             )
             if isinstance(subscription.get("stream_id"), int)
+        }
+        user_topics = [
+            topic
+            for topic in typing.cast(
+                list[dict[str, object]], registration.get("user_topics", [])
+            )
+            if int(topic["stream_id"]) in subscribed_stream_ids
+        ]
+        snapshots.extend({"type": "user_topic", **topic} for topic in user_topics)
+        explicit_topic_ids = {
+            converter.channel_topic_provider_id(
+                int(topic["stream_id"]), str(topic["topic_name"])
+            )
+            for topic in user_topics
         }
         for mapping in self.store.provider_topic_mappings(account_uuid):
             provider_topic_id = str(mapping["provider_id"])
@@ -1668,6 +1672,38 @@ class BridgeService:
             )
             if name in provider_message
         }
+
+    def _selected_provider_event_lane_changed(
+        self,
+        row: dict[str, object],
+        event: dict[str, object],
+    ) -> bool:
+        selected_causal_lane = row.get("causal_lane")
+        refresh_causal_lane = getattr(
+            self.store,
+            "refresh_provider_event_causal_lane",
+            None,
+        )
+        return (
+            self._provider_event_has_message_dependencies(event)
+            and callable(refresh_causal_lane)
+            and refresh_causal_lane(
+                str(row["account_uuid"]),
+                str(row["queue_id"]),
+                int(row["event_id"]),
+                event,
+            )
+            != selected_causal_lane
+        )
+
+    @staticmethod
+    def _provider_event_has_message_dependencies(
+        event: dict[str, object],
+    ) -> bool:
+        if event.get("message_id") is not None:
+            return True
+        message_ids = event.get("message_ids", event.get("messages"))
+        return isinstance(message_ids, list) and bool(message_ids)
 
     @classmethod
     def _reaction_assignment_wait_expired(cls, row: dict[str, object]) -> bool:
@@ -2735,6 +2771,12 @@ class BridgeService:
                                     event_id,
                                     provider_message,
                                 )
+                        if self._selected_provider_event_lane_changed(row, event):
+                            # The fetched message moved this already-selected
+                            # reaction into a chat lane whose older head may
+                            # currently block it. Let the selector enforce
+                            # that order before conversion starts.
+                            continue
                         _, chat_key = converter.provider_chat_reference(
                             provider_message
                         )
@@ -2796,6 +2838,11 @@ class BridgeService:
                                 account_uuid, "external_chat", chat_key
                             )
                         )
+                if self._selected_provider_event_lane_changed(row, event):
+                    # Resolving the message moved this already-selected event
+                    # into a chat lane whose older head may currently block it.
+                    # Leave it pending so the selector can enforce that order.
+                    continue
                 records = self._event_records_with_pending_delete_recreations(
                     adapter,
                     row,
@@ -2803,16 +2850,11 @@ class BridgeService:
                     event,
                     "live",
                 )
-                prepare_records = getattr(
-                    self.store, "prepare_provider_event_records", None
-                )
-                if records and callable(prepare_records):
-                    records = prepare_records(
-                        account_uuid,
-                        queue_id,
-                        event_id,
-                        records,
-                    )
+                if self._selected_provider_event_lane_changed(row, event):
+                    # Conversion can observe a message mapping committed after
+                    # the pre-conversion refresh. Re-select before persisting
+                    # records so an older head in the resolved lane stays first.
+                    continue
             except zulip_adapter.ZulipOperationError as exc:
                 authentication = self._handle_provider_account_error(
                     account_uuid, exc, self._adapter_generation(adapter)
@@ -2880,29 +2922,115 @@ class BridgeService:
             except Exception as exc:
                 processed += self._contain_provider_event_failure(row, exc)
                 continue
-            event_enqueued_atomically = False
+            lane_guard = getattr(self.store, "provider_event_lane_guard", None)
             try:
-                enqueue_event_records = getattr(
-                    self.store, "enqueue_provider_event_records", None
-                )
-                if records and callable(enqueue_event_records):
-                    enqueue_event_records(
-                        records,
-                        0,
+                guard = (
+                    lane_guard(
                         account_uuid,
                         queue_id,
                         event_id,
+                        event,
+                        row.get("causal_lane"),
                     )
-                    event_enqueued_atomically = True
-                else:
-                    for record in records:
-                        if hasattr(self.store, "mark_provider_event_delivering"):
-                            self.store.enqueue_workspace_delivery(
-                                record, 0, queue_id, event_id
+                    if callable(lane_guard)
+                    else contextlib.nullcontext(True)
+                )
+                with guard as lane_current:
+                    if not lane_current:
+                        continue
+                    prepare_records = getattr(
+                        self.store, "prepare_provider_event_records", None
+                    )
+                    if records and callable(prepare_records):
+                        records = prepare_records(
+                            account_uuid,
+                            queue_id,
+                            event_id,
+                            records,
+                        )
+                    enqueue_event_records = getattr(
+                        self.store, "enqueue_provider_event_records", None
+                    )
+                    event_enqueued_atomically = False
+                    if records and callable(enqueue_event_records):
+                        enqueue_event_records(
+                            records,
+                            0,
+                            account_uuid,
+                            queue_id,
+                            event_id,
+                        )
+                        event_enqueued_atomically = True
+                    else:
+                        for record in records:
+                            if hasattr(
+                                self.store, "mark_provider_event_delivering"
+                            ):
+                                self.store.enqueue_workspace_delivery(
+                                    record, 0, queue_id, event_id
+                                )
+                            else:
+                                self.store.enqueue_workspace_delivery(record, 0)
+                    deleted_message_ids: list[str] = []
+                    if event.get("type") == "delete_message":
+                        raw_ids = event.get("message_ids")
+                        if raw_ids is None and event.get("message_id") is not None:
+                            raw_ids = [event["message_id"]]
+                        deleted_message_ids = [
+                            str(value)
+                            for value in typing.cast(list[object], raw_ids or [])
+                        ]
+                    if records and event_enqueued_atomically:
+                        pass
+                    elif records and hasattr(
+                        self.store, "mark_provider_event_delivering"
+                    ):
+                        self.store.mark_provider_event_delivering(
+                            account_uuid, queue_id, event_id
+                        )
+                    elif callable(lane_guard):
+                        self.store.finalize_provider_event(
+                            account_uuid,
+                            queue_id,
+                            event_id,
+                            supported,
+                            deleted_message_ids,
+                        )
+                    else:
+                        finalize_if_lane_current = getattr(
+                            self.store,
+                            "finalize_provider_event_if_lane_current",
+                            None,
+                        )
+                        if callable(finalize_if_lane_current):
+                            finalized = finalize_if_lane_current(
+                                account_uuid,
+                                queue_id,
+                                event_id,
+                                event,
+                                row.get("causal_lane"),
+                                supported,
+                                deleted_message_ids,
                             )
+                            if not finalized:
+                                continue
                         else:
-                            self.store.enqueue_workspace_delivery(record, 0)
+                            self.store.finalize_provider_event(
+                                account_uuid,
+                                queue_id,
+                                event_id,
+                                supported,
+                                deleted_message_ids,
+                            )
             except ValueError as exc:
+                if str(exc) == "reaction_mapping_plan_changed":
+                    self.store.retry_provider_event(
+                        account_uuid,
+                        queue_id,
+                        event_id,
+                        str(exc),
+                    )
+                    continue
                 if str(exc) != "provider_chat_assignment_pending":
                     processed += self._contain_provider_event_failure(row, exc)
                     continue
@@ -2930,32 +3058,6 @@ class BridgeService:
                         str(exc),
                     )
                 continue
-            except Exception as exc:
-                processed += self._contain_provider_event_failure(row, exc)
-                continue
-            try:
-                deleted_message_ids: list[str] = []
-                if event.get("type") == "delete_message":
-                    raw_ids = event.get("message_ids")
-                    if raw_ids is None and event.get("message_id") is not None:
-                        raw_ids = [event["message_id"]]
-                    deleted_message_ids = [
-                        str(value) for value in typing.cast(list[object], raw_ids or [])
-                    ]
-                if records and event_enqueued_atomically:
-                    pass
-                elif records and hasattr(self.store, "mark_provider_event_delivering"):
-                    self.store.mark_provider_event_delivering(
-                        account_uuid, queue_id, event_id
-                    )
-                else:
-                    self.store.finalize_provider_event(
-                        account_uuid,
-                        queue_id,
-                        event_id,
-                        supported,
-                        deleted_message_ids,
-                    )
             except Exception as exc:
                 processed += self._contain_provider_event_failure(row, exc)
                 continue

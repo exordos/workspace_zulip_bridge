@@ -15,6 +15,112 @@ from workspace_zulip_bridge import canonical, control, emoji
 PARTICIPANT_RECHECK_INTERVAL_SECONDS = 3600
 
 
+def _provider_event_requires_account_barrier(event: dict[str, object]) -> bool:
+    """Return whether one event causally spans more than one provider chat."""
+
+    if event.get("type") != "update_message":
+        return False
+    source_stream_id = event.get("stream_id")
+    destination_stream_id = event.get("new_stream_id")
+    return (
+        isinstance(source_stream_id, int)
+        and isinstance(destination_stream_id, int)
+        and source_stream_id != destination_stream_id
+    )
+
+
+def _provider_event_static_causal_lane(event: dict[str, object]) -> str | None:
+    """Return a provider-side ordering lane without requiring persisted mappings."""
+
+    if _provider_event_requires_account_barrier(event):
+        return None
+    event_type = event.get("type")
+    if event_type == "message":
+        message = event.get("message")
+        if not isinstance(message, dict):
+            return None
+        if message.get("type") == "stream":
+            stream_id = message.get("stream_id")
+            return f"channel:{stream_id}" if isinstance(stream_id, int) else None
+        recipients = message.get("display_recipient")
+        if not isinstance(recipients, list):
+            return None
+        if not recipients or any(
+            not isinstance(recipient, dict)
+            or not isinstance(recipient.get("id"), int)
+            for recipient in recipients
+        ):
+            return None
+        participant_ids = sorted(int(recipient["id"]) for recipient in recipients)
+        chat_type = "direct" if len(participant_ids) == 2 else "group_direct"
+        return f"{chat_type}:{','.join(map(str, participant_ids))}"
+    if event_type == "user_topic":
+        stream_id = event.get("stream_id")
+        return f"channel:{stream_id}" if isinstance(stream_id, int) else None
+    if event_type == "update_message":
+        stream_id = event.get("stream_id")
+        if isinstance(stream_id, int):
+            return f"channel:{stream_id}"
+    if event_type in {"subscription", "user_settings"}:
+        stream_ids: set[int] = set()
+        stream_id = event.get("stream_id")
+        if isinstance(stream_id, int):
+            stream_ids.add(stream_id)
+        multiple_stream_ids = event.get("stream_ids")
+        if isinstance(multiple_stream_ids, list):
+            for value in multiple_stream_ids:
+                if isinstance(value, int):
+                    stream_ids.add(value)
+        subscriptions = event.get("subscriptions")
+        if isinstance(subscriptions, list):
+            for subscription in subscriptions:
+                if isinstance(subscription, dict) and isinstance(
+                    subscription.get("stream_id"), int
+                ):
+                    stream_ids.add(int(subscription["stream_id"]))
+        if len(stream_ids) == 1:
+            return f"channel:{next(iter(stream_ids))}"
+        if event_type == "subscription":
+            return None
+        return "account:user-settings"
+    if event_type == "realm_user":
+        person = event.get("person")
+        provider_user_id = (
+            person.get("user_id") if isinstance(person, dict) else event.get("user_id")
+        )
+        if isinstance(provider_user_id, int):
+            return f"identity:{provider_user_id}"
+        return "account:identities"
+    return None
+
+
+def _provider_event_message_ids(event: dict[str, object]) -> list[str]:
+    values: list[object] = []
+    if event.get("message_id") is not None:
+        values.append(event["message_id"])
+    message_ids = event.get("message_ids", event.get("messages", []))
+    if isinstance(message_ids, list):
+        values.extend(message_ids)
+    result: list[str] = []
+    for value in values:
+        if isinstance(value, bool):
+            continue
+        try:
+            normalized = str(int(str(value)))
+        except (TypeError, ValueError):
+            continue
+        if normalized not in result:
+            result.append(normalized)
+    return result
+
+
+def _provider_mapping_lock_key(
+    account_uuid: str, entity_kind: str, provider_id: str
+) -> str:
+    """Serialize mapping visibility with decisions that depend on its absence."""
+    return f"{account_uuid}:{entity_kind}:{provider_id}"
+
+
 def backfill_health_component(account_uuid: str, provider_chat_key: str) -> str:
     return f"provider:{account_uuid}:{provider_chat_key}"
 
@@ -1577,6 +1683,15 @@ class RestAlchemyStore:
         provider_revision: str | None = None,
     ) -> None:
         with self.session() as session:
+            if entity_kind == "message":
+                session.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (
+                        _provider_mapping_lock_key(
+                            account_uuid, entity_kind, provider_id
+                        ),
+                    ),
+                )
             session.execute(
                 """
                 INSERT INTO provider_mappings (
@@ -1611,6 +1726,14 @@ class RestAlchemyStore:
     ) -> None:
         """Refresh a recreation target without clearing a committed tombstone."""
         with self.session() as session:
+            session.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (
+                    _provider_mapping_lock_key(
+                        account_uuid, "message", provider_id
+                    ),
+                ),
+            )
             mapping = session.execute(
                 """
                 UPDATE provider_mappings
@@ -1642,10 +1765,20 @@ class RestAlchemyStore:
             # The lock is acquired in its own statement so a caller that waits
             # for a competing rename gets a fresh READ COMMITTED snapshot for
             # the mapping query below.
-            session.execute(
-                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-                (f"{account_uuid}:{entity_kind}:{new_provider_id}",),
+            lock_provider_ids = (
+                sorted({old_provider_id, new_provider_id})
+                if entity_kind == "message"
+                else [new_provider_id]
             )
+            for lock_provider_id in lock_provider_ids:
+                session.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (
+                        _provider_mapping_lock_key(
+                            account_uuid, entity_kind, lock_provider_id
+                        ),
+                    ),
+                )
             row = session.execute(
                 """
                 WITH existing_target AS (
@@ -1955,6 +2088,15 @@ class RestAlchemyStore:
         self, account_uuid: str, entity_kind: str, provider_id: str
     ) -> None:
         with self.session() as session:
+            if entity_kind == "message":
+                session.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (
+                        _provider_mapping_lock_key(
+                            account_uuid, entity_kind, provider_id
+                        ),
+                    ),
+                )
             session.execute(
                 """
                 UPDATE provider_mappings
@@ -1965,8 +2107,11 @@ class RestAlchemyStore:
             )
 
     def pending_provider_events(self, limit: int = 100) -> list[dict[str, object]]:
-        """Select a fair batch of eligible per-account FIFO journal heads."""
+        """Select fair chat-lane heads while preserving account-wide barriers."""
         with self.session() as session:
+            # This bounded selector is latency-sensitive and too branch-heavy
+            # for PostgreSQL JIT compilation to amortize on each scheduler tick.
+            session.execute("SET LOCAL jit = off")
             return list(
                 session.execute(
                     """
@@ -1977,23 +2122,147 @@ class RestAlchemyStore:
                                event.assignment_pending_since,
                                event.assignment_catalog_reported_at,
                                event.provider_message_context,
-                               event.created_at, event.available_at
+                               event.causal_lane, event.created_at,
+                               event.available_at
                         FROM scheduler_accounts AS journal
                         JOIN LATERAL (
-                            SELECT account_uuid, queue_id, event_id, body,
-                                   processing_reason, retry_count,
-                                   assignment_pending_since,
-                                   assignment_catalog_reported_at,
-                                   provider_message_context,
-                                   created_at, available_at
-                            FROM zulip_provider_events
-                            WHERE account_uuid = journal.account_uuid
-                              AND processing_state = 'pending'
-                            ORDER BY created_at, event_id, queue_id
+                            SELECT choice.*
+                            FROM (
+                                SELECT lane_event.account_uuid,
+                                       lane_event.queue_id,
+                                       lane_event.event_id,
+                                       lane_event.body,
+                                       lane_event.processing_reason,
+                                       lane_event.retry_count,
+                                       lane_event.assignment_pending_since,
+                                       lane_event.assignment_catalog_reported_at,
+                                       lane_event.provider_message_context,
+                                       lane_event.causal_lane,
+                                       lane_event.created_at,
+                                       lane_event.available_at,
+                                       lane.last_provider_event_dispatched_at
+                                           AS lane_dispatched_at
+                                FROM (
+                                    SELECT DISTINCT event.causal_lane
+                                    FROM zulip_provider_events AS event
+                                    WHERE event.account_uuid =
+                                          journal.account_uuid
+                                      AND event.causal_lane IS NOT NULL
+                                      AND event.processing_state IN (
+                                          'pending', 'delivering'
+                                      )
+                                ) AS active_lane
+                                LEFT JOIN scheduler_provider_event_lanes AS lane
+                                  ON lane.account_uuid = journal.account_uuid
+                                 AND lane.causal_lane = active_lane.causal_lane
+                                JOIN LATERAL (
+                                    SELECT event.account_uuid, event.queue_id,
+                                           event.event_id, event.body,
+                                           event.processing_state,
+                                           event.processing_reason,
+                                           event.retry_count,
+                                           event.assignment_pending_since,
+                                           event.assignment_catalog_reported_at,
+                                           event.provider_message_context,
+                                           event.causal_lane,
+                                           event.created_at,
+                                           event.available_at
+                                    FROM zulip_provider_events AS event
+                                    WHERE event.account_uuid =
+                                          journal.account_uuid
+                                      AND event.causal_lane =
+                                          active_lane.causal_lane
+                                      AND event.processing_state IN (
+                                          'pending', 'delivering'
+                                      )
+                                    ORDER BY event.created_at,
+                                             event.event_id, event.queue_id
+                                    LIMIT 1
+                                ) AS lane_event ON true
+                                WHERE lane_event.processing_state = 'pending'
+                                  AND lane_event.available_at <= now()
+                                  AND NOT EXISTS (
+                                      SELECT 1
+                                      FROM zulip_provider_events AS barrier
+                                      WHERE barrier.account_uuid =
+                                            lane_event.account_uuid
+                                        AND barrier.causal_lane IS NULL
+                                        AND barrier.processing_state IN (
+                                            'pending', 'delivering'
+                                        )
+                                        AND (
+                                            barrier.created_at,
+                                            barrier.event_id,
+                                            barrier.queue_id
+                                        ) < (
+                                            lane_event.created_at,
+                                            lane_event.event_id,
+                                            lane_event.queue_id
+                                        )
+                                  )
+                                UNION ALL
+                                SELECT global_event.account_uuid,
+                                       global_event.queue_id,
+                                       global_event.event_id,
+                                       global_event.body,
+                                       global_event.processing_reason,
+                                       global_event.retry_count,
+                                       global_event.assignment_pending_since,
+                                       global_event.assignment_catalog_reported_at,
+                                       global_event.provider_message_context,
+                                       global_event.causal_lane,
+                                       global_event.created_at,
+                                       global_event.available_at,
+                                       NULL::timestamptz AS lane_dispatched_at
+                                FROM LATERAL (
+                                    SELECT event.account_uuid, event.queue_id,
+                                           event.event_id, event.body,
+                                           event.processing_state,
+                                           event.processing_reason,
+                                           event.retry_count,
+                                           event.assignment_pending_since,
+                                           event.assignment_catalog_reported_at,
+                                           event.provider_message_context,
+                                           event.causal_lane,
+                                           event.created_at,
+                                           event.available_at
+                                    FROM zulip_provider_events AS event
+                                    WHERE event.account_uuid = journal.account_uuid
+                                      AND event.causal_lane IS NULL
+                                      AND event.processing_state IN (
+                                          'pending', 'delivering'
+                                      )
+                                    ORDER BY event.created_at,
+                                             event.event_id, event.queue_id
+                                    LIMIT 1
+                                ) AS global_event
+                                WHERE global_event.processing_state = 'pending'
+                                  AND global_event.available_at <= now()
+                                  AND NOT EXISTS (
+                                      SELECT 1
+                                      FROM zulip_provider_events AS predecessor
+                                      WHERE predecessor.account_uuid =
+                                            global_event.account_uuid
+                                        AND predecessor.processing_state IN (
+                                            'pending', 'delivering'
+                                        )
+                                        AND (
+                                            predecessor.created_at,
+                                            predecessor.event_id,
+                                            predecessor.queue_id
+                                        ) < (
+                                            global_event.created_at,
+                                            global_event.event_id,
+                                            global_event.queue_id
+                                        )
+                                  )
+                            ) AS choice
+                            ORDER BY choice.lane_dispatched_at NULLS FIRST,
+                                     choice.available_at, choice.created_at,
+                                     choice.event_id, choice.queue_id
                             LIMIT 1
                         ) AS event ON true
-                        WHERE event.available_at <= now()
-                          AND (
+                        WHERE (
                               NOT EXISTS (
                                   SELECT 1
                                   FROM desired_resources AS account
@@ -2051,13 +2320,27 @@ class RestAlchemyStore:
                         FROM candidates AS event
                         WHERE journal.account_uuid = event.account_uuid
                         RETURNING journal.account_uuid
+                    ), dispatched_lanes AS (
+                        INSERT INTO scheduler_provider_event_lanes (
+                            account_uuid, causal_lane,
+                            last_provider_event_dispatched_at
+                        )
+                        SELECT event.account_uuid, event.causal_lane,
+                               clock_timestamp()
+                        FROM candidates AS event
+                        WHERE event.causal_lane IS NOT NULL
+                        ON CONFLICT (account_uuid, causal_lane) DO UPDATE SET
+                            last_provider_event_dispatched_at =
+                                EXCLUDED.last_provider_event_dispatched_at
+                        RETURNING account_uuid, causal_lane
                     )
                     SELECT event.account_uuid, event.queue_id, event.event_id,
                            event.body, event.processing_reason,
                            event.retry_count,
                            event.assignment_pending_since,
                            event.assignment_catalog_reported_at,
-                           event.provider_message_context
+                           event.provider_message_context,
+                           event.causal_lane
                     FROM candidates AS event
                     JOIN dispatched
                       ON dispatched.account_uuid = event.account_uuid
@@ -2070,32 +2353,43 @@ class RestAlchemyStore:
     def has_pending_provider_events(self) -> bool:
         """Return whether live Zulip journal work still needs processing."""
         with self.session() as session:
+            session.execute("SET LOCAL jit = off")
             row = session.execute(
                 """
                 SELECT EXISTS (
                     SELECT 1
                     FROM scheduler_accounts AS journal
-                    JOIN LATERAL (
-                        SELECT account_uuid, queue_id, event_id,
-                               processing_state, available_at
-                        FROM zulip_provider_events
-                        WHERE account_uuid = journal.account_uuid
-                          AND processing_state IN ('pending', 'delivering')
-                        ORDER BY created_at, event_id, queue_id
-                        LIMIT 1
-                    ) AS event ON true
                     WHERE (
-                          (
-                              event.processing_state = 'pending'
-                              AND event.available_at <= now()
-                              AND (
+                          EXISTS (
+                              SELECT 1
+                              FROM zulip_provider_events AS event
+                              WHERE event.account_uuid = journal.account_uuid
+                                AND event.processing_state = 'delivering'
+                              AND EXISTS (
+                                  SELECT 1
+                                  FROM workspace_delivery_outbox AS delivery
+                                  WHERE delivery.account_uuid =
+                                        event.account_uuid
+                                    AND delivery.provider_queue_id =
+                                        event.queue_id
+                                    AND delivery.provider_event_id =
+                                        event.event_id
+                                    AND delivery.sent_at IS NULL
+                                    AND delivery.submission_state IN (
+                                        'pending', 'submitting', 'ambiguous',
+                                        'awaiting_result'
+                                    )
+                              )
+                          )
+                          OR (
+                              (
                                   NOT EXISTS (
                                       SELECT 1
                                       FROM desired_resources AS account
                                       WHERE account.resource_type =
                                             'external_account'
                                         AND account.resource_uuid =
-                                            event.account_uuid
+                                            journal.account_uuid
                                         AND NOT account.deleted
                                         AND COALESCE(
                                               (account.body
@@ -2113,7 +2407,7 @@ class RestAlchemyStore:
                                       WHERE account.resource_type =
                                             'external_account'
                                         AND account.resource_uuid =
-                                            event.account_uuid
+                                            journal.account_uuid
                                         AND NOT account.deleted
                                         AND COALESCE(
                                               (account.body
@@ -2136,23 +2430,102 @@ class RestAlchemyStore:
                                         )
                                   )
                               )
-                          )
-                          OR (
-                              event.processing_state = 'delivering'
-                              AND EXISTS (
-                                  SELECT 1
-                                  FROM workspace_delivery_outbox AS delivery
-                                  WHERE delivery.account_uuid =
-                                        event.account_uuid
-                                    AND delivery.provider_queue_id =
-                                        event.queue_id
-                                    AND delivery.provider_event_id =
-                                        event.event_id
-                                    AND delivery.sent_at IS NULL
-                                    AND delivery.submission_state IN (
-                                        'pending', 'submitting', 'ambiguous',
-                                        'awaiting_result'
-                                    )
+                              AND (
+                                  EXISTS (
+                                      SELECT 1
+                                      FROM (
+                                          SELECT DISTINCT event.causal_lane
+                                          FROM zulip_provider_events AS event
+                                          WHERE event.account_uuid =
+                                                journal.account_uuid
+                                            AND event.causal_lane IS NOT NULL
+                                            AND event.processing_state IN (
+                                                'pending', 'delivering'
+                                            )
+                                      ) AS active_lane
+                                      JOIN LATERAL (
+                                          SELECT event.account_uuid,
+                                                 event.created_at,
+                                                 event.event_id,
+                                                 event.queue_id,
+                                                 event.processing_state,
+                                                 event.available_at
+                                          FROM zulip_provider_events AS event
+                                          WHERE event.account_uuid =
+                                                journal.account_uuid
+                                            AND event.causal_lane =
+                                                active_lane.causal_lane
+                                            AND event.processing_state IN (
+                                                'pending', 'delivering'
+                                            )
+                                          ORDER BY event.created_at,
+                                                   event.event_id,
+                                                   event.queue_id
+                                          LIMIT 1
+                                      ) AS event ON true
+                                      WHERE event.processing_state = 'pending'
+                                        AND event.available_at <= now()
+                                        AND NOT EXISTS (
+                                            SELECT 1
+                                            FROM zulip_provider_events AS barrier
+                                            WHERE barrier.account_uuid =
+                                                  event.account_uuid
+                                              AND barrier.causal_lane IS NULL
+                                              AND barrier.processing_state IN (
+                                                  'pending', 'delivering'
+                                              )
+                                              AND (
+                                                  barrier.created_at,
+                                                  barrier.event_id,
+                                                  barrier.queue_id
+                                              ) < (
+                                                  event.created_at,
+                                                  event.event_id,
+                                                  event.queue_id
+                                              )
+                                        )
+                                  )
+                                  OR EXISTS (
+                                      SELECT 1
+                                      FROM LATERAL (
+                                          SELECT event.created_at,
+                                                 event.event_id,
+                                                 event.queue_id,
+                                                 event.processing_state,
+                                                 event.available_at
+                                          FROM zulip_provider_events AS event
+                                          WHERE event.account_uuid =
+                                                journal.account_uuid
+                                            AND event.causal_lane IS NULL
+                                            AND event.processing_state IN (
+                                                'pending', 'delivering'
+                                            )
+                                          ORDER BY event.created_at,
+                                                   event.event_id,
+                                                   event.queue_id
+                                          LIMIT 1
+                                      ) AS event
+                                      WHERE event.processing_state = 'pending'
+                                        AND event.available_at <= now()
+                                        AND NOT EXISTS (
+                                            SELECT 1
+                                            FROM zulip_provider_events
+                                                AS predecessor
+                                            WHERE predecessor.account_uuid =
+                                                  journal.account_uuid
+                                              AND predecessor.processing_state
+                                                  IN ('pending', 'delivering')
+                                              AND (
+                                                  predecessor.created_at,
+                                                  predecessor.event_id,
+                                                  predecessor.queue_id
+                                              ) < (
+                                                  event.created_at,
+                                                  event.event_id,
+                                                  event.queue_id
+                                              )
+                                        )
+                                  )
                               )
                           )
                       )
@@ -2223,20 +2596,54 @@ class RestAlchemyStore:
         provider_message_context: dict[str, object],
     ) -> dict[str, object]:
         """Persist the minimal provider message facts needed by a reaction."""
+        causal_lane = _provider_event_static_causal_lane(
+            {"type": "message", "message": provider_message_context}
+        )
+        message_ids = _provider_event_message_ids(
+            {"message_id": provider_message_context.get("id")}
+        )
+        provisional_lane = f"message:{message_ids[0]}" if message_ids else None
         with self.session() as session:
             row = session.execute(
                 """
+                WITH registered_lane AS (
+                    INSERT INTO scheduler_provider_event_lanes (
+                        account_uuid, causal_lane
+                    )
+                    SELECT %s, %s::text WHERE %s::text IS NOT NULL
+                    ON CONFLICT (account_uuid, causal_lane) DO NOTHING
+                ), reclassified_events AS (
+                    UPDATE zulip_provider_events
+                    SET causal_lane = %s
+                    WHERE %s::text IS NOT NULL
+                      AND account_uuid = %s
+                      AND causal_lane = %s
+                      AND (queue_id, event_id) <> (%s, %s)
+                      AND processing_state IN ('pending', 'delivering')
+                    RETURNING event_id
+                )
                 UPDATE zulip_provider_events
                 SET provider_message_context = COALESCE(
                         provider_message_context,
                         %s
-                    )
+                    ),
+                    causal_lane = COALESCE(%s, causal_lane)
                 WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
                   AND processing_state = 'pending'
                 RETURNING provider_message_context
                 """,
                 (
+                    account_uuid,
+                    causal_lane,
+                    causal_lane,
+                    causal_lane,
+                    causal_lane,
+                    account_uuid,
+                    provisional_lane,
+                    queue_id,
+                    event_id,
                     json.dumps(provider_message_context),
+                    causal_lane,
                     account_uuid,
                     queue_id,
                     event_id,
@@ -2245,6 +2652,101 @@ class RestAlchemyStore:
         if row is None or not isinstance(row["provider_message_context"], dict):
             raise ValueError("Provider event message context is unavailable")
         return typing.cast(dict[str, object], row["provider_message_context"])
+
+    def _refresh_provider_event_causal_lane(
+        self,
+        session: sessions.PgSQLSession,
+        account_uuid: str,
+        queue_id: str,
+        event_id: int,
+        event: dict[str, object],
+    ) -> tuple[bool, str | None]:
+        """Lock message mappings and refresh one selected row's durable lane."""
+        provider_message_ids = sorted(_provider_event_message_ids(event))
+        for provider_message_id in provider_message_ids:
+            session.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (
+                    _provider_mapping_lock_key(
+                        account_uuid, "message", provider_message_id
+                    ),
+                ),
+            )
+        current = session.execute(
+            """
+            SELECT causal_lane
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
+              AND processing_state = 'pending'
+            FOR UPDATE
+            """,
+            (account_uuid, queue_id, event_id),
+        ).fetchone()
+        if current is None:
+            return False, None
+        current_lane = typing.cast(str | None, current["causal_lane"])
+        if not provider_message_ids:
+            return True, current_lane
+        resolved_lane = self._provider_event_causal_lane(
+            session, account_uuid, event
+        )
+        if resolved_lane == current_lane:
+            return True, current_lane
+        session.execute(
+            """
+            WITH registered_lane AS (
+                INSERT INTO scheduler_provider_event_lanes (
+                    account_uuid, causal_lane
+                )
+                SELECT %s, %s::text WHERE %s::text IS NOT NULL
+                ON CONFLICT (account_uuid, causal_lane) DO NOTHING
+            )
+            UPDATE zulip_provider_events
+            SET causal_lane = %s
+            WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
+              AND processing_state = 'pending'
+            """,
+            (
+                account_uuid,
+                resolved_lane,
+                resolved_lane,
+                resolved_lane,
+                account_uuid,
+                queue_id,
+                event_id,
+            ),
+        )
+        return True, resolved_lane
+
+    def refresh_provider_event_causal_lane(
+        self,
+        account_uuid: str,
+        queue_id: str,
+        event_id: int,
+        event: dict[str, object],
+    ) -> str | None:
+        """Refresh any selected event whose lane depends on message mappings."""
+        with self.session() as session:
+            _, causal_lane = self._refresh_provider_event_causal_lane(
+                session, account_uuid, queue_id, event_id, event
+            )
+            return causal_lane
+
+    @contextlib.contextmanager
+    def provider_event_lane_guard(
+        self,
+        account_uuid: str,
+        queue_id: str,
+        event_id: int,
+        event: dict[str, object],
+        selected_causal_lane: object,
+    ) -> typing.Iterator[bool]:
+        """Hold mapping and journal locks through durable event persistence."""
+        with self.transaction() as session:
+            exists, causal_lane = self._refresh_provider_event_causal_lane(
+                session, account_uuid, queue_id, event_id, event
+            )
+            yield exists and causal_lane == selected_causal_lane
 
     def mark_provider_event_catalog_reported(
         self,
@@ -2351,6 +2853,35 @@ class RestAlchemyStore:
                     event_id,
                 ),
             )
+
+    def finalize_provider_event_if_lane_current(
+        self,
+        account_uuid: str,
+        queue_id: str,
+        event_id: int,
+        event: dict[str, object],
+        selected_causal_lane: object,
+        supported: bool,
+        deleted_message_ids: list[str],
+    ) -> bool:
+        """Refresh a mapping-dependent lane and terminalize it atomically."""
+        with self.provider_event_lane_guard(
+            account_uuid,
+            queue_id,
+            event_id,
+            event,
+            selected_causal_lane,
+        ) as lane_current:
+            if not lane_current:
+                return False
+            self.finalize_provider_event(
+                account_uuid,
+                queue_id,
+                event_id,
+                supported,
+                deleted_message_ids,
+            )
+            return True
 
     def mark_provider_event_invalid(
         self, account_uuid: str, queue_id: str, event_id: int, reason: str
@@ -4016,6 +4547,18 @@ class RestAlchemyStore:
                 """,
                 (limit,),
             ).fetchone()
+            session.execute(
+                """
+                DELETE FROM scheduler_provider_event_lanes AS lane
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM zulip_provider_events AS event
+                    WHERE event.account_uuid = lane.account_uuid
+                      AND event.causal_lane = lane.causal_lane
+                      AND event.processing_state IN ('pending', 'delivering')
+                )
+                """
+            )
             return int(deleted_deliveries["total"]), int(deleted_events["total"])
 
     def mark_workspace_delivery_submitted(self, record_uuid: str) -> None:
@@ -5679,9 +6222,29 @@ class RestAlchemyStore:
         provider = typing.cast(dict[str, object], operation["provider"])
         account_uuid = str(record["account_uuid"])
         workspace_uuid = str(operation["entity_uuid"])
+        provider_message_id = provider.get("entity_id")
+        if kind in {"message.update", "message.delete"} and (
+            provider_message_id is not None
+        ):
+            session.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (
+                    _provider_mapping_lock_key(
+                        account_uuid, "message", str(provider_message_id)
+                    ),
+                ),
+            )
         if kind == "message.create":
             if provider_entity_id is None:
                 raise ValueError("Committed message create has no provider identifier")
+            session.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (
+                    _provider_mapping_lock_key(
+                        account_uuid, "message", provider_entity_id
+                    ),
+                ),
+            )
             session.execute(
                 """
                 INSERT INTO provider_mappings (
@@ -6208,30 +6771,107 @@ class RestAlchemyStore:
                 ),
             )
 
+    @staticmethod
+    def _provider_event_causal_lane(
+        session: sessions.PgSQLSession,
+        account_uuid: str,
+        event: dict[str, object],
+    ) -> str | None:
+        if _provider_event_requires_account_barrier(event):
+            return None
+        static_lane = _provider_event_static_causal_lane(event)
+        if static_lane is not None:
+            return static_lane
+        message_ids = _provider_event_message_ids(event)
+        if not message_ids:
+            return None
+        mapped = session.execute(
+            """
+            SELECT provider_id, metadata->>'chat_key' AS causal_lane
+            FROM provider_mappings
+            WHERE account_uuid = %s AND entity_kind = 'message'
+              AND provider_id = ANY(%s) AND NOT deleted
+              AND metadata->>'chat_key' IS NOT NULL
+            """,
+            (account_uuid, message_ids),
+        ).fetchall()
+        resolved = {
+            str(row["provider_id"]): str(row["causal_lane"]) for row in mapped
+        }
+        if set(resolved) == set(message_ids):
+            resolved_lanes = set(resolved.values())
+            return resolved_lanes.pop() if len(resolved_lanes) == 1 else None
+        sources = session.execute(
+            """
+                SELECT DISTINCT ON (source.provider_id)
+                       source.provider_id, source.causal_lane
+                FROM (
+                    SELECT body->'message'->>'id' AS provider_id,
+                           causal_lane, created_at, event_id, queue_id
+                    FROM zulip_provider_events
+                    WHERE account_uuid = %s AND event_type = 'message'
+                      AND body->'message'->>'id' = ANY(%s)
+                      AND causal_lane IS NOT NULL
+                    UNION ALL
+                    SELECT provider_message_context->>'id' AS provider_id,
+                           causal_lane, created_at, event_id, queue_id
+                    FROM zulip_provider_events
+                    WHERE account_uuid = %s
+                      AND provider_message_context->>'id' = ANY(%s)
+                      AND causal_lane IS NOT NULL
+                ) AS source
+                ORDER BY source.provider_id, source.created_at,
+                         source.event_id, source.queue_id
+            """,
+            (account_uuid, message_ids, account_uuid, message_ids),
+        ).fetchall()
+        for row in sources:
+            resolved.setdefault(str(row["provider_id"]), str(row["causal_lane"]))
+        resolved_lanes = set(resolved.values())
+        if set(resolved) == set(message_ids) and len(resolved_lanes) == 1:
+            return resolved_lanes.pop()
+        if len(message_ids) == 1:
+            return f"message:{message_ids[0]}"
+        return None
+
     def record_provider_event(
         self, account_uuid: str, queue_id: str, event: dict[str, object]
     ) -> bool:
         with self.session() as session:
+            causal_lane = self._provider_event_causal_lane(
+                session, account_uuid, event
+            )
             result = session.execute(
                 """
                 WITH registered_account AS (
                     INSERT INTO scheduler_accounts (account_uuid)
                     VALUES (%s)
                     ON CONFLICT (account_uuid) DO NOTHING
+                ), registered_lane AS (
+                    INSERT INTO scheduler_provider_event_lanes (
+                        account_uuid, causal_lane
+                    )
+                    SELECT %s, %s::text WHERE %s::text IS NOT NULL
+                    ON CONFLICT (account_uuid, causal_lane) DO NOTHING
                 )
                 INSERT INTO zulip_provider_events (
-                    account_uuid, queue_id, event_id, event_type, body
-                ) VALUES (%s, %s, %s, %s, %s)
+                    account_uuid, queue_id, event_id, event_type, body,
+                    causal_lane
+                ) VALUES (%s, %s, %s, %s, %s, %s)
                 ON CONFLICT (account_uuid, queue_id, event_id) DO NOTHING
                 RETURNING event_id
                 """,
                 (
                     account_uuid,
                     account_uuid,
+                    causal_lane,
+                    causal_lane,
+                    account_uuid,
                     queue_id,
                     int(event["id"]),
                     str(event["type"]),
                     json.dumps(event),
+                    causal_lane,
                 ),
             ).fetchone()
             return result is not None
