@@ -400,6 +400,13 @@ def _provider_site(original_url: str) -> str:
     return ""
 
 
+def _safe_urlsplit(value: str) -> urllib.parse.SplitResult | None:
+    try:
+        return urllib.parse.urlsplit(value)
+    except ValueError:
+        return None
+
+
 def _decode_hash_component(value: str) -> str:
     return urllib.parse.unquote(value.replace(".", "%"))
 
@@ -424,8 +431,12 @@ def _same_provider_url(target: str, provider_site: str) -> bool:
         target.startswith("/") and not target.startswith("//")
     ):
         return True
-    parsed = urllib.parse.urlsplit(target)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+    parsed = _safe_urlsplit(target)
+    if (
+        parsed is None
+        or parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+    ):
         return False
     if not provider_site:
         return False
@@ -446,7 +457,9 @@ def _zulip_url_urn(
 ) -> str | None:
     if resolver is None or not _same_provider_url(target, provider_site):
         return None
-    parsed = urllib.parse.urlsplit(target)
+    parsed = _safe_urlsplit(target)
+    if parsed is None:
+        return None
     fragment = parsed.fragment
     if fragment.startswith("user/"):
         provider_user_id = fragment.removeprefix("user/").split("/", 1)[0]
@@ -531,8 +544,8 @@ def _absolute_provider_url(target: str, provider_site: str) -> str | None:
         if not provider_site:
             return None
         return urllib.parse.urljoin(provider_site.rstrip("/") + "/", target)
-    parsed = urllib.parse.urlsplit(target)
-    if parsed.scheme in {"http", "https"} and parsed.netloc:
+    parsed = _safe_urlsplit(target)
+    if parsed is not None and parsed.scheme in {"http", "https"} and parsed.netloc:
         return target
     if SCHEMELESS_WEB_TARGET_RE.fullmatch(target):
         return f"https://{target}"
@@ -597,8 +610,25 @@ def _trim_bare_url(value: str) -> tuple[str, str]:
     return url, suffix
 
 
+def _source_link_destination(link: markdown_conversion.MarkdownLink) -> str:
+    if link.reference:
+        return link.destination
+    if not link.raw.startswith(link.destination_prefix):
+        return link.destination
+    if link.destination_suffix and not link.raw.endswith(link.destination_suffix):
+        return link.destination
+    destination_end = len(link.raw) - len(link.destination_suffix)
+    if destination_end < len(link.destination_prefix):
+        return link.destination
+    return link.raw[len(link.destination_prefix) : destination_end]
+
+
 def _reply_provider_id(link: markdown_conversion.MarkdownLink) -> str | None:
-    target = urllib.parse.urlsplit(link.destination)
+    if _safe_urlsplit(_source_link_destination(link)) is None:
+        return None
+    target = _safe_urlsplit(link.destination)
+    if target is None:
+        return None
     if target.scheme and target.scheme.casefold() not in {"http", "https"}:
         return None
     match = REPLY_FRAGMENT_RE.fullmatch(target.fragment)
@@ -718,7 +748,9 @@ def _convert_zulip_links(
             if kind == "angle":
                 url = match.group("url")
                 target = _workspace_link_target(url, provider_site, resolver)
-                converted.append(f"[{url}]({target})")
+                converted.append(
+                    match.group(0) if target == url else f"[{url}]({target})"
+                )
                 continue
             if kind == "bare":
                 raw_url, suffix = _trim_bare_url(match.group("url"))
@@ -730,7 +762,10 @@ def _convert_zulip_links(
                 workspace_target = _workspace_link_target(
                     target, provider_site, resolver
                 )
-                converted.append(f"[{raw_url}]({workspace_target}){suffix}")
+                if workspace_target == target:
+                    converted.append(raw_url + suffix)
+                else:
+                    converted.append(f"[{raw_url}]({workspace_target}){suffix}")
                 continue
             raise AssertionError(f"unknown text token kind: {kind}")
         return "".join(converted)
@@ -747,6 +782,8 @@ def _convert_zulip_links(
                 label = link.label.strip() or "attachment"
                 return f"**{UNAVAILABLE_FILE_MARKER}:** {label}"
             return link.with_destination(destination)
+        if _safe_urlsplit(_source_link_destination(link)) is None:
+            return link.raw
         target = _workspace_link_target(
             link.destination,
             provider_site,
