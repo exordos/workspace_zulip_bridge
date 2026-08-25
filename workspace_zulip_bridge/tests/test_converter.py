@@ -3,7 +3,7 @@ import uuid
 
 import pytest
 
-from workspace_zulip_bridge import canonical, converter
+from workspace_zulip_bridge import canonical, converter, markdown_conversion
 
 ACCOUNT_UUID = str(uuid.uuid4())
 OWNER_UUID = str(uuid.uuid4())
@@ -498,6 +498,84 @@ def test_zulip_internal_and_external_links_become_workspace_urns():
     assert "`https://example.net/code`" in markdown
     assert "#**" not in markdown
     assert "Open original" not in markdown
+
+
+@pytest.mark.parametrize(
+    "malformed_url",
+    (
+        "https://[2001:db8::1",
+        "http://[::1",
+    ),
+)
+def test_malformed_ipv6_bare_url_is_preserved_without_aborting_conversion(
+    malformed_url,
+):
+    store = FakeStore()
+    resolver = converter.ZulipLinkResolver(store, ACCOUNT_UUID, OWNER_UUID)
+    original_url = "https://chat.example.invalid/#narrow/near/602"
+
+    converted, lossy = converter.convert_markdown(
+        f"Broken link: {malformed_url}",
+        {},
+        original_url,
+        link_resolver=resolver,
+    )
+
+    assert not lossy
+    assert converted == f"Broken link: {malformed_url}"
+
+
+@pytest.mark.parametrize(
+    "malformed_link",
+    (
+        "<https://[2001:db8::1>",
+        "[label](https://[2001:db8::1)",
+    ),
+)
+def test_malformed_ipv6_link_markup_is_preserved(malformed_link):
+    store = FakeStore()
+    resolver = converter.ZulipLinkResolver(store, ACCOUNT_UUID, OWNER_UUID)
+    content = f"Broken link: {malformed_link}"
+
+    converted, lossy = converter.convert_markdown(
+        content,
+        {},
+        "https://chat.example.invalid/#narrow/near/602",
+        link_resolver=resolver,
+    )
+
+    assert not lossy
+    assert converted == content
+
+
+def test_valid_ipv6_bare_url_remains_clickable():
+    store = FakeStore()
+    resolver = converter.ZulipLinkResolver(store, ACCOUNT_UUID, OWNER_UUID)
+    ipv6_url = "https://[2001:db8::1]/docs"
+
+    converted, lossy = converter.convert_markdown(
+        ipv6_url,
+        {},
+        "https://chat.example.invalid/#narrow/near/602",
+        link_resolver=resolver,
+    )
+
+    assert not lossy
+    assert converted == f"[{ipv6_url}](urn:url:{ipv6_url})"
+
+
+def test_malformed_ipv6_semantic_reply_url_is_ignored():
+    malformed_url = "https://[2001:db8::1"
+    link = markdown_conversion.MarkdownLink(
+        raw=f"[Quoted message]({malformed_url})",
+        image=False,
+        label="Quoted message",
+        destination="https://:1%5B2001:db8:",
+        destination_prefix="[Quoted message](",
+        destination_suffix=")",
+    )
+
+    assert converter._reply_provider_id(link) is None
 
 
 def test_zulip_quote_fences_convert_prose_links_and_preserve_nested_code():
