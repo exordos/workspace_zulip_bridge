@@ -123,24 +123,25 @@ successful quanta instead of applying a fixed throughput delay. History catalog
 and outbox writes use ten-message transactions while idle. Messages that invoke
 the remote file-transfer path retain a dedicated single-message transaction.
 
-Ready chat-catalog upserts are a strict dependency lane. The bridge drains those
-reports before submitting live or historical message events, and orders chat
-materialization ahead of ordinary observed status reports. This prevents an
-initial or newly discovered chat from remaining unmaterialized while unrelated
-message traffic continues through the data plane. A retryable catalog result
-keeps the message gate closed during its control-plane backoff; `available_at`
+Ready chat-catalog upserts are a strict per-chat dependency lane. The bridge
+orders chat materialization ahead of ordinary observed status reports and
+withholds live or historical message events only when their assignment UUID
+matches an incomplete catalog upsert. Independent chats and account-global
+events continue through the data plane. A retryable catalog result keeps that
+chat's message gate closed during its control-plane backoff; `available_at`
 delays only the next report submission, not the dependency itself.
-The same dependency is evaluated inside the durable delivery selector, so a
-catalog report committed after an earlier readiness probe is visible before any
-newly committed message can be selected for Provider submission.
+The same scoped dependency is evaluated inside the durable delivery selector,
+so a matching catalog report committed after an earlier readiness probe is
+visible before any newly committed message for that chat can be selected for
+Provider submission.
 
-After the chat-materialization lane is clear, live operations and priority-0
-Provider events take precedence over history. The history lane rechecks durable
-live work after acquiring the shared Provider HTTP mutex; when live work is
-waiting, history delivery and local conversion both fall back to one message per
-transaction and at most one priority-2 delivery per second. A live event that
-becomes durable after the check waits for no more than the already-started
-bounded Provider request.
+For deliveries whose chat-materialization dependency is clear, live operations
+and priority-0 Provider events take precedence over history. The history lane
+rechecks durable live work after acquiring the shared Provider HTTP mutex; when
+live work is waiting, history delivery and local conversion both fall back to
+one message per transaction and at most one priority-2 delivery per second. A
+live event that becomes durable after the check waits for no more than the
+already-started bounded Provider request.
 
 The 100-event batch removes the bridge-side ceiling for a 100 messages/second
 history target on large profiles. The sustained end-to-end rate still depends on

@@ -1880,16 +1880,107 @@ def test_deferred_chat_materialization_remains_in_delivery_gate(postgres_store):
     assert not postgres_store.has_pending_chat_materializations()
 
 
-def test_concurrent_chat_materialization_commit_blocks_delivery_selection(
+def test_chat_materialization_blocks_only_its_matching_delivery(postgres_store):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    _enable_zulip_provider(postgres_store)
+    blocked_delivery = _provider_record(account_uuid, project_uuid)
+    ready_delivery = _provider_record(
+        account_uuid,
+        project_uuid,
+        chat_id="channel:43",
+    )
+    ready_assignment_uuid = str(uuid.uuid4())
+    ready_assignment = {
+        "uuid": ready_assignment_uuid,
+        "generation": 1,
+        "external_account_uuid": account_uuid,
+        "project_id": project_uuid,
+        "selected": True,
+        "history_depth": "30_days",
+        "provider_chat": {
+            "provider_chat_key": "channel:43",
+            "chat_type": "channel",
+        },
+    }
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            INSERT INTO desired_resources (
+                resource_type, resource_uuid, generation, body, deleted
+            ) VALUES ('external_chat_assignment', %s, 1, %s, false)
+            """,
+            (ready_assignment_uuid, json.dumps(ready_assignment)),
+        )
+        blocked_assignment = session.execute(
+            """
+            SELECT resource_uuid
+            FROM desired_resources
+            WHERE resource_type = 'external_chat_assignment'
+              AND body->>'external_account_uuid' = %s
+              AND body->'provider_chat'->>'provider_chat_key' = 'channel:42'
+              AND NOT deleted
+            """,
+            (account_uuid,),
+        ).fetchone()
+    assert blocked_assignment is not None
+    materialization_report = {
+        "report_uuid": str(uuid.uuid4()),
+        "resource_type": "external_chat_catalog",
+        "resource_uuid": str(blocked_assignment["resource_uuid"]),
+        "observed_generation": 1,
+        "status": "ready",
+        "observed_at": datetime.datetime.now(datetime.UTC).isoformat(),
+        "catalog": {
+            "operation": "upsert",
+            "external_account_uuid": account_uuid,
+            "source": {"provider_chat_key": "channel:42"},
+        },
+    }
+    assert postgres_store.enqueue_observed_report(materialization_report)
+    assert postgres_store.enqueue_workspace_delivery(blocked_delivery, 0)
+    assert postgres_store.enqueue_workspace_delivery(ready_delivery, 0)
+
+    assert postgres_store.has_pending_chat_materializations()
+    assert postgres_store.has_pending_workspace_deliveries(0, 0)
+    assert postgres_store.pending_workspace_deliveries(0, 0) == [ready_delivery]
+
+    postgres_store.apply_observed_report_results(
+        [
+            {
+                "report_uuid": materialization_report["report_uuid"],
+                "status": "applied",
+            }
+        ]
+    )
+    selected = postgres_store.pending_workspace_deliveries(0, 0)
+    assert {record["record_uuid"] for record in selected} == {
+        blocked_delivery["record_uuid"],
+        ready_delivery["record_uuid"],
+    }
+
+
+def test_concurrent_chat_materialization_commit_blocks_matching_delivery_selection(
     postgres_store,
 ):
     account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
     _enable_zulip_provider(postgres_store)
     delivery = _provider_record(account_uuid, project_uuid)
+    with postgres_store.session() as session:
+        assignment = session.execute(
+            """
+            SELECT resource_uuid
+            FROM desired_resources
+            WHERE resource_type = 'external_chat_assignment'
+              AND body->>'external_account_uuid' = %s
+              AND NOT deleted
+            """,
+            (account_uuid,),
+        ).fetchone()
+    assert assignment is not None
     materialization_report = {
         "report_uuid": str(uuid.uuid4()),
         "resource_type": "external_chat_catalog",
-        "resource_uuid": str(uuid.uuid4()),
+        "resource_uuid": str(assignment["resource_uuid"]),
         "observed_generation": 1,
         "status": "ready",
         "observed_at": datetime.datetime.now(datetime.UTC).isoformat(),
