@@ -427,7 +427,13 @@ def test_prepare_provider_event_records_allocates_and_persists_full_sequence():
             self.statements.append((statement, parameters))
             if "SELECT processing_state, prepared_records" in statement:
                 return Result(
-                    ({"processing_state": "pending", "prepared_records": None},)
+                    (
+                        {
+                            "processing_state": "pending",
+                            "prepared_records": None,
+                            "body": {},
+                        },
+                    )
                 )
             if "INSERT INTO producer_lane_counters" in statement:
                 return Result(({"last_sequence": 0, "last_operation_uuid": None},))
@@ -844,6 +850,16 @@ class SharedDeliverySession:
                 },
             )
             return Result()
+        if normalized.startswith(
+            "SELECT record FROM workspace_delivery_outbox WHERE operation_uuid"
+        ):
+            record = self.deliveries.get(parameters[0])
+            return Result(() if record is None else ({"record": record},))
+        if normalized.startswith(
+            "SELECT operation_sha256, terminal_outcome, result_record_uuid"
+        ):
+            operation = self.operations.get(parameters[0])
+            return Result(() if operation is None else ({**operation},))
         if normalized.startswith("SELECT operation.operation_sha256"):
             operation = self.operations.get(parameters[0])
             record = self.deliveries.get(parameters[0])
@@ -1902,7 +1918,11 @@ def test_stale_assignment_delivery_is_removed_and_provider_event_replayed():
     session = Session()
     store = _store_with_session(session)
     assert store.reset_stale_workspace_deliveries() == 0
-    statement = session.statements[0][0]
+    statement = next(
+        statement
+        for statement, _parameters in session.statements
+        if "DELETE FROM workspace_delivery_outbox" in statement
+    )
     assert "assignment.generation" in statement
     assert "delivery.assignment_generation" in statement
     assert "assignment.body->>'project_id'" in statement
