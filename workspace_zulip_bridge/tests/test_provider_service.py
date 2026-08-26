@@ -506,6 +506,131 @@ def test_permanent_rejection_isolates_one_record_and_commits_valid_sibling():
     ]
 
 
+def test_history_rejection_isolation_submits_ready_live_work_between_requests():
+    instance = _instance()
+    rejected = _inbound_record()
+    accepted = copy.deepcopy(rejected)
+    accepted["record_uuid"] = str(uuid.uuid4())
+    accepted["operation_uuid"] = str(uuid.uuid4())
+    accepted["operation"]["entity_uuid"] = str(uuid.uuid4())
+    accepted["sequence"] = 2
+    live = copy.deepcopy(accepted)
+    live["record_uuid"] = str(uuid.uuid4())
+    live["operation_uuid"] = str(uuid.uuid4())
+    live["operation"]["entity_uuid"] = str(uuid.uuid4())
+    calls = []
+    live_ready = [False]
+    instance.provider_batch_size = 100
+    instance._live_workspace_delivery_pending = lambda: False
+    instance._ready_live_workspace_delivery_pending = lambda: live_ready[0]
+
+    def pending_workspace_deliveries(**kwargs):
+        if kwargs["minimum_priority"] == 2:
+            return [rejected, accepted]
+        if live_ready[0]:
+            live_ready[0] = False
+            return [live]
+        return []
+
+    instance.store.pending_workspace_deliveries = pending_workspace_deliveries
+
+    def apply(events):
+        resources = [event["payload"]["resource"]["uuid"] for event in events]
+        delivery_class = (
+            "live"
+            if resources == [live["operation"]["entity_uuid"]]
+            else "history"
+        )
+        calls.append((delivery_class, len(events)))
+        if any(
+            event["payload"]["resource"]["uuid"] == MESSAGE_UUID
+            for event in events
+        ):
+            if len(events) > 1:
+                live_ready[0] = True
+            raise provider_api.ProviderEventRejectedError(422)
+        return {
+            "results": [
+                {
+                    "provider_event_uuid": event["provider_event_uuid"],
+                    "status": "applied",
+                }
+                for event in events
+            ]
+        }
+
+    instance.provider_api.apply_events = apply
+
+    assert instance._flush_history_events() == (
+        1,
+        service.BridgeService.HISTORY_DELIVERY_BATCH_SIZE,
+        True,
+    )
+    assert calls == [
+        ("history", 2),
+        ("live", 1),
+        ("history", 1),
+        ("history", 1),
+    ]
+
+
+def test_interleaved_live_failure_defers_once_and_releases_both_batches(
+    monkeypatch,
+):
+    now = [100.0]
+    monkeypatch.setattr(service.time, "monotonic", lambda: now[0])
+
+    class Random:
+        def uniform(self, _lower, upper):
+            return upper
+
+    instance = _instance()
+    rejected = _inbound_record()
+    accepted = copy.deepcopy(rejected)
+    accepted["record_uuid"] = str(uuid.uuid4())
+    accepted["operation_uuid"] = str(uuid.uuid4())
+    accepted["operation"]["entity_uuid"] = str(uuid.uuid4())
+    live = copy.deepcopy(accepted)
+    live["record_uuid"] = str(uuid.uuid4())
+    live["operation_uuid"] = str(uuid.uuid4())
+    live["operation"]["entity_uuid"] = str(uuid.uuid4())
+    live_ready = [False]
+    instance.provider_batch_size = 100
+    instance.provider_delivery_random = Random()
+    instance._live_workspace_delivery_pending = lambda: False
+    instance._ready_live_workspace_delivery_pending = lambda: live_ready[0]
+
+    def pending_workspace_deliveries(**kwargs):
+        if kwargs["minimum_priority"] == 2:
+            return [rejected, accepted]
+        if live_ready[0]:
+            live_ready[0] = False
+            return [live]
+        return []
+
+    instance.store.pending_workspace_deliveries = pending_workspace_deliveries
+
+    def apply(events):
+        resources = [event["payload"]["resource"]["uuid"] for event in events]
+        if resources == [live["operation"]["entity_uuid"]]:
+            raise provider_api.ProviderApiRetryableError(503)
+        live_ready[0] = True
+        raise provider_api.ProviderEventRejectedError(422)
+
+    instance.provider_api.apply_events = apply
+
+    with pytest.raises(provider_api.ProviderApiRetryableError):
+        instance._flush_history_events()
+
+    assert instance.provider_delivery_retry_attempts == 1
+    assert instance.provider_delivery_retry_after == 101.0
+    assert instance.store.released == [
+        live["record_uuid"],
+        rejected["record_uuid"],
+        accepted["record_uuid"],
+    ]
+
+
 def test_unsupported_provider_mutation_is_released_not_acknowledged_as_committed():
     instance = _instance()
     record = _inbound_record()

@@ -147,6 +147,14 @@ hide pending work. It persists both account and lane fairness timestamps, and th
 downstream Provider outbox retains its existing causal-lane sequencing and
 idempotency boundaries.
 
+Registration snapshots authoritatively reconcile the subscribed-channel
+catalog before their synthetic notification events are recorded. Topic
+notification events keep waiting while their channel remains in that durable
+catalog and its Workspace assignment is still materializing. If a queue
+replacement snapshot outlives a channel omitted by the latest registration,
+the bridge finalizes the stale event instead of letting it occupy the channel
+lane forever.
+
 Control-derived backfill jobs are reconciled by a profile-sized history pool.
 Large profiles use eight workers so independent account/chat pages can be
 fetched and converted concurrently. Idle history delivery fills the configured
@@ -171,9 +179,11 @@ For deliveries whose chat-materialization dependency is clear, live operations
 and priority-0 Provider events take precedence over history. The history lane
 rechecks durable live work after acquiring the shared Provider HTTP mutex; when
 live work is waiting, history delivery and local conversion both fall back to
-one message per transaction and at most one priority-2 delivery per second. A
-live event that becomes durable after the check waits for no more than the
-already-started bounded Provider request.
+one message per transaction, while Provider submission uses at most one
+priority-2 batch of up to ten events per second. A live event that becomes
+durable after the check waits for no more than the already-started bounded
+Provider request. If Provider rejects a history batch permanently, the bridge
+rechecks and submits ready live events between the smaller isolation requests.
 
 The 100-event batch removes the bridge-side ceiling for a 100 messages/second
 history target on large profiles. The sustained end-to-end rate still depends on

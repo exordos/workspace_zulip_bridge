@@ -199,10 +199,11 @@ class BridgeService:
     # wake assignment-dependent live events after every small batch.
     OBSERVED_REPORT_BATCH_SIZE = 20
     # Idle history uses the full large-profile Provider batch. Once live work is
-    # durable, history drops to one event per second so people can keep chatting
-    # while the import continues in the background.
+    # durable, history drops to one small batch per second so people can keep
+    # chatting while the import continues in the background without reducing a
+    # large import to one event per HTTP round trip.
     HISTORY_DELIVERY_BATCH_SIZE = 100
-    HISTORY_LIVE_DELIVERY_BATCH_SIZE = 1
+    HISTORY_LIVE_DELIVERY_BATCH_SIZE = 10
     BACKGROUND_HISTORY_WORKERS = 8
     BACKGROUND_LIVE_WORKERS = 1
     # The main live lane owns journal conversion and outbound provider work.
@@ -1000,6 +1001,7 @@ class BridgeService:
         safe_error_code: str | None = None,
         ensure_durable: bool = False,
         provider_event_marker: tuple[str, str, int] | None = None,
+        catalog_deletion: tuple[str, str] | None = None,
     ) -> bool:
         observed_at = (
             datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
@@ -1030,6 +1032,18 @@ class BridgeService:
             report["catalog"] = catalog
         report["report_uuid"] = self._observed_report_uuid(report)
         if ensure_durable:
+            if catalog_deletion is not None:
+                ensure_deletion = getattr(
+                    self.store, "ensure_catalog_deletion", None
+                )
+                if callable(ensure_deletion):
+                    return bool(
+                        ensure_deletion(
+                            report,
+                            *catalog_deletion,
+                            provider_event_marker=provider_event_marker,
+                        )
+                    )
             if provider_event_marker is not None:
                 ensure_event_report = getattr(
                     self.store,
@@ -1250,6 +1264,45 @@ class BridgeService:
                 for value in ordered
             ]
             catalog[chat_key] = (chat_type, ", ".join(peer_names), participants)
+        if assignments is None:
+            omitted_channels = getattr(
+                self.store, "omitted_cataloged_channels", None
+            )
+            if callable(omitted_channels):
+                current_channel_keys = {
+                    chat_key
+                    for chat_key, (chat_type, _name, _participants) in catalog.items()
+                    if chat_type == "channel"
+                }
+                for chat_key in omitted_channels(account_uuid, current_channel_keys):
+                    mapping = self.store.provider_mapping(
+                        account_uuid, "stream", chat_key
+                    )
+                    metadata = (
+                        mapping.get("metadata") if isinstance(mapping, dict) else None
+                    )
+                    display_name = (
+                        metadata.get("name")
+                        if isinstance(metadata, dict)
+                        and isinstance(metadata.get("name"), str)
+                        else chat_key
+                    )
+                    # A registration snapshot is authoritative for subscribed
+                    # channels. Make the Workspace deletion durable before the
+                    # local topology is retired so a restart can retry safely.
+                    self._queue_catalog_report(
+                        account_uuid,
+                        owner_uuid,
+                        project_uuid,
+                        generation,
+                        chat_key,
+                        "channel",
+                        display_name,
+                        server_url,
+                        "delete",
+                        provider_realm_uuid=provider_realm_uuid,
+                        provider_owner_user_id=str(int(provider_user_id)),
+                    )
         for chat_key, (chat_type, display_name, participants) in catalog.items():
             topics = (
                 [
@@ -1557,8 +1610,6 @@ class BridgeService:
                 participants or [],
                 provider_owner_user_id,
             )
-        elif operation == "delete" and hasattr(self.store, "delete_catalog_topology"):
-            self.store.delete_catalog_topology(account_uuid, chat_key)
         if operation == "upsert" and chat_type in {"direct", "group_direct"}:
             peer_names = [
                 str(
@@ -1611,7 +1662,10 @@ class BridgeService:
             }
             for participant in participants or []
         ]
-        return self._queue_observed_report(
+        atomic_deletion = operation == "delete" and callable(
+            getattr(self.store, "ensure_catalog_deletion", None)
+        )
+        retained = self._queue_observed_report(
             "external_chat_catalog",
             external_chat_uuid,
             generation,
@@ -1639,7 +1693,18 @@ class BridgeService:
             },
             ensure_durable=True,
             provider_event_marker=provider_event_marker,
+            catalog_deletion=(
+                (account_uuid, chat_key) if operation == "delete" else None
+            ),
         )
+        if (
+            retained
+            and operation == "delete"
+            and not atomic_deletion
+            and hasattr(self.store, "delete_catalog_topology")
+        ):
+            self.store.delete_catalog_topology(account_uuid, chat_key)
+        return retained
 
     @staticmethod
     def _catalog_original_url(server_url: str, chat_key: str) -> str | None:
@@ -3450,6 +3515,7 @@ class BridgeService:
                     minimum_priority=2,
                     maximum_priority=2,
                     limit=history_batch_size,
+                    prioritize_live_between_rejections=True,
                 ),
                 history_batch_size,
                 True,
@@ -3460,6 +3526,9 @@ class BridgeService:
         minimum_priority: int,
         maximum_priority: int,
         limit: int,
+        *,
+        prioritize_live_between_rejections: bool = False,
+        defer_retryable_failure: bool = True,
     ) -> int:
         records = self.store.pending_workspace_deliveries(
             minimum_priority=minimum_priority,
@@ -3484,13 +3553,19 @@ class BridgeService:
                 else:
                     event_records.append((record, event))
             if event_records:
-                committed = self._apply_provider_event_records(event_records)
+                committed = self._apply_provider_event_records(
+                    event_records,
+                    prioritize_live_between_rejections=(
+                        prioritize_live_between_rejections
+                    ),
+                )
             else:
                 committed = 0
         except (httpx.TransportError, provider_api.ProviderApiRetryableError) as error:
             if hasattr(self.store, "release_provider_event_submissions"):
                 self.store.release_provider_event_submissions(submitting_record_uuids)
-            self._defer_provider_delivery(error, time.monotonic())
+            if defer_retryable_failure:
+                self._defer_provider_delivery(error, time.monotonic())
             raise
         except Exception:
             if hasattr(self.store, "release_provider_event_submissions"):
@@ -3512,6 +3587,8 @@ class BridgeService:
     def _apply_provider_event_records(
         self,
         event_records: list[tuple[dict[str, object], dict[str, object]]],
+        *,
+        prioritize_live_between_rejections: bool = False,
     ) -> int:
         """Apply in order, isolating only permanently rejected records."""
         try:
@@ -3521,9 +3598,28 @@ class BridgeService:
         except provider_api.ProviderEventRejectedError as exc:
             if len(event_records) > 1:
                 midpoint = len(event_records) // 2
-                return self._apply_provider_event_records(
-                    event_records[:midpoint]
-                ) + self._apply_provider_event_records(event_records[midpoint:])
+                committed = 0
+                for subset in (
+                    event_records[:midpoint],
+                    event_records[midpoint:],
+                ):
+                    if (
+                        prioritize_live_between_rejections
+                        and self._ready_live_workspace_delivery_pending()
+                    ):
+                        self._flush_provider_events_locked(
+                            minimum_priority=0,
+                            maximum_priority=0,
+                            limit=self._live_delivery_batch_size(),
+                            defer_retryable_failure=False,
+                        )
+                    committed += self._apply_provider_event_records(
+                        subset,
+                        prioritize_live_between_rejections=(
+                            prioritize_live_between_rejections
+                        ),
+                    )
+                return committed
             record, _event = event_records[0]
             error_code = f"provider_api_http_{exc.status_code}"
             rejected = self.store.reject_provider_event_submission(

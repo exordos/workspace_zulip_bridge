@@ -867,7 +867,14 @@ def test_large_profile_scales_live_conversion_and_delivery_batches():
     assert instance._live_delivery_batch_size() == 100
     assert instance._history_worker_count() == 8
     assert instance._history_delivery_batch_size(live_pending=False) == 100
-    assert instance._history_delivery_batch_size(live_pending=True) == 1
+    assert instance._history_delivery_batch_size(live_pending=True) == 10
+
+
+def test_small_profile_caps_live_history_batch_at_provider_capacity():
+    instance = object.__new__(service.BridgeService)
+    instance.provider_batch_size = 5
+
+    assert instance._history_delivery_batch_size(live_pending=True) == 5
 
 
 def test_run_recovers_interrupted_deliveries_before_starting_workers(monkeypatch):
@@ -2737,6 +2744,151 @@ def test_registration_snapshot_queues_account_live_ready_and_chat_catalog_report
             report["catalog"]["source"]["provider_chat_key"],
         )
         assert report["resource_uuid"] == expected
+
+
+def test_registration_snapshot_retires_omitted_channel_catalogs():
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+    owner_uuid = "00000000-0000-4000-8000-000000000002"
+    project_uuid = "00000000-0000-4000-8000-000000000003"
+    reports = []
+
+    class Store:
+        def account_resource(self, requested):
+            assert requested == account_uuid
+            return {
+                "uuid": account_uuid,
+                "generation": 7,
+                "owner_user_uuid": owner_uuid,
+                "settings": {
+                    "selection_mode": "all",
+                    "default_project_id": project_uuid,
+                },
+            }
+
+        def remember_provider_mapping(self, *_args):
+            return None
+
+        def omitted_cataloged_channels(self, requested, current):
+            assert requested == account_uuid
+            assert current == {"channel:42"}
+            return ["channel:12"]
+
+        def provider_mapping(self, requested, entity_kind, provider_id):
+            assert (requested, entity_kind, provider_id) == (
+                account_uuid,
+                "stream",
+                "channel:12",
+            )
+            return {"metadata": {"name": "Retired"}}
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance._queue_catalog_report = lambda *args, **kwargs: (
+        reports.append((args, kwargs)) or True
+    )
+
+    instance._queue_registration_reports(
+        account_uuid,
+        {
+            "user_id": 1,
+            "realm_uuid": "00000000-0000-4000-8000-000000000004",
+            "realm_users": [{"user_id": 1, "full_name": "Owner"}],
+            "subscriptions": [
+                {
+                    "stream_id": 42,
+                    "name": "Engineering",
+                    "subscribers": [1],
+                }
+            ],
+            "recent_private_conversations": [],
+        },
+        "https://zulip.example.invalid",
+    )
+
+    assert [
+        (args[4], args[8] if len(args) > 8 else "upsert")
+        for args, _kwargs in reports
+    ] == [
+        ("channel:12", "delete"),
+        ("channel:42", "upsert"),
+    ]
+
+
+@pytest.mark.parametrize("durable", [False, True])
+def test_catalog_topology_is_deleted_only_after_durable_report(durable):
+    deleted = []
+
+    class Store:
+        def ensure_observed_report(self, _report):
+            return durable
+
+        def delete_catalog_topology(self, account_uuid, chat_key):
+            deleted.append((account_uuid, chat_key))
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+
+    assert (
+        instance._queue_catalog_report(
+            account_uuid,
+            "00000000-0000-4000-8000-000000000002",
+            "00000000-0000-4000-8000-000000000003",
+            7,
+            "channel:12",
+            "channel",
+            "Retired",
+            "https://zulip.example.invalid",
+            "delete",
+            provider_realm_uuid="00000000-0000-4000-8000-000000000004",
+            provider_owner_user_id="1",
+        )
+        is durable
+    )
+    assert deleted == ([(account_uuid, "channel:12")] if durable else [])
+
+
+def test_catalog_delete_uses_atomic_store_retention_when_available():
+    calls = []
+
+    class Store:
+        def ensure_catalog_deletion(
+            self,
+            report,
+            account_uuid,
+            chat_key,
+            *,
+            provider_event_marker=None,
+        ):
+            calls.append(
+                (report, account_uuid, chat_key, provider_event_marker)
+            )
+            return True
+
+        def delete_catalog_topology(self, *_args):
+            raise AssertionError("atomic deletion must not be repeated")
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+    marker = (account_uuid, "queue-1", 7)
+
+    assert instance._queue_catalog_report(
+        account_uuid,
+        "00000000-0000-4000-8000-000000000002",
+        "00000000-0000-4000-8000-000000000003",
+        7,
+        "channel:12",
+        "channel",
+        "Retired",
+        "https://zulip.example.invalid",
+        "delete",
+        provider_realm_uuid="00000000-0000-4000-8000-000000000004",
+        provider_owner_user_id="1",
+        provider_event_marker=marker,
+    )
+    assert len(calls) == 1
+    assert calls[0][1:] == (account_uuid, "channel:12", marker)
 
 
 @pytest.mark.parametrize(
@@ -4940,6 +5092,7 @@ def test_delivery_selector_controls_chat_materialization_scoping():
             "minimum_priority": 2,
             "maximum_priority": 2,
             "limit": service.BridgeService.HISTORY_DELIVERY_BATCH_SIZE,
+            "prioritize_live_between_rejections": True,
         },
     ]
 
@@ -4961,6 +5114,7 @@ def test_idle_history_uses_full_large_profile_delivery_batch():
             "minimum_priority": 2,
             "maximum_priority": 2,
             "limit": service.BridgeService.HISTORY_DELIVERY_BATCH_SIZE,
+            "prioritize_live_between_rejections": True,
         }
     ]
 
@@ -5085,12 +5239,15 @@ def test_history_rechecks_live_work_after_waiting_for_provider_mutex(monkeypatch
     worker.join(timeout=1.0)
 
     assert not worker.is_alive()
-    assert result == [(1, 1, True)]
+    assert result == [
+        (1, service.BridgeService.HISTORY_LIVE_DELIVERY_BATCH_SIZE, True)
+    ]
     assert calls == [
         {
             "minimum_priority": 2,
             "maximum_priority": 2,
             "limit": service.BridgeService.HISTORY_LIVE_DELIVERY_BATCH_SIZE,
+            "prioritize_live_between_rejections": True,
         }
     ]
 
