@@ -3068,6 +3068,57 @@ def test_user_topic_same_second_changes_advance_logical_timestamp():
     )
 
 
+def test_user_topic_for_retired_catalog_chat_does_not_wait_for_assignment():
+    store = FakeStore(auto_materialize=False)
+    store.assignment_for_provider_chat = lambda *_args: None
+    store.provider_chat_is_cataloged = lambda *_args: False
+    event = {
+        "id": -1,
+        "type": "user_topic",
+        "stream_id": 42,
+        "topic_name": "retired",
+        "visibility_policy": 1,
+        "last_updated": 1_800_000_020,
+    }
+
+    with pytest.raises(ValueError, match="provider_chat_not_selected"):
+        converter.event_records(store, ACCOUNT_UUID, "queue", event)
+
+
+def test_user_topic_for_cataloged_chat_still_waits_for_assignment():
+    store = FakeStore(auto_materialize=False)
+    store.assignment_for_provider_chat = lambda *_args: None
+    store.provider_chat_is_cataloged = lambda *_args: True
+    event = {
+        "id": -1,
+        "type": "user_topic",
+        "stream_id": 42,
+        "topic_name": "pending",
+        "visibility_policy": 1,
+        "last_updated": 1_800_000_020,
+    }
+
+    with pytest.raises(ValueError, match="provider_chat_assignment_pending"):
+        converter.event_records(store, ACCOUNT_UUID, "queue", event)
+
+
+def test_live_user_topic_for_missing_catalog_still_waits_for_assignment():
+    store = FakeStore(auto_materialize=False)
+    store.assignment_for_provider_chat = lambda *_args: None
+    store.provider_chat_is_cataloged = lambda *_args: False
+    event = {
+        "id": 1,
+        "type": "user_topic",
+        "stream_id": 42,
+        "topic_name": "new",
+        "visibility_policy": 1,
+        "last_updated": 1_800_000_020,
+    }
+
+    with pytest.raises(ValueError, match="provider_chat_assignment_pending"):
+        converter.event_records(store, ACCOUNT_UUID, "queue", event)
+
+
 def test_registration_default_tombstone_clears_missing_user_topic_override():
     store = FakeStore()
     converter.event_records(

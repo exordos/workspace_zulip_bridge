@@ -2044,6 +2044,130 @@ def test_concurrent_chat_materialization_commit_blocks_matching_delivery_selecti
     assert postgres_store.pending_workspace_deliveries(0, 0) == [delivery]
 
 
+def test_provider_chat_catalog_lookup_tracks_topology(postgres_store):
+    account_uuid = str(uuid.uuid4())
+    project_uuid = str(uuid.uuid4())
+    chat_key = "channel:42"
+    account = {
+        "uuid": account_uuid,
+        "generation": 1,
+        "owner_user_uuid": str(uuid.uuid4()),
+        "synchronization_enabled": True,
+        "settings": {
+            "selection_mode": "all",
+            "default_project_id": project_uuid,
+        },
+    }
+    event = {
+        "id": -1,
+        "type": "user_topic",
+        "stream_id": 42,
+        "topic_name": "retired",
+        "visibility_policy": 1,
+    }
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            INSERT INTO desired_resources (
+                resource_type, resource_uuid, generation, body, deleted
+            ) VALUES ('external_account', %s, 1, %s, false)
+            """,
+            (account_uuid, json.dumps(account)),
+        )
+
+    assert not postgres_store.provider_chat_is_cataloged(account_uuid, chat_key)
+    with pytest.raises(ValueError, match="provider_chat_not_selected"):
+        converter.event_records(postgres_store, account_uuid, "queue", event)
+
+    postgres_store.merge_catalog_topology(account_uuid, chat_key, [], [])
+    assert postgres_store.provider_chat_is_cataloged(account_uuid, chat_key)
+    with pytest.raises(ValueError, match="provider_chat_assignment_pending"):
+        converter.event_records(postgres_store, account_uuid, "queue", event)
+
+    postgres_store.delete_catalog_topology(account_uuid, chat_key)
+    assert not postgres_store.provider_chat_is_cataloged(account_uuid, chat_key)
+
+
+def test_registration_membership_finds_omitted_channel_topology(postgres_store):
+    account_uuid = str(uuid.uuid4())
+    stale_chat_key = "channel:12"
+    retained_chat_key = "channel:42"
+    direct_chat_key = "direct:1,2"
+    postgres_store.merge_catalog_topology(account_uuid, stale_chat_key, [], [])
+    postgres_store.merge_catalog_topology(account_uuid, retained_chat_key, [], [])
+    postgres_store.merge_catalog_topology(account_uuid, direct_chat_key, [], [])
+
+    retired = postgres_store.omitted_cataloged_channels(
+        account_uuid, {retained_chat_key}
+    )
+
+    assert retired == [stale_chat_key]
+    assert postgres_store.provider_chat_is_cataloged(account_uuid, stale_chat_key)
+    assert postgres_store.provider_chat_is_cataloged(account_uuid, retained_chat_key)
+    assert postgres_store.provider_chat_is_cataloged(account_uuid, direct_chat_key)
+
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "replacement-queue",
+        {
+            "id": -1,
+            "type": "user_topic",
+            "stream_id": 12,
+            "topic_name": "retired",
+            "visibility_policy": 1,
+        },
+    )
+    postgres_store.retry_provider_event(
+        account_uuid,
+        "replacement-queue",
+        -1,
+        "provider_chat_assignment_pending",
+    )
+    with postgres_store.session() as session:
+        assert session.execute(
+            """
+            SELECT available_at > now() AS delayed
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = %s AND event_id = -1
+            """,
+            (account_uuid, "replacement-queue"),
+        ).fetchone()["delayed"]
+
+    report_uuid = str(uuid.uuid4())
+    assert postgres_store.ensure_catalog_deletion(
+        {
+            "report_uuid": report_uuid,
+            "resource_type": "external_chat_catalog",
+            "resource_uuid": str(uuid.uuid4()),
+            "observed_generation": 1,
+            "status": "deleted",
+        },
+        account_uuid,
+        stale_chat_key,
+    )
+
+    assert not postgres_store.provider_chat_is_cataloged(
+        account_uuid, stale_chat_key
+    )
+    with postgres_store.session() as session:
+        assert session.execute(
+            """
+            SELECT count(*) AS total
+            FROM observed_report_outbox
+            WHERE report_uuid = %s
+            """,
+            (report_uuid,),
+        ).fetchone()["total"] == 1
+        assert not session.execute(
+            """
+            SELECT available_at > now() AS delayed
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = %s AND event_id = -1
+            """,
+            (account_uuid, "replacement-queue"),
+        ).fetchone()["delayed"]
+
+
 def test_pending_observed_reports_prioritize_live_message_dependency(postgres_store):
     account_uuid = str(uuid.uuid4())
     queue_id = "live-priority"

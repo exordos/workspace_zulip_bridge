@@ -2699,11 +2699,27 @@ def _user_topic_records(
     stream_id = int(event["stream_id"])
     topic_name = channel_topic_name(str(event["topic_name"]))
     chat_key = f"channel:{stream_id}"
-    project_uuid, _assignment_exists = provider_chat_assignment(
-        store,
-        account_uuid,
-        chat_key,
-    )
+    try:
+        project_uuid, _assignment_exists = provider_chat_assignment(
+            store,
+            account_uuid,
+            chat_key,
+        )
+    except ValueError as exc:
+        cataloged = getattr(store, "provider_chat_is_cataloged", None)
+        if (
+            str(exc) == "provider_chat_assignment_pending"
+            and isinstance(event.get("id"), int)
+            and int(event["id"]) < 0
+            and callable(cataloged)
+            and not cataloged(account_uuid, chat_key)
+        ):
+            # Queue replacement snapshots can outlive a channel that was
+            # removed from the latest provider catalog. No Workspace target can
+            # ever appear for that stale notification override, so do not leave
+            # it at the causal-lane head forever.
+            raise ValueError("provider_chat_not_selected") from exc
+        raise
     stream_mapping = store.provider_mapping(account_uuid, "stream", chat_key)
     if stream_mapping is None:
         raise ValueError("provider_chat_assignment_pending")

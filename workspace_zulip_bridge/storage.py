@@ -528,12 +528,53 @@ class RestAlchemyStore:
         self, account_uuid: str, provider_chat_key: str
     ) -> None:
         with self.session() as session:
-            session.execute(
+            self._delete_catalog_topology_in_session(
+                session, account_uuid, provider_chat_key
+            )
+
+    @staticmethod
+    def _delete_catalog_topology_in_session(
+        session: sessions.PgSQLSession,
+        account_uuid: str,
+        provider_chat_key: str,
+    ) -> None:
+        session.execute(
+            """
+            DELETE FROM external_chat_catalog_state
+            WHERE account_uuid = %s AND provider_chat_key = %s
+            """,
+            (account_uuid, provider_chat_key),
+        )
+        session.execute(
+            """
+            UPDATE zulip_provider_events
+            SET available_at = now()
+            WHERE account_uuid = %s
+              AND causal_lane = %s
+              AND processing_state = 'pending'
+              AND processing_reason = 'provider_chat_assignment_pending'
+            """,
+            (account_uuid, provider_chat_key),
+        )
+
+    def omitted_cataloged_channels(
+        self, account_uuid: str, provider_chat_keys: set[str]
+    ) -> list[str]:
+        """Return channels omitted from one authoritative registration snapshot."""
+        with self.session() as session:
+            rows = session.execute(
                 """
-                DELETE FROM external_chat_catalog_state
-                WHERE account_uuid = %s AND provider_chat_key = %s
+                SELECT provider_chat_key
+                FROM external_chat_catalog_state
+                WHERE account_uuid = %s
+                  AND provider_chat_key LIKE 'channel:%%'
                 """,
-                (account_uuid, provider_chat_key),
+                (account_uuid,),
+            ).fetchall()
+            return sorted(
+                str(row["provider_chat_key"])
+                for row in rows
+                if str(row["provider_chat_key"]) not in provider_chat_keys
             )
 
     @staticmethod
@@ -1216,6 +1257,23 @@ class RestAlchemyStore:
                 (account_uuid, provider_chat_key),
             ).fetchone()
             return None if row is None else typing.cast(dict[str, object], row["body"])
+
+    def provider_chat_is_cataloged(
+        self, account_uuid: str, provider_chat_key: str
+    ) -> bool:
+        """Return whether the latest local catalog still contains one chat."""
+        with self.session() as session:
+            row = session.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM external_chat_catalog_state
+                    WHERE account_uuid = %s AND provider_chat_key = %s
+                ) AS cataloged
+                """,
+                (account_uuid, provider_chat_key),
+            ).fetchone()
+            return bool(row and row["cataloged"])
 
     def reconcile_assignment_projection(
         self, account_uuid: str, provider_chat_key: str
@@ -9032,6 +9090,44 @@ class RestAlchemyStore:
                 (account_uuid, queue_id, event_id),
             ).fetchone()
             return marker is not None
+
+    def ensure_catalog_deletion(
+        self,
+        report: dict[str, object],
+        account_uuid: str,
+        provider_chat_key: str,
+        *,
+        provider_event_marker: tuple[str, str, int] | None = None,
+    ) -> bool:
+        """Atomically retain a delete report, retire topology, and wake its lane."""
+        with self.session() as session:
+            durable = self._enqueue_observed_report_in_session(
+                session,
+                report,
+                confirm_existing=True,
+            )
+            if not durable:
+                return False
+            if provider_event_marker is not None:
+                marker = session.execute(
+                    """
+                    UPDATE zulip_provider_events
+                    SET assignment_catalog_reported_at = COALESCE(
+                            assignment_catalog_reported_at,
+                            now()
+                        )
+                    WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
+                      AND processing_state = 'pending'
+                    RETURNING assignment_catalog_reported_at
+                    """,
+                    provider_event_marker,
+                ).fetchone()
+                if marker is None:
+                    return False
+            self._delete_catalog_topology_in_session(
+                session, account_uuid, provider_chat_key
+            )
+            return True
 
     def pending_observed_reports(self, limit: int = 500) -> list[dict[str, object]]:
         with self.session() as session:
