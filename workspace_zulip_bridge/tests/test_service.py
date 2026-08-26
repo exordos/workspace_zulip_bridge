@@ -805,12 +805,16 @@ def test_provider_journal_recovers_interrupted_deliveries_only_once():
             super().__init__()
             self.ambiguous_recoveries = 0
             self.stale_recoveries = 0
+            self.finalized_recoveries = 0
 
         def mark_interrupted_workspace_deliveries_ambiguous(self):
             self.ambiguous_recoveries += 1
 
         def reset_stale_workspace_deliveries(self):
             self.stale_recoveries += 1
+
+        def finalize_ready_provider_events(self):
+            self.finalized_recoveries += 1
 
     store = Store()
     instance = _delivery_service(store)
@@ -819,6 +823,7 @@ def test_provider_journal_recovers_interrupted_deliveries_only_once():
     assert instance.process_provider_journal() == 0
     assert store.ambiguous_recoveries == 1
     assert store.stale_recoveries == 1
+    assert store.finalized_recoveries == 1
 
 
 def test_provider_journal_processes_distinct_account_heads_in_parallel():
@@ -877,6 +882,9 @@ def test_run_recovers_interrupted_deliveries_before_starting_workers(monkeypatch
             return None
 
         def reset_stale_workspace_deliveries(self):
+            return None
+
+        def finalize_ready_provider_events(self):
             return None
 
     instance = object.__new__(service.BridgeService)
@@ -2305,12 +2313,16 @@ def test_provider_journal_waits_for_assignment_bound_delivery(monkeypatch):
     assert store.processed == []
 
 
-def test_provider_journal_retries_changed_reaction_mapping_plan(monkeypatch):
+@pytest.mark.parametrize(
+    "reason",
+    ["provider_message_mapping_changed", "reaction_mapping_plan_changed"],
+)
+def test_provider_journal_retries_changed_mapping_plan(monkeypatch, reason):
     class Store(DeliveryStore):
         def prepare_provider_event_records(
             self, account_uuid, queue_id, event_id, records
         ):
-            raise ValueError("reaction_mapping_plan_changed")
+            raise ValueError(reason)
 
     account_uuid = "00000000-0000-0000-0000-000000000001"
     store = Store(
@@ -2331,7 +2343,7 @@ def test_provider_journal_retries_changed_reaction_mapping_plan(monkeypatch):
 
     assert _delivery_service(store).process_provider_journal() == 0
     assert store.retried == [
-        (account_uuid, "queue", 7, "reaction_mapping_plan_changed")
+        (account_uuid, "queue", 7, reason)
     ]
     assert store.enqueued == []
     assert store.invalid == []

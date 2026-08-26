@@ -50,7 +50,26 @@ errors and retryable responses release claimed submissions so the idempotent
 event UUIDs can be retried. A record-scoped permanent rejection is isolated by
 ordered batch bisection. Valid siblings still commit; the rejected record is
 retained in the durable outbox with `submission_state = 'rejected'` and a safe
-status code, and is not automatically resubmitted.
+status code, and is not automatically resubmitted. Its operation idempotency is
+terminalized immediately, so a rejected move or delete cannot become the
+message context for later provider events. Unsent records are quarantined with
+a dependency-specific safe code only when the rejected materialization was
+causally earlier in the same producer lane, or was ordered first inside the
+same prepared source event, and became terminal after the dependent record was
+prepared. A later rejected operation therefore cannot invalidate an earlier
+record. A rejected provisional message create also
+retires its pending mapping. Before submission, a grouped read containing a
+causally prior rejected message is narrowed to the still-materialized messages;
+an empty read is omitted. The record identifiers and lane position stay stable,
+while the prepared snapshot and digest are updated atomically. A rejected
+content-only message edit does not invalidate a read because it does not change
+message materialization.
+Records prepared after the terminal boundary and delivery selectors both
+ignore retained terminal reconciliation evidence. Once every sibling record
+is terminal, the source journal event is quarantined as invalid so it cannot
+remain a `delivering` predecessor and stall later causal lanes. The retained
+outbox evidence can still be discarded and the source event replayed if its
+Workspace assignment changes.
 
 ### Staged synchronization
 

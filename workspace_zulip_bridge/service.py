@@ -2582,6 +2582,8 @@ class BridgeService:
             self.store.mark_interrupted_workspace_deliveries_ambiguous()
         if hasattr(self.store, "reset_stale_workspace_deliveries"):
             self.store.reset_stale_workspace_deliveries()
+        if hasattr(self.store, "finalize_ready_provider_events"):
+            self.store.finalize_ready_provider_events()
         self._workspace_delivery_recovery_done = True
 
     def _contain_provider_event_failure(
@@ -3023,7 +3025,10 @@ class BridgeService:
                                 deleted_message_ids,
                             )
             except ValueError as exc:
-                if str(exc) == "reaction_mapping_plan_changed":
+                if str(exc) in {
+                    "provider_message_mapping_changed",
+                    "reaction_mapping_plan_changed",
+                }:
                     self.store.retry_provider_event(
                         account_uuid,
                         queue_id,
