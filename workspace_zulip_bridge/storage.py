@@ -6028,6 +6028,87 @@ class RestAlchemyStore:
                 """,
                 (limit,),
             ).fetchone()
+            # Walk old terminal reports through a durable cursor and probe the
+            # semantic head through the resource-order index.  Both the outer
+            # scan and every head lookup stay bounded even when every retained
+            # report belongs to a distinct resource.
+            session.execute(
+                """
+                WITH prune_cursor AS MATERIALIZED (
+                    SELECT last_completed_at, last_report_uuid
+                    FROM observed_report_prune_state
+                    WHERE singleton
+                    FOR UPDATE
+                ), probe AS MATERIALIZED (
+                    SELECT report.report_uuid, report.body,
+                           report.completed_at
+                    FROM observed_report_outbox AS report
+                    CROSS JOIN prune_cursor AS cursor
+                    WHERE report.completed_at <
+                          now() - interval '10 minutes'
+                      AND (
+                          cursor.last_completed_at IS NULL
+                          OR (report.completed_at, report.report_uuid) >
+                             (cursor.last_completed_at,
+                              cursor.last_report_uuid)
+                      )
+                    ORDER BY report.completed_at, report.report_uuid
+                    LIMIT %s
+                    FOR UPDATE OF report SKIP LOCKED
+                ), classified AS MATERIALIZED (
+                    SELECT probe.report_uuid,
+                           semantic_head.report_uuid AS head_report_uuid
+                    FROM probe
+                    JOIN LATERAL (
+                        SELECT candidate.report_uuid
+                        FROM observed_report_outbox AS candidate
+                        WHERE candidate.body->>'resource_type' =
+                                  probe.body->>'resource_type'
+                          AND (candidate.body->>'resource_uuid')::uuid =
+                              (probe.body->>'resource_uuid')::uuid
+                        ORDER BY
+                            (candidate.body->>'observed_generation')::bigint DESC,
+                            candidate.body->>'observed_at' DESC NULLS LAST,
+                            candidate.created_at DESC,
+                            candidate.report_uuid DESC
+                        LIMIT 1
+                    ) AS semantic_head ON true
+                ), deleted AS (
+                    DELETE FROM observed_report_outbox AS report
+                    USING classified
+                    WHERE report.report_uuid = classified.report_uuid
+                      AND classified.head_report_uuid <>
+                          classified.report_uuid
+                    RETURNING report.report_uuid
+                ), advanced AS (
+                    UPDATE observed_report_prune_state AS state
+                    SET last_completed_at = tail.completed_at,
+                        last_report_uuid = tail.report_uuid
+                    FROM (
+                        SELECT completed_at, report_uuid
+                        FROM probe
+                        ORDER BY completed_at DESC, report_uuid DESC
+                        LIMIT 1
+                    ) AS tail
+                    WHERE state.singleton
+                    RETURNING state.singleton
+                ), rewound AS (
+                    UPDATE observed_report_prune_state AS state
+                    SET last_completed_at = NULL,
+                        last_report_uuid = NULL
+                    WHERE state.singleton
+                      AND NOT EXISTS (SELECT 1 FROM probe)
+                      AND EXISTS (
+                          SELECT 1
+                          FROM prune_cursor
+                          WHERE last_completed_at IS NOT NULL
+                      )
+                    RETURNING state.singleton
+                )
+                SELECT count(*) AS total FROM deleted
+                """,
+                (limit,),
+            )
             session.execute(
                 """
                 DELETE FROM scheduler_provider_event_lanes AS lane
@@ -6830,7 +6911,10 @@ class RestAlchemyStore:
                           body->'catalog'->>'external_account_uuid'
                       )::uuid = %s
                       AND (body->>'observed_generation')::bigint = %s
-                    ORDER BY (body->>'resource_uuid')::uuid, created_at DESC
+                    ORDER BY (body->>'resource_uuid')::uuid,
+                             (body->>'observed_generation')::bigint DESC,
+                             body->>'observed_at' DESC NULLS LAST,
+                             created_at DESC, report_uuid DESC
                 )
                 SELECT NOT EXISTS (
                     SELECT 1 FROM latest
@@ -6871,7 +6955,10 @@ class RestAlchemyStore:
                           body->'catalog'->>'external_account_uuid'
                       )::uuid = %s
                       AND (body->>'observed_generation')::bigint = %s
-                    ORDER BY (body->>'resource_uuid')::uuid, created_at DESC
+                    ORDER BY (body->>'resource_uuid')::uuid,
+                             (body->>'observed_generation')::bigint DESC,
+                             body->>'observed_at' DESC NULLS LAST,
+                             created_at DESC, report_uuid DESC
                 )
                 SELECT COUNT(*) AS count FROM latest
                 WHERE body->'catalog'->>'operation' = 'upsert'
@@ -9173,8 +9260,10 @@ class RestAlchemyStore:
                 SELECT body, result_status, completed_at
                 FROM observed_report_outbox
                 WHERE body->>'resource_type' = %s
-                  AND body->>'resource_uuid' = %s
-                ORDER BY created_at DESC
+                  AND (body->>'resource_uuid')::uuid = %s::uuid
+                ORDER BY (body->>'observed_generation')::bigint DESC,
+                         body->>'observed_at' DESC NULLS LAST,
+                         created_at DESC, report_uuid DESC
                 LIMIT 1
                 FOR UPDATE
             ) AS latest
@@ -9317,8 +9406,11 @@ class RestAlchemyStore:
                     SELECT report_uuid,
                            row_number() OVER (
                                PARTITION BY body->>'resource_type',
-                                            body->>'resource_uuid'
-                               ORDER BY created_at DESC, report_uuid DESC
+                                            (body->>'resource_uuid')::uuid
+                               ORDER BY
+                                   (body->>'observed_generation')::bigint DESC,
+                                   body->>'observed_at' DESC NULLS LAST,
+                                   created_at DESC, report_uuid DESC
                            ) AS position
                     FROM observed_report_outbox
                     WHERE completed_at IS NULL

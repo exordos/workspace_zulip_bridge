@@ -1,6 +1,7 @@
 import importlib.util
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import urllib.parse
@@ -26,7 +27,11 @@ def _schema_connection_url(connection_url: str, schema: str) -> str:
     return f"{base_url}?{urllib.parse.urlencode(query)}"
 
 
-def _apply_migrations(connection_url: str, config_path: pathlib.Path) -> None:
+def _apply_migrations(
+    connection_url: str,
+    config_path: pathlib.Path,
+    migrations_path: pathlib.Path = MIGRATIONS,
+) -> None:
     config_path.write_text(
         f"[db]\nconnection_url = {connection_url}\n",
         encoding="utf-8",
@@ -39,13 +44,89 @@ def _apply_migrations(connection_url: str, config_path: pathlib.Path) -> None:
             "--config-file",
             str(config_path),
             "--path",
-            str(MIGRATIONS),
+            str(migrations_path),
         ],
         check=False,
         text=True,
         capture_output=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_semantic_report_indexes_upgrade_an_applied_archive_chain(tmp_path):
+    connection_url = os.environ.get("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN")
+    if not connection_url:
+        pytest.skip("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN is not configured")
+    schema = f"bridge_archive_upgrade_{uuid.uuid4().hex}"
+    scoped_url = _schema_connection_url(connection_url, schema)
+    config_path = tmp_path / "bridge.conf"
+    archive_migrations = tmp_path / "archive-migrations"
+    archive_migrations.mkdir()
+    for migration_path in MIGRATIONS.glob("*.py"):
+        if migration_path.name != (
+            "0024-index-observed-report-semantic-order-6ecddb.py"
+        ):
+            shutil.copy2(migration_path, archive_migrations / migration_path.name)
+    admin_store = storage.RestAlchemyStore(connection_url)
+    scoped_store = storage.RestAlchemyStore(scoped_url)
+
+    with admin_store.session() as session:
+        session.execute(f'CREATE SCHEMA "{schema}"')
+    try:
+        _apply_migrations(scoped_url, config_path, archive_migrations)
+        with scoped_store.session() as session:
+            applied = session.execute(
+                "SELECT count(*) AS count FROM ra_migrations WHERE applied"
+            ).fetchone()
+            archive_indexes = session.execute(
+                """
+                SELECT indexname FROM pg_indexes
+                WHERE schemaname = current_schema()
+                  AND indexname IN (
+                      'provider_mappings_reaction_provider_prefix_idx',
+                      'observed_report_outbox_resource_latest_idx'
+                  )
+                ORDER BY indexname
+                """
+            ).fetchall()
+        assert applied["count"] == 24
+        assert [row["indexname"] for row in archive_indexes] == [
+            "observed_report_outbox_resource_latest_idx",
+            "provider_mappings_reaction_provider_prefix_idx",
+        ]
+
+        _apply_migrations(scoped_url, config_path)
+        with scoped_store.session() as session:
+            applied = session.execute(
+                "SELECT count(*) AS count FROM ra_migrations WHERE applied"
+            ).fetchone()
+            indexes = session.execute(
+                """
+                SELECT indexname, indexdef FROM pg_indexes
+                WHERE schemaname = current_schema()
+                  AND indexname IN (
+                      'observed_report_outbox_resource_latest_idx',
+                      'observed_report_outbox_resource_observed_idx',
+                      'observed_report_outbox_catalog_readiness_idx',
+                      'observed_report_outbox_terminal_history_idx',
+                      'provider_mappings_reaction_provider_prefix_idx'
+                  )
+                ORDER BY indexname
+                """
+            ).fetchall()
+        assert applied["count"] == 25
+        assert [row["indexname"] for row in indexes] == [
+            "observed_report_outbox_catalog_readiness_idx",
+            "observed_report_outbox_resource_observed_idx",
+            "observed_report_outbox_terminal_history_idx",
+            "provider_mappings_reaction_provider_prefix_idx",
+        ]
+        catalog_index = indexes[0]["indexdef"]
+        assert "observed_at" in catalog_index
+        assert "report_uuid DESC" in catalog_index
+    finally:
+        with admin_store.session() as session:
+            session.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
 
 
 def test_migrations_have_one_versioned_dependency_chain():
@@ -78,11 +159,12 @@ def test_migrations_have_one_versioned_dependency_chain():
         "0021-index-pending-chat-materializations-dcdd12.py",
         "0022-isolate-provider-journal-causal-lanes-3ae83f.py",
         "0023-index-reaction-provider-prefixes-dbc736.py",
+        "0024-index-observed-report-semantic-order-6ecddb.py",
     ]
     assert engine.get_latest_migration() == (
-        "0023-index-reaction-provider-prefixes-dbc736.py"
+        "0024-index-observed-report-semantic-order-6ecddb.py"
     )
-    assert len({step["uuid"] for step in all_migrations.values()}) == 24
+    assert len({step["uuid"] for step in all_migrations.values()}) == 25
     assert all_migrations["0001-add-Zulip-provider-scheduler-state-143113.py"][
         "depends"
     ] == ["0000-initialize-bridge-operational-state-18f707.py"]
@@ -152,6 +234,9 @@ def test_migrations_have_one_versioned_dependency_chain():
     assert all_migrations["0023-index-reaction-provider-prefixes-dbc736.py"][
         "depends"
     ] == ["0022-isolate-provider-journal-causal-lanes-3ae83f.py"]
+    assert all_migrations["0024-index-observed-report-semantic-order-6ecddb.py"][
+        "depends"
+    ] == ["0023-index-reaction-provider-prefixes-dbc736.py"]
 
 
 def test_reaction_provider_prefix_migration_adds_pattern_index():
@@ -181,6 +266,37 @@ def test_reaction_provider_prefix_migration_adds_pattern_index():
 
     module.migration_step.downgrade(session)
     assert len(session.statements) == 2
+    assert "DROP INDEX IF EXISTS" in session.statements[1]
+
+
+def test_observed_report_order_migration_adds_semantic_latest_index():
+    migration_path = MIGRATIONS / "0024-index-observed-report-semantic-order-6ecddb.py"
+    spec = importlib.util.spec_from_file_location(
+        "observed_report_order", migration_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class Session:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, statement):
+            self.statements.append(statement)
+
+    session = Session()
+    module.migration_step.upgrade(session)
+
+    statement = session.statements[0]
+    assert "observed_report_outbox_resource_observed_idx" in statement
+    assert "observed_generation" in statement
+    assert "body->>'observed_at'" in statement
+    assert "DESC NULLS LAST" in statement
+    assert "created_at DESC" in statement
+    assert "report_uuid DESC" in statement
+
+    module.migration_step.downgrade(session)
     assert "DROP INDEX IF EXISTS" in session.statements[1]
 
 
@@ -598,7 +714,8 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                   AND indexname IN (
                       'workspace_delivery_outbox_pending_order_idx',
                       'workspace_delivery_outbox_pending_dependency_idx',
-                      'observed_report_outbox_resource_latest_idx',
+                      'observed_report_outbox_resource_observed_idx',
+                      'observed_report_outbox_terminal_history_idx',
                       'observed_report_outbox_pending_order_idx',
                       'observed_report_outbox_chat_materialization_idx',
                       'observed_report_outbox_catalog_readiness_idx',
@@ -618,7 +735,8 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                       'zulip_provider_events_account_head_idx',
                       'zulip_provider_events_lane_head_idx',
                       'zulip_provider_events_global_head_idx',
-                      'zulip_provider_message_context_inflight_idx'
+                      'zulip_provider_message_context_inflight_idx',
+                      'provider_mappings_reaction_provider_prefix_idx'
                   )
                 ORDER BY indexname
                 """
@@ -630,7 +748,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                   AND indexname = 'zulip_provider_events_account_head_idx'
                 """
             ).fetchone()
-            assert applied["count"] == 23
+            assert applied["count"] == 25
             assert [row["indexname"] for row in indexes] == [
                 "bridge_operations_active_local_echo_idx",
                 "desired_resources_assignment_chat_idx",
@@ -638,7 +756,9 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                 "observed_report_outbox_catalog_readiness_idx",
                 "observed_report_outbox_chat_materialization_idx",
                 "observed_report_outbox_pending_order_idx",
-                "observed_report_outbox_resource_latest_idx",
+                "observed_report_outbox_resource_observed_idx",
+                "observed_report_outbox_terminal_history_idx",
+                "provider_mappings_reaction_provider_prefix_idx",
                 "scheduler_accounts_provider_ready_idx",
                 "workspace_delivery_outbox_initial_backfill_idx",
                 "workspace_delivery_outbox_pending_dependency_idx",
@@ -686,7 +806,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
             provider_cursor_count = session.execute(
                 "SELECT count(*) AS count FROM zulip_event_cursors"
             ).fetchone()
-            assert applied["count"] == 23
+            assert applied["count"] == 25
             assert cursor["control_cursor"] == "preserved"
             assert provider_cursor_count["count"] == 0
     finally:
