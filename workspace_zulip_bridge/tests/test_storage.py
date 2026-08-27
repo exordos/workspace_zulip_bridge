@@ -108,7 +108,82 @@ def test_pending_provider_events_claim_fair_account_heads():
     assert "INSERT INTO scheduler_provider_event_lanes" in statement
     assert "ON CONFLICT (account_uuid, causal_lane) DO UPDATE" in statement
     assert "ORDER BY event.created_at, event.event_id, event.queue_id" in statement
-    assert parameters == (20,)
+    assert parameters == (4, 20)
+
+
+def test_pending_provider_event_lane_batch_stops_at_global_barrier():
+    session = Session(({"account_uuid": "account", "event_id": 7},))
+    store = _store_with_session(session)
+
+    assert store.pending_provider_event_lane_batch(
+        "account", "queue", 7, "channel:42", 20
+    ) == [{"account_uuid": "account", "event_id": 7}]
+    statement, parameters = session.statements[0]
+    assert "WITH anchor AS" in statement
+    assert "delivering.processing_state = 'delivering'" in statement
+    assert "predecessor.available_at > now()" in statement
+    assert "barrier.causal_lane IS NULL" in statement
+    assert "ORDER BY event.created_at, event.event_id, event.queue_id" in statement
+    assert parameters == (
+        "account",
+        "queue",
+        7,
+        "channel:42",
+        "account",
+        "channel:42",
+        20,
+    )
+
+
+def test_redundant_provider_message_event_requires_committed_mapping():
+    session = Session(({"event_id": 7},))
+    store = _store_with_session(session)
+
+    assert store.finalize_redundant_provider_message_event("account", "queue", 7)
+    statement, parameters = session.statements[0]
+    assert "event.event_type = 'message'" in statement
+    assert "event.processing_state = 'pending'" in statement
+    assert "jsonb_typeof(event.body->'message'->'flags')" in statement
+    assert "IS DISTINCT FROM 'array'" in statement
+    assert "mapping.entity_kind = 'message'" in statement
+    assert "NOT mapping.deleted" in statement
+    assert "workspace_delivery_state" in statement
+    assert parameters == ("account", "queue", 7)
+
+
+def test_redundant_provider_message_events_are_finalized_in_bulk():
+    session = Session(({"count": 9},))
+    store = _store_with_session(session)
+
+    assert store.finalize_redundant_provider_message_events() == 9
+    statement, parameters = session.statements[0]
+    assert "WITH finalized AS" in statement
+    assert "event.event_type = 'message'" in statement
+    assert "event.processing_state = 'pending'" in statement
+    assert "jsonb_typeof(event.body->'message'->'flags')" in statement
+    assert "IS DISTINCT FROM 'array'" in statement
+    assert "workspace_delivery_state" in statement
+    assert parameters is None
+
+
+def test_provider_event_catalog_report_marks_equivalent_message_topic(monkeypatch):
+    session = Session(({"assignment_catalog_reported_at": "now"},))
+    store = _store_with_session(session)
+    monkeypatch.setattr(
+        store,
+        "_enqueue_observed_report_in_session",
+        lambda _session, _report, *, confirm_existing: confirm_existing,
+    )
+    report = {"report_uuid": str(uuid.uuid4())}
+
+    assert store.ensure_provider_event_catalog_report(report, "account", "queue", 7)
+    statement, parameters = session.statements[0]
+    assert "WITH marker AS" in statement
+    assert "marker.event_type = 'message'" in statement
+    assert "event.causal_lane = marker.causal_lane" in statement
+    assert "event.body->'message'->'display_recipient'" in statement
+    assert "event.body->'message'->>'subject'" in statement
+    assert parameters == ("account", "queue", 7)
 
 
 @pytest.mark.parametrize(

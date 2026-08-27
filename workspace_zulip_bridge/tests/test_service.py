@@ -832,6 +832,7 @@ def test_provider_journal_recovers_interrupted_deliveries_only_once():
             self.ambiguous_recoveries = 0
             self.stale_recoveries = 0
             self.finalized_recoveries = 0
+            self.redundant_message_recoveries = 0
 
         def mark_interrupted_workspace_deliveries_ambiguous(self):
             self.ambiguous_recoveries += 1
@@ -842,6 +843,9 @@ def test_provider_journal_recovers_interrupted_deliveries_only_once():
         def finalize_ready_provider_events(self):
             self.finalized_recoveries += 1
 
+        def finalize_redundant_provider_message_events(self):
+            self.redundant_message_recoveries += 1
+
     store = Store()
     instance = _delivery_service(store)
 
@@ -850,6 +854,7 @@ def test_provider_journal_recovers_interrupted_deliveries_only_once():
     assert store.ambiguous_recoveries == 1
     assert store.stale_recoveries == 1
     assert store.finalized_recoveries == 1
+    assert store.redundant_message_recoveries == 1
 
 
 def test_provider_journal_processes_distinct_account_heads_in_parallel():
@@ -885,12 +890,98 @@ def test_provider_journal_processes_distinct_account_heads_in_parallel():
     instance.provider_journal_executor.shutdown(wait=True)
 
 
+def test_provider_journal_processes_one_lane_batch_in_order():
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+    events = [
+        {
+            "account_uuid": account_uuid,
+            "queue_id": "queue",
+            "event_id": event_id,
+            "causal_lane": "channel:42",
+            "body": {"id": event_id, "type": "heartbeat"},
+        }
+        for event_id in range(1, 4)
+    ]
+    ignored = []
+
+    class Store(DeliveryStore):
+        def pending_provider_event_lane_batch(
+            self, requested, queue_id, event_id, causal_lane, limit
+        ):
+            assert (requested, queue_id, event_id, causal_lane, limit) == (
+                account_uuid,
+                "queue",
+                1,
+                "channel:42",
+                service.BridgeService.PROVIDER_JOURNAL_LANE_BATCH_SIZE,
+            )
+            return events
+
+        def account_is_active(self, account_uuid):
+            return False
+
+        def ignore_provider_event_for_inactive_account(
+            self, requested, queue_id, event_id
+        ):
+            ignored.append(event_id)
+            return True
+
+    instance = _delivery_service(Store([events[0]]))
+    instance.provider_journal_parallel_enabled = True
+
+    assert instance.process_provider_journal() == 3
+    assert ignored == [1, 2, 3]
+    instance.provider_journal_executor.shutdown(wait=True)
+
+
+def test_full_provider_journal_quantum_skips_noop_lane_expansion():
+    events = [
+        {
+            "account_uuid": f"00000000-0000-4000-8000-{index:012d}",
+            "queue_id": f"queue-{index}",
+            "event_id": 1,
+            "causal_lane": f"channel:{index}",
+            "body": {"id": 1, "type": "heartbeat"},
+        }
+        for index in range(service.BridgeService.PROVIDER_JOURNAL_QUANTUM)
+    ]
+
+    class Store(DeliveryStore):
+        def pending_provider_event_lane_batch(self, *_args, **_kwargs):
+            raise AssertionError("a one-row lane prefix needs no expansion query")
+
+        def account_is_active(self, _account_uuid):
+            return False
+
+    instance = _delivery_service(Store(events))
+
+    assert instance.process_provider_journal() == 0
+
+
+def test_provider_journal_lane_batch_stops_after_retryable_head():
+    rows = [
+        {"event_id": 1},
+        {"event_id": 2},
+    ]
+    calls = []
+    instance = object.__new__(service.BridgeService)
+
+    def process(selected):
+        calls.append(selected[0]["event_id"])
+        return 0 if selected[0]["event_id"] == 1 else 1
+
+    instance.process_provider_journal = process
+
+    assert instance._process_provider_journal_lane_group(rows) == 0
+    assert calls == [1]
+
+
 def test_large_profile_scales_live_conversion_and_delivery_batches():
     instance = object.__new__(service.BridgeService)
     instance.provider_batch_size = 100
 
     assert instance._provider_journal_worker_count() == 16
-    assert instance._live_delivery_batch_size() == 100
+    assert instance._live_delivery_batch_size() == 20
     assert instance._history_worker_count() == 8
     assert instance._history_delivery_batch_size(live_pending=False) == 100
     assert instance._history_delivery_batch_size(live_pending=True) == 10
@@ -1058,6 +1149,98 @@ def test_inactive_account_event_is_terminalized_without_provider_access():
 
     assert instance.process_provider_journal() == 1
     assert store.ignored == [(account_uuid, "retired-queue", 7)]
+
+
+def test_committed_message_event_skips_replay_and_provider_access():
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+
+    class Store(DeliveryStore):
+        def __init__(self):
+            super().__init__(
+                [
+                    {
+                        "account_uuid": account_uuid,
+                        "queue_id": "queue-1",
+                        "event_id": 7,
+                        "body": {
+                            "id": 7,
+                            "type": "message",
+                            "message": {"id": 42},
+                        },
+                    }
+                ]
+            )
+            self.finalized = []
+
+        def finalize_redundant_provider_message_event(
+            self, requested, queue_id, event_id
+        ):
+            self.finalized.append((requested, queue_id, event_id))
+            return True
+
+    store = Store()
+    instance = _delivery_service(store)
+    instance.provider_adapters = lambda requested: pytest.fail(
+        "committed messages must not instantiate a Zulip client"
+    )
+
+    assert instance.process_provider_journal() == 1
+    assert store.finalized == [(account_uuid, "queue-1", 7)]
+    assert store.enqueued == []
+
+
+@pytest.mark.parametrize("flags", [["read"], []])
+def test_committed_message_event_preserves_owner_read_state(flags, monkeypatch):
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+
+    class Store(DeliveryStore):
+        def __init__(self):
+            super().__init__(
+                [
+                    {
+                        "account_uuid": account_uuid,
+                        "queue_id": "queue-1",
+                        "event_id": 7,
+                        "assignment_catalog_reported_at": "now",
+                        "body": {
+                            "id": 7,
+                            "type": "message",
+                            "flags": flags,
+                            "message": {
+                                "id": 42,
+                                "type": "stream",
+                                "stream_id": 9,
+                            },
+                        },
+                    }
+                ]
+            )
+            self.finalized = []
+
+        def finalize_redundant_provider_message_event(
+            self, requested, queue_id, event_id
+        ):
+            self.finalized.append((requested, queue_id, event_id))
+            return True
+
+    expected_record = {
+        "record_uuid": "read-state-record",
+        "operation": {
+            "kind": "read_state.set",
+            "payload": {"read": "read" in flags},
+        },
+    }
+    store = Store()
+    instance = _delivery_service(store)
+    monkeypatch.setattr(
+        instance,
+        "_event_records_with_pending_delete_recreations",
+        lambda *_args, **_kwargs: [expected_record],
+    )
+
+    assert instance.process_provider_journal() == 1
+    assert store.finalized == []
+    assert store.enqueued == [(expected_record, 0)]
 
 
 class ProviderAdapter:
@@ -5235,7 +5418,9 @@ def test_ready_live_work_preempts_slow_history_and_backfill_delivery(tmp_path):
 
     instance.run_backfill_once = slow_history
     assert instance.tick()
-    assert calls.index("live-provider-call") < calls.index("delivery:0:0:20")
+    assert calls.index("live-provider-call") < calls.index(
+        f"delivery:0:0:{service.BridgeService.LIVE_DELIVERY_BATCH_SIZE}"
+    )
     assert "delivery:2:2:1" not in calls
 
 
@@ -5370,6 +5555,34 @@ def test_background_live_worker_does_not_race_dedicated_delivery_worker():
 
     assert not instance._run_live_lane_once()
     assert calls == []
+
+
+def test_live_turn_fills_journal_lanes_before_polling_provider_operations():
+    calls = []
+
+    class Scheduler:
+        def reconcile_once(self):
+            return False
+
+        def run_once(self):
+            return False
+
+    instance = object.__new__(service.BridgeService)
+    instance.background_live_delivery_enabled = True
+    instance.scheduler = Scheduler()
+    instance.process_provider_journal = lambda: calls.append("journal") or 1
+    instance.poll_provider_operations = (
+        lambda: calls.append("provider-operations") or 0
+    )
+    instance.flush_provider_results = lambda: 0
+
+    assert service.BridgeService.PROVIDER_JOURNAL_QUANTA_PER_LIVE_TURN == 1
+    assert instance._run_live_lane_once()
+    assert calls == [
+        "journal"
+    ] * service.BridgeService.PROVIDER_JOURNAL_QUANTA_PER_LIVE_TURN + [
+        "provider-operations"
+    ]
 
 
 def test_history_workers_serialize_delivery_selection_and_submission():
@@ -5507,7 +5720,7 @@ def test_continuous_live_work_still_runs_bounded_history_quantum(tmp_path, monke
     assert instance.tick()
     assert calls == [
         "live",
-        "delivery:0:0:20",
+        f"delivery:0:0:{service.BridgeService.LIVE_DELIVERY_BATCH_SIZE}",
         f"delivery:2:2:{service.BridgeService.HISTORY_LIVE_DELIVERY_BATCH_SIZE}",
         "backfill",
     ]
@@ -5516,7 +5729,10 @@ def test_continuous_live_work_still_runs_bounded_history_quantum(tmp_path, monke
     instance.background_history_enabled = True
     now[0] += 1.0
     assert instance.tick()
-    assert calls == ["live", "delivery:0:0:20"]
+    assert calls == [
+        "live",
+        f"delivery:0:0:{service.BridgeService.LIVE_DELIVERY_BATCH_SIZE}",
+    ]
 
 
 def test_history_quantum_runs_in_the_main_service_thread(tmp_path, monkeypatch):
@@ -5710,7 +5926,7 @@ def test_full_history_delivery_batch_defers_more_provider_io(tmp_path, monkeypat
 
     assert instance.tick()
     assert calls == [
-        "delivery:0:0:20",
+        f"delivery:0:0:{service.BridgeService.LIVE_DELIVERY_BATCH_SIZE}",
         f"delivery:2:2:{service.BridgeService.HISTORY_DELIVERY_BATCH_SIZE}",
     ]
 
