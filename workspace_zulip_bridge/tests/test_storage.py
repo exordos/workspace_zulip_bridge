@@ -1049,6 +1049,9 @@ def test_catalog_readiness_queries_use_native_uuid_index_expressions():
     assert "external_account_uuid" in report_query
     assert ")::uuid = %s" in report_query
     assert "resource_uuid')::uuid" in report_query
+    assert "observed_generation')::bigint DESC" in report_query
+    assert "body->>'observed_at' DESC NULLS LAST" in report_query
+    assert "created_at DESC, report_uuid DESC" in report_query
 
 
 def test_inactive_provider_event_terminalization_preserves_audit_rows():

@@ -73,6 +73,12 @@ def postgres_store(migrated_postgres_dsn):
                      bridge_health CASCADE
             """
         )
+        session.execute(
+            """
+            UPDATE observed_report_prune_state
+            SET last_completed_at = NULL, last_report_uuid = NULL
+            """
+        )
     return store
 
 
@@ -289,6 +295,26 @@ def _explain_text(session, query: str, parameters=()) -> str:
         parameters,
     ).fetchall()
     return "\n".join(str(next(iter(row.values()))) for row in rows)
+
+
+def _explain_json(session, query: str, parameters=()) -> dict[str, object]:
+    row = session.execute(
+        f"EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, FORMAT JSON) {query}",
+        parameters,
+    ).fetchone()
+    result = next(iter(row.values()))
+    if isinstance(result, str):
+        result = json.loads(result)
+    return result[0]["Plan"]
+
+
+def _max_plan_actual_rows(plan: dict[str, object]) -> int:
+    nested = [
+        _max_plan_actual_rows(child)
+        for child in plan.get("Plans", [])
+        if isinstance(child, dict)
+    ]
+    return max([int(plan.get("Actual Rows", 0)), *nested])
 
 
 def _insert_account_and_assignment(
@@ -1725,6 +1751,140 @@ def test_pending_observed_reports_supersede_older_unsent_resource_states(
     ]
 
 
+def test_pending_observed_reports_keep_semantically_latest_resource_state(
+    postgres_store,
+):
+    resource_uuid = str(uuid.uuid4())
+    newer = {
+        "report_uuid": str(uuid.uuid4()),
+        "resource_type": "external_account",
+        "resource_uuid": resource_uuid,
+        "observed_generation": 1,
+        "status": "live_ready",
+        "reason": "live",
+        "observed_at": "2026-08-27T12:00:01Z",
+    }
+    older = {
+        **newer,
+        "report_uuid": str(uuid.uuid4()),
+        "status": "degraded",
+        "reason": "retry",
+        "observed_at": "2026-08-27T12:00:00Z",
+    }
+
+    assert postgres_store.enqueue_observed_report(newer)
+    assert postgres_store.enqueue_observed_report(older)
+
+    assert postgres_store.pending_observed_reports() == [newer]
+    with postgres_store.session() as session:
+        rows = session.execute(
+            """
+            SELECT report_uuid, result_status
+            FROM observed_report_outbox
+            WHERE body->>'resource_uuid' = %s
+            ORDER BY body->>'observed_at'
+            """,
+            (resource_uuid,),
+        ).fetchall()
+    assert rows == [
+        {
+            "report_uuid": uuid.UUID(str(older["report_uuid"])),
+            "result_status": "superseded",
+        },
+        {
+            "report_uuid": uuid.UUID(str(newer["report_uuid"])),
+            "result_status": None,
+        },
+    ]
+
+
+def test_pending_observed_reports_keep_highest_resource_generation(postgres_store):
+    resource_uuid = str(uuid.uuid4())
+    current = {
+        "report_uuid": str(uuid.uuid4()),
+        "resource_type": "external_account",
+        "resource_uuid": resource_uuid,
+        "observed_generation": 2,
+        "status": "live_ready",
+        "observed_at": "2026-08-27T12:00:00Z",
+    }
+    stale = {
+        **current,
+        "report_uuid": str(uuid.uuid4()),
+        "observed_generation": 1,
+        "status": "degraded",
+        "observed_at": "2026-08-27T13:00:00Z",
+    }
+
+    assert postgres_store.enqueue_observed_report(stale)
+    assert postgres_store.enqueue_observed_report(current)
+
+    assert postgres_store.pending_observed_reports() == [current]
+
+
+def test_catalog_marker_does_not_cover_changed_direct_participants(postgres_store):
+    account_uuid, _project_uuid = _insert_account_and_assignment(postgres_store)
+    base_message = {
+        "type": "private",
+        "display_recipient": [
+            {
+                "id": 1,
+                "full_name": "Owner",
+                "email": "owner@example.invalid",
+                "is_me": True,
+            },
+            {
+                "id": 2,
+                "full_name": "Old name",
+                "email": "peer@example.invalid",
+                "is_me": False,
+            },
+        ],
+    }
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        {"id": 1, "type": "message", "message": {"id": 701, **base_message}},
+    )
+    renamed_message = json.loads(json.dumps(base_message))
+    renamed_message["display_recipient"][1]["full_name"] = "New name"
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        {"id": 2, "type": "message", "message": {"id": 702, **renamed_message}},
+    )
+    report = {
+        "report_uuid": str(uuid.uuid4()),
+        "resource_type": "external_chat_catalog",
+        "resource_uuid": str(uuid.uuid4()),
+        "observed_generation": 1,
+        "status": "ready",
+        "observed_at": "2026-08-27T12:00:00Z",
+    }
+
+    assert postgres_store.ensure_provider_event_catalog_report(
+        report,
+        account_uuid,
+        "queue",
+        1,
+    )
+
+    with postgres_store.session() as session:
+        rows = session.execute(
+            """
+            SELECT event_id, assignment_catalog_reported_at IS NOT NULL AS marked
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = 'queue'
+            ORDER BY event_id
+            """,
+            (account_uuid,),
+        ).fetchall()
+    assert rows == [
+        {"event_id": 1, "marked": True},
+        {"event_id": 2, "marked": False},
+    ]
+
+
 def test_pending_observed_reports_round_robin_catalog_accounts(postgres_store):
     first_account_uuid = str(uuid.uuid4())
     second_account_uuid = str(uuid.uuid4())
@@ -2352,7 +2512,7 @@ def test_observed_report_hot_queries_use_migration_indexes(postgres_store):
                     )
                 ),
                 'applied', now()
-            FROM generate_series(1, 2000) AS sample
+            FROM generate_series(1, 100000) AS sample
             ON CONFLICT (report_uuid) DO NOTHING
             """,
             (catalog_account_uuid,),
@@ -2363,8 +2523,10 @@ def test_observed_report_hot_queries_use_migration_indexes(postgres_store):
             """
             SELECT body FROM observed_report_outbox
             WHERE body->>'resource_type' = %s
-              AND body->>'resource_uuid' = %s
-            ORDER BY created_at DESC
+              AND (body->>'resource_uuid')::uuid = %s::uuid
+            ORDER BY (body->>'observed_generation')::bigint DESC,
+                     body->>'observed_at' DESC NULLS LAST,
+                     created_at DESC, report_uuid DESC
             LIMIT 1
             """,
             ("external_account", resource_uuid),
@@ -2375,8 +2537,10 @@ def test_observed_report_hot_queries_use_migration_indexes(postgres_store):
             SELECT report_uuid,
                    row_number() OVER (
                        PARTITION BY body->>'resource_type',
-                                    body->>'resource_uuid'
-                       ORDER BY created_at DESC, report_uuid DESC
+                                    (body->>'resource_uuid')::uuid
+                       ORDER BY (body->>'observed_generation')::bigint DESC,
+                                body->>'observed_at' DESC NULLS LAST,
+                                created_at DESC, report_uuid DESC
                    ) AS position
             FROM observed_report_outbox
             WHERE completed_at IS NULL
@@ -2412,12 +2576,56 @@ def test_observed_report_hot_queries_use_migration_indexes(postgres_store):
             WHERE body->>'resource_type' = 'external_chat_catalog'
               AND (body->'catalog'->>'external_account_uuid')::uuid = %s
               AND (body->>'observed_generation')::bigint = 3
-            ORDER BY (body->>'resource_uuid')::uuid, created_at DESC
+            ORDER BY (body->>'resource_uuid')::uuid,
+                     (body->>'observed_generation')::bigint DESC,
+                     body->>'observed_at' DESC NULLS LAST,
+                     created_at DESC, report_uuid DESC
             """,
             (catalog_account_uuid,),
         )
+        catalog_readiness_actual_plan = _explain_json(
+            session,
+            """
+            SELECT DISTINCT ON ((body->>'resource_uuid')::uuid) result_status
+            FROM observed_report_outbox
+            WHERE body->>'resource_type' = 'external_chat_catalog'
+              AND (body->'catalog'->>'external_account_uuid')::uuid = %s
+              AND (body->>'observed_generation')::bigint = 3
+            ORDER BY (body->>'resource_uuid')::uuid,
+                     (body->>'observed_generation')::bigint DESC,
+                     body->>'observed_at' DESC NULLS LAST,
+                     created_at DESC, report_uuid DESC
+            """,
+            (catalog_account_uuid,),
+        )
+        prune_query = """
+            WITH probe AS MATERIALIZED (
+                SELECT report.report_uuid, report.body, report.completed_at
+                FROM observed_report_outbox AS report
+                WHERE report.completed_at IS NOT NULL
+                ORDER BY report.completed_at, report.report_uuid
+                LIMIT 100
+            )
+            SELECT count(*)
+            FROM probe
+            JOIN LATERAL (
+                SELECT candidate.report_uuid
+                FROM observed_report_outbox AS candidate
+                WHERE candidate.body->>'resource_type' =
+                          probe.body->>'resource_type'
+                  AND (candidate.body->>'resource_uuid')::uuid =
+                      (probe.body->>'resource_uuid')::uuid
+                ORDER BY
+                    (candidate.body->>'observed_generation')::bigint DESC,
+                    candidate.body->>'observed_at' DESC NULLS LAST,
+                    candidate.created_at DESC, candidate.report_uuid DESC
+                LIMIT 1
+            ) AS semantic_head ON true
+        """
+        prune_plan = _explain_text(session, prune_query)
+        prune_actual_plan = _explain_json(session, prune_query)
 
-    assert "observed_report_outbox_resource_latest_idx" in dedup_plan
+    assert "observed_report_outbox_resource_observed_idx" in dedup_plan
     assert "observed_report_outbox_pending_order_idx" in pending_rank_plan
     assert "observed_report_outbox_pending_order_idx" in pending_order_plan
     assert (
@@ -2425,6 +2633,10 @@ def test_observed_report_hot_queries_use_migration_indexes(postgres_store):
         in materialization_plan
     )
     assert "observed_report_outbox_catalog_readiness_idx" in catalog_readiness_plan
+    assert _max_plan_actual_rows(catalog_readiness_actual_plan) <= 5_000
+    assert "observed_report_outbox_terminal_history_idx" in prune_plan
+    assert "observed_report_outbox_resource_observed_idx" in prune_plan
+    assert _max_plan_actual_rows(prune_actual_plan) <= 100
 
 
 def _provider_record(
@@ -6087,6 +6299,10 @@ def test_terminal_delivery_state_is_pruned_by_priority_and_age(postgres_store):
     account_uuid = str(uuid.uuid4())
     history_record_uuid = str(uuid.uuid4())
     live_record_uuid = str(uuid.uuid4())
+    report_resource_uuid = str(uuid.uuid4())
+    old_report_uuid = str(uuid.uuid4())
+    latest_report_uuid = str(uuid.uuid4())
+    singleton_report_uuid = str(uuid.uuid4())
     with postgres_store.session() as session:
         session.execute(
             """
@@ -6126,6 +6342,42 @@ def test_terminal_delivery_state_is_pruned_by_priority_and_age(postgres_store):
                 account_uuid,
             ),
         )
+        session.execute(
+            """
+            INSERT INTO observed_report_outbox (
+                report_uuid, body, result_status, completed_at, created_at
+            ) VALUES
+                (%s, jsonb_build_object(
+                    'resource_type', 'external_account',
+                    'resource_uuid', %s::text,
+                    'observed_generation', 1,
+                    'observed_at', '2026-08-27T06:00:00Z'
+                ), 'applied', now() - interval '20 minutes',
+                    now() - interval '20 minutes'),
+                (%s, jsonb_build_object(
+                    'resource_type', 'external_account',
+                    'resource_uuid', %s::text,
+                    'observed_generation', 2,
+                    'observed_at', '2026-08-27T05:00:00Z'
+                ), 'applied', now() - interval '20 minutes',
+                    now() - interval '20 minutes'),
+                (%s, jsonb_build_object(
+                    'resource_type', 'external_account',
+                    'resource_uuid', %s::text,
+                    'observed_generation', 1,
+                    'observed_at', '2026-08-27T06:00:00Z'
+                ), 'applied', now() - interval '20 minutes',
+                    now() - interval '20 minutes')
+            """,
+            (
+                old_report_uuid,
+                report_resource_uuid,
+                latest_report_uuid,
+                report_resource_uuid,
+                singleton_report_uuid,
+                str(uuid.uuid4()),
+            ),
+        )
 
     assert postgres_store.prune_terminal_delivery_state() == (1, 2)
 
@@ -6136,8 +6388,86 @@ def test_terminal_delivery_state_is_pruned_by_priority_and_age(postgres_store):
         events = session.execute(
             "SELECT queue_id FROM zulip_provider_events ORDER BY queue_id"
         ).fetchall()
+        reports = session.execute(
+            """
+            SELECT report_uuid::text AS report_uuid
+            FROM observed_report_outbox
+            WHERE report_uuid = ANY(%s::uuid[])
+            ORDER BY report_uuid
+            """,
+            ([old_report_uuid, latest_report_uuid, singleton_report_uuid],),
+        ).fetchall()
     assert deliveries == [{"provider_queue_id": "live"}]
     assert events == [{"queue_id": "live"}, {"queue_id": "pending"}]
+    assert [row["report_uuid"] for row in reports] == sorted(
+        [latest_report_uuid, singleton_report_uuid]
+    )
+
+    # The next bounded pass reaches the end and rewinds without a table scan.
+    assert postgres_store.prune_terminal_delivery_state() == (0, 0)
+    with postgres_store.session() as session:
+        cursor = session.execute(
+            """
+            SELECT last_completed_at, last_report_uuid
+            FROM observed_report_prune_state
+            WHERE singleton
+            """
+        ).fetchone()
+    assert cursor == {"last_completed_at": None, "last_report_uuid": None}
+
+
+def test_committed_message_fast_path_keeps_flagged_snapshots_pending(
+    postgres_store,
+):
+    account_uuid = str(uuid.uuid4())
+    message_uuid = str(uuid.uuid4())
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "message",
+        "42",
+        message_uuid,
+        {"workspace_delivery_state": "committed"},
+    )
+    events = [
+        {
+            "id": 1,
+            "type": "message",
+            "flags": ["read"],
+            "message": {"id": 42},
+        },
+        {
+            "id": 2,
+            "type": "message",
+            "message": {"id": 42, "flags": []},
+        },
+        {"id": 3, "type": "message", "message": {"id": 42}},
+    ]
+    for event in events:
+        assert postgres_store.record_provider_event(account_uuid, "queue", event)
+
+    assert not postgres_store.finalize_redundant_provider_message_event(
+        account_uuid, "queue", 1
+    )
+    assert postgres_store.finalize_redundant_provider_message_event(
+        account_uuid, "queue", 3
+    )
+    assert postgres_store.finalize_redundant_provider_message_events() == 0
+
+    with postgres_store.session() as session:
+        states = session.execute(
+            """
+            SELECT event_id, processing_state
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = 'queue'
+            ORDER BY event_id
+            """,
+            (account_uuid,),
+        ).fetchall()
+    assert states == [
+        {"event_id": 1, "processing_state": "pending"},
+        {"event_id": 2, "processing_state": "pending"},
+        {"event_id": 3, "processing_state": "processed"},
+    ]
 
 
 def test_pending_provider_probe_waits_for_each_accounts_head(postgres_store):
