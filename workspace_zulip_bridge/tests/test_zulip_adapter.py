@@ -313,6 +313,15 @@ class FakeRouting:
     def workspace_mapping(self, entity_kind, workspace_uuid):
         return self.workspace.get((entity_kind, workspace_uuid))
 
+    def workspace_mappings(self, entity_kind, workspace_uuids):
+        return {
+            workspace_uuid: mapping
+            for workspace_uuid in workspace_uuids
+            if (
+                mapping := self.workspace.get((entity_kind, workspace_uuid))
+            ) is not None
+        }
+
     def topic_message_mapping(self, topic_uuid):
         if topic_uuid != TOPIC_UUID:
             return None
@@ -1041,6 +1050,46 @@ def test_exact_read_state_updates_only_listed_messages():
     }
     assert adapter.apply(operation) == ("99", None)
     assert client.flags == [{"messages": [99], "op": "remove", "flag": "read"}]
+
+
+def test_exact_read_state_resolves_the_page_with_one_bulk_mapping_call():
+    message_uuids = [
+        "10000000-0000-0000-0000-000000000010",
+        "20000000-0000-0000-0000-000000000020",
+    ]
+
+    class Routing(FakeRouting):
+        def __init__(self):
+            self.bulk_calls = []
+
+        def workspace_mapping(self, entity_kind, workspace_uuid):
+            raise AssertionError("exact read pages must not use scalar lookups")
+
+        def workspace_mappings(self, entity_kind, workspace_uuids):
+            self.bulk_calls.append((entity_kind, workspace_uuids))
+            return {
+                message_uuids[0]: {"provider_id": "9002", "metadata": {}},
+                message_uuids[1]: {"provider_id": "1001", "metadata": {}},
+            }
+
+    client = FakeClient()
+    routing = Routing()
+    adapter = _adapter(client, routing=routing)
+    operation = {
+        "kind": "read_state.set",
+        "provider": {"kind": "zulip", "chat_id": "channel:42"},
+        "payload": {
+            "stream_uuid": STREAM_UUID,
+            "topic_uuid": TOPIC_UUID,
+            "reader_uuid": OWNER_UUID,
+            "message_uuids": message_uuids,
+            "read": True,
+        },
+    }
+
+    assert adapter.apply(operation) == ("9002", None)
+    assert routing.bulk_calls == [("message", message_uuids)]
+    assert client.flags == [{"messages": [9002, 1001], "op": "add", "flag": "read"}]
 
 
 def test_reaction_create_update_and_delete_use_official_client_semantics():
