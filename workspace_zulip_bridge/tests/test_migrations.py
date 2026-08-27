@@ -77,11 +77,12 @@ def test_migrations_have_one_versioned_dependency_chain():
         "0020-refresh-Zulip-notification-queues-93df4e.py",
         "0021-index-pending-chat-materializations-dcdd12.py",
         "0022-isolate-provider-journal-causal-lanes-3ae83f.py",
+        "0023-index-reaction-provider-prefixes-dbc736.py",
     ]
     assert engine.get_latest_migration() == (
-        "0022-isolate-provider-journal-causal-lanes-3ae83f.py"
+        "0023-index-reaction-provider-prefixes-dbc736.py"
     )
-    assert len({step["uuid"] for step in all_migrations.values()}) == 23
+    assert len({step["uuid"] for step in all_migrations.values()}) == 24
     assert all_migrations["0001-add-Zulip-provider-scheduler-state-143113.py"][
         "depends"
     ] == ["0000-initialize-bridge-operational-state-18f707.py"]
@@ -148,6 +149,39 @@ def test_migrations_have_one_versioned_dependency_chain():
     assert all_migrations["0022-isolate-provider-journal-causal-lanes-3ae83f.py"][
         "depends"
     ] == ["0021-index-pending-chat-materializations-dcdd12.py"]
+    assert all_migrations["0023-index-reaction-provider-prefixes-dbc736.py"][
+        "depends"
+    ] == ["0022-isolate-provider-journal-causal-lanes-3ae83f.py"]
+
+
+def test_reaction_provider_prefix_migration_adds_pattern_index():
+    migration_path = MIGRATIONS / "0023-index-reaction-provider-prefixes-dbc736.py"
+    spec = importlib.util.spec_from_file_location(
+        "reaction_provider_prefix", migration_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class Session:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, statement):
+            self.statements.append(statement)
+
+    session = Session()
+    module.migration_step.upgrade(session)
+
+    assert len(session.statements) == 1
+    statement = session.statements[0]
+    assert "provider_mappings_reaction_provider_prefix_idx" in statement
+    assert "provider_id text_pattern_ops" in statement
+    assert "WHERE entity_kind = 'reaction'" in statement
+
+    module.migration_step.downgrade(session)
+    assert len(session.statements) == 2
+    assert "DROP INDEX IF EXISTS" in session.statements[1]
 
 
 def test_provider_journal_lane_migration_backfills_and_indexes_scheduler():
