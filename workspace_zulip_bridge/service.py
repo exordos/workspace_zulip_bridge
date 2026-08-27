@@ -164,6 +164,13 @@ class _AccountRouting:
             self.account_uuid, entity_kind, workspace_uuid
         )
 
+    def workspace_mappings(
+        self, entity_kind: str, workspace_uuids: list[str]
+    ) -> dict[str, dict[str, object]]:
+        return self.store.workspace_mappings(
+            self.account_uuid, entity_kind, workspace_uuids
+        )
+
     def topic_message_mapping(self, topic_uuid: str) -> dict[str, object] | None:
         return self.store.topic_message_mapping(self.account_uuid, topic_uuid)
 

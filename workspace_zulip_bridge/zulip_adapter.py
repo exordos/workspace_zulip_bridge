@@ -124,6 +124,10 @@ class ZulipRoutingMappings(typing.Protocol):
         self, entity_kind: str, workspace_uuid: str
     ) -> dict[str, object] | None: ...
 
+    def workspace_mappings(
+        self, entity_kind: str, workspace_uuids: list[str]
+    ) -> dict[str, dict[str, object]]: ...
+
     def topic_message_mapping(self, topic_uuid: str) -> dict[str, object] | None: ...
 
     def workspace_message_mappings_through(
@@ -1562,9 +1566,13 @@ class OfficialZulipAdapter:
             if exact_uuids is not None:
                 if self.routing is None:
                     raise ZulipOperationError("not_found", False)
+                workspace_uuids = [str(value) for value in exact_uuids]
+                mappings = self.routing.workspace_mappings(
+                    "message", workspace_uuids
+                )
                 provider_ids = []
-                for value in exact_uuids:
-                    mapping = self.routing.workspace_mapping("message", str(value))
+                for workspace_uuid in workspace_uuids:
+                    mapping = mappings.get(workspace_uuid)
                     if mapping is not None:
                         provider_ids.append(int(str(mapping["provider_id"])))
                 if not provider_ids:

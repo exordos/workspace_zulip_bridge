@@ -1556,6 +1556,53 @@ class RestAlchemyStore:
                 ),
             ).fetchone()
 
+    def workspace_mappings(
+        self,
+        account_uuid: str,
+        entity_kind: str,
+        workspace_uuids: list[str],
+    ) -> dict[str, dict[str, object]]:
+        """Resolve one exact provider mapping page in a single transaction."""
+        if not workspace_uuids:
+            return {}
+        with self.session() as session:
+            rows = session.execute(
+                """
+                SELECT DISTINCT ON (workspace_uuid)
+                       workspace_uuid::text AS workspace_uuid,
+                       provider_id, provider_revision, metadata
+                FROM (
+                    SELECT workspace_uuid, provider_id, provider_revision, metadata,
+                           1 AS source_order
+                    FROM provider_mappings
+                    WHERE account_uuid = %s AND entity_kind = %s
+                      AND workspace_uuid = ANY(%s::uuid[]) AND NOT deleted
+                    UNION ALL
+                    SELECT alias.workspace_uuid, alias.provider_id,
+                           mapping.provider_revision, alias.metadata, 0 AS source_order
+                    FROM provider_mapping_aliases AS alias
+                    LEFT JOIN provider_mappings AS mapping
+                      ON mapping.account_uuid = alias.account_uuid
+                     AND mapping.entity_kind = alias.entity_kind
+                     AND mapping.provider_id = alias.provider_id
+                     AND NOT mapping.deleted
+                    WHERE alias.account_uuid = %s AND alias.entity_kind = %s
+                      AND alias.workspace_uuid = ANY(%s::uuid[])
+                      AND NOT alias.deleted
+                ) AS candidates
+                ORDER BY workspace_uuid, source_order
+                """,
+                (
+                    account_uuid,
+                    entity_kind,
+                    workspace_uuids,
+                    account_uuid,
+                    entity_kind,
+                    workspace_uuids,
+                ),
+            ).fetchall()
+            return {str(row["workspace_uuid"]): row for row in rows}
+
     def tombstoned_workspace_mapping(
         self, account_uuid: str, entity_kind: str, workspace_uuid: str
     ) -> dict[str, object] | None:

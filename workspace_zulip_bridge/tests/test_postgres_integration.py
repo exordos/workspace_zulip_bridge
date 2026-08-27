@@ -985,6 +985,14 @@ def test_topic_recanonicalization_keeps_previous_workspace_route(postgres_store)
     )
     assert canonical_route is not None
     assert canonical_route["provider_id"] == "42:resolved topic"
+    page_routes = postgres_store.workspace_mappings(
+        account_uuid,
+        "topic",
+        [original_topic_uuid, canonical_topic_uuid, str(uuid.uuid4())],
+    )
+    assert set(page_routes) == {original_topic_uuid, canonical_topic_uuid}
+    assert page_routes[original_topic_uuid]["provider_id"] == "42:resolved topic"
+    assert page_routes[canonical_topic_uuid]["provider_id"] == "42:resolved topic"
 
     postgres_store.apply_desired_changes(
         [
