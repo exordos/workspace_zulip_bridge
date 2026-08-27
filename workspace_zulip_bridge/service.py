@@ -1,5 +1,6 @@
 import concurrent.futures
 import contextlib
+import copy
 import dataclasses
 import datetime
 import hashlib
@@ -182,6 +183,142 @@ class _AccountRouting:
         return converter.stable_entity_uuid(
             self.account_uuid, "external_chat", provider_chat_key
         )
+
+
+class _BackfillConversionStore:
+    """Avoid repeated mapping round trips within one backfill transaction."""
+
+    def __init__(self, store: storage.RestAlchemyStore):
+        self.store = store
+        self.account_resources: dict[str, dict[str, object] | None] = {}
+        self.assignments: dict[tuple[str, str], dict[str, object] | None] = {}
+        self.provider_mappings: dict[
+            tuple[str, str, str], dict[str, object] | None
+        ] = {}
+        self.provider_message_mappings: dict[
+            tuple[str, str], dict[str, object] | None
+        ] = {}
+        self.provider_mappings_by_name: dict[
+            tuple[str, str, str], dict[str, object] | None
+        ] = {}
+        self.workspace_mappings: dict[
+            tuple[str, str, str], dict[str, object] | None
+        ] = {}
+        self.remembered_mappings: dict[
+            tuple[str, str, str], tuple[str, str | None, dict[str, object]]
+        ] = {}
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.store, name)
+
+    def account_resource(self, account_uuid: str) -> dict[str, object] | None:
+        if account_uuid not in self.account_resources:
+            self.account_resources[account_uuid] = self.store.account_resource(
+                account_uuid
+            )
+        return self.account_resources[account_uuid]
+
+    def assignment_for_provider_chat(
+        self, account_uuid: str, provider_chat_key: str
+    ) -> dict[str, object] | None:
+        key = (account_uuid, provider_chat_key)
+        if key not in self.assignments:
+            self.assignments[key] = self.store.assignment_for_provider_chat(*key)
+        return self.assignments[key]
+
+    def provider_mapping(
+        self, account_uuid: str, entity_kind: str, provider_id: str
+    ) -> dict[str, object] | None:
+        key = (account_uuid, entity_kind, provider_id)
+        if key not in self.provider_mappings:
+            self.provider_mappings[key] = self.store.provider_mapping(*key)
+        return self.provider_mappings[key]
+
+    def provider_message_mapping(
+        self, account_uuid: str, provider_id: str
+    ) -> dict[str, object] | None:
+        key = (account_uuid, provider_id)
+        if key not in self.provider_message_mappings:
+            self.provider_message_mappings[key] = (
+                self.store.provider_message_mapping(*key)
+            )
+        return self.provider_message_mappings[key]
+
+    def provider_mapping_by_name(
+        self, account_uuid: str, entity_kind: str, name: str
+    ) -> dict[str, object] | None:
+        # PostgreSQL owns the case-insensitive lookup semantics.  Python
+        # casefolding is intentionally not used here: values such as Straße
+        # and STRASSE collide in Python but remain distinct under PostgreSQL's
+        # LOWER() in the supported database locale.
+        key = (account_uuid, entity_kind, name)
+        if key not in self.provider_mappings_by_name:
+            self.provider_mappings_by_name[key] = self.store.provider_mapping_by_name(
+                account_uuid, entity_kind, name
+            )
+        return self.provider_mappings_by_name[key]
+
+    def workspace_mapping(
+        self, account_uuid: str, entity_kind: str, workspace_uuid: str
+    ) -> dict[str, object] | None:
+        key = (account_uuid, entity_kind, workspace_uuid)
+        if key not in self.workspace_mappings:
+            self.workspace_mappings[key] = self.store.workspace_mapping(*key)
+        return self.workspace_mappings[key]
+
+    def remember_provider_mapping(
+        self,
+        account_uuid: str,
+        entity_kind: str,
+        provider_id: str,
+        workspace_uuid: str,
+        metadata: dict[str, object],
+        provider_revision: str | None = None,
+    ) -> None:
+        key = (account_uuid, entity_kind, provider_id)
+        previous = self.remembered_mappings.get(key)
+        if previous is not None and previous == (
+            workspace_uuid,
+            provider_revision,
+            metadata,
+        ):
+            return
+        self.store.remember_provider_mapping(
+            account_uuid,
+            entity_kind,
+            provider_id,
+            workspace_uuid,
+            metadata,
+            provider_revision,
+        )
+        self.remembered_mappings[key] = (
+            workspace_uuid,
+            provider_revision,
+            copy.deepcopy(metadata),
+        )
+        mapping = self.provider_mappings.get(key)
+        if isinstance(mapping, dict):
+            self.provider_mappings[key] = {
+                **mapping,
+                "provider_revision": provider_revision
+                if provider_revision is not None
+                else mapping.get("provider_revision"),
+                "metadata": copy.deepcopy(metadata),
+            }
+        else:
+            self.provider_mappings.pop(key, None)
+        if entity_kind == "message":
+            self.provider_message_mappings.pop((account_uuid, provider_id), None)
+        self.provider_mappings_by_name = {
+            cache_key: value
+            for cache_key, value in self.provider_mappings_by_name.items()
+            if cache_key[:2] != (account_uuid, entity_kind)
+        }
+        self.workspace_mappings = {
+            cache_key: value
+            for cache_key, value in self.workspace_mappings.items()
+            if cache_key[:2] != (account_uuid, entity_kind)
+        }
 
 
 class BridgeService:
@@ -2391,6 +2528,7 @@ class BridgeService:
         queue_id: str,
         event: dict[str, object],
         delivery_class: str,
+        conversion_store: converter.ConversionStore | None = None,
     ) -> list[dict[str, object]]:
         file_resolver = self._file_resolver(
             adapter,
@@ -2412,7 +2550,7 @@ class BridgeService:
 
             file_resolver = resolve_historical_file
         return converter.event_records(
-            self.store,
+            self.store if conversion_store is None else conversion_store,
             account_uuid,
             queue_id,
             event,
@@ -3181,6 +3319,33 @@ class BridgeService:
             and "/user_uploads/" in str(message.get("content", ""))
         )
 
+    @staticmethod
+    def _backfill_catalog_key(message: dict[str, object]) -> tuple[object, ...]:
+        chat_type, chat_key = converter.provider_chat_reference(message)
+        recipient = message.get("display_recipient")
+        if chat_type == "channel":
+            subject = message.get("subject")
+            topic_name = (
+                converter.channel_topic_name(subject)
+                if isinstance(subject, str)
+                else None
+            )
+            return (chat_key, str(recipient), topic_name)
+        if isinstance(recipient, list):
+            participants = tuple(
+                (
+                    str(person.get("id")),
+                    str(person.get("full_name")),
+                    str(person.get("email")),
+                    bool(person.get("is_me")),
+                    str(person.get("is_active")),
+                )
+                for person in recipient
+                if isinstance(person, dict) and isinstance(person.get("id"), int)
+            )
+            return (chat_key, participants)
+        return (chat_key, str(recipient))
+
     def _backfill_message_chunks(
         self,
         messages: list[dict[str, object]],
@@ -3235,9 +3400,13 @@ class BridgeService:
         self.backfill_topic_cache = topic_cache
         ordered_messages = converter.newest_first(messages)
         transaction = getattr(self.store, "transaction", contextlib.nullcontext)
+        catalog_keys: set[tuple[object, ...]] = set()
         for message_chunk in self._backfill_message_chunks(ordered_messages):
             with transaction():
                 for message in message_chunk:
+                    catalog_key = self._backfill_catalog_key(message)
+                    if catalog_key in catalog_keys:
+                        continue
                     self._queue_event_catalog(
                         account_uuid,
                         {
@@ -3247,12 +3416,14 @@ class BridgeService:
                         },
                         adapter.server_url,
                     )
+                    catalog_keys.add(catalog_key)
         for message_chunk in self._backfill_message_chunks(
             ordered_messages,
             isolate_file_transfers=True,
         ):
             durable_topic_cache_keys = set()
             with transaction():
+                conversion_store = _BackfillConversionStore(self.store)
                 for message in message_chunk:
                     event = {
                         "id": int(message["id"]),
@@ -3270,6 +3441,7 @@ class BridgeService:
                         queue_id,
                         event,
                         "backfill",
+                        conversion_store,
                     )
                     for record in records:
                         operation = typing.cast(

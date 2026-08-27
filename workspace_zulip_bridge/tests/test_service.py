@@ -1,3 +1,4 @@
+import collections
 import contextlib
 import datetime
 import hashlib
@@ -4531,6 +4532,113 @@ def test_backfill_is_discovered_newest_first_and_queued_at_priority_two(
     }
 
 
+def test_backfill_conversion_store_caches_reads_and_identical_writes():
+    class Store:
+        def __init__(self):
+            self.calls = collections.Counter()
+            self.remembered = []
+
+        def account_resource(self, account_uuid):
+            self.calls["account_resource"] += 1
+            return {"uuid": account_uuid}
+
+        def assignment_for_provider_chat(self, account_uuid, chat_key):
+            self.calls["assignment_for_provider_chat"] += 1
+            return {"account_uuid": account_uuid, "chat_key": chat_key}
+
+        def provider_mapping(self, account_uuid, entity_kind, provider_id):
+            self.calls["provider_mapping"] += 1
+            return {
+                "workspace_uuid": "workspace-uuid",
+                "provider_id": provider_id,
+                "provider_revision": None,
+                "metadata": {"name": "old"},
+            }
+
+        def provider_message_mapping(self, account_uuid, provider_id):
+            self.calls["provider_message_mapping"] += 1
+            return {"workspace_uuid": "message-uuid", "provider_id": provider_id}
+
+        def provider_mapping_by_name(self, account_uuid, entity_kind, name):
+            self.calls["provider_mapping_by_name"] += 1
+            return {"workspace_uuid": "stream-uuid", "name": name}
+
+        def workspace_mapping(self, account_uuid, entity_kind, workspace_uuid):
+            self.calls["workspace_mapping"] += 1
+            return {"workspace_uuid": workspace_uuid}
+
+        def remember_provider_mapping(self, *args):
+            self.calls["remember_provider_mapping"] += 1
+            self.remembered.append(args)
+
+    store = Store()
+    cached = service._BackfillConversionStore(store)
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+
+    assert cached.account_resource(account_uuid) is cached.account_resource(account_uuid)
+    assert cached.assignment_for_provider_chat(
+        account_uuid, "channel:42"
+    ) is cached.assignment_for_provider_chat(account_uuid, "channel:42")
+    assert cached.provider_mapping(
+        account_uuid, "stream", "channel:42"
+    ) is cached.provider_mapping(account_uuid, "stream", "channel:42")
+    assert cached.provider_message_mapping(
+        account_uuid, "42"
+    ) is cached.provider_message_mapping(account_uuid, "42")
+    assert cached.provider_mapping_by_name(
+        account_uuid, "stream", "Engineering"
+    ) is cached.provider_mapping_by_name(account_uuid, "stream", "Engineering")
+    assert cached.workspace_mapping(
+        account_uuid, "stream", "workspace-uuid"
+    ) is cached.workspace_mapping(account_uuid, "stream", "workspace-uuid")
+
+    metadata = {"name": "Engineering"}
+    cached.remember_provider_mapping(
+        account_uuid, "stream", "channel:42", "workspace-uuid", metadata
+    )
+    metadata["name"] = "mutated after write"
+    cached.remember_provider_mapping(
+        account_uuid,
+        "stream",
+        "channel:42",
+        "workspace-uuid",
+        {"name": "Engineering"},
+    )
+
+    assert store.calls == {
+        "account_resource": 1,
+        "assignment_for_provider_chat": 1,
+        "provider_mapping": 1,
+        "provider_message_mapping": 1,
+        "provider_mapping_by_name": 1,
+        "workspace_mapping": 1,
+        "remember_provider_mapping": 1,
+    }
+    assert cached.provider_mapping(account_uuid, "stream", "channel:42")[
+        "metadata"
+    ] == {"name": "Engineering"}
+
+
+def test_backfill_conversion_store_does_not_casefold_mapping_cache_keys():
+    class Store:
+        def __init__(self):
+            self.names = []
+
+        def provider_mapping_by_name(self, account_uuid, entity_kind, name):
+            self.names.append(name)
+            return {"workspace_uuid": name, "name": name}
+
+    store = Store()
+    cached = service._BackfillConversionStore(store)
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+
+    first = cached.provider_mapping_by_name(account_uuid, "stream", "Straße")
+    second = cached.provider_mapping_by_name(account_uuid, "stream", "STRASSE")
+
+    assert first != second
+    assert store.names == ["Straße", "STRASSE"]
+
+
 def test_backfill_bounds_catalog_and_message_transactions(monkeypatch):
     class Store(DeliveryStore):
         def __init__(self):
@@ -4543,15 +4651,21 @@ def test_backfill_bounds_catalog_and_message_transactions(monkeypatch):
             yield
 
     store = Store()
-    monkeypatch.setattr(
-        converter,
-        "event_records",
-        lambda *args, **kwargs: [
+    conversion_stores = []
+
+    def records(*args, **kwargs):
+        conversion_stores.append(args[0])
+        return [
             {
                 "record_uuid": f"record-{args[3]['message']['id']}",
                 "operation_uuid": f"operation-{args[3]['message']['id']}",
             }
-        ],
+        ]
+
+    monkeypatch.setattr(
+        converter,
+        "event_records",
+        records,
     )
     monkeypatch.setattr(
         converter, "provider_chat_reference", lambda message: ("channel", "channel:42")
@@ -4566,6 +4680,13 @@ def test_backfill_bounds_catalog_and_message_transactions(monkeypatch):
         == 12
     )
     assert store.transactions == 4
+    assert all(
+        isinstance(conversion_store, service._BackfillConversionStore)
+        for conversion_store in conversion_stores
+    )
+    assert len({id(value) for value in conversion_stores[:10]}) == 1
+    assert len({id(value) for value in conversion_stores[10:]}) == 1
+    assert conversion_stores[0] is not conversion_stores[10]
 
 
 def test_backfill_uses_single_message_transactions_while_live_work_is_pending(
@@ -4839,6 +4960,13 @@ def test_backfill_discovers_all_topics_before_waiting_for_workspace_mappings(
                 {
                     "id": 2,
                     "timestamp": 11,
+                    "type": "stream",
+                    "stream_id": 42,
+                    "subject": "newer",
+                },
+                {
+                    "id": 3,
+                    "timestamp": 12,
                     "type": "stream",
                     "stream_id": 42,
                     "subject": "newer",
