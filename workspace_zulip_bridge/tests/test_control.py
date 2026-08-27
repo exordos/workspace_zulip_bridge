@@ -48,6 +48,11 @@ def test_zb_control_002_heartbeat_reports_exact_capabilities():
     assert captured["capabilities"]["messenger.file.transfer"]["limits"] == {
         "max_file_bytes": 52_428_800
     }
+    assert captured["capabilities"]["messenger.message.read"]["revision"] == 2
+    assert captured["capabilities"]["messenger.message.read.paging"] == {
+        "revision": 1,
+        "limits": {},
+    }
 
 
 def test_production_control_client_uses_loaded_mtls_context():

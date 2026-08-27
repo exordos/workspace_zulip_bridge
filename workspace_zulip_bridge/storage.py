@@ -157,6 +157,29 @@ def _same_provider_identity_replay(
     return normalized[0] == normalized[1]
 
 
+def _provider_read_semantic_sha256(record: dict[str, object]) -> str | None:
+    """Return a stable identity for one logical provider read operation."""
+
+    operation = record.get("operation")
+    if not isinstance(operation, dict) or operation.get("kind") != "read_state.set":
+        return None
+    value = copy.deepcopy(record)
+    normalized_operation = typing.cast(dict[str, object], value["operation"])
+    normalized_operation.pop("occurred_at", None)
+    for key in (
+        "_workspace_read_semantic_sha256",
+        "created_at",
+        "expires_at",
+        "operation_sha256",
+        "operation_uuid",
+        "predecessor_operation_uuid",
+        "sequence",
+        "transport",
+    ):
+        value.pop(key, None)
+    return hashlib.sha256(canonical.canonical_json(value)).hexdigest()
+
+
 def _merge_catalog_participants(
     current: list[object],
     observed: list[dict[str, object]],
@@ -373,7 +396,10 @@ class QueueStore(typing.Protocol):
     def mark_result_sent(self, record_uuid: str) -> None: ...
 
     def finalize_provider_result_response(
-        self, record_uuid: str, status: str
+        self,
+        record_uuid: str,
+        status: str,
+        lease_uuid: str | None = None,
     ) -> None: ...
 
 
@@ -7231,31 +7257,124 @@ class RestAlchemyStore:
     def bind_provider_lease(self, record: dict[str, object]) -> bool:
         """Attach a renewed backend lease to existing durable work or outcome."""
         transport = typing.cast(dict[str, object], record["transport"])
+        read_semantic_sha256 = _provider_read_semantic_sha256(record)
         with self.session() as session:
             updated = session.execute(
                 """
-                UPDATE bridge_operations
-                SET record = jsonb_set(
-                        record, '{transport}', %s::jsonb, true
-                    ),
-                    result_record = CASE
-                        WHEN result_record IS NULL THEN NULL
+                WITH candidate AS (
+                    SELECT %s::jsonb AS record,
+                           %s::text AS read_semantic_sha256
+                )
+                UPDATE bridge_operations AS persisted
+                SET record = CASE
+                        WHEN candidate.read_semantic_sha256 IS NULL THEN
+                            jsonb_set(
+                                persisted.record, '{transport}', %s::jsonb, true
+                            )
                         ELSE jsonb_set(
-                            result_record, '{transport}', %s::jsonb, true
+                            jsonb_set(
+                                persisted.record, '{transport}', %s::jsonb, true
+                            ),
+                            '{_workspace_read_semantic_sha256}',
+                            to_jsonb(candidate.read_semantic_sha256),
+                            true
+                        )
+                    END,
+                    result_record = CASE
+                        WHEN persisted.result_record IS NULL THEN NULL
+                        ELSE jsonb_set(
+                            persisted.result_record,
+                            '{transport}', %s::jsonb, true
                         )
                     END,
                     result_sent_at = CASE
-                        WHEN result_record IS NULL THEN result_sent_at
+                        WHEN persisted.result_record IS NULL
+                        THEN persisted.result_sent_at
                         ELSE NULL
                     END,
                     expires_at = %s,
                     updated_at = now()
-                WHERE record_uuid = %s
-                  AND operation_uuid = %s
-                  AND operation_sha256 = %s
-                RETURNING record_uuid
+                FROM candidate
+                WHERE persisted.record_uuid = %s
+                  AND (
+                      (
+                          persisted.operation_uuid = %s
+                          AND persisted.operation_sha256 = %s
+                      )
+                      OR (
+                          persisted.record #>> '{operation,kind}' =
+                              'read_state.set'
+                          AND candidate.record #>> '{operation,kind}' =
+                              'read_state.set'
+                          AND (
+                              persisted.record
+                                  ->>'_workspace_read_semantic_sha256' =
+                                  candidate.read_semantic_sha256
+                              OR (
+                                  persisted.record
+                                      ->>'_workspace_read_semantic_sha256'
+                                      IS NULL
+                                  AND (
+                                      persisted.record
+                                          #- '{operation,occurred_at}'
+                                  ) - ARRAY[
+                                      'created_at', 'expires_at',
+                                      'operation_sha256', 'operation_uuid',
+                                      'predecessor_operation_uuid', 'sequence',
+                                      'transport'
+                                  ] = (
+                                      candidate.record
+                                          #- '{operation,occurred_at}'
+                                  ) - ARRAY[
+                                      'created_at', 'expires_at',
+                                      'operation_sha256', 'operation_uuid',
+                                      'predecessor_operation_uuid', 'sequence',
+                                      'transport'
+                                  ]
+                              )
+                              OR (
+                                  persisted.record
+                                      ->>'_workspace_read_semantic_sha256'
+                                      IS NULL
+                                  AND persisted.result_record IS NOT NULL
+                                  AND persisted.state IN (
+                                      'committed', 'rejected', 'expired',
+                                      'cancelled'
+                                  )
+                                  AND persisted.record
+                                      #> '{operation,payload,message_uuids}' =
+                                      '[]'::jsonb
+                                  AND (
+                                      persisted.record
+                                          #- '{operation,occurred_at}'
+                                  ) - ARRAY[
+                                      'created_at', 'expires_at',
+                                      'operation_sha256', 'operation_uuid',
+                                      'predecessor_operation_uuid', 'sequence',
+                                      'transport'
+                                  ] = (
+                                      jsonb_set(
+                                          candidate.record,
+                                          '{operation,payload,message_uuids}',
+                                          '[]'::jsonb,
+                                          false
+                                      ) #- '{operation,occurred_at}'
+                                  ) - ARRAY[
+                                      'created_at', 'expires_at',
+                                      'operation_sha256', 'operation_uuid',
+                                      'predecessor_operation_uuid', 'sequence',
+                                      'transport'
+                                  ]
+                              )
+                          )
+                      )
+                  )
+                RETURNING persisted.record_uuid
                 """,
                 (
+                    json.dumps(record),
+                    read_semantic_sha256,
+                    json.dumps(transport),
                     json.dumps(transport),
                     json.dumps(transport),
                     record["expires_at"],
@@ -8695,7 +8814,12 @@ class RestAlchemyStore:
                 (record_uuid,),
             )
 
-    def finalize_provider_result_response(self, record_uuid: str, status: str) -> None:
+    def finalize_provider_result_response(
+        self,
+        record_uuid: str,
+        status: str,
+        lease_uuid: str | None = None,
+    ) -> None:
         """Persist one terminal Provider API acknowledgement without retry loops."""
         if status not in {
             "applied",
@@ -8711,10 +8835,50 @@ class RestAlchemyStore:
             None if status in {"applied", "duplicate"} else f"provider_result_{status}"
         )
         with self.session() as session:
+            persisted = session.execute(
+                """
+                SELECT record
+                FROM bridge_operations
+                WHERE result_record->>'record_uuid' = %s
+                  AND (
+                      %s::text IS NULL
+                      OR result_record #>> '{transport,lease_uuid}' = %s
+                  )
+                FOR UPDATE
+                """,
+                (record_uuid, lease_uuid, lease_uuid),
+            ).fetchone()
+            if persisted is None:
+                return
+            persisted_record = typing.cast(dict[str, object], persisted["record"])
+            stored_semantic_sha256 = persisted_record.get(
+                "_workspace_read_semantic_sha256"
+            )
+            read_semantic_sha256 = (
+                stored_semantic_sha256
+                if isinstance(stored_semantic_sha256, str)
+                else _provider_read_semantic_sha256(persisted_record)
+            )
             session.execute(
                 """
                 UPDATE bridge_operations
                 SET result_sent_at = now(),
+                    record = CASE
+                        WHEN %s::text IN ('applied', 'duplicate')
+                         AND record #>> '{operation,kind}' = 'read_state.set'
+                        THEN jsonb_set(
+                            jsonb_set(
+                                record,
+                                '{_workspace_read_semantic_sha256}',
+                                to_jsonb(%s::text),
+                                true
+                            ),
+                            '{operation,payload,message_uuids}',
+                            '[]'::jsonb,
+                            false
+                        )
+                        ELSE record
+                    END,
                     manual_reconciliation_required =
                         manual_reconciliation_required OR %s::boolean,
                     last_error_code = COALESCE(%s::text, last_error_code),
@@ -8729,8 +8893,22 @@ class RestAlchemyStore:
                     END,
                     updated_at = now()
                 WHERE result_record->>'record_uuid' = %s
+                  AND (
+                      %s::text IS NULL
+                      OR result_record #>> '{transport,lease_uuid}' = %s
+                  )
                 """,
-                (manual, code, code, status, record_uuid),
+                (
+                    status,
+                    read_semantic_sha256,
+                    manual,
+                    code,
+                    code,
+                    status,
+                    record_uuid,
+                    lease_uuid,
+                    lease_uuid,
+                ),
             )
 
     def accept_result(self, result: dict[str, object]) -> None:

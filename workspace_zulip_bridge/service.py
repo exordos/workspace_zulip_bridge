@@ -625,8 +625,14 @@ class BridgeService:
         sent = 0
         for record, result in zip(records, results, strict=True):
             status = str(result["status"])
+            transport = record.get("transport")
+            lease_uuid = (
+                str(transport["lease_uuid"])
+                if isinstance(transport, dict) and transport.get("lease_uuid")
+                else None
+            )
             self.store.finalize_provider_result_response(
-                str(record["record_uuid"]), status
+                str(record["record_uuid"]), status, lease_uuid
             )
             if status in {"applied", "duplicate"}:
                 sent += 1
