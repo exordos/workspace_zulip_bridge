@@ -418,6 +418,102 @@ def test_workspace_mapping_prefers_active_alias_over_stale_primary_mapping():
     )
 
 
+def test_workspace_mappings_resolves_a_page_with_one_alias_aware_query():
+    first_uuid = str(uuid.uuid4())
+    second_uuid = str(uuid.uuid4())
+    rows = (
+        {
+            "workspace_uuid": first_uuid,
+            "provider_id": "101",
+            "provider_revision": None,
+            "metadata": {},
+        },
+        {
+            "workspace_uuid": second_uuid,
+            "provider_id": "102",
+            "provider_revision": None,
+            "metadata": {},
+        },
+    )
+    session = Session(rows)
+    store = _store_with_session(session)
+    account_uuid = str(uuid.uuid4())
+
+    assert store.workspace_mappings(
+        account_uuid, "message", [first_uuid, second_uuid]
+    ) == {first_uuid: rows[0], second_uuid: rows[1]}
+    assert len(session.statements) == 1
+    statement, parameters = session.statements[0]
+    assert "DISTINCT ON (workspace_uuid)" in statement
+    assert "alias.metadata, 0 AS source_order" in statement
+    assert "workspace_uuid = ANY(%s::uuid[])" in statement
+    assert parameters == (
+        account_uuid,
+        "message",
+        [first_uuid, second_uuid],
+        account_uuid,
+        "message",
+        [first_uuid, second_uuid],
+    )
+
+
+def test_workspace_mappings_skips_the_database_for_an_empty_page():
+    session = Session()
+    store = _store_with_session(session)
+
+    assert store.workspace_mappings(str(uuid.uuid4()), "message", []) == {}
+    assert session.statements == []
+
+
+def test_provider_result_page_uses_two_bulk_statements_in_one_session():
+    operation_record_uuid = str(uuid.uuid4())
+    result_record_uuid = str(uuid.uuid4())
+    session = Session(
+        (
+            {
+                "record_uuid": operation_record_uuid,
+                "record": {"operation": {"kind": "message.create"}},
+                "result_record_uuid": result_record_uuid,
+                "status": "applied",
+                "lease_uuid": None,
+                "ordinal": 1,
+            },
+        )
+    )
+    store = _store_with_session(session)
+
+    store.finalize_provider_result_responses(
+        [(result_record_uuid, "applied", None)]
+    )
+
+    assert len(session.statements) == 2
+    select_statement, select_parameters = session.statements[0]
+    update_statement, update_parameters = session.statements[1]
+    assert "(operation.result_record->>'record_uuid')::uuid" in select_statement
+    assert "unnest(%s::uuid[], %s::text[], %s::text[])" in select_statement
+    assert select_parameters == ([result_record_uuid], ["applied"], [None])
+    assert "UPDATE bridge_operations AS operation" in update_statement
+    assert "FROM unnest(%s::uuid[], %s::text[], %s::text[])" in update_statement
+    assert update_parameters == (
+        [operation_record_uuid],
+        ["applied"],
+        [None],
+    )
+
+
+def test_pending_results_uses_the_partial_queue_index_shape():
+    result_record_uuid = str(uuid.uuid4())
+    result_record = {"record_uuid": result_record_uuid}
+    session = Session(({"result_record": result_record},))
+    store = _store_with_session(session)
+
+    assert store.pending_results(25) == [result_record]
+    statement, parameters = session.statements[0]
+    assert "result_record IS NOT NULL" in statement
+    assert "ORDER BY updated_at, record_uuid" in statement
+    assert parameters == (25,)
+
+
 def test_tombstoned_workspace_mapping_retains_identity_profile_for_delivery():
     row = {
         "workspace_uuid": uuid.uuid4(),

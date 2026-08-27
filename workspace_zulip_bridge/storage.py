@@ -404,6 +404,11 @@ class QueueStore(typing.Protocol):
         lease_uuid: str | None = None,
     ) -> None: ...
 
+    def finalize_provider_result_responses(
+        self,
+        responses: list[tuple[str, str, str | None]],
+    ) -> None: ...
+
 
 _ENGINE_LOCK = threading.Lock()
 _ENGINE_POOL_CONFIG = {"min_size": 1, "max_size": 20}
@@ -6253,6 +6258,70 @@ class RestAlchemyStore:
                 """,
                 (limit,),
             ).fetchone()
+            session.execute(
+                """
+                WITH candidates AS MATERIALIZED (
+                    SELECT operation.record_uuid,
+                           operation.operation_uuid
+                    FROM bridge_operations AS operation
+                    JOIN operation_idempotency AS legacy
+                      ON legacy.operation_uuid = operation.operation_uuid
+                     AND legacy.terminal_outcome IS NOT NULL
+                    WHERE operation.state = 'committed'
+                      AND operation.result_sent_at IS NOT NULL
+                      AND NOT operation.manual_reconciliation_required
+                      AND operation.last_error_code IS DISTINCT FROM
+                          'provider_result_stale_lease'
+                      AND operation.updated_at <
+                          now() - interval '10 minutes'
+                      AND operation.record->'operation'->>'kind' =
+                          'read_state.set'
+                    ORDER BY operation.updated_at, operation.record_uuid
+                    LIMIT %s
+                    FOR UPDATE OF operation SKIP LOCKED
+                ), physical_idempotency AS (
+                    INSERT INTO operation_idempotency (
+                        operation_uuid, operation_sha256, terminal_outcome,
+                        target_entity_id, target_revision, result_record_uuid,
+                        manual_retry_allowed, updated_at
+                    )
+                    SELECT
+                        candidate.record_uuid,
+                        legacy.operation_sha256,
+                        legacy.terminal_outcome,
+                        legacy.target_entity_id,
+                        legacy.target_revision,
+                        legacy.result_record_uuid,
+                        legacy.manual_retry_allowed,
+                        legacy.updated_at
+                    FROM candidates AS candidate
+                    JOIN operation_idempotency AS legacy
+                      ON legacy.operation_uuid = candidate.operation_uuid
+                    ON CONFLICT (operation_uuid) DO NOTHING
+                    RETURNING operation_uuid
+                ), safe AS MATERIALIZED (
+                    SELECT candidate.record_uuid
+                    FROM candidates AS candidate
+                    JOIN operation_idempotency AS legacy
+                      ON legacy.operation_uuid = candidate.operation_uuid
+                    LEFT JOIN operation_idempotency AS physical
+                      ON physical.operation_uuid = candidate.record_uuid
+                    LEFT JOIN physical_idempotency AS inserted
+                      ON inserted.operation_uuid = candidate.record_uuid
+                    WHERE inserted.operation_uuid IS NOT NULL
+                       OR (
+                            physical.terminal_outcome IS NOT DISTINCT FROM
+                                legacy.terminal_outcome
+                            AND physical.manual_retry_allowed =
+                                legacy.manual_retry_allowed
+                          )
+                )
+                DELETE FROM bridge_operations AS operation
+                USING safe
+                WHERE operation.record_uuid = safe.record_uuid
+                """,
+                (limit,),
+            )
             # Walk old terminal reports through a durable cursor and probe the
             # semantic head through the resource-order index.  Both the outer
             # scan and every head lookup stay bounded even when every retained
@@ -7480,16 +7549,36 @@ class RestAlchemyStore:
                 """,
                 (operation_uuid,),
             ).fetchone()
+            attempt = int(record["attempt"])
+            operation = typing.cast(dict[str, object], record["operation"])
+            if (
+                attempt == 1
+                and prior is not None
+                and prior["terminal_outcome"] is not None
+                and operation.get("kind") == "read_state.set"
+            ):
+                # A compact terminal operation can be pruned after its result
+                # acknowledgement.  Older retained digests include a generated
+                # read timestamp, so recognize the immutable physical page UUID
+                # before comparing that legacy digest.
+                return False
             if prior is not None and prior["operation_sha256"] != operation_sha256:
                 raise ValueError("Operation UUID reused with a different digest")
-            attempt = int(record["attempt"])
+            if (
+                attempt == 1
+                and prior is not None
+                and prior["terminal_outcome"] is not None
+            ):
+                # A compact terminal operation can be pruned after its result
+                # acknowledgement.  Its durable idempotency row must still
+                # prevent a delayed lease replay from calling Zulip again.
+                return False
             if attempt > 1 and (
                 prior is None
                 or prior["terminal_outcome"] not in {"rejected", "expired"}
                 or prior["manual_retry_allowed"] is not True
             ):
                 raise ValueError("Higher attempt is not authorized by prior result")
-            operation = typing.cast(dict[str, object], record["operation"])
             provider = typing.cast(dict[str, object], operation["provider"])
             assignment = session.execute(
                 """
@@ -7605,6 +7694,13 @@ class RestAlchemyStore:
                         WHEN persisted.result_record IS NULL
                         THEN persisted.result_sent_at
                         ELSE NULL
+                    END,
+                    last_error_code = CASE
+                        WHEN persisted.result_record IS NOT NULL
+                         AND persisted.last_error_code =
+                             'provider_result_stale_lease'
+                        THEN NULL
+                        ELSE persisted.last_error_code
                     END,
                     expires_at = %s,
                     updated_at = now()
@@ -9110,7 +9206,7 @@ class RestAlchemyStore:
                 """
                 SELECT result_record FROM bridge_operations
                 WHERE result_record IS NOT NULL AND result_sent_at IS NULL
-                ORDER BY updated_at LIMIT %s
+                ORDER BY updated_at, record_uuid LIMIT %s
                 """,
                 (limit,),
             ).fetchall()
@@ -9123,7 +9219,7 @@ class RestAlchemyStore:
             session.execute(
                 """
                 UPDATE bridge_operations SET result_sent_at = now(), updated_at = now()
-                WHERE result_record->>'record_uuid' = %s
+                WHERE (result_record->>'record_uuid')::uuid = %s
                 """,
                 (record_uuid,),
             )
@@ -9135,94 +9231,126 @@ class RestAlchemyStore:
         lease_uuid: str | None = None,
     ) -> None:
         """Persist one terminal Provider API acknowledgement without retry loops."""
-        if status not in {
+        self.finalize_provider_result_responses(
+            [(record_uuid, status, lease_uuid)]
+        )
+
+    def finalize_provider_result_responses(
+        self,
+        responses: list[tuple[str, str, str | None]],
+    ) -> None:
+        """Persist one Provider API result page with two indexed SQL statements."""
+        if not responses:
+            return
+        allowed_statuses = {
             "applied",
             "duplicate",
             "conflict",
             "not_found",
             "stale_lease",
             "rejected",
-        }:
+        }
+        if any(status not in allowed_statuses for _, status, _ in responses):
             raise ValueError("Unsupported Provider result response status")
-        manual = status in {"conflict", "not_found", "rejected"}
-        code = (
-            None if status in {"applied", "duplicate"} else f"provider_result_{status}"
-        )
+        result_uuids = [record_uuid for record_uuid, _, _ in responses]
+        statuses = [status for _, status, _ in responses]
+        lease_uuids = [lease_uuid for _, _, lease_uuid in responses]
         with self.session() as session:
-            persisted = session.execute(
+            persisted_rows = session.execute(
                 """
-                SELECT record
-                FROM bridge_operations
-                WHERE result_record->>'record_uuid' = %s
-                  AND (
-                      %s::text IS NULL
-                      OR result_record #>> '{transport,lease_uuid}' = %s
-                  )
-                FOR UPDATE
+                WITH responses AS (
+                    SELECT *
+                    FROM unnest(%s::uuid[], %s::text[], %s::text[])
+                         WITH ORDINALITY AS response(
+                             result_record_uuid, status, lease_uuid, ordinal
+                         )
+                )
+                SELECT operation.record_uuid, operation.record,
+                       response.result_record_uuid, response.status,
+                       response.lease_uuid, response.ordinal
+                FROM responses AS response
+                JOIN bridge_operations AS operation
+                  ON (operation.result_record->>'record_uuid')::uuid =
+                     response.result_record_uuid
+                WHERE response.lease_uuid IS NULL
+                   OR operation.result_record #>> '{transport,lease_uuid}' =
+                      response.lease_uuid
+                ORDER BY response.ordinal
+                FOR UPDATE OF operation
                 """,
-                (record_uuid, lease_uuid, lease_uuid),
-            ).fetchone()
-            if persisted is None:
+                (result_uuids, statuses, lease_uuids),
+            ).fetchall()
+            if not persisted_rows:
                 return
-            persisted_record = typing.cast(dict[str, object], persisted["record"])
-            stored_semantic_sha256 = persisted_record.get(
-                "_workspace_read_semantic_sha256"
-            )
-            read_semantic_sha256 = (
-                stored_semantic_sha256
-                if isinstance(stored_semantic_sha256, str)
-                else _provider_read_semantic_sha256(persisted_record)
-            )
+            operation_uuids = []
+            matched_statuses = []
+            semantic_sha256s = []
+            for row in persisted_rows:
+                persisted_record = typing.cast(dict[str, object], row["record"])
+                stored_semantic_sha256 = persisted_record.get(
+                    "_workspace_read_semantic_sha256"
+                )
+                semantic_sha256s.append(
+                    stored_semantic_sha256
+                    if isinstance(stored_semantic_sha256, str)
+                    else _provider_read_semantic_sha256(persisted_record)
+                )
+                operation_uuids.append(str(row["record_uuid"]))
+                matched_statuses.append(str(row["status"]))
             session.execute(
                 """
-                UPDATE bridge_operations
+                WITH responses AS (
+                    SELECT *
+                    FROM unnest(%s::uuid[], %s::text[], %s::text[])
+                         AS response(
+                             record_uuid, status, read_semantic_sha256
+                         )
+                )
+                UPDATE bridge_operations AS operation
                 SET result_sent_at = now(),
                     record = CASE
-                        WHEN %s::text IN ('applied', 'duplicate')
-                         AND record #>> '{operation,kind}' = 'read_state.set'
+                        WHEN response.status IN ('applied', 'duplicate')
+                         AND operation.record #>> '{operation,kind}' =
+                             'read_state.set'
                         THEN jsonb_set(
                             jsonb_set(
-                                record,
+                                operation.record,
                                 '{_workspace_read_semantic_sha256}',
-                                to_jsonb(%s::text),
+                                to_jsonb(response.read_semantic_sha256),
                                 true
                             ),
                             '{operation,payload,message_uuids}',
                             '[]'::jsonb,
                             false
                         )
-                        ELSE record
+                        ELSE operation.record
                     END,
                     manual_reconciliation_required =
-                        manual_reconciliation_required OR %s::boolean,
-                    last_error_code = COALESCE(%s::text, last_error_code),
+                        operation.manual_reconciliation_required
+                        OR response.status IN (
+                            'conflict', 'not_found', 'rejected'
+                        ),
+                    last_error_code = CASE
+                        WHEN response.status IN ('applied', 'duplicate')
+                        THEN NULL
+                        ELSE 'provider_result_' || response.status
+                    END,
                     reconciliation_evidence = CASE
-                        WHEN %s::text IS NULL THEN reconciliation_evidence
-                        ELSE reconciliation_evidence || jsonb_build_array(
-                            jsonb_build_object(
-                                'kind', 'provider_result_response',
-                                'status', %s::text
-                            )
-                        )
+                        WHEN response.status IN ('applied', 'duplicate')
+                        THEN operation.reconciliation_evidence
+                        ELSE operation.reconciliation_evidence ||
+                             jsonb_build_array(
+                                 jsonb_build_object(
+                                     'kind', 'provider_result_response',
+                                     'status', response.status
+                                 )
+                             )
                     END,
                     updated_at = now()
-                WHERE result_record->>'record_uuid' = %s
-                  AND (
-                      %s::text IS NULL
-                      OR result_record #>> '{transport,lease_uuid}' = %s
-                  )
+                FROM responses AS response
+                WHERE operation.record_uuid = response.record_uuid
                 """,
-                (
-                    status,
-                    read_semantic_sha256,
-                    manual,
-                    code,
-                    code,
-                    status,
-                    record_uuid,
-                    lease_uuid,
-                    lease_uuid,
-                ),
+                (operation_uuids, matched_statuses, semantic_sha256s),
             )
 
     def accept_result(self, result: dict[str, object]) -> None:
