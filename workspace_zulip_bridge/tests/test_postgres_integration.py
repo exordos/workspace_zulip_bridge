@@ -1,3 +1,4 @@
+import copy
 import datetime
 import json
 import os
@@ -3271,6 +3272,267 @@ def test_provider_result_acknowledgement_types_nullable_sql_parameters(
     assert row["last_error_code"] == expected_code
     assert row["manual_reconciliation_required"] is expected_manual
     assert row["reconciliation_evidence"] == expected_evidence
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_message_count"),
+    [("applied", 0), ("duplicate", 0), ("rejected", 2)],
+)
+def test_provider_result_acknowledgement_scrubs_terminal_read_payload(
+    postgres_store,
+    status,
+    expected_message_count,
+):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    record = _provider_record(account_uuid, project_uuid, kind="read_state.set")
+    operation = record["operation"]
+    assert isinstance(operation, dict)
+    payload = operation["payload"]
+    assert isinstance(payload, dict)
+    payload["message_uuids"] = [str(uuid.uuid4()), str(uuid.uuid4())]
+    payload["reader_uuid"] = str(uuid.uuid4())
+    payload["read"] = True
+    record["transport"] = {
+        "provider_operation_uuid": record["record_uuid"],
+        "lease_uuid": str(uuid.uuid4()),
+    }
+    record["operation_sha256"] = canonical.operation_digest(record)
+    result_uuid = str(uuid.uuid4())
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            INSERT INTO bridge_operations (
+                record_uuid, operation_uuid, attempt, operation_sha256,
+                account_uuid, project_uuid, origin, causal_lane, lane_sequence,
+                priority, state, record, result_record
+            ) VALUES (%s, %s, 1, %s, %s, %s, 'workspace', %s, 1, 0,
+                      'committed', %s::jsonb, %s::jsonb)
+            """,
+            (
+                record["record_uuid"],
+                record["operation_uuid"],
+                record["operation_sha256"],
+                account_uuid,
+                project_uuid,
+                record["causal_lane"],
+                json.dumps(record),
+                json.dumps({"record_uuid": result_uuid}),
+            ),
+        )
+
+    postgres_store.finalize_provider_result_response(result_uuid, status)
+
+    with postgres_store.session() as session:
+        row = session.execute(
+            """
+            SELECT record #> '{operation,payload,message_uuids}' AS message_uuids,
+                   operation_sha256,
+                   record->>'operation_sha256' AS record_operation_sha256
+            FROM bridge_operations
+            WHERE record_uuid = %s
+            """,
+            (record["record_uuid"],),
+        ).fetchone()
+    assert len(row["message_uuids"]) == expected_message_count
+    assert row["operation_sha256"] == record["operation_sha256"]
+    assert row["record_operation_sha256"] == record["operation_sha256"]
+    if status in {"applied", "duplicate"}:
+        renewed_lease_uuid = str(uuid.uuid4())
+        transport = record["transport"]
+        assert isinstance(transport, dict)
+        transport["lease_uuid"] = renewed_lease_uuid
+        assert postgres_store.bind_provider_lease(record) is True
+        pending = postgres_store.pending_results()
+        assert len(pending) == 1
+        assert pending[0]["transport"]["lease_uuid"] == renewed_lease_uuid
+        with postgres_store.session() as session:
+            rebound = session.execute(
+                """
+                SELECT record #> '{operation,payload,message_uuids}'
+                           AS message_uuids,
+                       result_sent_at
+                FROM bridge_operations
+                WHERE record_uuid = %s
+                """,
+                (record["record_uuid"],),
+            ).fetchone()
+        assert rebound["message_uuids"] == []
+        assert rebound["result_sent_at"] is None
+
+
+def test_provider_read_rebind_preserves_persisted_revision_identity(
+    postgres_store,
+):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    provider_operation_uuid = str(uuid.uuid4())
+    public_operation_uuid = str(uuid.uuid4())
+    old_lease_uuid = str(uuid.uuid4())
+    renewed_lease_uuid = str(uuid.uuid4())
+    persisted = _provider_record(
+        account_uuid,
+        project_uuid,
+        kind="read_state.set",
+    )
+    persisted.update(
+        {
+            "record_uuid": provider_operation_uuid,
+            "operation_uuid": provider_operation_uuid,
+            "origin": "workspace",
+            "sequence": 7,
+            "predecessor_operation_uuid": str(uuid.uuid4()),
+            "expires_at": "2026-08-27T12:05:00Z",
+            "transport": {
+                "provider_operation_uuid": provider_operation_uuid,
+                "lease_uuid": old_lease_uuid,
+            },
+        }
+    )
+    operation = persisted["operation"]
+    assert isinstance(operation, dict)
+    operation["occurred_at"] = "2026-08-27T12:00:00Z"
+    operation["payload"] = {
+        "message_uuids": [str(uuid.uuid4()), str(uuid.uuid4())],
+        "reader_uuid": str(uuid.uuid4()),
+        "read": True,
+    }
+    persisted["operation_sha256"] = canonical.operation_digest(persisted)
+    result_uuid = str(uuid.uuid4())
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            INSERT INTO bridge_operations (
+                record_uuid, operation_uuid, attempt, operation_sha256,
+                account_uuid, project_uuid, origin, causal_lane, lane_sequence,
+                predecessor_operation_uuid, priority, state, expires_at,
+                record, result_record, result_sent_at
+            ) VALUES (
+                %s, %s, 1, %s, %s, %s, 'workspace', %s, 7, %s, 0,
+                'committed', %s, %s::jsonb, %s::jsonb, now()
+            )
+            """,
+            (
+                provider_operation_uuid,
+                provider_operation_uuid,
+                persisted["operation_sha256"],
+                account_uuid,
+                project_uuid,
+                persisted["causal_lane"],
+                persisted["predecessor_operation_uuid"],
+                persisted["expires_at"],
+                json.dumps(persisted),
+                json.dumps(
+                    {
+                        "record_uuid": result_uuid,
+                        "transport": persisted["transport"],
+                    }
+                ),
+            ),
+        )
+
+    postgres_store.finalize_provider_result_response(result_uuid, "applied")
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE bridge_operations
+            SET record = record - '_workspace_read_semantic_sha256'
+            WHERE record_uuid = %s
+            """,
+            (provider_operation_uuid,),
+        )
+
+    renewed = copy.deepcopy(persisted)
+    renewed["operation_uuid"] = public_operation_uuid
+    renewed["sequence"] = 0
+    renewed["predecessor_operation_uuid"] = None
+    renewed["created_at"] = "2026-08-27T12:01:00Z"
+    renewed["expires_at"] = "2026-08-27T12:06:00Z"
+    renewed_operation = renewed["operation"]
+    assert isinstance(renewed_operation, dict)
+    renewed_operation["occurred_at"] = "2026-08-27T12:01:00Z"
+    renewed["transport"] = {
+        "provider_operation_uuid": provider_operation_uuid,
+        "lease_uuid": renewed_lease_uuid,
+    }
+    renewed["operation_sha256"] = canonical.operation_digest(renewed)
+
+    legacy_mismatch = copy.deepcopy(renewed)
+    legacy_mismatch_operation = legacy_mismatch["operation"]
+    assert isinstance(legacy_mismatch_operation, dict)
+    legacy_mismatch_payload = legacy_mismatch_operation["payload"]
+    assert isinstance(legacy_mismatch_payload, dict)
+    legacy_mismatch_payload["reader_uuid"] = str(uuid.uuid4())
+    legacy_mismatch["operation_sha256"] = canonical.operation_digest(legacy_mismatch)
+    assert postgres_store.bind_provider_lease(legacy_mismatch) is False
+    assert postgres_store.pending_results() == []
+
+    assert postgres_store.bind_provider_lease(renewed) is True
+
+    with postgres_store.session() as session:
+        rebound = session.execute(
+            """
+            SELECT operation_uuid, operation_sha256,
+                   record #>> '{transport,lease_uuid}' AS record_lease_uuid,
+                   record #> '{operation,payload,message_uuids}'
+                       AS message_uuids,
+                   record->>'_workspace_read_semantic_sha256'
+                       AS read_semantic_sha256,
+                   result_record #>> '{transport,lease_uuid}'
+                       AS result_lease_uuid,
+                   result_sent_at, expires_at
+            FROM bridge_operations
+            WHERE record_uuid = %s
+            """,
+            (provider_operation_uuid,),
+        ).fetchone()
+    assert str(rebound["operation_uuid"]) == provider_operation_uuid
+    assert rebound["operation_sha256"] == persisted["operation_sha256"]
+    assert rebound["record_lease_uuid"] == renewed_lease_uuid
+    assert rebound["message_uuids"] == []
+    assert len(rebound["read_semantic_sha256"]) == 64
+    assert rebound["result_lease_uuid"] == renewed_lease_uuid
+    assert rebound["result_sent_at"] is None
+    assert (
+        rebound["expires_at"]
+        .astimezone(datetime.UTC)
+        .isoformat()
+        .replace("+00:00", "Z")
+        == renewed["expires_at"]
+    )
+
+    postgres_store.finalize_provider_result_response(
+        result_uuid,
+        "duplicate",
+        old_lease_uuid,
+    )
+    assert postgres_store.pending_results() != []
+    postgres_store.finalize_provider_result_response(
+        result_uuid,
+        "duplicate",
+        renewed_lease_uuid,
+    )
+    assert postgres_store.pending_results() == []
+    mismatched = copy.deepcopy(renewed)
+    mismatched_operation = mismatched["operation"]
+    assert isinstance(mismatched_operation, dict)
+    mismatched_payload = mismatched_operation["payload"]
+    assert isinstance(mismatched_payload, dict)
+    mismatched_payload["message_uuids"] = [str(uuid.uuid4())]
+    mismatched["operation_sha256"] = canonical.operation_digest(mismatched)
+    mismatched_transport = mismatched["transport"]
+    assert isinstance(mismatched_transport, dict)
+    mismatched_transport["lease_uuid"] = str(uuid.uuid4())
+
+    assert postgres_store.bind_provider_lease(mismatched) is False
+    with postgres_store.session() as session:
+        result_sent_at = session.execute(
+            """
+            SELECT result_sent_at
+            FROM bridge_operations
+            WHERE record_uuid = %s
+            """,
+            (provider_operation_uuid,),
+        ).fetchone()["result_sent_at"]
+    assert result_sent_at is not None
 
 
 def test_initial_backfill_gate_uses_account_priority_index(postgres_store):

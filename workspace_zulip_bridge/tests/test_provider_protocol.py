@@ -113,6 +113,57 @@ def test_provider_lease_adapts_to_existing_durable_zulip_scheduler():
     assert record["transport"]["lease_uuid"] == leased["lease_uuid"]
 
 
+def test_provider_read_lease_uses_physical_page_identity_internally():
+    first = _lease("read_state.set")
+    first["required_capability"] = "messenger.message.read"
+    first["payload"] = {
+        "stream_uuid": STREAM_UUID,
+        "topic_uuid": TOPIC_UUID,
+        "reader_uuid": ACCOUNT_UUID,
+        "message_uuids": [MESSAGE_UUID],
+        "read": True,
+    }
+    second = _lease("read_state.set")
+    second["external_operation_uuid"] = second["provider_operation_uuid"]
+    second["required_capability"] = "messenger.message.read"
+    second["payload"] = {
+        **first["payload"],
+        "message_uuids": [str(uuid.uuid4())],
+    }
+
+    first_record = provider_protocol.leased_operation_record(Store(), first)
+    second_record = provider_protocol.leased_operation_record(Store(), second)
+
+    assert first["external_operation_uuid"] != first["provider_operation_uuid"]
+    assert first_record["operation_uuid"] == first["provider_operation_uuid"]
+    assert second["external_operation_uuid"] == second["provider_operation_uuid"]
+    assert second_record["operation_uuid"] == second["provider_operation_uuid"]
+    assert first_record["operation_uuid"] != second_record["operation_uuid"]
+    assert first_record["operation_sha256"] != second_record["operation_sha256"]
+
+
+def test_provider_read_lease_reconstruction_keeps_terminal_digest():
+    leased = _lease("read_state.set")
+    leased["required_capability"] = "messenger.message.read"
+    leased["payload"] = {
+        "stream_uuid": STREAM_UUID,
+        "topic_uuid": TOPIC_UUID,
+        "reader_uuid": ACCOUNT_UUID,
+        "message_uuids": [MESSAGE_UUID],
+        "read": True,
+    }
+
+    first = provider_protocol.leased_operation_record(Store(), leased)
+    leased["lease_uuid"] = str(uuid.uuid4())
+    leased["lease_expires_at"] = "2026-07-18T16:00:00Z"
+    second = provider_protocol.leased_operation_record(Store(), leased)
+
+    assert first["operation"]["occurred_at"] == "1970-01-01T00:00:00Z"
+    assert second["operation"]["occurred_at"] == "1970-01-01T00:00:00Z"
+    assert first["operation_uuid"] == second["operation_uuid"]
+    assert first["operation_sha256"] == second["operation_sha256"]
+
+
 def test_provider_reaction_lease_resolves_the_target_message_mapping():
     leased = _lease("reaction.create")
     leased["required_capability"] = "messenger.reaction.write"

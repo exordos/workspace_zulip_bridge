@@ -66,8 +66,8 @@ class Store:
     def mark_result_sent(self, record_uuid):
         self.sent.append(record_uuid)
 
-    def finalize_provider_result_response(self, record_uuid, status):
-        self.finalized.append((record_uuid, status))
+    def finalize_provider_result_response(self, record_uuid, status, lease_uuid=None):
+        self.finalized.append((record_uuid, status, lease_uuid))
         if status in {"applied", "duplicate"}:
             self.sent.append(record_uuid)
 
@@ -255,6 +255,37 @@ def test_poll_provider_operations_durably_enqueues_exact_read_state_selector():
     assert record["transport"]["required_capability"] == "messenger.message.read"
 
 
+def test_poll_provider_operations_keeps_lazy_read_pages_independently_idempotent():
+    instance = _instance()
+    pages = []
+    for message_uuid in (str(uuid.uuid4()), str(uuid.uuid4())):
+        leased = _lease()
+        leased.update(
+            {
+                "operation_kind": "read_state.set",
+                "required_capability": "messenger.message.read",
+                "payload": {
+                    "stream_uuid": STREAM_UUID,
+                    "topic_uuid": TOPIC_UUID,
+                    "reader_uuid": ACCOUNT_UUID,
+                    "message_uuids": [message_uuid],
+                    "read": True,
+                },
+            }
+        )
+        leased["external_operation_uuid"] = leased["provider_operation_uuid"]
+        pages.append(leased)
+    instance.provider_api.leased = pages
+
+    assert instance.poll_provider_operations() == 2
+
+    records = [record for record, priority in instance.store.enqueued if priority == 0]
+    assert [record["operation_uuid"] for record in records] == [
+        page["provider_operation_uuid"] for page in pages
+    ]
+    assert records[0]["operation_sha256"] != records[1]["operation_sha256"]
+
+
 def test_poll_provider_operations_durably_enqueues_membership_write():
     instance = _instance()
     leased = _lease()
@@ -304,7 +335,11 @@ def test_flush_provider_results_reports_and_persists_backend_acceptance():
     assert instance.provider_api.reported[0]["status"] == "succeeded"
     assert instance.store.sent == [instance.store.results[0]["record_uuid"]]
     assert instance.store.finalized == [
-        (instance.store.results[0]["record_uuid"], "applied")
+        (
+            instance.store.results[0]["record_uuid"],
+            "applied",
+            leased["lease_uuid"],
+        )
     ]
 
 
@@ -332,7 +367,7 @@ def test_flush_provider_results_terminal_response_does_not_retry_forever(status)
     instance.provider_api.report_results = respond
 
     assert instance.flush_provider_results() == 0
-    assert instance.store.finalized == [(record_uuid, status)]
+    assert instance.store.finalized == [(record_uuid, status, leased["lease_uuid"])]
 
 
 def _inbound_record():

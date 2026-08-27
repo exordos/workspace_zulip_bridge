@@ -150,6 +150,21 @@ def leased_operation_record(store, leased: dict[str, object]) -> dict[str, objec
     elif kind not in {"message.create", "read_state.set"}:
         mapping = _provider_mapping(store, account_uuid, entity_kind, entity_uuid)
         entity_id = str(mapping["provider_id"])
+    occurred_at = (
+        payload.get("notification_updated_at")
+        or payload.get("updated_at")
+        or payload.get("created_at")
+    )
+    if occurred_at is None:
+        # Read pages carry no event timestamp.  Their physical provider UUID is
+        # immutable across renewed leases, so keep the digest immutable too;
+        # otherwise a replay reconstructed after terminal-row pruning is
+        # rejected before durable idempotency can deduplicate it.
+        occurred_at = (
+            "1970-01-01T00:00:00Z"
+            if kind == "read_state.set"
+            else datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
+        )
     operation = {
         "kind": bridge_kind,
         "entity_uuid": entity_uuid,
@@ -160,12 +175,7 @@ def leased_operation_record(store, leased: dict[str, object]) -> dict[str, objec
             or payload.get("author_uuid")
             or uuid.UUID(int=0)
         ),
-        "occurred_at": str(
-            payload.get("notification_updated_at")
-            or payload.get("updated_at")
-            or payload.get("created_at")
-            or datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
-        ),
+        "occurred_at": str(occurred_at),
         "provider": {
             "kind": "zulip",
             "chat_id": chat_key,
@@ -175,7 +185,20 @@ def leased_operation_record(store, leased: dict[str, object]) -> dict[str, objec
         "payload": payload,
         "extensions": {},
     }
-    local_operation_uuid = str(uuid.UUID(str(leased["external_operation_uuid"])))
+    # The provider record is the durable local unit. Its UUID remains stable
+    # across lease retries even when an older backend exposes a public read
+    # operation UUID in the legacy external field.
+    local_operation_uuid = str(
+        uuid.UUID(
+            str(
+                leased[
+                    "provider_operation_uuid"
+                    if kind == "read_state.set"
+                    else "external_operation_uuid"
+                ]
+            )
+        )
+    )
     record: dict[str, object] = {
         "schema": "workspace.provider",
         "schema_version": 1,
