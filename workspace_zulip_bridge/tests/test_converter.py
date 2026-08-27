@@ -500,6 +500,33 @@ def test_zulip_internal_and_external_links_become_workspace_urns():
     assert "Open original" not in markdown
 
 
+def test_self_dm_link_resolves_group_direct_mapping():
+    store = FakeStore()
+    store.remember_provider_mapping(
+        ACCOUNT_UUID,
+        "identity",
+        "1",
+        OWNER_UUID,
+        {"display_name": "Owner", "active": True},
+    )
+    self_dm_uuid = store.provider_mapping(
+        ACCOUNT_UUID,
+        "stream",
+        "group_direct:1",
+    )["workspace_uuid"]
+    resolver = converter.ZulipLinkResolver(store, ACCOUNT_UUID, OWNER_UUID)
+
+    converted, lossy = converter.convert_markdown(
+        "[self](https://chat.example.invalid/#narrow/dm/1-user)",
+        {},
+        "https://chat.example.invalid/#narrow/near/602",
+        link_resolver=resolver,
+    )
+
+    assert not lossy
+    assert converted == f"[self](urn:stream:{self_dm_uuid})"
+
+
 @pytest.mark.parametrize(
     "malformed_url",
     (

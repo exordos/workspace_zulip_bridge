@@ -1399,8 +1399,6 @@ class BridgeService:
             participants = set(typing.cast(list[int], user_ids))
             if isinstance(provider_user_id, int):
                 participants.add(provider_user_id)
-            if len(participants) < 2:
-                continue
             ordered = sorted(participants)
             chat_type = "direct" if len(ordered) == 2 else "group_direct"
             chat_key = f"{chat_type}:{','.join(map(str, ordered))}"
@@ -1416,7 +1414,11 @@ class BridgeService:
                 )
                 for value in ordered
             ]
-            catalog[chat_key] = (chat_type, ", ".join(peer_names), participants)
+            catalog[chat_key] = (
+                chat_type,
+                ", ".join(peer_names) if peer_names else owner_name,
+                participants,
+            )
         if assignments is None:
             omitted_channels = getattr(
                 self.store, "omitted_cataloged_channels", None
@@ -1870,6 +1872,8 @@ class BridgeService:
         if chat_type == "direct":
             return f"{provider_site}/#narrow/dm/{identifiers}-dm"
         if chat_type == "group_direct":
+            if "," not in identifiers:
+                return f"{provider_site}/#narrow/dm/{identifiers}-user"
             return f"{provider_site}/#narrow/dm/{identifiers}-group"
         return provider_site
 
