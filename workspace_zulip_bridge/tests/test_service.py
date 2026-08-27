@@ -2863,7 +2863,10 @@ def test_registration_snapshot_queues_account_live_ready_and_chat_catalog_report
                     "subscribers": [1, 2],
                 }
             ],
-            "recent_private_conversations": [{"user_ids": [2], "max_message_id": 99}],
+            "recent_private_conversations": [
+                {"user_ids": [1], "max_message_id": 98},
+                {"user_ids": [2], "max_message_id": 99},
+            ],
         },
         "https://zulip.example.invalid",
     )
@@ -2875,14 +2878,16 @@ def test_registration_snapshot_queues_account_live_ready_and_chat_catalog_report
     assert len(account) == 1
     assert account[0]["status"] == "live_ready"
     assert account[0]["observed_generation"] == 7
-    assert len(catalog) == 2
+    assert len(catalog) == 3
     assert {r["catalog"]["source"]["provider_chat_key"] for r in catalog} == {
         "channel:42",
         "direct:1,2",
+        "group_direct:1",
     }
     assert {r["catalog"]["display_name"] for r in catalog} == {
         "Engineering",
         "Other User",
+        "Owner",
     }
     assert instance.store.mappings[0][1:4] == ("identity", "1", owner_uuid)
     channel = next(
@@ -2895,8 +2900,16 @@ def test_registration_snapshot_queues_account_live_ready_and_chat_catalog_report
         for report in catalog
         if report["catalog"]["source"]["provider_chat_key"] == "direct:1,2"
     )
+    self_direct = next(
+        report
+        for report in catalog
+        if report["catalog"]["source"]["provider_chat_key"] == "group_direct:1"
+    )
     assert channel["catalog"]["source"]["original_url"].endswith("/#narrow/channel/42")
     assert direct["catalog"]["source"]["original_url"].endswith("/#narrow/dm/1,2-dm")
+    assert self_direct["catalog"]["source"]["original_url"].endswith(
+        "/#narrow/dm/1-user"
+    )
     assert channel["catalog"]["participants"] == [
         {
             "provider_user_id": "1",
@@ -2938,6 +2951,22 @@ def test_registration_snapshot_queues_account_live_ready_and_chat_catalog_report
             "avatar_urn": None,
             "is_owner": False,
         },
+    ]
+    assert self_direct["catalog"]["participants"] == [
+        {
+            "provider_user_id": "1",
+            "display_name": "Owner",
+            "email": "owner@example.invalid",
+            "avatar_urn": None,
+            "is_owner": True,
+        }
+    ]
+    assert self_direct["catalog"]["topics"] == [
+        {
+            "provider_topic_id": "group_direct:1:default",
+            "name": "Zulip",
+            "is_default": True,
+        }
     ]
     assert direct["catalog"]["topics"] == [
         {
@@ -3855,6 +3884,9 @@ def test_catalog_original_urls_follow_zulip_dm_permalink_shapes():
     assert (
         service.BridgeService._catalog_original_url(site, "group_direct:1,2,3")
         == f"{site}/#narrow/dm/1,2,3-group"
+    )
+    assert service.BridgeService._catalog_original_url(site, "group_direct:1") == (
+        f"{site}/#narrow/dm/1-user"
     )
 
 

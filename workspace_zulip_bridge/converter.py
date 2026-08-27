@@ -201,7 +201,7 @@ class ZulipLinkResolver:
         ids.add(self._owner_provider_id)
         if not ids:
             return None
-        chat_type = "direct" if len(ids) <= 2 else "group_direct"
+        chat_type = "direct" if len(ids) == 2 else "group_direct"
         provider_id = f"{chat_type}:{','.join(str(value) for value in sorted(ids))}"
         return self.provider_urn("stream", provider_id)
 

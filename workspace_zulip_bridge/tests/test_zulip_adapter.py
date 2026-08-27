@@ -238,6 +238,13 @@ class FakeRouting:
                 "participants": [OWNER_UUID, USER_2_UUID, USER_3_UUID],
             }
         },
+        "group_direct:1": {
+            "metadata": {
+                "chat_type": "group_direct",
+                "name": "Owner",
+                "participants": [OWNER_UUID],
+            }
+        },
     }
     workspace = {
         ("stream", STREAM_UUID): {
@@ -277,10 +284,10 @@ class FakeRouting:
             },
         },
         ("stream", SELF_STREAM_UUID): {
-            "provider_id": "direct:1",
+            "provider_id": "group_direct:1",
             "metadata": {
-                "chat_type": "direct",
-                "name": "Direct message",
+                "chat_type": "group_direct",
+                "name": "Owner",
                 "participants": [OWNER_UUID],
             },
         },
@@ -320,6 +327,7 @@ def _operation(chat_kind="channel"):
         "channel": "channel:42",
         "personal_dm": "direct:2",
         "group_dm": "group_direct:2,3",
+        "self_dm": "group_direct:1",
     }[chat_kind]
     return {
         "kind": "message.create",
@@ -436,7 +444,9 @@ def test_selected_channel_catalog_marks_missing_subscriber_unavailable():
     assert client.user_requests == [(3, {})]
 
 
-@pytest.mark.parametrize("chat_kind", ["channel", "personal_dm", "group_dm"])
+@pytest.mark.parametrize(
+    "chat_kind", ["channel", "personal_dm", "group_dm", "self_dm"]
+)
 def test_zb_msg_001_message_mapping_uses_official_client_semantics(chat_kind):
     client = FakeClient()
     adapter = _adapter(client)
@@ -451,7 +461,11 @@ def test_zb_msg_001_message_mapping_uses_official_client_semantics(chat_kind):
         assert request["to"] == "engineering"
         assert request["topic"] == "bridge"
     else:
-        assert request["to"] == ([2] if chat_kind == "personal_dm" else [2, 3])
+        assert request["to"] == {
+            "personal_dm": [2],
+            "group_dm": [2, 3],
+            "self_dm": [1],
+        }[chat_kind]
 
 
 def test_outbound_mentions_and_attachments_use_provider_formats_without_raw_urns():

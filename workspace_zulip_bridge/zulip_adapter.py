@@ -449,6 +449,12 @@ class OfficialZulipAdapter:
         recipient_ids = []
         for participant_uuid in participants:
             if participant_uuid == self.owner_user_uuid:
+                if len(participants) == 1:
+                    identity = self._workspace_mapping("identity", participant_uuid)
+                    try:
+                        recipient_ids.append(int(str(identity["provider_id"])))
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise ZulipOperationError("not_found", False) from exc
                 continue
             identity = self._workspace_mapping("identity", participant_uuid)
             try:
