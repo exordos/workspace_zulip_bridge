@@ -3196,6 +3196,9 @@ def test_user_topic_event_catalog_is_durable_and_marks_dependency():
             }
 
         def provider_mapping(self, requested, entity_kind, provider_id):
+            if entity_kind == "identity":
+                assert (requested, provider_id) == (account_uuid, "1")
+                return None
             assert (requested, entity_kind, provider_id) == (
                 account_uuid,
                 "stream",
@@ -3468,6 +3471,62 @@ def test_catalog_report_repairs_authenticated_owner_in_persisted_topology():
     assert instance.store.reports[0]["catalog"]["display_name"] == "Peer"
 
 
+def test_catalog_report_adds_authenticated_owner_to_empty_channel_topology():
+    class Store:
+        def __init__(self):
+            self.participants = []
+            self.reports = []
+
+        def merge_catalog_topology(
+            self,
+            _account,
+            _chat,
+            participants,
+            topics,
+            *,
+            authoritative_participants=False,
+        ):
+            self.participants = participants
+            return participants, topics
+
+        def provider_mapping(self, _account, _entity_kind, _provider_id):
+            return None
+
+        def enqueue_observed_report(self, report):
+            self.reports.append(report)
+            return True
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance._queue_catalog_report(
+        "10000000-0000-4000-8000-000000000001",
+        "10000000-0000-4000-8000-000000000002",
+        "10000000-0000-4000-8000-000000000003",
+        1,
+        "channel:42",
+        "channel",
+        "Engineering",
+        "https://zulip.example.invalid",
+        topics=[
+            {
+                "provider_topic_id": "42:general",
+                "name": "general",
+                "is_default": True,
+            }
+        ],
+        provider_realm_uuid="10000000-0000-4000-8000-000000000004",
+        provider_owner_user_id="9",
+    )
+
+    assert instance.store.reports[0]["catalog"]["participants"] == [
+        {
+            "provider_user_id": "9",
+            "display_name": "9",
+            "email": None,
+            "avatar_urn": None,
+            "is_owner": True,
+        }
+    ]
 def test_direct_message_event_catalog_excludes_authenticated_owner_from_name():
     class Store:
         def __init__(self):
