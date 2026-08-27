@@ -6576,6 +6576,48 @@ def test_provider_journal_backoff_blocks_only_its_causal_lane(postgres_store):
     assert postgres_store.pending_provider_events() == []
 
 
+def test_provider_journal_lane_expansion_stops_at_deferred_predecessor(
+    postgres_store,
+):
+    account_uuid = str(uuid.uuid4())
+    for event_id in range(1, 4):
+        assert postgres_store.record_provider_event(
+            account_uuid,
+            "queue",
+            {
+                "id": event_id,
+                "type": "user_topic",
+                "stream_id": 12,
+                "topic_name": f"Ordered {event_id}",
+                "visibility_policy": 1,
+                "last_updated": 1_800_000_000 + event_id,
+            },
+        )
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_provider_events
+            SET available_at = CASE event_id
+                    WHEN 2 THEN now() + interval '5 minutes'
+                    ELSE now()
+                END,
+                created_at = now() - (4 - event_id) * interval '1 minute'
+            WHERE account_uuid = %s AND queue_id = 'queue'
+            """,
+            (account_uuid,),
+        )
+
+    expanded = postgres_store.pending_provider_event_lane_batch(
+        account_uuid,
+        "queue",
+        1,
+        "channel:12",
+        10,
+    )
+
+    assert [event["event_id"] for event in expanded] == [1]
+
+
 def test_provider_journal_missing_lane_metadata_does_not_hide_event(postgres_store):
     account_uuid = str(uuid.uuid4())
     assert postgres_store.record_provider_event(
@@ -6878,8 +6920,9 @@ def test_full_provider_journal_selector_disables_jit_on_fresh_statistics(
         session.execute("SET LOCAL jit_above_cost = 0")
         selected = postgres_store.pending_provider_events(limit=20)
         jit = session.execute("SHOW jit").fetchone()
-    assert len(selected) == 1
-    assert str(selected[0]["account_uuid"]) == account_uuid
+    assert len(selected) == 4
+    assert {str(row["account_uuid"]) for row in selected} == {account_uuid}
+    assert len({str(row["causal_lane"]) for row in selected}) == 4
     assert jit == {"jit": "off"}
 
     with postgres_store.transaction() as session:
@@ -11106,8 +11149,10 @@ def test_rejection_serializes_stale_grouped_read_preparation(
     instance._queue_event_catalog = lambda *_args, **_kwargs: False
     instance._workspace_delivery_recovery_done = True
     selected = postgres_store.pending_provider_events()
-    assert [row["event_id"] for row in selected] == [2]
-    assert instance.process_provider_journal(selected) == 1
+    assert {row["event_id"] for row in selected} == {2, 3}
+    assert instance.process_provider_journal(
+        [row for row in selected if row["event_id"] == 2]
+    ) == 1
 
     with postgres_store.session() as session:
         grouped = session.execute(

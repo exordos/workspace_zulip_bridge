@@ -2195,6 +2195,9 @@ class RestAlchemyStore:
 
     def pending_provider_events(self, limit: int = 100) -> list[dict[str, object]]:
         """Select fair chat-lane heads while preserving account-wide barriers."""
+        # Let one busy account expose several independent lanes without
+        # allowing it to consume the entire global scheduler quantum.
+        per_account_limit = max(1, min(limit, 4))
         with self.session() as session:
             # This bounded selector is latency-sensitive and too branch-heavy
             # for PostgreSQL JIT compilation to amortize on each scheduler tick.
@@ -2387,7 +2390,7 @@ class RestAlchemyStore:
                             ORDER BY choice.lane_dispatched_at NULLS FIRST,
                                      choice.available_at, choice.created_at,
                                      choice.event_id, choice.queue_id
-                            LIMIT 1
+                            LIMIT %s
                         ) AS event ON true
                         WHERE (
                               NOT EXISTS (
@@ -2467,13 +2470,116 @@ class RestAlchemyStore:
                            event.assignment_pending_since,
                            event.assignment_catalog_reported_at,
                            event.provider_message_context,
-                           event.causal_lane
+                           event.causal_lane, event.created_at
                     FROM candidates AS event
                     JOIN dispatched
                       ON dispatched.account_uuid = event.account_uuid
                     ORDER BY event.created_at, event.event_id, event.queue_id
                     """,
-                    (limit,),
+                    (per_account_limit, limit),
+                ).fetchall()
+            )
+
+    def pending_provider_event_lane_batch(
+        self,
+        account_uuid: str,
+        queue_id: str,
+        event_id: int,
+        causal_lane: str,
+        limit: int,
+    ) -> list[dict[str, object]]:
+        """Extend one selected head with its ordered pending lane prefix."""
+        with self.session() as session:
+            return list(
+                session.execute(
+                    """
+                    WITH anchor AS (
+                        SELECT created_at, event_id, queue_id
+                        FROM zulip_provider_events
+                        WHERE account_uuid = %s AND queue_id = %s
+                          AND event_id = %s AND causal_lane = %s
+                          AND processing_state = 'pending'
+                    )
+                    SELECT event.account_uuid, event.queue_id, event.event_id,
+                           event.body, event.processing_reason,
+                           event.retry_count, event.assignment_pending_since,
+                           event.assignment_catalog_reported_at,
+                           event.provider_message_context, event.causal_lane,
+                           event.created_at
+                    FROM zulip_provider_events AS event
+                    CROSS JOIN anchor
+                    WHERE event.account_uuid = %s
+                      AND event.causal_lane = %s
+                      AND event.processing_state = 'pending'
+                      AND event.available_at <= now()
+                      AND (
+                          event.created_at, event.event_id, event.queue_id
+                      ) >= (
+                          anchor.created_at, anchor.event_id, anchor.queue_id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM zulip_provider_events AS predecessor
+                          WHERE predecessor.account_uuid = event.account_uuid
+                            AND predecessor.causal_lane = event.causal_lane
+                            AND predecessor.processing_state = 'pending'
+                            AND predecessor.available_at > now()
+                            AND (
+                                predecessor.created_at,
+                                predecessor.event_id,
+                                predecessor.queue_id
+                            ) >= (
+                                anchor.created_at,
+                                anchor.event_id,
+                                anchor.queue_id
+                            )
+                            AND (
+                                predecessor.created_at,
+                                predecessor.event_id,
+                                predecessor.queue_id
+                            ) < (
+                                event.created_at,
+                                event.event_id,
+                                event.queue_id
+                            )
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM zulip_provider_events AS delivering
+                          WHERE delivering.account_uuid = event.account_uuid
+                            AND delivering.causal_lane = event.causal_lane
+                            AND delivering.processing_state = 'delivering'
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM zulip_provider_events AS barrier
+                          WHERE barrier.account_uuid = event.account_uuid
+                            AND barrier.causal_lane IS NULL
+                            AND barrier.processing_state IN (
+                                'pending', 'delivering'
+                            )
+                            AND (
+                                barrier.created_at,
+                                barrier.event_id,
+                                barrier.queue_id
+                            ) < (
+                                event.created_at,
+                                event.event_id,
+                                event.queue_id
+                            )
+                      )
+                    ORDER BY event.created_at, event.event_id, event.queue_id
+                    LIMIT %s
+                    """,
+                    (
+                        account_uuid,
+                        queue_id,
+                        event_id,
+                        causal_lane,
+                        account_uuid,
+                        causal_lane,
+                        max(1, limit),
+                    ),
                 ).fetchall()
             )
 
@@ -3196,6 +3302,78 @@ class RestAlchemyStore:
                     event_id,
                 ),
             )
+
+    def finalize_redundant_provider_message_event(
+        self,
+        account_uuid: str,
+        queue_id: str,
+        event_id: int,
+    ) -> bool:
+        """Finish a replayed create after its message is already committed."""
+        with self.session() as session:
+            row = session.execute(
+                """
+                UPDATE zulip_provider_events AS event
+                SET processing_state = 'processed', processing_reason = NULL
+                WHERE event.account_uuid = %s
+                  AND event.queue_id = %s
+                  AND event.event_id = %s
+                  AND event.event_type = 'message'
+                  AND event.processing_state = 'pending'
+                  AND CASE
+                          WHEN event.body->'message' ? 'flags' THEN
+                              jsonb_typeof(event.body->'message'->'flags')
+                          ELSE jsonb_typeof(event.body->'flags')
+                      END IS DISTINCT FROM 'array'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM provider_mappings AS mapping
+                      WHERE mapping.account_uuid = event.account_uuid
+                        AND mapping.entity_kind = 'message'
+                        AND mapping.provider_id =
+                            event.body->'message'->>'id'
+                        AND NOT mapping.deleted
+                        AND mapping.metadata->>'workspace_delivery_state' =
+                            'committed'
+                  )
+                RETURNING event.event_id
+                """,
+                (account_uuid, queue_id, event_id),
+            ).fetchone()
+            return row is not None
+
+    def finalize_redundant_provider_message_events(self) -> int:
+        """Bulk-finish replayed creates already materialized by backfill."""
+        with self.session() as session:
+            row = session.execute(
+                """
+                WITH finalized AS (
+                    UPDATE zulip_provider_events AS event
+                    SET processing_state = 'processed', processing_reason = NULL
+                    WHERE event.event_type = 'message'
+                      AND event.processing_state = 'pending'
+                      AND CASE
+                              WHEN event.body->'message' ? 'flags' THEN
+                                  jsonb_typeof(event.body->'message'->'flags')
+                              ELSE jsonb_typeof(event.body->'flags')
+                          END IS DISTINCT FROM 'array'
+                      AND EXISTS (
+                          SELECT 1
+                          FROM provider_mappings AS mapping
+                          WHERE mapping.account_uuid = event.account_uuid
+                            AND mapping.entity_kind = 'message'
+                            AND mapping.provider_id =
+                                event.body->'message'->>'id'
+                            AND NOT mapping.deleted
+                            AND mapping.metadata
+                                    ->>'workspace_delivery_state' = 'committed'
+                      )
+                    RETURNING 1
+                )
+                SELECT count(*) AS count FROM finalized
+                """
+            ).fetchone()
+            return int(row["count"])
 
     def finalize_provider_event(
         self,
@@ -9347,18 +9525,47 @@ class RestAlchemyStore:
                 return False
             marker = session.execute(
                 """
-                UPDATE zulip_provider_events
+                WITH marker AS (
+                    SELECT account_uuid, queue_id, event_id, event_type,
+                           causal_lane, body
+                    FROM zulip_provider_events
+                    WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
+                      AND processing_state = 'pending'
+                )
+                UPDATE zulip_provider_events AS event
                 SET assignment_catalog_reported_at = COALESCE(
-                        assignment_catalog_reported_at,
+                        event.assignment_catalog_reported_at,
                         now()
                     )
-                WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
-                  AND processing_state = 'pending'
-                RETURNING assignment_catalog_reported_at
+                FROM marker
+                WHERE event.account_uuid = marker.account_uuid
+                  AND event.processing_state = 'pending'
+                  AND (
+                      (
+                          event.queue_id = marker.queue_id
+                          AND event.event_id = marker.event_id
+                      )
+                      OR (
+                          marker.event_type = 'message'
+                          AND event.event_type = 'message'
+                          AND event.causal_lane = marker.causal_lane
+                          AND event.body->'message'->'display_recipient'
+                              IS NOT DISTINCT FROM
+                              marker.body->'message'->'display_recipient'
+                          AND (
+                              marker.body->'message'->>'type'
+                                  IS DISTINCT FROM 'stream'
+                              OR event.body->'message'->>'subject'
+                                  IS NOT DISTINCT FROM
+                                  marker.body->'message'->>'subject'
+                          )
+                      )
+                  )
+                RETURNING event.assignment_catalog_reported_at
                 """,
                 (account_uuid, queue_id, event_id),
-            ).fetchone()
-            return marker is not None
+            ).fetchall()
+            return bool(marker)
 
     def ensure_catalog_deletion(
         self,

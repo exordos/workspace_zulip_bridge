@@ -353,10 +353,17 @@ class BridgeService:
     # journal conversion remains concurrent with delivery and history still
     # runs across independent workers.
     BACKGROUND_LIVE_DELIVERY_WORKERS = 1
-    LIVE_DELIVERY_BATCH_SIZE = 100
+    # Bound live Provider transactions by backend fan-out, not ingest capacity.
+    # Large mixed batches can outlive the HTTP timeout and keep consuming a DB
+    # connection after the bridge retries them.
+    LIVE_DELIVERY_BATCH_SIZE = 20
     LIVE_DELIVERY_DEPENDENCY_RECHECK_SECONDS = 1.0
     LIVE_DELIVERY_STALL_THRESHOLD_SECONDS = 300.0
     PROVIDER_JOURNAL_QUANTUM = 20
+    # Two sequential creates amortize Workspace broadcast setup while keeping
+    # the resulting Provider transaction comfortably below its HTTP timeout.
+    PROVIDER_JOURNAL_LANE_BATCH_SIZE = 2
+    PROVIDER_JOURNAL_QUANTA_PER_LIVE_TURN = 1
     PROVIDER_JOURNAL_WORKERS = 16
     PROVIDER_EVENT_FAILURE_MAX_ATTEMPTS = 5
     # Give a newly discovered chat five minutes to reach desired state, then
@@ -2796,6 +2803,8 @@ class BridgeService:
             self.store.reset_stale_workspace_deliveries()
         if hasattr(self.store, "finalize_ready_provider_events"):
             self.store.finalize_ready_provider_events()
+        if hasattr(self.store, "finalize_redundant_provider_message_events"):
+            self.store.finalize_redundant_provider_message_events()
         self._workspace_delivery_recovery_done = True
 
     def _contain_provider_event_failure(
@@ -2837,10 +2846,45 @@ class BridgeService:
         self._recover_interrupted_workspace_deliveries_once()
         if rows is None:
             rows = self.store.pending_provider_events(self.PROVIDER_JOURNAL_QUANTUM)
+            expand_lane = getattr(
+                self.store,
+                "pending_provider_event_lane_batch",
+                None,
+            )
+            if rows and callable(expand_lane):
+                per_lane_limit = min(
+                    self.PROVIDER_JOURNAL_LANE_BATCH_SIZE,
+                    max(1, self.PROVIDER_JOURNAL_QUANTUM // len(rows)),
+                )
+                if per_lane_limit > 1:
+                    expanded_rows: list[dict[str, object]] = []
+                    for row in rows:
+                        causal_lane = row.get("causal_lane")
+                        lane_rows = (
+                            expand_lane(
+                                str(row["account_uuid"]),
+                                str(row["queue_id"]),
+                                int(row["event_id"]),
+                                str(causal_lane),
+                                per_lane_limit,
+                            )
+                            if causal_lane is not None
+                            else []
+                        )
+                        expanded_rows.extend(lane_rows or [row])
+                    rows = expanded_rows
             if (
                 getattr(self, "provider_journal_parallel_enabled", False)
                 and len(rows) > 1
             ):
+                lane_groups: dict[
+                    tuple[str, object], list[dict[str, object]]
+                ] = {}
+                for row in rows:
+                    lane_groups.setdefault(
+                        (str(row["account_uuid"]), row.get("causal_lane")),
+                        [],
+                    ).append(row)
                 executor = getattr(self, "provider_journal_executor", None)
                 if executor is None:
                     executor = concurrent.futures.ThreadPoolExecutor(
@@ -2850,8 +2894,8 @@ class BridgeService:
                     self.provider_journal_executor = executor
                 return sum(
                     executor.map(
-                        lambda row: self.process_provider_journal([row]),
-                        rows,
+                        self._process_provider_journal_lane_group,
+                        lane_groups.values(),
                     )
                 )
         processed = 0
@@ -2881,6 +2925,25 @@ class BridgeService:
                     account_uuid, queue_id, event_id
                 ):
                     processed += 1
+                continue
+            finalize_redundant_message = getattr(
+                self.store,
+                "finalize_redundant_provider_message_event",
+                None,
+            )
+            message = event.get("message")
+            message_flags = (
+                message.get("flags", event.get("flags"))
+                if isinstance(message, dict)
+                else event.get("flags")
+            )
+            if (
+                event.get("type") == "message"
+                and not isinstance(message_flags, list)
+                and callable(finalize_redundant_message)
+                and finalize_redundant_message(account_uuid, queue_id, event_id)
+            ):
+                processed += 1
                 continue
             try:
                 adapter = self.provider_adapters(account_uuid)
@@ -3279,6 +3342,20 @@ class BridgeService:
                 processed += self._contain_provider_event_failure(row, exc)
                 continue
             processed += 1
+        return processed
+
+    def _process_provider_journal_lane_group(
+        self,
+        rows: list[dict[str, object]],
+    ) -> int:
+        processed = 0
+        for row in rows:
+            current = self.process_provider_journal([row])
+            processed += current
+            if current == 0:
+                # A retryable lane head remains authoritative. Do not let its
+                # already-fetched successor overtake it in the same turn.
+                break
         return processed
 
     def _provider_journal_worker_count(self) -> int:
@@ -3932,9 +4009,10 @@ class BridgeService:
         progressed = False
         if before_provider_poll is None:
             # The dedicated background lane must not let a slow outbound lease
-            # postpone already-journaled Zulip events. Bound the inbound quantum,
-            # then give Workspace-to-Zulip operations their turn below.
-            progressed |= self.process_provider_journal() > 0
+            # postpone already-journaled Zulip events. Fill several independent
+            # chat lanes, then give Workspace-to-Zulip operations their turn.
+            for _ in range(self.PROVIDER_JOURNAL_QUANTA_PER_LIVE_TURN):
+                progressed |= self.process_provider_journal() > 0
         if before_provider_poll is not False:
             try:
                 progressed |= self.poll_provider_operations() > 0
