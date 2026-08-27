@@ -777,6 +777,7 @@ class BridgeService:
         if actual != expected:
             raise ValueError("Provider result response does not match request order")
         sent = 0
+        acknowledgements = []
         for record, result in zip(records, results, strict=True):
             status = str(result["status"])
             transport = record.get("transport")
@@ -785,11 +786,12 @@ class BridgeService:
                 if isinstance(transport, dict) and transport.get("lease_uuid")
                 else None
             )
-            self.store.finalize_provider_result_response(
-                str(record["record_uuid"]), status, lease_uuid
+            acknowledgements.append(
+                (str(record["record_uuid"]), status, lease_uuid)
             )
             if status in {"applied", "duplicate"}:
                 sent += 1
+        self.store.finalize_provider_result_responses(acknowledgements)
         return sent
 
     def _poll_provider_account(

@@ -3494,9 +3494,144 @@ def test_provider_result_acknowledgement_types_nullable_sql_parameters(
     assert row["reconciliation_evidence"] == expected_evidence
 
 
+def test_provider_result_acknowledgements_are_applied_as_one_batch(postgres_store):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    records = [
+        _provider_record(account_uuid, project_uuid),
+        _provider_record(account_uuid, project_uuid),
+    ]
+    result_uuids = [str(uuid.uuid4()), str(uuid.uuid4())]
+    with postgres_store.session() as session:
+        for sequence, (record, result_uuid) in enumerate(
+            zip(records, result_uuids, strict=True), start=1
+        ):
+            session.execute(
+                """
+                INSERT INTO bridge_operations (
+                    record_uuid, operation_uuid, attempt, operation_sha256,
+                    account_uuid, project_uuid, origin, causal_lane,
+                    lane_sequence, priority, state, record, result_record
+                ) VALUES (
+                    %s, %s, 1, %s, %s, %s, 'zulip', %s, %s, 0,
+                    'committed', %s::jsonb, %s::jsonb
+                )
+                """,
+                (
+                    record["record_uuid"],
+                    record["operation_uuid"],
+                    record["operation_sha256"],
+                    account_uuid,
+                    project_uuid,
+                    record["causal_lane"],
+                    sequence,
+                    json.dumps(record),
+                    json.dumps({"record_uuid": result_uuid}),
+                ),
+            )
+
+    postgres_store.finalize_provider_result_responses(
+        [
+            (result_uuids[0], "applied", None),
+            (result_uuids[1], "rejected", None),
+        ]
+    )
+
+    with postgres_store.session() as session:
+        rows = session.execute(
+            """
+            SELECT result_record->>'record_uuid' AS result_record_uuid,
+                   result_sent_at IS NOT NULL AS sent,
+                   manual_reconciliation_required, last_error_code
+            FROM bridge_operations
+            ORDER BY lane_sequence
+            """
+        ).fetchall()
+    assert rows == [
+        {
+            "result_record_uuid": result_uuids[0],
+            "sent": True,
+            "manual_reconciliation_required": False,
+            "last_error_code": None,
+        },
+        {
+            "result_record_uuid": result_uuids[1],
+            "sent": True,
+            "manual_reconciliation_required": True,
+            "last_error_code": "provider_result_rejected",
+        },
+    ]
+
+
+def test_provider_result_queue_and_retention_queries_stay_index_bounded(
+    postgres_store,
+):
+    account_uuid = str(uuid.uuid4())
+    project_uuid = str(uuid.uuid4())
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            INSERT INTO bridge_operations (
+                record_uuid, operation_uuid, attempt, operation_sha256,
+                account_uuid, project_uuid, origin, causal_lane,
+                lane_sequence, priority, state, record, result_record,
+                result_sent_at, created_at, updated_at
+            )
+            SELECT md5('result-record-' || sample::text)::uuid,
+                   md5('result-operation-' || sample::text)::uuid,
+                   1, repeat('a', 64), %s, %s, 'workspace',
+                   'read:' || sample::text, 1, 0, 'committed',
+                   jsonb_build_object(
+                       'operation', jsonb_build_object(
+                           'kind', 'read_state.set'
+                       )
+                   ),
+                   jsonb_build_object(
+                       'record_uuid',
+                       md5('provider-result-' || sample::text)::uuid::text
+                   ),
+                   CASE WHEN sample %% 2 = 0 THEN now() ELSE NULL END,
+                   now() - interval '20 minutes',
+                   now() - interval '20 minutes'
+            FROM generate_series(1, 20000) AS sample
+            """,
+            (account_uuid, project_uuid),
+        )
+        session.execute("ANALYZE bridge_operations")
+        pending_query = """
+            SELECT result_record FROM bridge_operations
+            WHERE result_record IS NOT NULL AND result_sent_at IS NULL
+            ORDER BY updated_at, record_uuid LIMIT 100
+        """
+        retention_query = """
+            SELECT record_uuid FROM bridge_operations
+            WHERE state = 'committed'
+              AND result_sent_at IS NOT NULL
+              AND NOT manual_reconciliation_required
+              AND last_error_code IS DISTINCT FROM
+                  'provider_result_stale_lease'
+              AND updated_at < now() - interval '10 minutes'
+              AND record->'operation'->>'kind' = 'read_state.set'
+            ORDER BY updated_at, record_uuid LIMIT 100
+        """
+        pending_plan = _explain_text(session, pending_query)
+        pending_actual_plan = _explain_json(session, pending_query)
+        retention_plan = _explain_text(session, retention_query)
+        retention_actual_plan = _explain_json(session, retention_query)
+
+    assert "bridge_operations_pending_result_idx" in pending_plan
+    assert "bridge_operations_terminal_read_retention_idx" in retention_plan
+    assert _max_plan_actual_rows(pending_actual_plan) <= 100
+    assert _max_plan_actual_rows(retention_actual_plan) <= 100
+
+
 @pytest.mark.parametrize(
     ("status", "expected_message_count"),
-    [("applied", 0), ("duplicate", 0), ("rejected", 2)],
+    [
+        ("applied", 0),
+        ("duplicate", 0),
+        ("rejected", 2),
+        ("stale_lease", 2),
+    ],
 )
 def test_provider_result_acknowledgement_scrubs_terminal_read_payload(
     postgres_store,
@@ -3547,7 +3682,8 @@ def test_provider_result_acknowledgement_scrubs_terminal_read_payload(
             """
             SELECT record #> '{operation,payload,message_uuids}' AS message_uuids,
                    operation_sha256,
-                   record->>'operation_sha256' AS record_operation_sha256
+                   record->>'operation_sha256' AS record_operation_sha256,
+                   result_sent_at, last_error_code
             FROM bridge_operations
             WHERE record_uuid = %s
             """,
@@ -3556,7 +3692,28 @@ def test_provider_result_acknowledgement_scrubs_terminal_read_payload(
     assert len(row["message_uuids"]) == expected_message_count
     assert row["operation_sha256"] == record["operation_sha256"]
     assert row["record_operation_sha256"] == record["operation_sha256"]
-    if status in {"applied", "duplicate"}:
+    if status in {"rejected", "stale_lease"}:
+        assert row["result_sent_at"] is not None
+        assert postgres_store.pending_results() == []
+        assert row["last_error_code"] == f"provider_result_{status}"
+        with postgres_store.session() as session:
+            session.execute(
+                """
+                UPDATE bridge_operations
+                SET updated_at = now() - interval '20 minutes'
+                WHERE record_uuid = %s
+                """,
+                (record["record_uuid"],),
+            )
+        postgres_store.prune_terminal_delivery_state()
+        with postgres_store.session() as session:
+            retained = session.execute(
+                "SELECT count(*) AS count FROM bridge_operations "
+                "WHERE record_uuid = %s",
+                (record["record_uuid"],),
+            ).fetchone()
+        assert retained["count"] == 1
+    if status in {"applied", "duplicate", "stale_lease"}:
         renewed_lease_uuid = str(uuid.uuid4())
         transport = record["transport"]
         assert isinstance(transport, dict)
@@ -3576,8 +3733,17 @@ def test_provider_result_acknowledgement_scrubs_terminal_read_payload(
                 """,
                 (record["record_uuid"],),
             ).fetchone()
-        assert rebound["message_uuids"] == []
+        assert rebound["message_uuids"] == (
+            [] if status in {"applied", "duplicate"} else payload["message_uuids"]
+        )
         assert rebound["result_sent_at"] is None
+        if status == "stale_lease":
+            postgres_store.finalize_provider_result_response(
+                result_uuid,
+                "applied",
+                renewed_lease_uuid,
+            )
+            assert postgres_store.pending_results() == []
 
 
 def test_provider_read_rebind_preserves_persisted_revision_identity(
@@ -6422,6 +6588,163 @@ def test_terminal_delivery_state_is_pruned_by_priority_and_age(postgres_store):
             """
         ).fetchone()
     assert cursor == {"last_completed_at": None, "last_report_uuid": None}
+
+
+def test_acknowledged_read_operations_are_pruned_without_losing_idempotency(
+    postgres_store,
+):
+    account_uuid = str(uuid.uuid4())
+    project_uuid = str(uuid.uuid4())
+    read_record_uuid = str(uuid.uuid4())
+    read_operation_uuid = str(uuid.uuid4())
+    message_record_uuid = str(uuid.uuid4())
+    message_operation_uuid = str(uuid.uuid4())
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            INSERT INTO operation_idempotency (
+                operation_uuid, operation_sha256, terminal_outcome
+            ) VALUES (%s, %s, 'committed')
+            """,
+            (read_operation_uuid, "a" * 64),
+        )
+        session.execute(
+            """
+            INSERT INTO bridge_operations (
+                record_uuid, operation_uuid, attempt, operation_sha256,
+                account_uuid, project_uuid, origin, causal_lane,
+                lane_sequence, priority, state, record, result_record,
+                result_sent_at, created_at, updated_at
+            ) VALUES
+                (%s, %s, 1, %s, %s, %s, 'workspace', 'read:old', 1, 0,
+                 'committed',
+                 '{"operation":{"kind":"read_state.set"}}'::jsonb,
+                 jsonb_build_object('record_uuid', %s::text), now(),
+                 now() - interval '20 minutes', now() - interval '20 minutes'),
+                (%s, %s, 1, %s, %s, %s, 'workspace', 'message:old', 1, 0,
+                 'committed',
+                 '{"operation":{"kind":"message.create"}}'::jsonb,
+                 jsonb_build_object('record_uuid', %s::text), now(),
+                 now() - interval '20 minutes', now() - interval '20 minutes')
+            """,
+            (
+                read_record_uuid,
+                read_operation_uuid,
+                "a" * 64,
+                account_uuid,
+                project_uuid,
+                str(uuid.uuid4()),
+                message_record_uuid,
+                message_operation_uuid,
+                "b" * 64,
+                account_uuid,
+                project_uuid,
+                str(uuid.uuid4()),
+            ),
+        )
+
+    assert postgres_store.prune_terminal_delivery_state() == (0, 0)
+
+    with postgres_store.session() as session:
+        operations = session.execute(
+            """
+            SELECT record_uuid::text AS record_uuid
+            FROM bridge_operations ORDER BY record_uuid
+            """
+        ).fetchall()
+        idempotency = session.execute(
+            """
+            SELECT operation_uuid::text AS operation_uuid, terminal_outcome
+            FROM operation_idempotency
+            WHERE operation_uuid = ANY(%s::uuid[])
+            ORDER BY operation_uuid
+            """,
+            ([read_operation_uuid, read_record_uuid],),
+        ).fetchall()
+    assert operations == [{"record_uuid": message_record_uuid}]
+    assert idempotency == sorted(
+        [
+            {
+                "operation_uuid": read_operation_uuid,
+                "terminal_outcome": "committed",
+            },
+            {
+                "operation_uuid": read_record_uuid,
+                "terminal_outcome": "committed",
+            },
+        ],
+        key=lambda row: row["operation_uuid"],
+    )
+
+    replay = _provider_record(
+        account_uuid,
+        project_uuid,
+        kind="read_state.set",
+    )
+    replay["record_uuid"] = read_record_uuid
+    replay["operation_uuid"] = read_record_uuid
+    replay["sequence"] = 1
+    replay["operation_sha256"] = canonical.operation_digest(replay)
+    assert postgres_store.enqueue(replay, 0) is False
+
+
+def test_pruned_terminal_operation_cannot_be_enqueued_again(postgres_store):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    record = _provider_record(
+        account_uuid, project_uuid, kind="read_state.set"
+    )
+    record["sequence"] = 1
+    record["operation_sha256"] = canonical.operation_digest(record)
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            INSERT INTO operation_idempotency (
+                operation_uuid, operation_sha256, terminal_outcome
+            ) VALUES (%s, %s, 'committed')
+            """,
+            (record["operation_uuid"], record["operation_sha256"]),
+        )
+
+    replay = json.loads(json.dumps(record))
+    replay["operation"]["occurred_at"] = "2026-07-18T12:00:01Z"
+    replay["operation_sha256"] = canonical.operation_digest(replay)
+    assert replay["operation_sha256"] != record["operation_sha256"]
+    assert postgres_store.enqueue(replay, 0) is False
+    with postgres_store.session() as session:
+        persisted = session.execute(
+            """
+            SELECT count(*) AS count FROM bridge_operations
+            WHERE operation_uuid = %s
+            """,
+            (record["operation_uuid"],),
+        ).fetchone()
+    assert persisted["count"] == 0
+
+
+def test_nonterminal_read_operation_still_rejects_changed_digest(postgres_store):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    record = _provider_record(
+        account_uuid, project_uuid, kind="read_state.set"
+    )
+    record["sequence"] = 1
+    record["operation_sha256"] = canonical.operation_digest(record)
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            INSERT INTO operation_idempotency (
+                operation_uuid, operation_sha256
+            ) VALUES (%s, %s)
+            """,
+            (record["operation_uuid"], record["operation_sha256"]),
+        )
+
+    replay = json.loads(json.dumps(record))
+    replay["operation"]["occurred_at"] = "2026-07-18T12:00:01Z"
+    replay["operation_sha256"] = canonical.operation_digest(replay)
+    with pytest.raises(
+        ValueError, match="Operation UUID reused with a different digest"
+    ):
+        postgres_store.enqueue(replay, 0)
 
 
 def test_committed_message_fast_path_keeps_flagged_snapshots_pending(

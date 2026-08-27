@@ -71,6 +71,14 @@ class Store:
         if status in {"applied", "duplicate"}:
             self.sent.append(record_uuid)
 
+    def finalize_provider_result_responses(self, responses):
+        self.finalized.extend(responses)
+        self.sent.extend(
+            record_uuid
+            for record_uuid, status, _lease_uuid in responses
+            if status in {"applied", "duplicate"}
+        )
+
     def pending_workspace_deliveries(self, **kwargs):
         return self.deliveries
 
