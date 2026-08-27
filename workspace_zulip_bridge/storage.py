@@ -102,6 +102,7 @@ def _provider_event_message_ids(event: dict[str, object]) -> list[str]:
     if isinstance(message_ids, list):
         values.extend(message_ids)
     result: list[str] = []
+    seen: set[str] = set()
     for value in values:
         if isinstance(value, bool):
             continue
@@ -109,7 +110,8 @@ def _provider_event_message_ids(event: dict[str, object]) -> list[str]:
             normalized = str(int(str(value)))
         except (TypeError, ValueError):
             continue
-        if normalized not in result:
+        if normalized not in seen:
+            seen.add(normalized)
             result.append(normalized)
     return result
 

@@ -177,6 +177,23 @@ def test_provider_event_static_causal_lane(event, expected):
     assert storage._provider_event_static_causal_lane(event) == expected
 
 
+def test_provider_event_message_ids_normalizes_and_preserves_order():
+    assert storage._provider_event_message_ids(
+        {
+            "message_id": "003",
+            "message_ids": [2, "3", True, "invalid", 1, 2],
+        }
+    ) == ["3", "2", "1"]
+
+
+def test_provider_event_message_ids_scales_to_large_unique_batches():
+    message_ids = list(range(100_000))
+
+    assert storage._provider_event_message_ids({"messages": message_ids}) == [
+        str(message_id) for message_id in message_ids
+    ]
+
+
 def test_cross_stream_message_move_requires_account_barrier():
     assert storage._provider_event_requires_account_barrier(
         {
