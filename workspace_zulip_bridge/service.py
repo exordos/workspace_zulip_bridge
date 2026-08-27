@@ -1660,7 +1660,7 @@ class BridgeService:
             value["is_owner"] = is_owner
             owner_present |= is_owner
             normalized.append(value)
-        if owner_present or not normalized:
+        if owner_present:
             return normalized
 
         metadata: dict[str, object] = {}
