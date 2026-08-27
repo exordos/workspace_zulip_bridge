@@ -1,5 +1,6 @@
 import contextlib
 import datetime
+import hashlib
 import pathlib
 import threading
 import time
@@ -223,11 +224,13 @@ def test_adapter_registry_combines_system_and_managed_provider_ca(
     )
 
     class Store:
+        current_ca = custom_ca
+
         def provider_is_enabled(self, provider_kind):
             return True
 
         def custom_ca_bundle(self, provider_kind):
-            return {"certificates_pem": [custom_ca]}
+            return {"certificates_pem": [self.current_ca]}
 
         def desired_resource(self, resource_type, resource_uuid):
             return {
@@ -242,18 +245,40 @@ def test_adapter_registry_combines_system_and_managed_provider_ca(
             return zulip_adapter.ZulipCredentials("https://zulip.invalid", "e", "k")
 
     created = []
+    validated = []
+    create_default_context = service.ssl.create_default_context
+
+    def validate_ca(*args, **kwargs):
+        validated.append(kwargs["cadata"])
+        return create_default_context(*args, **kwargs)
 
     class Adapter:
         def __init__(self, adapter_credentials, **kwargs):
             created.append(adapter_credentials)
 
     monkeypatch.setattr(zulip_adapter, "OfficialZulipAdapter", Adapter)
+    monkeypatch.setattr(service.ssl, "create_default_context", validate_ca)
     registry = service.AdapterRegistry(Store(), Decryptor(), tmp_path / "ca")
+    registry("00000000-0000-0000-0000-000000000001")
     registry("00000000-0000-0000-0000-000000000001")
 
     bundle = pathlib.Path(created[0].cert_bundle).read_text(encoding="ascii")
     assert bundle.startswith(pathlib.Path(certifi.where()).read_text(encoding="ascii"))
     assert bundle.endswith(custom_ca)
+    assert validated == [custom_ca]
+
+    rotated_ca = custom_ca + "\n"
+    registry.store.current_ca = rotated_ca
+    registry("00000000-0000-0000-0000-000000000001")
+    registry("00000000-0000-0000-0000-000000000001")
+
+    assert validated == [custom_ca, rotated_ca]
+    assert registry.validated_ca_digest == hashlib.sha256(
+        rotated_ca.encode("ascii")
+    ).hexdigest()
+    assert [path.name for path in (tmp_path / "ca").glob("zulip-*.pem")] == [
+        pathlib.Path(created[-1].cert_bundle).name
+    ]
 
 
 def test_adapter_registry_fails_closed_when_provider_is_suspended():
