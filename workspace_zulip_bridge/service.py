@@ -44,6 +44,7 @@ class AdapterRegistry:
         self.decryptor = decryptor
         self.file_client = file_client
         self.custom_ca_dir = custom_ca_dir
+        self.validated_ca_digest: str | None = None
 
     def _cert_bundle(self) -> str | None:
         resource = self.store.custom_ca_bundle("zulip")
@@ -57,13 +58,15 @@ class AdapterRegistry:
         ):
             raise zulip_adapter.ZulipOperationError("invalid_custom_ca_bundle", False)
         custom_pem = "".join(typing.cast(list[str], certificates))
-        try:
-            ssl.create_default_context(cadata=custom_pem)
-        except ssl.SSLError as exc:
-            raise zulip_adapter.ZulipOperationError(
-                "invalid_custom_ca_bundle", False
-            ) from exc
         digest = hashlib.sha256(custom_pem.encode("ascii")).hexdigest()
+        if digest != self.validated_ca_digest:
+            try:
+                ssl.create_default_context(cadata=custom_pem)
+            except ssl.SSLError as exc:
+                raise zulip_adapter.ZulipOperationError(
+                    "invalid_custom_ca_bundle", False
+                ) from exc
+            self.validated_ca_digest = digest
         self.custom_ca_dir.mkdir(mode=0o750, parents=True, exist_ok=True)
         target = self.custom_ca_dir / f"zulip-{digest}.pem"
         if not target.is_file():
