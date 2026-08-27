@@ -66,6 +66,7 @@ def test_semantic_report_indexes_upgrade_an_applied_archive_chain(tmp_path):
         if migration_path.name not in {
             "0024-index-observed-report-semantic-order-6ecddb.py",
             "0025-bound-provider-result-delivery-state-3cd8cf.py",
+            "0026-compare-observed-report-timestamps-chronologically-00f58f.py",
         }:
             shutil.copy2(migration_path, archive_migrations / migration_path.name)
     admin_store = storage.RestAlchemyStore(connection_url)
@@ -127,7 +128,7 @@ def test_semantic_report_indexes_upgrade_an_applied_archive_chain(tmp_path):
                   AND column_name = 'result_record_uuid'
                 """
             ).fetchone()
-        assert applied["count"] == 26
+        assert applied["count"] == 27
         assert [row["indexname"] for row in indexes] == [
             "bridge_operations_pending_result_idx",
             "bridge_operations_result_record_uuid_idx",
@@ -138,10 +139,11 @@ def test_semantic_report_indexes_upgrade_an_applied_archive_chain(tmp_path):
             "provider_mappings_reaction_provider_prefix_idx",
         ]
         catalog_index = indexes[3]["indexdef"]
-        assert "observed_at" in catalog_index
+        assert "workspace_bridge_observed_at" in catalog_index
+        assert "body ->> 'observed_at'" in catalog_index
+        assert "COALESCE" in catalog_index
         assert "report_uuid DESC" in catalog_index
-        assert result_record_uuid["is_generated"] == "ALWAYS"
-        assert "record_uuid" in result_record_uuid["generation_expression"]
+        assert result_record_uuid is None
     finally:
         with admin_store.session() as session:
             session.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
@@ -179,11 +181,12 @@ def test_migrations_have_one_versioned_dependency_chain():
         "0023-index-reaction-provider-prefixes-dbc736.py",
         "0024-index-observed-report-semantic-order-6ecddb.py",
         "0025-bound-provider-result-delivery-state-3cd8cf.py",
+        "0026-compare-observed-report-timestamps-chronologically-00f58f.py",
     ]
     assert engine.get_latest_migration() == (
-        "0025-bound-provider-result-delivery-state-3cd8cf.py"
+        "0026-compare-observed-report-timestamps-chronologically-00f58f.py"
     )
-    assert len({step["uuid"] for step in all_migrations.values()}) == 26
+    assert len({step["uuid"] for step in all_migrations.values()}) == 27
     assert all_migrations["0001-add-Zulip-provider-scheduler-state-143113.py"][
         "depends"
     ] == ["0000-initialize-bridge-operational-state-18f707.py"]
@@ -259,6 +262,9 @@ def test_migrations_have_one_versioned_dependency_chain():
     assert all_migrations["0025-bound-provider-result-delivery-state-3cd8cf.py"][
         "depends"
     ] == ["0024-index-observed-report-semantic-order-6ecddb.py"]
+    assert all_migrations[
+        "0026-compare-observed-report-timestamps-chronologically-00f58f.py"
+    ]["depends"] == ["0025-bound-provider-result-delivery-state-3cd8cf.py"]
 
 
 def test_reaction_provider_prefix_migration_adds_pattern_index():
@@ -320,6 +326,85 @@ def test_observed_report_order_migration_adds_semantic_latest_index():
 
     module.migration_step.downgrade(session)
     assert "DROP INDEX IF EXISTS" in session.statements[1]
+
+
+def test_observed_report_timestamp_migration_adds_chronological_indexes():
+    migration_path = (
+        MIGRATIONS
+        / "0026-compare-observed-report-timestamps-chronologically-00f58f.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "observed_report_timestamp", migration_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class Session:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, statement):
+            self.statements.append(statement)
+
+    session = Session()
+    module.migration_step.upgrade(session)
+
+    statement = "\n".join(session.statements)
+    assert "workspace_bridge_observed_at(value text)" in statement
+    assert "RETURNS timestamptz" in statement
+    assert "CREATE INDEX CONCURRENTLY" in statement
+    assert "COALESCE" in statement
+    assert "body->>'observed_at'" in statement
+    assert statement.count("created_at DESC") >= 2
+    assert statement.index(
+        "DROP INDEX CONCURRENTLY IF EXISTS "
+        "observed_report_outbox_resource_chronological_idx"
+    ) < statement.index(
+        "CREATE INDEX CONCURRENTLY\n"
+        "                observed_report_outbox_resource_chronological_idx"
+    )
+    assert "CREATE INDEX CONCURRENTLY IF NOT EXISTS" not in statement
+
+    module.migration_step.downgrade(session)
+    downgrade = "\n".join(session.statements)
+    assert "DROP INDEX CONCURRENTLY" in downgrade
+    assert "DROP FUNCTION IF EXISTS workspace_bridge_observed_at" in downgrade
+
+
+def test_provider_result_indexes_rebuild_interrupted_concurrent_remnants():
+    migration_path = (
+        MIGRATIONS / "0025-bound-provider-result-delivery-state-3cd8cf.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "provider_result_delivery_state", migration_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class Session:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, statement):
+            self.statements.append(statement)
+
+    session = Session()
+    module.migration_step.upgrade(session)
+
+    statement = "\n".join(session.statements)
+    for index_name in (
+        "bridge_operations_result_record_uuid_idx",
+        "bridge_operations_pending_result_idx",
+        "bridge_operations_terminal_read_retention_idx",
+    ):
+        assert statement.index(
+            f"DROP INDEX CONCURRENTLY IF EXISTS {index_name}"
+        ) < statement.index(f"CREATE INDEX CONCURRENTLY\n                {index_name}")
+    assert "CREATE INDEX CONCURRENTLY IF NOT EXISTS" not in statement
+    assert "NOT manual_reconciliation_required" in statement
+    assert "provider_result_stale_lease" in statement
 
 
 def test_provider_journal_lane_migration_backfills_and_indexes_scheduler():
@@ -770,7 +855,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                   AND indexname = 'zulip_provider_events_account_head_idx'
                 """
             ).fetchone()
-            assert applied["count"] == 26
+            assert applied["count"] == 27
             assert [row["indexname"] for row in indexes] == [
                 "bridge_operations_active_local_echo_idx",
                 "desired_resources_assignment_chat_idx",
@@ -828,7 +913,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
             provider_cursor_count = session.execute(
                 "SELECT count(*) AS count FROM zulip_event_cursors"
             ).fetchone()
-            assert applied["count"] == 26
+            assert applied["count"] == 27
             assert cursor["control_cursor"] == "preserved"
             assert provider_cursor_count["count"] == 0
     finally:
