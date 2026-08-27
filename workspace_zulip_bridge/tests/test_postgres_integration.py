@@ -1770,7 +1770,7 @@ def test_pending_observed_reports_keep_semantically_latest_resource_state(
         "observed_generation": 1,
         "status": "live_ready",
         "reason": "live",
-        "observed_at": "2026-08-27T12:00:01Z",
+        "observed_at": "2026-08-27T12:00:00.500000Z",
     }
     older = {
         **newer,
@@ -1790,7 +1790,7 @@ def test_pending_observed_reports_keep_semantically_latest_resource_state(
             SELECT report_uuid, result_status
             FROM observed_report_outbox
             WHERE body->>'resource_uuid' = %s
-            ORDER BY body->>'observed_at'
+            ORDER BY workspace_bridge_observed_at(body->>'observed_at')
             """,
             (resource_uuid,),
         ).fetchall()
@@ -1804,6 +1804,43 @@ def test_pending_observed_reports_keep_semantically_latest_resource_state(
             "result_status": None,
         },
     ]
+
+
+def test_equal_observed_report_timestamps_keep_latest_inserted_state(postgres_store):
+    resource_uuid = str(uuid.uuid4())
+    observed_at = "2026-08-27T12:00:00Z"
+    older = {
+        "report_uuid": "ffffffff-ffff-4fff-8fff-ffffffffffff",
+        "resource_type": "external_account",
+        "resource_uuid": resource_uuid,
+        "observed_generation": 1,
+        "status": "degraded",
+        "reason": "retry",
+        "observed_at": observed_at,
+    }
+    newer = {
+        **older,
+        "report_uuid": "00000000-0000-4000-8000-000000000001",
+        "status": "live_ready",
+        "reason": "live",
+    }
+
+    assert postgres_store.enqueue_observed_report(older)
+    assert postgres_store.enqueue_observed_report(newer)
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE observed_report_outbox
+            SET created_at = CASE report_uuid
+                WHEN %s::uuid THEN '2026-08-27T12:00:01Z'::timestamptz
+                ELSE '2026-08-27T12:00:00Z'::timestamptz
+            END
+            WHERE report_uuid = ANY(%s::uuid[])
+            """,
+            (newer["report_uuid"], [older["report_uuid"], newer["report_uuid"]]),
+        )
+
+    assert postgres_store.pending_observed_reports() == [newer]
 
 
 def test_pending_observed_reports_keep_highest_resource_generation(postgres_store):
@@ -2533,8 +2570,11 @@ def test_observed_report_hot_queries_use_migration_indexes(postgres_store):
             WHERE body->>'resource_type' = %s
               AND (body->>'resource_uuid')::uuid = %s::uuid
             ORDER BY (body->>'observed_generation')::bigint DESC,
-                     body->>'observed_at' DESC NULLS LAST,
-                     created_at DESC, report_uuid DESC
+                     COALESCE(
+                         workspace_bridge_observed_at(body->>'observed_at'),
+                         created_at
+                     ) DESC,
+                     report_uuid DESC
             LIMIT 1
             """,
             ("external_account", resource_uuid),
@@ -2547,8 +2587,13 @@ def test_observed_report_hot_queries_use_migration_indexes(postgres_store):
                        PARTITION BY body->>'resource_type',
                                     (body->>'resource_uuid')::uuid
                        ORDER BY (body->>'observed_generation')::bigint DESC,
-                                body->>'observed_at' DESC NULLS LAST,
-                                created_at DESC, report_uuid DESC
+                                COALESCE(
+                                    workspace_bridge_observed_at(
+                                        body->>'observed_at'
+                                    ),
+                                    created_at
+                                ) DESC,
+                                report_uuid DESC
                    ) AS position
             FROM observed_report_outbox
             WHERE completed_at IS NULL
@@ -2586,8 +2631,11 @@ def test_observed_report_hot_queries_use_migration_indexes(postgres_store):
               AND (body->>'observed_generation')::bigint = 3
             ORDER BY (body->>'resource_uuid')::uuid,
                      (body->>'observed_generation')::bigint DESC,
-                     body->>'observed_at' DESC NULLS LAST,
-                     created_at DESC, report_uuid DESC
+                     COALESCE(
+                         workspace_bridge_observed_at(body->>'observed_at'),
+                         created_at
+                     ) DESC,
+                     report_uuid DESC
             """,
             (catalog_account_uuid,),
         )
@@ -2601,8 +2649,11 @@ def test_observed_report_hot_queries_use_migration_indexes(postgres_store):
               AND (body->>'observed_generation')::bigint = 3
             ORDER BY (body->>'resource_uuid')::uuid,
                      (body->>'observed_generation')::bigint DESC,
-                     body->>'observed_at' DESC NULLS LAST,
-                     created_at DESC, report_uuid DESC
+                     COALESCE(
+                         workspace_bridge_observed_at(body->>'observed_at'),
+                         created_at
+                     ) DESC,
+                     report_uuid DESC
             """,
             (catalog_account_uuid,),
         )
@@ -2625,8 +2676,13 @@ def test_observed_report_hot_queries_use_migration_indexes(postgres_store):
                       (probe.body->>'resource_uuid')::uuid
                 ORDER BY
                     (candidate.body->>'observed_generation')::bigint DESC,
-                    candidate.body->>'observed_at' DESC NULLS LAST,
-                    candidate.created_at DESC, candidate.report_uuid DESC
+                    COALESCE(
+                        workspace_bridge_observed_at(
+                            candidate.body->>'observed_at'
+                        ),
+                        candidate.created_at
+                    ) DESC,
+                    candidate.report_uuid DESC
                 LIMIT 1
             ) AS semantic_head ON true
         """

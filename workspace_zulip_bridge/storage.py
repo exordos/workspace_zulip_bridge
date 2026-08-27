@@ -6362,7 +6362,12 @@ class RestAlchemyStore:
                               (probe.body->>'resource_uuid')::uuid
                         ORDER BY
                             (candidate.body->>'observed_generation')::bigint DESC,
-                            candidate.body->>'observed_at' DESC NULLS LAST,
+                            COALESCE(
+                                workspace_bridge_observed_at(
+                                    candidate.body->>'observed_at'
+                                ),
+                                candidate.created_at
+                            ) DESC,
                             candidate.created_at DESC,
                             candidate.report_uuid DESC
                         LIMIT 1
@@ -7207,8 +7212,14 @@ class RestAlchemyStore:
                       AND (body->>'observed_generation')::bigint = %s
                     ORDER BY (body->>'resource_uuid')::uuid,
                              (body->>'observed_generation')::bigint DESC,
-                             body->>'observed_at' DESC NULLS LAST,
-                             created_at DESC, report_uuid DESC
+                             COALESCE(
+                                 workspace_bridge_observed_at(
+                                     body->>'observed_at'
+                                 ),
+                                 created_at
+                             ) DESC,
+                             created_at DESC,
+                             report_uuid DESC
                 )
                 SELECT NOT EXISTS (
                     SELECT 1 FROM latest
@@ -7251,8 +7262,14 @@ class RestAlchemyStore:
                       AND (body->>'observed_generation')::bigint = %s
                     ORDER BY (body->>'resource_uuid')::uuid,
                              (body->>'observed_generation')::bigint DESC,
-                             body->>'observed_at' DESC NULLS LAST,
-                             created_at DESC, report_uuid DESC
+                             COALESCE(
+                                 workspace_bridge_observed_at(
+                                     body->>'observed_at'
+                                 ),
+                                 created_at
+                             ) DESC,
+                             created_at DESC,
+                             report_uuid DESC
                 )
                 SELECT COUNT(*) AS count FROM latest
                 WHERE body->'catalog'->>'operation' = 'upsert'
@@ -9615,8 +9632,14 @@ class RestAlchemyStore:
                 WHERE body->>'resource_type' = %s
                   AND (body->>'resource_uuid')::uuid = %s::uuid
                 ORDER BY (body->>'observed_generation')::bigint DESC,
-                         body->>'observed_at' DESC NULLS LAST,
-                         created_at DESC, report_uuid DESC
+                         COALESCE(
+                             workspace_bridge_observed_at(
+                                 body->>'observed_at'
+                             ),
+                             created_at
+                         ) DESC,
+                         created_at DESC,
+                         report_uuid DESC
                 LIMIT 1
                 FOR UPDATE
             ) AS latest
@@ -9658,7 +9681,10 @@ class RestAlchemyStore:
             ON CONFLICT (report_uuid) DO NOTHING
             RETURNING report_uuid
             """,
-            (str(report["report_uuid"]), json.dumps(report)),
+            (
+                str(report["report_uuid"]),
+                json.dumps(report),
+            ),
         ).fetchone()
         return row is not None
 
@@ -9791,8 +9817,14 @@ class RestAlchemyStore:
                                             (body->>'resource_uuid')::uuid
                                ORDER BY
                                    (body->>'observed_generation')::bigint DESC,
-                                   body->>'observed_at' DESC NULLS LAST,
-                                   created_at DESC, report_uuid DESC
+                                   COALESCE(
+                                       workspace_bridge_observed_at(
+                                           body->>'observed_at'
+                                       ),
+                                       created_at
+                                   ) DESC,
+                                   created_at DESC,
+                                   report_uuid DESC
                            ) AS position
                     FROM observed_report_outbox
                     WHERE completed_at IS NULL
