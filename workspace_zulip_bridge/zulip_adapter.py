@@ -12,7 +12,7 @@ import uuid
 import requests
 import zulip
 
-from workspace_zulip_bridge import emoji, file_api, markdown_conversion
+from workspace_zulip_bridge import converter, emoji, file_api, markdown_conversion
 
 MAX_PROVIDER_FILE_BYTES = 52_428_800
 PROVIDER_QUEUE_IDLE_TIMEOUT_SECONDS = 43_200
@@ -78,6 +78,10 @@ class ZulipClient(typing.Protocol):
     def update_message(self, request: dict[str, object]) -> dict[str, object]: ...
 
     def update_stream(self, request: dict[str, object]) -> dict[str, object]: ...
+
+    def delete_stream(self, stream_id: int) -> dict[str, object]: ...
+
+    def get_stream_topics(self, stream_id: int) -> dict[str, object]: ...
 
     def delete_message(self, message_id: int) -> dict[str, object]: ...
 
@@ -1715,6 +1719,32 @@ class OfficialZulipAdapter:
                     )
                 )
             return str(provider_user_id), None
+        if kind == "stream.delete":
+            chat_key = provider.get("chat_id")
+            stream_id = self._channel_id(chat_key)
+            current = _successful(
+                self.client.call_endpoint(
+                    url=f"streams/{stream_id}",
+                    method="GET",
+                    request={},
+                )
+            ).get("stream")
+            if not isinstance(current, dict):
+                raise ZulipOperationError("invalid_record", False)
+            if current.get("is_archived") is True:
+                return str(stream_id), None
+            _successful(self.client.delete_stream(stream_id))
+            return str(stream_id), None
+        if kind == "topic.create":
+            # Zulip topics are message fields rather than independent objects.
+            # Remembering the deterministic provider identity is sufficient;
+            # the first outbound message materializes the topic in Zulip.
+            chat_key = provider.get("chat_id")
+            stream_id = self._channel_id(chat_key)
+            name = payload.get("name")
+            if not isinstance(name, str) or not name:
+                raise ZulipOperationError("invalid_record", False)
+            return converter.channel_topic_provider_id(stream_id, name), None
         if kind == "stream.upsert":
             chat_key = provider.get("chat_id")
             stream_id = self._channel_id(chat_key)
@@ -1725,10 +1755,55 @@ class OfficialZulipAdapter:
             )
             return str(stream_id), None
         if kind == "topic.upsert":
-            message = self._topic_message_mapping(operation["entity_uuid"])
-            request = {"message_id": int(str(message["provider_id"]))}
-            request["topic"] = payload["name"]
-            request["propagate_mode"] = "change_all"
-            _successful(self.client.update_message(request))
-            return str(message["provider_id"]), None
+            chat_key = provider.get("chat_id")
+            stream_id = self._channel_id(chat_key)
+            name = payload.get("name")
+            if not isinstance(name, str) or not name:
+                raise ZulipOperationError("invalid_record", False)
+            if self.routing is None:
+                raise ZulipOperationError("not_found", False)
+            message = self.routing.topic_message_mapping(
+                str(operation["entity_uuid"])
+            )
+            if message is not None:
+                _successful(
+                    self.client.update_message(
+                        {
+                            "message_id": int(str(message["provider_id"])),
+                            "topic": name,
+                            "propagate_mode": "change_all",
+                        }
+                    )
+                )
+            return converter.channel_topic_provider_id(stream_id, name), None
+        if kind == "topic.delete":
+            chat_key = provider.get("chat_id")
+            if not isinstance(chat_key, str):
+                raise ZulipOperationError("invalid_record", False)
+            stream_id = self._channel_id(chat_key)
+            topic_mapping = self._workspace_mapping(
+                "topic",
+                operation["entity_uuid"],
+            )
+            topic_name = self._topic_name(chat_key, operation["entity_uuid"])
+            topics = _successful(self.client.get_stream_topics(stream_id)).get("topics")
+            if not isinstance(topics, list):
+                raise ZulipOperationError("invalid_record", False)
+            if not any(
+                isinstance(topic, dict) and topic.get("name") == topic_name
+                for topic in topics
+            ):
+                return str(topic_mapping["provider_id"]), None
+            result = _successful(
+                self.client.call_endpoint(
+                    url=f"streams/{stream_id}/delete_topic",
+                    method="POST",
+                    request={
+                        "topic_name": topic_name
+                    },
+                )
+            )
+            if result.get("complete") is not True:
+                raise ZulipOperationError("topic_delete_incomplete", True)
+            return str(topic_mapping["provider_id"]), None
         raise ZulipOperationError("unsupported_operation", False)

@@ -17,7 +17,7 @@ def _settings():
     )
 
 
-def test_provider_api_uses_exact_private_v1_routes_and_envelopes():
+def test_provider_api_uses_exact_private_v2_routes_and_envelopes():
     seen = []
 
     def handle(request):
@@ -38,7 +38,7 @@ def test_provider_api_uses_exact_private_v1_routes_and_envelopes():
             json={
                 "results": [
                     {
-                        "provider_event_uuid": "event",
+                        "provider_event_key": "event",
                         "status": "applied",
                         "target_uuid": None,
                         "safe_error": None,
@@ -59,12 +59,25 @@ def test_provider_api_uses_exact_private_v1_routes_and_envelopes():
 
     assert client.lease_operations(request_uuid)["request_uuid"] == str(request_uuid)
     assert client.report_results([{"result_uuid": "result"}])["results"]
-    assert client.apply_events([{"provider_event_uuid": "event"}])["results"]
+    assert client.apply_commands([{"provider_event_key": "event"}])["results"]
     assert [path for _method, path, _body in seen] == [
-        "/api/workspace-provider/v1/operations/actions/lease",
-        "/api/workspace-provider/v1/operation-results",
-        "/api/workspace-provider/v1/events",
+        "/api/workspace-provider/v2/operations/actions/lease",
+        "/api/workspace-provider/v2/operation-results",
+        "/api/workspace-provider/v2/commands",
     ]
+
+
+def test_provider_http_runtime_documents_the_v2_contract_and_routes():
+    repository_root = pathlib.Path(__file__).parents[2]
+    readme = (repository_root / "README.md").read_text()
+    runtime = (repository_root / "docs/provider_http_runtime.md").read_text()
+
+    assert "docs/workspace_provider_api_v2.yaml" in readme
+    assert "workspace_backend/docs/workspace_provider_api_v2.yaml" in runtime
+    assert "/api/workspace-provider/v2/operations/actions/lease" in runtime
+    assert "/api/workspace-provider/v2/operation-results" in runtime
+    assert "/api/workspace-provider/v2/commands" in runtime
+    assert "/api/workspace-provider/v1" not in runtime
 
 
 def test_provider_api_keeps_retryable_conflict_separate_from_bad_request():
@@ -88,13 +101,11 @@ def test_provider_event_validation_rejection_has_a_terminal_error_type():
         _settings(),
         httpx.Client(
             base_url="https://provider.invalid",
-            transport=httpx.MockTransport(
-                lambda _request: httpx.Response(422)
-            ),
+            transport=httpx.MockTransport(lambda _request: httpx.Response(422)),
         ),
     )
 
     with pytest.raises(provider_api.ProviderEventRejectedError) as exc_info:
-        client.apply_events([{"provider_event_uuid": str(uuid.uuid4())}])
+        client.apply_commands([{"provider_event_key": str(uuid.uuid4())}])
 
     assert exc_info.value.status_code == 422

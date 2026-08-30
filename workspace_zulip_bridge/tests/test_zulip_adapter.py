@@ -52,6 +52,9 @@ class FakeClient:
         self.event_requests = []
         self.endpoint_requests = []
         self.stream_updates = []
+        self.deleted_streams = []
+        self.topic_deletions = []
+        self.topic_delete_result = {"result": "success", "complete": True}
         self.read_streams = []
         self.read_topics = []
         self.added_reactions = []
@@ -77,6 +80,8 @@ class FakeClient:
                 "desktop_notifications": None,
             }
         ]
+        self.stream = {"stream_id": 42, "name": "Engineering", "is_archived": False}
+        self.stream_topics = [{"name": "bridge", "max_id": 99}]
         self.members = [
             {
                 "user_id": 1,
@@ -135,6 +140,11 @@ class FakeClient:
             return self.get_events(**request)
         if url == "user_topics":
             return {"result": "success"}
+        if url == "streams/42" and method == "GET":
+            return {"result": "success", "stream": self.stream}
+        if url == "streams/42/delete_topic":
+            self.topic_deletions.append(request)
+            return self.topic_delete_result
         raise AssertionError(f"Unexpected endpoint: {url}")
 
     def get_profile(self):
@@ -172,6 +182,14 @@ class FakeClient:
 
     def update_stream(self, request):
         self.stream_updates.append(request)
+        return {"result": "success"}
+
+    def get_stream_topics(self, stream_id):
+        assert stream_id == 42
+        return {"result": "success", "topics": self.stream_topics}
+
+    def delete_stream(self, stream_id):
+        self.deleted_streams.append(stream_id)
         return {"result": "success"}
 
     def delete_message(self, message_id):
@@ -1591,10 +1609,120 @@ def test_topic_rename_uses_canonical_topic_uuid_mapping():
         "payload": {"stream_uuid": STREAM_UUID, "name": "renamed topic"},
     }
 
-    assert adapter.apply(operation) == ("99", None)
+    assert adapter.apply(operation) == ("42:renamed topic", None)
     assert client.updated == [
         {"message_id": 99, "topic": "renamed topic", "propagate_mode": "change_all"}
     ]
+
+
+def test_unmaterialized_topic_rename_only_updates_provider_identity():
+    class EmptyTopicRouting(FakeRouting):
+        def topic_message_mapping(self, topic_uuid):
+            assert topic_uuid == TOPIC_UUID
+            return None
+
+    client = FakeClient()
+    adapter = _adapter(client, routing=EmptyTopicRouting())
+    operation = {
+        "kind": "topic.upsert",
+        "entity_uuid": TOPIC_UUID,
+        "provider": {
+            "kind": "zulip",
+            "chat_id": "channel:42",
+            "entity_id": "42:bridge",
+            "revision": None,
+        },
+        "payload": {"stream_uuid": STREAM_UUID, "name": "renamed topic"},
+    }
+
+    assert adapter.apply(operation) == ("42:renamed topic", None)
+    assert client.updated == []
+
+
+def test_topic_create_records_identity_without_synthetic_provider_request():
+    client = FakeClient()
+    adapter = _adapter(client)
+    operation = {
+        "kind": "topic.create",
+        "entity_uuid": TOPIC_UUID,
+        "provider": {
+            "kind": "zulip",
+            "chat_id": "channel:42",
+            "entity_id": None,
+            "revision": None,
+        },
+        "payload": {
+            "uuid": TOPIC_UUID,
+            "stream_uuid": STREAM_UUID,
+            "name": "new topic",
+        },
+    }
+
+    assert adapter.apply(operation) == ("42:new topic", None)
+    assert client.sent == []
+    assert client.endpoint_requests == []
+
+
+def test_stream_delete_uses_official_archive_api():
+    client = FakeClient()
+    adapter = _adapter(client)
+    operation = {
+        "kind": "stream.delete",
+        "entity_uuid": STREAM_UUID,
+        "provider": {
+            "kind": "zulip",
+            "chat_id": "channel:42",
+            "entity_id": "channel:42",
+            "revision": None,
+        },
+        "payload": {"uuid": STREAM_UUID},
+    }
+
+    assert adapter.apply(operation) == ("42", None)
+    assert client.deleted_streams == [42]
+
+    client.stream["is_archived"] = True
+    assert adapter.apply(operation) == ("42", None)
+    assert client.deleted_streams == [42]
+
+
+def test_topic_delete_retries_until_provider_reports_complete():
+    client = FakeClient()
+    client.topic_delete_result = {"result": "success", "complete": False}
+    adapter = _adapter(client)
+    operation = {
+        "kind": "topic.delete",
+        "entity_uuid": TOPIC_UUID,
+        "provider": {
+            "kind": "zulip",
+            "chat_id": "channel:42",
+            "entity_id": "42:bridge",
+            "revision": None,
+        },
+        "payload": {
+            "uuid": TOPIC_UUID,
+            "stream_uuid": STREAM_UUID,
+            "name": "bridge",
+        },
+    }
+
+    with pytest.raises(zulip_adapter.ZulipOperationError) as captured:
+        adapter.apply(operation)
+
+    assert captured.value.code == "topic_delete_incomplete"
+    assert captured.value.retryable
+    assert client.topic_deletions == [{"topic_name": "bridge"}]
+
+    client.topic_delete_result = {"result": "success", "complete": True}
+    assert adapter.apply(operation) == ("42:bridge", None)
+    assert client.topic_deletions == [
+        {"topic_name": "bridge"},
+        {"topic_name": "bridge"},
+    ]
+
+    client.stream_topics = []
+    assert adapter.apply(operation) == ("42:bridge", None)
+    assert len(client.topic_deletions) == 2
 
 
 def test_backfill_history_is_raw_and_newest_first():

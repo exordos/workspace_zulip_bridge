@@ -67,6 +67,7 @@ def test_semantic_report_indexes_upgrade_an_applied_archive_chain(tmp_path):
             "0024-index-observed-report-semantic-order-6ecddb.py",
             "0025-bound-provider-result-delivery-state-3cd8cf.py",
             "0026-compare-observed-report-timestamps-chronologically-00f58f.py",
+            "0027-track-Workspace-projection-resets-a627d4.py",
         }:
             shutil.copy2(migration_path, archive_migrations / migration_path.name)
     admin_store = storage.RestAlchemyStore(connection_url)
@@ -128,7 +129,7 @@ def test_semantic_report_indexes_upgrade_an_applied_archive_chain(tmp_path):
                   AND column_name = 'result_record_uuid'
                 """
             ).fetchone()
-        assert applied["count"] == 27
+        assert applied["count"] == 28
         assert [row["indexname"] for row in indexes] == [
             "bridge_operations_pending_result_idx",
             "bridge_operations_result_record_uuid_idx",
@@ -144,6 +145,137 @@ def test_semantic_report_indexes_upgrade_an_applied_archive_chain(tmp_path):
         assert "COALESCE" in catalog_index
         assert "report_uuid DESC" in catalog_index
         assert result_record_uuid is None
+    finally:
+        with admin_store.session() as session:
+            session.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+
+def test_projection_reset_upgrade_forces_snapshot_after_old_bridge_consumed_change(
+    tmp_path,
+):
+    connection_url = os.environ.get("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN")
+    if not connection_url:
+        pytest.skip("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN is not configured")
+    schema = f"bridge_projection_reset_upgrade_{uuid.uuid4().hex}"
+    scoped_url = _schema_connection_url(connection_url, schema)
+    config_path = tmp_path / "bridge.conf"
+    old_bridge_migrations = tmp_path / "old-bridge-migrations"
+    old_bridge_migrations.mkdir()
+    for migration_path in MIGRATIONS.glob("*.py"):
+        if migration_path.name != (
+            "0027-track-Workspace-projection-resets-a627d4.py"
+        ):
+            shutil.copy2(migration_path, old_bridge_migrations / migration_path.name)
+    admin_store = storage.RestAlchemyStore(connection_url)
+    scoped_store = storage.RestAlchemyStore(scoped_url)
+    account_uuid = str(uuid.uuid4())
+    message_uuid = str(uuid.uuid4())
+
+    with admin_store.session() as session:
+        session.execute(f'CREATE SCHEMA "{schema}"')
+    try:
+        _apply_migrations(scoped_url, config_path, old_bridge_migrations)
+        with scoped_store.session() as session:
+            session.execute(
+                """
+                UPDATE bridge_metadata
+                SET control_cursor = 'cursor-after-reset-change'
+                WHERE singleton
+                """
+            )
+            session.execute(
+                """
+                INSERT INTO desired_resources (
+                    resource_type, resource_uuid, generation, body, deleted
+                ) VALUES (
+                    'external_account', %s, 2,
+                    jsonb_build_object(
+                        'resource_type', 'external_account',
+                        'uuid', %s::text,
+                        'generation', 2,
+                        'projection_reset_generation', 1
+                    ),
+                    false
+                )
+                """,
+                (account_uuid, account_uuid),
+            )
+            session.execute(
+                """
+                INSERT INTO scheduler_accounts (
+                    account_uuid, provider_generation
+                ) VALUES (%s, 2)
+                """,
+                (account_uuid,),
+            )
+            session.execute(
+                """
+                INSERT INTO provider_mappings (
+                    account_uuid, entity_kind, workspace_uuid, provider_id
+                ) VALUES (%s, 'message', %s, '42')
+                """,
+                (account_uuid, message_uuid),
+            )
+
+        _apply_migrations(scoped_url, config_path)
+        with scoped_store.session() as session:
+            migrated = session.execute(
+                """
+                SELECT metadata.control_cursor,
+                       account.projection_reset_generation,
+                       desired.body->>'projection_reset_generation'
+                           AS desired_reset_generation
+                FROM bridge_metadata AS metadata
+                JOIN scheduler_accounts AS account
+                  ON account.account_uuid = %s
+                JOIN desired_resources AS desired
+                  ON desired.resource_type = 'external_account'
+                 AND desired.resource_uuid = account.account_uuid
+                WHERE metadata.singleton
+                """,
+                (account_uuid,),
+            ).fetchone()
+        assert migrated == {
+            "control_cursor": "",
+            "projection_reset_generation": 0,
+            "desired_reset_generation": "1",
+        }
+
+        scoped_store.install_snapshot(
+            [
+                {
+                    "resource_type": "external_account",
+                    "uuid": account_uuid,
+                    "generation": 2,
+                    "projection_reset_generation": 1,
+                    "required_capabilities": {},
+                }
+            ],
+            "snapshot-after-upgrade",
+        )
+        with scoped_store.session() as session:
+            reconciled = session.execute(
+                """
+                SELECT metadata.control_cursor,
+                       account.projection_reset_generation,
+                       (
+                           SELECT count(*)
+                           FROM provider_mappings
+                           WHERE account_uuid = account.account_uuid
+                             AND entity_kind = 'message'
+                       ) AS stale_message_mappings
+                FROM bridge_metadata AS metadata
+                JOIN scheduler_accounts AS account
+                  ON account.account_uuid = %s
+                WHERE metadata.singleton
+                """,
+                (account_uuid,),
+            ).fetchone()
+        assert reconciled == {
+            "control_cursor": "snapshot-after-upgrade",
+            "projection_reset_generation": 1,
+            "stale_message_mappings": 0,
+        }
     finally:
         with admin_store.session() as session:
             session.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
@@ -182,11 +314,12 @@ def test_migrations_have_one_versioned_dependency_chain():
         "0024-index-observed-report-semantic-order-6ecddb.py",
         "0025-bound-provider-result-delivery-state-3cd8cf.py",
         "0026-compare-observed-report-timestamps-chronologically-00f58f.py",
+        "0027-track-Workspace-projection-resets-a627d4.py",
     ]
     assert engine.get_latest_migration() == (
-        "0026-compare-observed-report-timestamps-chronologically-00f58f.py"
+        "0027-track-Workspace-projection-resets-a627d4.py"
     )
-    assert len({step["uuid"] for step in all_migrations.values()}) == 27
+    assert len({step["uuid"] for step in all_migrations.values()}) == 28
     assert all_migrations["0001-add-Zulip-provider-scheduler-state-143113.py"][
         "depends"
     ] == ["0000-initialize-bridge-operational-state-18f707.py"]
@@ -265,6 +398,9 @@ def test_migrations_have_one_versioned_dependency_chain():
     assert all_migrations[
         "0026-compare-observed-report-timestamps-chronologically-00f58f.py"
     ]["depends"] == ["0025-bound-provider-result-delivery-state-3cd8cf.py"]
+    assert all_migrations["0027-track-Workspace-projection-resets-a627d4.py"][
+        "depends"
+    ] == ["0026-compare-observed-report-timestamps-chronologically-00f58f.py"]
 
 
 def test_reaction_provider_prefix_migration_adds_pattern_index():
@@ -330,8 +466,7 @@ def test_observed_report_order_migration_adds_semantic_latest_index():
 
 def test_observed_report_timestamp_migration_adds_chronological_indexes():
     migration_path = (
-        MIGRATIONS
-        / "0026-compare-observed-report-timestamps-chronologically-00f58f.py"
+        MIGRATIONS / "0026-compare-observed-report-timestamps-chronologically-00f58f.py"
     )
     spec = importlib.util.spec_from_file_location(
         "observed_report_timestamp", migration_path
@@ -373,9 +508,7 @@ def test_observed_report_timestamp_migration_adds_chronological_indexes():
 
 
 def test_provider_result_indexes_rebuild_interrupted_concurrent_remnants():
-    migration_path = (
-        MIGRATIONS / "0025-bound-provider-result-delivery-state-3cd8cf.py"
-    )
+    migration_path = MIGRATIONS / "0025-bound-provider-result-delivery-state-3cd8cf.py"
     spec = importlib.util.spec_from_file_location(
         "provider_result_delivery_state", migration_path
     )
@@ -855,7 +988,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                   AND indexname = 'zulip_provider_events_account_head_idx'
                 """
             ).fetchone()
-            assert applied["count"] == 27
+            assert applied["count"] == 28
             assert [row["indexname"] for row in indexes] == [
                 "bridge_operations_active_local_echo_idx",
                 "desired_resources_assignment_chat_idx",
@@ -913,7 +1046,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
             provider_cursor_count = session.execute(
                 "SELECT count(*) AS count FROM zulip_event_cursors"
             ).fetchone()
-            assert applied["count"] == 27
+            assert applied["count"] == 28
             assert cursor["control_cursor"] == "preserved"
             assert provider_cursor_count["count"] == 0
     finally:

@@ -1,7 +1,7 @@
 # Provider HTTP runtime
 
 The bridge data plane is the private Workspace Provider API defined by
-`workspace_backend/docs/workspace_provider_api_v1.yaml`. Control-plane desired
+`workspace_backend/docs/workspace_provider_api_v2.yaml`. Control-plane desired
 state and heartbeats remain on the separate control API. File bytes use the
 private file API.
 
@@ -17,7 +17,7 @@ fallback.
 The bridge polls:
 
 ```text
-POST /api/workspace-provider/v1/operations/actions/lease
+POST /api/workspace-provider/v2/operations/actions/lease
 ```
 
 The request uses a client-generated request UUID, a maximum batch size, and a
@@ -28,7 +28,7 @@ transport failure. Each returned operation is durably bound to its
 Terminal outcomes are reported to:
 
 ```text
-POST /api/workspace-provider/v1/operation-results
+POST /api/workspace-provider/v2/operation-results
 ```
 
 `applied` and `duplicate` acknowledge success. `conflict`, `rejected`, and
@@ -38,16 +38,16 @@ the durable result. No response status is retried forever.
 
 ## Zulip to Workspace
 
-Canonical resource events are submitted to:
+Canonical resource commands are submitted to:
 
 ```text
-POST /api/workspace-provider/v1/events
+POST /api/workspace-provider/v2/commands
 ```
 
-The backend applies each batch atomically. The bridge validates response order,
-event UUIDs, and `applied` status before committing its local outbox. Transport
-errors and retryable responses release claimed submissions so the idempotent
-event UUIDs can be retried. A record-scoped permanent rejection is isolated by
+The backend applies each command batch atomically. The bridge validates response
+order, command keys, and `applied` status before committing its local outbox.
+Transport errors and retryable responses release claimed submissions so the
+idempotent event UUIDs can be retried. A record-scoped permanent rejection is isolated by
 ordered batch bisection. Valid siblings still commit; the rejected record is
 retained in the durable outbox with `submission_state = 'rejected'` and a safe
 status code, and is not automatically resubmitted. Its operation idempotency is

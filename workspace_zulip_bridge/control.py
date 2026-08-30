@@ -17,7 +17,10 @@ CAPABILITIES: dict[str, dict[str, object]] = {
     "messenger.reaction.write": {"revision": 1, "limits": {}},
     "messenger.membership.write": {"revision": 1, "limits": {}},
     "messenger.notification.write": {"revision": 1, "limits": {}},
+    "messenger.stream.delete": {"revision": 1, "limits": {}},
     "messenger.stream.rename": {"revision": 1, "limits": {}},
+    "messenger.topic.create": {"revision": 1, "limits": {}},
+    "messenger.topic.delete": {"revision": 1, "limits": {}},
     "messenger.topic.rename": {"revision": 1, "limits": {}},
     "messenger.file.transfer": {
         "revision": 1,

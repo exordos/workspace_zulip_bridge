@@ -1625,12 +1625,17 @@ def test_provider_topic_rename_moves_workspace_aliases_to_current_provider_id():
         == row
     )
 
-    assert len(session.statements) == 3
-    lock_statement, lock_parameters = session.statements[0]
-    primary_statement, primary_parameters = session.statements[1]
-    alias_statement, alias_parameters = session.statements[2]
-    assert "pg_advisory_xact_lock" in lock_statement
-    assert lock_parameters == (f"{account_uuid}:topic:42:renamed",)
+    assert len(session.statements) == 4
+    first_lock_statement, first_lock_parameters = session.statements[0]
+    second_lock_statement, second_lock_parameters = session.statements[1]
+    primary_statement, primary_parameters = session.statements[2]
+    alias_statement, alias_parameters = session.statements[3]
+    assert "pg_advisory_xact_lock" in first_lock_statement
+    assert "pg_advisory_xact_lock" in second_lock_statement
+    assert {first_lock_parameters, second_lock_parameters} == {
+        (f"{account_uuid}:topic:42:old",),
+        (f"{account_uuid}:topic:42:renamed",),
+    }
     assert "existing_target AS" in primary_statement
     assert "metadata = CASE" in primary_statement
     assert "deleted = false" in primary_statement
@@ -1643,6 +1648,9 @@ def test_provider_topic_rename_moves_workspace_aliases_to_current_provider_id():
         "42:renamed",
         "42:renamed",
         "2",
+        "topic",
+        json.dumps({"name": "renamed"}),
+        "42:old",
         json.dumps({"name": "renamed"}),
         account_uuid,
         "topic",
@@ -1693,9 +1701,10 @@ def test_provider_topic_rename_returns_existing_target_without_mutating_source()
         "metadata": {"name": "renamed", "workspace_delivery_state": "committed"},
     }
 
-    assert len(session.statements) == 2
+    assert len(session.statements) == 3
     assert "pg_advisory_xact_lock" in session.statements[0][0]
-    assert "existing_target AS" in session.statements[1][0]
+    assert "pg_advisory_xact_lock" in session.statements[1][0]
+    assert "existing_target AS" in session.statements[2][0]
 
 
 def test_workspace_projection_contract_materializes_first_outbound_mappings():

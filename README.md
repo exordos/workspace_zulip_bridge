@@ -8,7 +8,7 @@ The service implements the contracts maintained by the sibling
 
 - `docs/zulip_bridge_v1_product_and_api.md`;
 - `docs/zulip_bridge_control_api_v1.yaml`;
-- `docs/workspace_provider_api_v1.yaml`;
+- `docs/workspace_provider_api_v2.yaml`;
 - `docs/zulip_bridge_file_api_v1.yaml`.
 
 Workspace messages and operations cross the private Provider HTTP API. The
@@ -112,6 +112,20 @@ The current implementation provides:
   stale recovery state cannot keep an account in backfill forever;
 - stable history cutoffs and reconciliation checkpoints across unchanged
   control-plane polls;
+- explicit `projection_reset_generation` reconciliation: a newer Workspace
+  generation atomically discards rebuildable Zulip message/reaction mappings,
+  delivery idempotency and completed history checkpoints while retaining
+  account identity/catalog state, then restarts a fresh complete backfill;
+- rolling-upgrade recovery for a backend-first deployment: the schema step
+  that first adds reset-generation tracking clears the persisted control cursor
+  once, forcing an authoritative startup snapshot. Thus a pre-upgrade Bridge
+  that stored the new account resource but ignored its reset field cannot lose
+  the reimport request; idempotent migration-ledger repair does not clear a
+  current cursor again;
+- Provider API v2 channel lifecycle parity: channel deletion archives the
+  mapped Zulip channel, topic deletion repeats the official batched endpoint
+  until complete, and a Workspace-created topic installs its deterministic
+  mapping without a synthetic message before normal message materialization;
 - durable backfill retry state with exponential full-jitter deferral for
   retryable provider failures; non-retryable failures terminate only the
   affected account/chat backfill job and produce a degraded observed report.

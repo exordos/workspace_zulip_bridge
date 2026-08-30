@@ -1,4 +1,6 @@
 import datetime
+import hashlib
+import json
 import typing
 import uuid
 
@@ -16,8 +18,11 @@ _OUTBOUND_KIND = {
     "membership.remove": "membership.remove",
     "stream.notification.update": "stream.notification.update",
     "topic.notification.update": "topic.notification.update",
+    "stream.delete": "stream.delete",
+    "topic.create": "topic.create",
     "stream.update": "stream.upsert",
     "topic.update": "topic.upsert",
+    "topic.delete": "topic.delete",
 }
 
 _INBOUND_KIND = {
@@ -34,6 +39,21 @@ _INBOUND_KIND = {
     "read_state.set": "read_state.set",
     "stream.notification.update": "stream.notification.update",
     "topic.notification.update": "topic.notification.update",
+}
+
+_SERVER_OWNED_RESOURCE_FIELDS = {
+    "external_account_uuid",
+    "external_chat_uuid",
+    "message_uuid",
+    "message_uuids",
+    "project_id",
+    "provider_external_id",
+    "provider_uuid",
+    "reader_uuid",
+    "stream_uuid",
+    "topic_uuid",
+    "user_uuid",
+    "uuid",
 }
 
 
@@ -147,6 +167,21 @@ def leased_operation_record(store, leased: dict[str, object]) -> dict[str, objec
         )
         if mapping is not None:
             entity_id = str(mapping["provider_id"])
+    elif kind in {
+        "topic.create",
+        "topic.update",
+        "topic.delete",
+        "topic.notification.update",
+    }:
+        # A topic create and its first mutation can be leased together. The
+        # causal predecessor installs the mapping before the mutation runs.
+        mapping = store.workspace_mapping(
+            account_uuid,
+            entity_kind,
+            entity_uuid,
+        )
+        if mapping is not None:
+            entity_id = str(mapping["provider_id"])
     elif kind not in {"message.create", "read_state.set"}:
         mapping = _provider_mapping(store, account_uuid, entity_kind, entity_uuid)
         entity_id = str(mapping["provider_id"])
@@ -156,15 +191,11 @@ def leased_operation_record(store, leased: dict[str, object]) -> dict[str, objec
         or payload.get("created_at")
     )
     if occurred_at is None:
-        # Read pages carry no event timestamp.  Their physical provider UUID is
-        # immutable across renewed leases, so keep the digest immutable too;
-        # otherwise a replay reconstructed after terminal-row pruning is
-        # rejected before durable idempotency can deduplicate it.
-        occurred_at = (
-            "1970-01-01T00:00:00Z"
-            if kind == "read_state.set"
-            else datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
-        )
+        # Some server-owned operations have no domain timestamp. Their stable
+        # operation UUID still identifies the same desired change across lease
+        # renewal, so a stable sentinel is required to keep the operation digest
+        # replay-safe.
+        occurred_at = "1970-01-01T00:00:00Z"
     operation = {
         "kind": bridge_kind,
         "entity_uuid": entity_uuid,
@@ -370,6 +401,196 @@ def event_payload(store, record: dict[str, object]) -> dict[str, object] | None:
         "provider_sequence": str(record["sequence"]),
         "kind": kind,
         "payload": {"resource": resource},
+    }
+
+
+def direct_conversation_key(
+    store,
+    account_uuid: str,
+    provider_chat_key: str,
+) -> str:
+    """Return the realm-global v1 direct-conversation serialization."""
+    if provider_chat_key.startswith("channel:") or provider_chat_key == "account":
+        return provider_chat_key
+    if provider_chat_key.startswith("direct-conversation:v1:"):
+        count, separator, identifiers = provider_chat_key.removeprefix(
+            "direct-conversation:v1:"
+        ).partition(":")
+        values = identifiers.split(",") if separator else []
+        if str(len(values)) != count:
+            raise ValueError("Provider direct-conversation key is invalid")
+    elif provider_chat_key.startswith(("direct:", "group_direct:")):
+        values = provider_chat_key.split(":", 1)[1].split(",")
+    else:
+        raise ValueError("Provider chat key is invalid")
+    participant_ids = {int(value) for value in values if value}
+    cursor_reader = getattr(store, "provider_event_cursor", None)
+    cursor = cursor_reader(account_uuid) if callable(cursor_reader) else None
+    owner_id = (
+        cursor.get("provider_owner_user_id") if isinstance(cursor, dict) else None
+    )
+    if owner_id is not None:
+        participant_ids.add(int(str(owner_id)))
+    if not participant_ids:
+        raise ValueError("Provider direct-conversation participants are missing")
+    identifiers = ",".join(str(value) for value in sorted(participant_ids))
+    return f"direct-conversation:v1:{len(participant_ids)}:{identifiers}"
+
+
+def _workspace_provider_id(
+    store,
+    account_uuid: str,
+    kind: str,
+    workspace_uuid: object,
+) -> str:
+    return str(
+        _provider_mapping(store, account_uuid, kind, workspace_uuid)["provider_id"]
+    )
+
+
+def provider_event_key(
+    kind: str,
+    provider_chat_key: str,
+    provider_object: dict[str, str],
+    provider_references: dict[str, object],
+    payload: dict[str, object],
+) -> str:
+    """Return the account-independent semantic key for a desired provider state."""
+    object_kind = str(provider_object["kind"])
+    object_id = str(provider_object["id"])
+    state = {
+        "provider_chat_key": provider_chat_key,
+        "provider_object": provider_object,
+        "provider_references": provider_references,
+        "payload": payload,
+    }
+    normalized = json.dumps(
+        state,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    digest = hashlib.sha256(normalized).hexdigest()
+    object_id_length = len(object_id.encode("utf-8"))
+    return (
+        f"provider-event:v1:{kind}:{object_kind}:"
+        f"{object_id_length}:{object_id}:{digest}"
+    )
+
+
+def command_payload(store, record: dict[str, object]) -> dict[str, object] | None:
+    """Adapt one durable record to the server-owned Provider Data API v2."""
+    event = event_payload(store, record)
+    if event is None:
+        return None
+    account_uuid = str(record["account_uuid"])
+    operation = typing.cast(dict[str, object], record["operation"])
+    provider = typing.cast(dict[str, object], operation["provider"])
+    resource = dict(typing.cast(dict[str, object], event["payload"])["resource"])
+    kind = str(event["kind"])
+    provider_chat_key = direct_conversation_key(
+        store,
+        account_uuid,
+        str(provider["chat_id"]),
+    )
+    object_kind = {
+        "identity": "user",
+        "stream": "channel"
+        if provider_chat_key.startswith("channel:")
+        else "conversation",
+        "topic": "topic",
+        "message": "message",
+        "reaction": "reaction",
+        "read_state": "read-state",
+    }[kind.split(".", 1)[0]]
+    object_id = str(resource["provider_external_id"])
+    references: dict[str, object] = {}
+    if kind.startswith("topic."):
+        references["topic"] = object_id
+    elif kind.startswith("message."):
+        topic_uuid = resource.get("topic_uuid")
+        if topic_uuid is not None:
+            references["topic"] = _workspace_provider_id(
+                store, account_uuid, "topic", topic_uuid
+            )
+        user_uuid = resource.get("user_uuid")
+        if user_uuid is not None:
+            references["user"] = _workspace_provider_id(
+                store, account_uuid, "identity", user_uuid
+            )
+    elif kind.startswith("reaction."):
+        references["message"] = _workspace_provider_id(
+            store,
+            account_uuid,
+            "message",
+            resource["message_uuid"],
+        )
+        references["user"] = _workspace_provider_id(
+            store,
+            account_uuid,
+            "identity",
+            resource["user_uuid"],
+        )
+    elif kind == "read_state.set":
+        references["messages"] = [
+            _workspace_provider_id(store, account_uuid, "message", message_uuid)
+            for message_uuid in typing.cast(list[object], resource["message_uuids"])
+        ]
+        references["reader"] = _workspace_provider_id(
+            store,
+            account_uuid,
+            "identity",
+            resource["reader_uuid"],
+        )
+        topic_uuid = resource.get("topic_uuid")
+        if topic_uuid is not None:
+            references["topic"] = _workspace_provider_id(
+                store, account_uuid, "topic", topic_uuid
+            )
+    elif kind == "topic.notification.update":
+        references["topic"] = _workspace_provider_id(
+            store,
+            account_uuid,
+            "topic",
+            resource["uuid"],
+        )
+    provider_metadata = resource.get("provider_metadata")
+    if isinstance(provider_metadata, dict):
+        resource["provider_metadata"] = {
+            key: value
+            for key, value in provider_metadata.items()
+            if key
+            not in {
+                "account_uuid",
+                "chat_key",
+                "delivery_class",
+                "external_id",
+                "provider_event_uuid",
+            }
+        }
+    payload = {
+        key: value
+        for key, value in resource.items()
+        if key not in _SERVER_OWNED_RESOURCE_FIELDS
+    }
+    provider_object = {"kind": object_kind, "id": object_id}
+    command_chat_key = "account" if kind == "identity.upsert" else provider_chat_key
+    return {
+        "provider_event_key": provider_event_key(
+            kind,
+            command_chat_key,
+            provider_object,
+            references,
+            payload,
+        ),
+        "delivery_uuid": str(uuid.UUID(str(record["operation_uuid"]))),
+        "external_account_uuid": account_uuid,
+        "provider_chat_key": command_chat_key,
+        "provider_sequence": provider.get("revision"),
+        "kind": kind,
+        "provider_object": provider_object,
+        "provider_references": references,
+        "payload": payload,
     }
 
 

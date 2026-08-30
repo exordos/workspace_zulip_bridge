@@ -46,8 +46,7 @@ def _provider_event_static_causal_lane(event: dict[str, object]) -> str | None:
         if not isinstance(recipients, list):
             return None
         if not recipients or any(
-            not isinstance(recipient, dict)
-            or not isinstance(recipient.get("id"), int)
+            not isinstance(recipient, dict) or not isinstance(recipient.get("id"), int)
             for recipient in recipients
         ):
             return None
@@ -615,30 +614,53 @@ class RestAlchemyStore:
         session: sessions.PgSQLSession,
         account_uuid: str,
         generation: int,
+        projection_reset_generation: int = 0,
     ) -> None:
-        """Reset only a breaker that belongs to an older desired generation."""
+        """Reconcile account fencing and an explicit Workspace projection reset."""
+        current = session.execute(
+            """
+            SELECT projection_reset_generation
+            FROM scheduler_accounts
+            WHERE account_uuid = %s
+            FOR UPDATE
+            """,
+            (account_uuid,),
+        ).fetchone()
+        current_reset_generation = (
+            0 if current is None else int(current["projection_reset_generation"])
+        )
+        if projection_reset_generation < current_reset_generation:
+            raise ValueError("Projection reset generation moved backwards")
+        reset_projection = projection_reset_generation > current_reset_generation
         changed = session.execute(
             """
             INSERT INTO scheduler_accounts (
                 account_uuid, provider_generation, provider_state,
                 provider_retry_count, provider_retry_after,
-                provider_error_code, provider_state_updated_at
-            ) VALUES (%s, %s, 'ready', 0, NULL, NULL, now())
+                provider_error_code, provider_state_updated_at,
+                projection_reset_generation
+            ) VALUES (%s, %s, 'ready', 0, NULL, NULL, now(), %s)
             ON CONFLICT (account_uuid) DO UPDATE SET
                 provider_generation = EXCLUDED.provider_generation,
                 provider_state = 'ready',
                 provider_retry_count = 0,
                 provider_retry_after = NULL,
                 provider_error_code = NULL,
-                provider_state_updated_at = now()
+                provider_state_updated_at = now(),
+                projection_reset_generation =
+                    EXCLUDED.projection_reset_generation
             WHERE scheduler_accounts.provider_generation IS DISTINCT FROM
                   EXCLUDED.provider_generation
+               OR scheduler_accounts.projection_reset_generation IS DISTINCT FROM
+                  EXCLUDED.projection_reset_generation
             RETURNING account_uuid
             """,
-            (account_uuid, generation),
+            (account_uuid, generation, projection_reset_generation),
         ).fetchone()
         if changed is None:
             return
+        if reset_projection:
+            RestAlchemyStore._reset_provider_projection(session, account_uuid)
         session.execute(
             """
             UPDATE zulip_backfill_jobs
@@ -652,6 +674,93 @@ class RestAlchemyStore:
         session.execute(
             "DELETE FROM bridge_health WHERE component = %s",
             (provider_account_health_component(account_uuid),),
+        )
+
+    @staticmethod
+    def _reset_provider_projection(
+        session: sessions.PgSQLSession,
+        account_uuid: str,
+    ) -> None:
+        """Forget rebuildable Zulip state while retaining identities and catalog."""
+        statements = (
+            """
+            DELETE FROM operation_idempotency AS idempotency
+            WHERE EXISTS (
+                SELECT 1
+                FROM bridge_operations AS operation
+                WHERE operation.operation_uuid = idempotency.operation_uuid
+                  AND operation.account_uuid = %s
+                  AND operation.origin = 'zulip'
+            )
+            """,
+            """
+            WITH target AS (
+                SELECT %s::uuid AS account_uuid
+            ), owned_operation AS MATERIALIZED (
+                SELECT operation.operation_uuid
+                FROM bridge_operations AS operation
+                CROSS JOIN target
+                WHERE operation.account_uuid = target.account_uuid
+                  AND operation.origin = 'zulip'
+                UNION ALL
+                SELECT delivery.operation_uuid
+                FROM workspace_delivery_outbox AS delivery
+                CROSS JOIN target
+                WHERE delivery.account_uuid = target.account_uuid
+                  AND delivery.record->>'origin' = 'zulip'
+                UNION ALL
+                SELECT (prepared.record->>'operation_uuid')::uuid
+                FROM zulip_provider_events AS event
+                CROSS JOIN target
+                CROSS JOIN LATERAL jsonb_array_elements(
+                    COALESCE(event.prepared_records, '[]'::jsonb)
+                ) AS prepared(record)
+                WHERE event.account_uuid = target.account_uuid
+                  AND prepared.record->>'origin' = 'zulip'
+            )
+            DELETE FROM producer_operations AS producer
+            USING owned_operation AS owned
+            WHERE producer.origin = 'zulip'
+              AND producer.operation_uuid = owned.operation_uuid
+            """,
+            """
+            DELETE FROM workspace_delivery_outbox
+            WHERE account_uuid = %s AND record->>'origin' = 'zulip'
+            """,
+            """
+            DELETE FROM bridge_operations
+            WHERE account_uuid = %s AND origin = 'zulip'
+            """,
+            """
+            DELETE FROM provider_mapping_aliases
+            WHERE account_uuid = %s AND entity_kind <> 'identity'
+            """,
+            """
+            DELETE FROM provider_mappings
+            WHERE account_uuid = %s AND entity_kind <> 'identity'
+            """,
+            "DELETE FROM zulip_provider_events WHERE account_uuid = %s",
+            "DELETE FROM zulip_event_cursors WHERE account_uuid = %s",
+            "DELETE FROM scheduler_provider_event_lanes WHERE account_uuid = %s",
+            "DELETE FROM zulip_queue_catchup_jobs WHERE account_uuid = %s",
+            "DELETE FROM zulip_participant_sync WHERE account_uuid = %s",
+            """
+            UPDATE zulip_backfill_jobs
+            SET state = 'cancelled', next_anchor = NULL, cutoff_at = NULL,
+                lease_until = NULL, available_at = now(), retry_count = 0,
+                last_error_code = NULL, updated_at = now()
+            WHERE account_uuid = %s
+            """,
+        )
+        for statement in statements:
+            session.execute(statement, (account_uuid,))
+        session.execute(
+            """
+            DELETE FROM bridge_health
+            WHERE component = 'provider:' || %s
+               OR component LIKE 'provider:' || %s || ':%%'
+            """,
+            (account_uuid, account_uuid),
         )
 
     def apply_desired_changes(
@@ -732,6 +841,11 @@ class RestAlchemyStore:
                             session,
                             resource_uuid,
                             generation,
+                            int(
+                                typing.cast(dict[str, object], body).get(
+                                    "projection_reset_generation", 0
+                                )
+                            ),
                         )
                 if resource_type == "external_chat_assignment":
                     if operation == "upsert":
@@ -817,6 +931,7 @@ class RestAlchemyStore:
                         session,
                         str(resource["uuid"]),
                         int(resource["generation"]),
+                        int(resource.get("projection_reset_generation", 0)),
                     )
             session.execute(
                 """
@@ -1380,26 +1495,52 @@ class RestAlchemyStore:
         with self.session() as session:
             return session.execute(
                 """
-                SELECT mapping.workspace_uuid, mapping.provider_id,
+                WITH exact_mapping AS (
+                    SELECT mapping.workspace_uuid, mapping.provider_id,
+                           mapping.provider_revision, mapping.metadata,
+                           EXISTS (
+                               SELECT 1 FROM provider_mapping_aliases AS alias
+                               WHERE alias.account_uuid = mapping.account_uuid
+                                 AND alias.entity_kind = mapping.entity_kind
+                                 AND alias.workspace_uuid = mapping.workspace_uuid
+                                 AND alias.provider_id = mapping.provider_id
+                                 AND NOT alias.deleted
+                           ) AS convergent_alias
+                    FROM provider_mappings AS mapping
+                    WHERE mapping.account_uuid = %s
+                      AND mapping.entity_kind = %s
+                      AND mapping.provider_id = %s
+                      AND NOT mapping.deleted
+                )
+                SELECT * FROM exact_mapping
+                UNION ALL
+                SELECT mapping.workspace_uuid, %s AS provider_id,
                        mapping.provider_revision, mapping.metadata,
-                       EXISTS (
-                           SELECT 1 FROM provider_mapping_aliases AS alias
-                           WHERE alias.account_uuid = mapping.account_uuid
-                             AND alias.entity_kind = mapping.entity_kind
-                             AND alias.workspace_uuid = mapping.workspace_uuid
-                             AND alias.provider_id = mapping.provider_id
-                             AND NOT alias.deleted
-                       ) AS convergent_alias
+                       false AS convergent_alias
                 FROM provider_mappings AS mapping
-                WHERE mapping.account_uuid = %s AND mapping.entity_kind = %s
-                  AND mapping.provider_id = %s AND NOT mapping.deleted
+                WHERE NOT EXISTS (SELECT 1 FROM exact_mapping)
+                  AND %s = 'topic'
+                  AND mapping.account_uuid = %s
+                  AND mapping.entity_kind = 'topic'
+                  AND NOT mapping.deleted
+                  AND COALESCE(
+                      mapping.metadata->'provider_aliases', '[]'::jsonb
+                  ) ? %s
+                ORDER BY workspace_uuid
+                LIMIT 1
                 """,
-                (account_uuid, entity_kind, provider_id),
+                (
+                    account_uuid,
+                    entity_kind,
+                    provider_id,
+                    provider_id,
+                    entity_kind,
+                    account_uuid,
+                    provider_id,
+                ),
             ).fetchone()
 
-    def provider_topic_mappings(
-        self, account_uuid: str
-    ) -> list[dict[str, object]]:
+    def provider_topic_mappings(self, account_uuid: str) -> list[dict[str, object]]:
         """Return active non-default topics for registration tombstones."""
         with self.session() as session:
             return list(
@@ -1831,6 +1972,35 @@ class RestAlchemyStore:
                         ),
                     ),
                 )
+            if entity_kind == "topic":
+                # A late event can still carry a pre-rename topic name. In that
+                # case refresh the canonical row reached through its durable
+                # alias without moving the primary provider id back in time.
+                refreshed_alias = session.execute(
+                    """
+                    UPDATE provider_mappings
+                    SET provider_revision = COALESCE(%s, provider_revision),
+                        metadata = metadata || %s,
+                        updated_at = now()
+                    WHERE account_uuid = %s AND entity_kind = 'topic'
+                      AND workspace_uuid = %s AND provider_id <> %s
+                      AND NOT deleted
+                      AND COALESCE(
+                          metadata->'provider_aliases', '[]'::jsonb
+                      ) ? %s
+                    RETURNING workspace_uuid
+                    """,
+                    (
+                        provider_revision,
+                        json.dumps(metadata),
+                        account_uuid,
+                        workspace_uuid,
+                        provider_id,
+                        provider_id,
+                    ),
+                ).fetchone()
+                if refreshed_alias is not None:
+                    return
             session.execute(
                 """
                 INSERT INTO provider_mappings (
@@ -1867,11 +2037,7 @@ class RestAlchemyStore:
         with self.session() as session:
             session.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-                (
-                    _provider_mapping_lock_key(
-                        account_uuid, "message", provider_id
-                    ),
-                ),
+                (_provider_mapping_lock_key(account_uuid, "message", provider_id),),
             )
             mapping = session.execute(
                 """
@@ -1904,11 +2070,7 @@ class RestAlchemyStore:
             # The lock is acquired in its own statement so a caller that waits
             # for a competing rename gets a fresh READ COMMITTED snapshot for
             # the mapping query below.
-            lock_provider_ids = (
-                sorted({old_provider_id, new_provider_id})
-                if entity_kind == "message"
-                else [new_provider_id]
-            )
+            lock_provider_ids = sorted({old_provider_id, new_provider_id})
             for lock_provider_id in lock_provider_ids:
                 session.execute(
                     "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
@@ -1945,7 +2107,19 @@ class RestAlchemyStore:
                 ),
                 renamed AS (
                     UPDATE provider_mappings AS mapping
-                    SET provider_id = %s, provider_revision = %s, metadata = %s,
+                    SET provider_id = %s, provider_revision = %s,
+                        metadata = CASE
+                            WHEN %s = 'topic' THEN
+                                (%s::jsonb - 'provider_aliases') ||
+                                jsonb_build_object(
+                                    'provider_aliases',
+                                    COALESCE(
+                                        mapping.metadata->'provider_aliases',
+                                        '[]'::jsonb
+                                    ) || jsonb_build_array(%s::text)
+                                )
+                            ELSE %s::jsonb
+                        END,
                         deleted = false, updated_at = now()
                     WHERE mapping.account_uuid = %s
                       AND mapping.entity_kind = %s
@@ -1969,6 +2143,9 @@ class RestAlchemyStore:
                     new_provider_id,
                     new_provider_id,
                     provider_revision,
+                    entity_kind,
+                    json.dumps(metadata),
+                    old_provider_id,
                     json.dumps(metadata),
                     account_uuid,
                     entity_kind,
@@ -3225,9 +3402,7 @@ class RestAlchemyStore:
         current_lane = typing.cast(str | None, current["causal_lane"])
         if not provider_message_ids:
             return True, current_lane
-        resolved_lane = self._provider_event_causal_lane(
-            session, account_uuid, event
-        )
+        resolved_lane = self._provider_event_causal_lane(session, account_uuid, event)
         if resolved_lane == current_lane:
             return True, current_lane
         session.execute(
@@ -4945,10 +5120,14 @@ class RestAlchemyStore:
             provider_event["processing_state"] == "invalid"
             and provider_event["processing_reason"] == "workspace_delivery_rejected"
         )
-        if provider_event["processing_state"] not in {
-            "pending",
-            "delivering",
-        } and not recoverable_rejection:
+        if (
+            provider_event["processing_state"]
+            not in {
+                "pending",
+                "delivering",
+            }
+            and not recoverable_rejection
+        ):
             return False
         prepared_records = provider_event["prepared_records"]
         prepared = (
@@ -5129,9 +5308,7 @@ class RestAlchemyStore:
                 FOR UPDATE
                 """
             ).fetchall()
-            candidate_operations = [
-                row["operation_uuid"] for row in locked_stale
-            ]
+            candidate_operations = [row["operation_uuid"] for row in locked_stale]
             if candidate_operations:
                 # Terminal rejection also locks the durable outbox row before
                 # its idempotency row. Keep the same explicit order here and
@@ -5261,18 +5438,13 @@ class RestAlchemyStore:
                             and payload.get("name") == stream_metadata.get("name")
                             and payload.get("description")
                             == stream_metadata.get("description")
-                            and payload.get("private")
-                            == stream_metadata.get("private")
+                            and payload.get("private") == stream_metadata.get("private")
                             and payload.get("chat_kind")
                             == stream_metadata.get("chat_type")
                             and isinstance(payload_participants, list)
                             and isinstance(mapping_participants, list)
-                            and sorted(
-                                str(value) for value in payload_participants
-                            )
-                            == sorted(
-                                str(value) for value in mapping_participants
-                            )
+                            and sorted(str(value) for value in payload_participants)
+                            == sorted(str(value) for value in mapping_participants)
                             and (
                                 None
                                 if payload.get("default_topic_uuid") is None
@@ -5320,11 +5492,9 @@ class RestAlchemyStore:
                         topic_metadata = typing.cast(
                             dict[str, object], topic_mapping["metadata"]
                         )
-                        compatible = (
-                            str(provider.get("entity_id"))
-                            == str(topic_mapping["provider_id"])
-                            and payload.get("name") == topic_metadata.get("name")
-                        )
+                        compatible = str(provider.get("entity_id")) == str(
+                            topic_mapping["provider_id"]
+                        ) and payload.get("name") == topic_metadata.get("name")
                 if compatible:
                     session.execute(
                         """
@@ -6531,7 +6701,11 @@ class RestAlchemyStore:
         with self.session() as session:
             desired = session.execute(
                 """
-                SELECT generation
+                SELECT generation,
+                       COALESCE(
+                           (body->>'projection_reset_generation')::bigint,
+                           0
+                       ) AS projection_reset_generation
                 FROM desired_resources
                 WHERE resource_type = 'external_account'
                   AND resource_uuid = %s
@@ -6547,7 +6721,10 @@ class RestAlchemyStore:
             if desired is None:
                 return None
             self._reconcile_provider_account_generation(
-                session, account_uuid, attempted_generation
+                session,
+                account_uuid,
+                attempted_generation,
+                int(desired["projection_reset_generation"]),
             )
             row = session.execute(
                 """
@@ -6599,7 +6776,11 @@ class RestAlchemyStore:
         with self.session() as session:
             desired = session.execute(
                 """
-                SELECT generation
+                SELECT generation,
+                       COALESCE(
+                           (body->>'projection_reset_generation')::bigint,
+                           0
+                       ) AS projection_reset_generation
                 FROM desired_resources
                 WHERE resource_type = 'external_account'
                   AND resource_uuid = %s
@@ -6615,7 +6796,10 @@ class RestAlchemyStore:
             if desired is None:
                 return None
             self._reconcile_provider_account_generation(
-                session, account_uuid, attempted_generation
+                session,
+                account_uuid,
+                attempted_generation,
+                int(desired["projection_reset_generation"]),
             )
             row = session.execute(
                 """
@@ -8311,7 +8495,47 @@ class RestAlchemyStore:
                     ),
                 ),
             )
-        if kind == "message.create":
+        if kind == "topic.create":
+            if provider_entity_id is None:
+                raise ValueError("Committed topic create has no provider identifier")
+            metadata = {
+                "stream_uuid": payload["stream_uuid"],
+                "chat_key": provider["chat_id"],
+                "name": payload["name"],
+                "project_uuid": record["project_uuid"],
+                "mapping_origin": str(record["origin"]),
+                "workspace_delivery_state": "committed",
+            }
+            session.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (
+                    _provider_mapping_lock_key(
+                        account_uuid, "topic", provider_entity_id
+                    ),
+                ),
+            )
+            session.execute(
+                """
+                INSERT INTO provider_mappings (
+                    account_uuid, entity_kind, workspace_uuid, provider_id,
+                    provider_revision, metadata, deleted
+                ) VALUES (%s, 'topic', %s, %s, %s, %s, false)
+                ON CONFLICT (account_uuid, entity_kind, provider_id) DO UPDATE SET
+                    workspace_uuid = EXCLUDED.workspace_uuid,
+                    provider_revision = EXCLUDED.provider_revision,
+                    metadata = EXCLUDED.metadata,
+                    deleted = false,
+                    updated_at = now()
+                """,
+                (
+                    account_uuid,
+                    workspace_uuid,
+                    provider_entity_id,
+                    provider_revision,
+                    json.dumps(metadata),
+                ),
+            )
+        elif kind == "message.create":
             if provider_entity_id is None:
                 raise ValueError("Committed message create has no provider identifier")
             session.execute(
@@ -8491,7 +8715,96 @@ class RestAlchemyStore:
                     workspace_uuid,
                 ),
             )
-        elif kind in {"topic.upsert", "stream.upsert"}:
+        elif kind == "topic.upsert":
+            if provider_entity_id is None:
+                raise ValueError("Committed topic update has no provider identifier")
+            previous_provider_id = provider.get("entity_id")
+            metadata = {
+                "stream_uuid": payload["stream_uuid"],
+                "chat_key": provider["chat_id"],
+                "name": payload["name"],
+                "project_uuid": record["project_uuid"],
+                "mapping_origin": str(record["origin"]),
+                "workspace_delivery_state": "committed",
+            }
+            session.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (
+                    _provider_mapping_lock_key(
+                        account_uuid, "topic", provider_entity_id
+                    ),
+                ),
+            )
+            session.execute(
+                """
+                UPDATE provider_mappings
+                SET provider_id = %s,
+                    provider_revision = COALESCE(%s, provider_revision),
+                    metadata = metadata || %s::jsonb || CASE
+                        WHEN %s::text IS NOT NULL AND %s::text <> %s::text
+                        THEN jsonb_build_object(
+                            'provider_aliases',
+                            COALESCE(
+                                metadata->'provider_aliases', '[]'::jsonb
+                            ) || jsonb_build_array(%s::text)
+                        )
+                        ELSE '{}'::jsonb
+                    END,
+                    deleted = false,
+                    updated_at = now()
+                WHERE account_uuid = %s AND entity_kind = 'topic'
+                  AND workspace_uuid = %s
+                """,
+                (
+                    provider_entity_id,
+                    provider_revision,
+                    json.dumps(metadata),
+                    previous_provider_id,
+                    previous_provider_id,
+                    provider_entity_id,
+                    previous_provider_id,
+                    account_uuid,
+                    workspace_uuid,
+                ),
+            )
+            if previous_provider_id is not None:
+                session.execute(
+                    """
+                    UPDATE provider_mapping_aliases
+                    SET provider_id = %s,
+                        metadata = metadata || %s,
+                        deleted = false,
+                        updated_at = now()
+                    WHERE account_uuid = %s AND entity_kind = 'topic'
+                      AND provider_id = %s
+                    """,
+                    (
+                        provider_entity_id,
+                        json.dumps(metadata),
+                        account_uuid,
+                        str(previous_provider_id),
+                    ),
+                )
+        elif kind == "topic.delete":
+            session.execute(
+                """
+                UPDATE provider_mappings
+                SET deleted = true, updated_at = now()
+                WHERE account_uuid = %s AND entity_kind = 'topic'
+                  AND workspace_uuid = %s
+                """,
+                (account_uuid, workspace_uuid),
+            )
+            session.execute(
+                """
+                UPDATE provider_mapping_aliases
+                SET deleted = true, updated_at = now()
+                WHERE account_uuid = %s AND entity_kind = 'topic'
+                  AND workspace_uuid = %s
+                """,
+                (account_uuid, workspace_uuid),
+            )
+        elif kind == "stream.upsert":
             entity_kind = kind.partition(".")[0]
             session.execute(
                 """
@@ -8872,9 +9185,7 @@ class RestAlchemyStore:
             """,
             (account_uuid, message_ids),
         ).fetchall()
-        resolved = {
-            str(row["provider_id"]): str(row["causal_lane"]) for row in mapped
-        }
+        resolved = {str(row["provider_id"]): str(row["causal_lane"]) for row in mapped}
         if set(resolved) == set(message_ids):
             resolved_lanes = set(resolved.values())
             return resolved_lanes.pop() if len(resolved_lanes) == 1 else None
@@ -8915,9 +9226,7 @@ class RestAlchemyStore:
         self, account_uuid: str, queue_id: str, event: dict[str, object]
     ) -> bool:
         with self.session() as session:
-            causal_lane = self._provider_event_causal_lane(
-                session, account_uuid, event
-            )
+            causal_lane = self._provider_event_causal_lane(session, account_uuid, event)
             result = session.execute(
                 """
                 WITH registered_account AS (
@@ -9248,9 +9557,7 @@ class RestAlchemyStore:
         lease_uuid: str | None = None,
     ) -> None:
         """Persist one terminal Provider API acknowledgement without retry loops."""
-        self.finalize_provider_result_responses(
-            [(record_uuid, status, lease_uuid)]
-        )
+        self.finalize_provider_result_responses([(record_uuid, status, lease_uuid)])
 
     def finalize_provider_result_responses(
         self,

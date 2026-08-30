@@ -16,6 +16,10 @@ BINDING_UUID = "80000000-0000-0000-0000-000000000008"
 
 
 class Store:
+    def provider_event_cursor(self, account_uuid):
+        assert account_uuid == ACCOUNT_UUID
+        return {"provider_owner_user_id": "42"}
+
     def provider_mapping(self, account_uuid, kind, provider_id):
         assert (account_uuid, kind, provider_id) == (
             ACCOUNT_UUID,
@@ -52,6 +56,13 @@ class Store:
 class PendingMessageMappingStore(Store):
     def workspace_mapping(self, account_uuid, kind, workspace_uuid):
         if kind == "message":
+            return None
+        return super().workspace_mapping(account_uuid, kind, workspace_uuid)
+
+
+class NewTopicMappingStore(Store):
+    def workspace_mapping(self, account_uuid, kind, workspace_uuid):
+        if kind == "topic":
             return None
         return super().workspace_mapping(account_uuid, kind, workspace_uuid)
 
@@ -113,6 +124,67 @@ def test_provider_lease_adapts_to_existing_durable_zulip_scheduler():
     assert record["transport"]["lease_uuid"] == leased["lease_uuid"]
 
 
+@pytest.mark.parametrize(
+    ("kind", "required_capability", "payload", "expected_bridge_kind"),
+    [
+        (
+            "stream.delete",
+            "messenger.stream.delete",
+            {"uuid": STREAM_UUID},
+            "stream.delete",
+        ),
+        (
+            "topic.create",
+            "messenger.topic.create",
+            {"uuid": TOPIC_UUID, "stream_uuid": STREAM_UUID, "name": "new topic"},
+            "topic.create",
+        ),
+        (
+            "topic.delete",
+            "messenger.topic.delete",
+            {"uuid": TOPIC_UUID, "stream_uuid": STREAM_UUID, "name": "dev"},
+            "topic.delete",
+        ),
+    ],
+)
+def test_provider_lease_accepts_channel_lifecycle_operations(
+    kind, required_capability, payload, expected_bridge_kind
+):
+    leased = _lease(kind)
+    leased["required_capability"] = required_capability
+    leased["payload"] = payload
+    store = NewTopicMappingStore() if kind == "topic.create" else Store()
+
+    record = provider_protocol.leased_operation_record(store, leased)
+
+    assert record["operation"]["kind"] == expected_bridge_kind
+    assert record["operation"]["provider"]["chat_id"] == "channel:42"
+    assert record["operation"]["provider"]["entity_id"] == (
+        None
+        if kind == "topic.create"
+        else "channel:42" if kind == "stream.delete" else "42:dev"
+    )
+
+
+@pytest.mark.parametrize("kind", ["topic.update", "topic.delete"])
+def test_topic_mutation_can_be_leased_behind_pending_create(kind):
+    leased = _lease(kind)
+    leased["required_capability"] = (
+        "messenger.topic.rename"
+        if kind == "topic.update"
+        else "messenger.topic.delete"
+    )
+    leased["payload"] = {
+        "uuid": TOPIC_UUID,
+        "stream_uuid": STREAM_UUID,
+        "name": "new topic",
+    }
+
+    record = provider_protocol.leased_operation_record(NewTopicMappingStore(), leased)
+
+    assert record["operation"]["provider"]["entity_id"] is None
+
+
 def test_provider_read_lease_uses_physical_page_identity_internally():
     first = _lease("read_state.set")
     first["required_capability"] = "messenger.message.read"
@@ -152,6 +224,22 @@ def test_provider_read_lease_reconstruction_keeps_terminal_digest():
         "message_uuids": [MESSAGE_UUID],
         "read": True,
     }
+
+    first = provider_protocol.leased_operation_record(Store(), leased)
+    leased["lease_uuid"] = str(uuid.uuid4())
+    leased["lease_expires_at"] = "2026-07-18T16:00:00Z"
+    second = provider_protocol.leased_operation_record(Store(), leased)
+
+    assert first["operation"]["occurred_at"] == "1970-01-01T00:00:00Z"
+    assert second["operation"]["occurred_at"] == "1970-01-01T00:00:00Z"
+    assert first["operation_uuid"] == second["operation_uuid"]
+    assert first["operation_sha256"] == second["operation_sha256"]
+
+
+def test_timestamp_free_delete_lease_reconstruction_keeps_terminal_digest():
+    leased = _lease("stream.delete")
+    leased["required_capability"] = "messenger.stream.delete"
+    leased["payload"] = {"uuid": STREAM_UUID}
 
     first = provider_protocol.leased_operation_record(Store(), leased)
     leased["lease_uuid"] = str(uuid.uuid4())
@@ -271,6 +359,105 @@ def test_zulip_record_adapts_to_atomic_provider_event_resource():
         "avatar_urn": None,
         "active": True,
     }
+
+
+def test_zulip_record_adapts_to_provider_native_v2_command():
+    record = provider_protocol.leased_operation_record(Store(), _lease())
+    record["origin"] = "zulip"
+    record["operation_uuid"] = str(uuid.uuid4())
+    record["operation"]["provider"]["entity_id"] = "101"
+
+    command = provider_protocol.command_payload(Store(), record)
+
+    assert command == {
+        "provider_event_key": provider_protocol.provider_event_key(
+            "message.upsert",
+            "channel:42",
+            {"kind": "message", "id": "101"},
+            {"topic": "42:dev", "user": "42"},
+            {
+                "payload": {"kind": "markdown", "content": "hello"},
+                "created_at": (
+                    datetime.datetime.fromtimestamp(1_752_840_000, datetime.UTC)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                ),
+                "author_identity": {
+                    "provider_external_id": "42",
+                    "display_name": "Former User",
+                    "email": None,
+                    "avatar_urn": None,
+                    "active": True,
+                },
+                "provider_metadata": {"provider_revision": None},
+            },
+        ),
+        "delivery_uuid": record["operation_uuid"],
+        "external_account_uuid": ACCOUNT_UUID,
+        "provider_chat_key": "channel:42",
+        "provider_sequence": None,
+        "kind": "message.upsert",
+        "provider_object": {"kind": "message", "id": "101"},
+        "provider_references": {"topic": "42:dev", "user": "42"},
+        "payload": {
+            "payload": {"kind": "markdown", "content": "hello"},
+            "created_at": (
+                datetime.datetime.fromtimestamp(1_752_840_000, datetime.UTC)
+                .isoformat()
+                .replace("+00:00", "Z")
+            ),
+            "author_identity": {
+                "provider_external_id": "42",
+                "display_name": "Former User",
+                "email": None,
+                "avatar_urn": None,
+                "active": True,
+            },
+            "provider_metadata": {"provider_revision": None},
+        },
+    }
+
+
+def test_provider_event_key_is_state_based_across_delivery_paths():
+    record = provider_protocol.leased_operation_record(Store(), _lease())
+    record["origin"] = "zulip"
+    record["operation_uuid"] = str(uuid.uuid4())
+    record["operation"]["provider"]["entity_id"] = "101"
+    record["operation"]["extensions"] = {"delivery_class": "history"}
+
+    history = provider_protocol.command_payload(Store(), record)
+    record["operation_uuid"] = str(uuid.uuid4())
+    record["operation"]["extensions"] = {"delivery_class": "live"}
+    live = provider_protocol.command_payload(Store(), record)
+
+    assert history["provider_event_key"] == live["provider_event_key"]
+    assert history["delivery_uuid"] != live["delivery_uuid"]
+    assert history["provider_event_key"].startswith(
+        "provider-event:v1:message.upsert:message:3:101:"
+    )
+
+
+def test_provider_event_key_changes_with_desired_provider_state():
+    record = provider_protocol.leased_operation_record(Store(), _lease())
+    record["origin"] = "zulip"
+    record["operation_uuid"] = str(uuid.uuid4())
+    record["operation"]["provider"]["entity_id"] = "101"
+    initial = provider_protocol.command_payload(Store(), record)
+    record["operation"]["payload"]["payload"]["content"] = "updated"
+    updated = provider_protocol.command_payload(Store(), record)
+
+    assert initial["provider_event_key"] != updated["provider_event_key"]
+
+
+def test_direct_conversation_key_is_sorted_and_includes_verified_owner():
+    assert (
+        provider_protocol.direct_conversation_key(
+            Store(),
+            ACCOUNT_UUID,
+            "group_direct:77,7",
+        )
+        == "direct-conversation:v1:3:7,42,77"
+    )
 
 
 def test_provider_message_event_reuses_tombstoned_author_profile():
