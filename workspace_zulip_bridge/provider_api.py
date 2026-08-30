@@ -24,9 +24,9 @@ class ProviderEventRejectedError(RuntimeError):
 
 
 class ProviderApiClient:
-    """mTLS client for the private Workspace Provider Data API v1."""
+    """mTLS client for the private Workspace Provider Data API v2."""
 
-    API_ROOT = "/api/workspace-provider/v1"
+    API_ROOT = "/api/workspace-provider/v2"
 
     def __init__(
         self,
@@ -118,12 +118,12 @@ class ProviderApiClient:
         self._raise_for_status(response)
         return typing.cast(dict[str, object], response.json())
 
-    def apply_events(self, events: list[dict[str, object]]) -> dict[str, object]:
-        if not 1 <= len(events) <= 500:
-            raise ValueError("Provider event batch size is invalid")
+    def apply_commands(self, commands: list[dict[str, object]]) -> dict[str, object]:
+        if not 1 <= len(commands) <= 500:
+            raise ValueError("Provider command batch size is invalid")
         response = self.client.post(
-            f"{self.API_ROOT}/events",
-            json={"events": events},
+            f"{self.API_ROOT}/commands",
+            json={"commands": commands},
         )
         try:
             self._raise_for_status(response)

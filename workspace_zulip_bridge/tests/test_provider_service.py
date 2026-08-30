@@ -38,6 +38,7 @@ class Store:
                 },
             },
             "stream": {"provider_id": "channel:42", "metadata": {}},
+            "topic": {"provider_id": "42:dev", "metadata": {}},
             "message": {
                 "provider_id": "101",
                 "metadata": {"chat_key": "channel:42"},
@@ -120,18 +121,18 @@ class Provider:
             ]
         }
 
-    def apply_events(self, events):
-        self.events.extend(events)
+    def apply_commands(self, commands):
+        self.events.extend(commands)
         return {
             "results": [
                 {
-                    "provider_event_uuid": event["provider_event_uuid"],
+                    "provider_event_key": command["provider_event_key"],
                     "status": "applied",
-                    "target_uuid": event["payload"]["resource"]["uuid"],
+                    "target_uuid": None,
                     "safe_error": None,
                     "duplicate": False,
                 }
-                for event in events
+                for command in commands
             ]
         }
 
@@ -320,9 +321,7 @@ def test_poll_provider_operations_durably_enqueues_membership_write():
     assert record["operation"]["entity_uuid"] == BINDING_UUID
     assert record["operation"]["provider"]["chat_id"] == "channel:42"
     assert record["operation"]["provider"]["entity_id"] == "9"
-    assert (
-        record["transport"]["required_capability"] == "messenger.membership.write"
-    )
+    assert record["transport"]["required_capability"] == "messenger.membership.write"
 
 
 def test_flush_provider_results_reports_and_persists_backend_acceptance():
@@ -433,7 +432,7 @@ def test_retryable_provider_event_failure_releases_idempotent_http_submission():
         request = httpx.Request("POST", "https://provider.invalid/events")
         raise httpx.ConnectError("offline", request=request)
 
-    instance.provider_api.apply_events = fail
+    instance.provider_api.apply_commands = fail
 
     with pytest.raises(httpx.ConnectError):
         instance.flush_provider_events()
@@ -458,7 +457,7 @@ def test_retryable_provider_event_failure_uses_shared_bounded_backoff(monkeypatc
         calls.append(events)
         raise provider_api.ProviderApiRetryableError(409)
 
-    instance.provider_api.apply_events = fail
+    instance.provider_api.apply_commands = fail
 
     with pytest.raises(provider_api.ProviderApiRetryableError):
         instance.flush_provider_events()
@@ -476,7 +475,7 @@ def test_retryable_provider_event_failure_uses_shared_bounded_backoff(monkeypatc
     assert instance.provider_delivery_retry_attempts == 2
     assert instance.provider_delivery_retry_after == 103.0
 
-    instance.provider_api.apply_events = Provider().apply_events
+    instance.provider_api.apply_commands = Provider().apply_commands
     now[0] = 103.0
     assert instance.flush_provider_events() == 1
     assert instance.provider_delivery_retry_attempts == 0
@@ -493,7 +492,7 @@ def test_provider_event_backoff_honors_retry_after_header(monkeypatch):
     instance = _instance()
     instance.store.deliveries = [_inbound_record()]
     instance.provider_delivery_random = Random()
-    instance.provider_api.apply_events = lambda _events: (_ for _ in ()).throw(
+    instance.provider_api.apply_commands = lambda _commands: (_ for _ in ()).throw(
         provider_api.ProviderApiRetryableError(503, 17.0)
     )
 
@@ -514,24 +513,24 @@ def test_permanent_rejection_isolates_one_record_and_commits_valid_sibling():
     instance.store.deliveries = [rejected, accepted]
     calls = []
 
-    def apply(events):
-        calls.append([event["provider_event_uuid"] for event in events])
+    def apply(commands):
+        calls.append([command["provider_event_key"] for command in commands])
         if any(
-            event["payload"]["resource"]["uuid"] == MESSAGE_UUID
-            for event in events
+            command["delivery_uuid"] == rejected["operation_uuid"]
+            for command in commands
         ):
             raise provider_api.ProviderEventRejectedError(422)
         return {
             "results": [
                 {
-                    "provider_event_uuid": event["provider_event_uuid"],
+                    "provider_event_key": command["provider_event_key"],
                     "status": "applied",
                 }
-                for event in events
+                for command in commands
             ]
         }
 
-    instance.provider_api.apply_events = apply
+    instance.provider_api.apply_commands = apply
 
     assert instance.flush_provider_events() == 1
     assert [len(call) for call in calls] == [2, 1, 1]
@@ -540,9 +539,7 @@ def test_permanent_rejection_isolates_one_record_and_commits_valid_sibling():
     ]
     assert [
         result["in_reply_to_record_uuid"] for result in instance.store.accepted
-    ] == [
-        accepted["record_uuid"]
-    ]
+    ] == [accepted["record_uuid"]]
     assert instance.store.released == []
     assert instance.store.health == [
         ("provider_api", "degraded", "provider_event_rejected")
@@ -577,32 +574,30 @@ def test_history_rejection_isolation_submits_ready_live_work_between_requests():
 
     instance.store.pending_workspace_deliveries = pending_workspace_deliveries
 
-    def apply(events):
-        resources = [event["payload"]["resource"]["uuid"] for event in events]
+    def apply(commands):
+        delivery_uuids = [command["delivery_uuid"] for command in commands]
         delivery_class = (
-            "live"
-            if resources == [live["operation"]["entity_uuid"]]
-            else "history"
+            "live" if delivery_uuids == [live["operation_uuid"]] else "history"
         )
-        calls.append((delivery_class, len(events)))
+        calls.append((delivery_class, len(commands)))
         if any(
-            event["payload"]["resource"]["uuid"] == MESSAGE_UUID
-            for event in events
+            command["delivery_uuid"] == rejected["operation_uuid"]
+            for command in commands
         ):
-            if len(events) > 1:
+            if len(commands) > 1:
                 live_ready[0] = True
             raise provider_api.ProviderEventRejectedError(422)
         return {
             "results": [
                 {
-                    "provider_event_uuid": event["provider_event_uuid"],
+                    "provider_event_key": command["provider_event_key"],
                     "status": "applied",
                 }
-                for event in events
+                for command in commands
             ]
         }
 
-    instance.provider_api.apply_events = apply
+    instance.provider_api.apply_commands = apply
 
     assert instance._flush_history_events() == (
         1,
@@ -653,14 +648,14 @@ def test_interleaved_live_failure_defers_once_and_releases_both_batches(
 
     instance.store.pending_workspace_deliveries = pending_workspace_deliveries
 
-    def apply(events):
-        resources = [event["payload"]["resource"]["uuid"] for event in events]
-        if resources == [live["operation"]["entity_uuid"]]:
+    def apply(commands):
+        delivery_uuids = [command["delivery_uuid"] for command in commands]
+        if delivery_uuids == [live["operation_uuid"]]:
             raise provider_api.ProviderApiRetryableError(503)
         live_ready[0] = True
         raise provider_api.ProviderEventRejectedError(422)
 
-    instance.provider_api.apply_events = apply
+    instance.provider_api.apply_commands = apply
 
     with pytest.raises(provider_api.ProviderApiRetryableError):
         instance._flush_history_events()
@@ -694,18 +689,18 @@ def test_invalid_provider_event_response_releases_submissions(failure):
     record = _inbound_record()
     instance.store.deliveries = [record]
 
-    def invalid(events):
+    def invalid(commands):
         result = {
-            "provider_event_uuid": (
+            "provider_event_key": (
                 str(uuid.uuid4())
                 if failure == "wrong_order"
-                else events[0]["provider_event_uuid"]
+                else commands[0]["provider_event_key"]
             ),
             "status": "rejected" if failure == "non_applied" else "applied",
         }
         return {"results": [result]}
 
-    instance.provider_api.apply_events = invalid
+    instance.provider_api.apply_commands = invalid
 
     with pytest.raises(ValueError):
         instance.flush_provider_events()

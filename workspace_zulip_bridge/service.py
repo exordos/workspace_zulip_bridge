@@ -246,8 +246,8 @@ class _BackfillConversionStore:
     ) -> dict[str, object] | None:
         key = (account_uuid, provider_id)
         if key not in self.provider_message_mappings:
-            self.provider_message_mappings[key] = (
-                self.store.provider_message_mapping(*key)
+            self.provider_message_mappings[key] = self.store.provider_message_mapping(
+                *key
             )
         return self.provider_message_mappings[key]
 
@@ -786,9 +786,7 @@ class BridgeService:
                 if isinstance(transport, dict) and transport.get("lease_uuid")
                 else None
             )
-            acknowledgements.append(
-                (str(record["record_uuid"]), status, lease_uuid)
-            )
+            acknowledgements.append((str(record["record_uuid"]), status, lease_uuid))
             if status in {"applied", "duplicate"}:
                 sent += 1
         self.store.finalize_provider_result_responses(acknowledgements)
@@ -1195,9 +1193,7 @@ class BridgeService:
         report["report_uuid"] = self._observed_report_uuid(report)
         if ensure_durable:
             if catalog_deletion is not None:
-                ensure_deletion = getattr(
-                    self.store, "ensure_catalog_deletion", None
-                )
+                ensure_deletion = getattr(self.store, "ensure_catalog_deletion", None)
                 if callable(ensure_deletion):
                     return bool(
                         ensure_deletion(
@@ -1429,9 +1425,7 @@ class BridgeService:
                 participants,
             )
         if assignments is None:
-            omitted_channels = getattr(
-                self.store, "omitted_cataloged_channels", None
-            )
+            omitted_channels = getattr(self.store, "omitted_cataloged_channels", None)
             if callable(omitted_channels):
                 current_channel_keys = {
                     chat_key
@@ -1801,7 +1795,10 @@ class BridgeService:
                 {
                     "messenger.membership.write",
                     "messenger.notification.write",
+                    "messenger.stream.delete",
                     "messenger.stream.rename",
+                    "messenger.topic.create",
+                    "messenger.topic.delete",
                     "messenger.topic.rename",
                 }
             )
@@ -2890,9 +2887,7 @@ class BridgeService:
                 getattr(self, "provider_journal_parallel_enabled", False)
                 and len(rows) > 1
             ):
-                lane_groups: dict[
-                    tuple[str, object], list[dict[str, object]]
-                ] = {}
+                lane_groups: dict[tuple[str, object], list[dict[str, object]]] = {}
                 for row in rows:
                     lane_groups.setdefault(
                         (str(row["account_uuid"]), row.get("causal_lane")),
@@ -3253,9 +3248,7 @@ class BridgeService:
                         event_enqueued_atomically = True
                     else:
                         for record in records:
-                            if hasattr(
-                                self.store, "mark_provider_event_delivering"
-                            ):
+                            if hasattr(self.store, "mark_provider_event_delivering"):
                                 self.store.enqueue_workspace_delivery(
                                     record, 0, queue_id, event_id
                                 )
@@ -3401,13 +3394,10 @@ class BridgeService:
         )
         return min(ceiling, configured_batch)
 
-    def _history_message_uses_file_transfer(
-        self, message: dict[str, object]
-    ) -> bool:
-        return (
-            getattr(self, "file_client", None) is not None
-            and "/user_uploads/" in str(message.get("content", ""))
-        )
+    def _history_message_uses_file_transfer(self, message: dict[str, object]) -> bool:
+        return getattr(
+            self, "file_client", None
+        ) is not None and "/user_uploads/" in str(message.get("content", ""))
 
     @staticmethod
     def _backfill_catalog_key(message: dict[str, object]) -> tuple[object, ...]:
@@ -3818,11 +3808,11 @@ class BridgeService:
                     if not self.store.mark_workspace_delivery_submitting(record_uuid):
                         continue
                 submitting_record_uuids.append(record_uuid)
-                event = provider_protocol.event_payload(self.store, record)
-                if event is None:
+                command = provider_protocol.command_payload(self.store, record)
+                if command is None:
                     completed_without_event.append(record)
                 else:
-                    event_records.append((record, event))
+                    event_records.append((record, command))
             if event_records:
                 committed = self._apply_provider_event_records(
                     event_records,
@@ -3863,8 +3853,8 @@ class BridgeService:
     ) -> int:
         """Apply in order, isolating only permanently rejected records."""
         try:
-            response = self.provider_api.apply_events(
-                [event for _record, event in event_records]
+            response = self.provider_api.apply_commands(
+                [command for _record, command in event_records]
             )
         except provider_api.ProviderEventRejectedError as exc:
             if len(event_records) > 1:
@@ -3909,9 +3899,9 @@ class BridgeService:
             return 0
         results = typing.cast(list[dict[str, object]], response["results"])
         expected = [
-            str(event["provider_event_uuid"]) for _record, event in event_records
+            str(command["provider_event_key"]) for _record, command in event_records
         ]
-        actual = [str(result["provider_event_uuid"]) for result in results]
+        actual = [str(result["provider_event_key"]) for result in results]
         if actual != expected:
             raise ValueError("Provider event response does not match request order")
         if any(result["status"] != "applied" for result in results):

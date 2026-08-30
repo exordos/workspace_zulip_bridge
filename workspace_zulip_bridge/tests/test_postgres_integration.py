@@ -6,6 +6,7 @@ import pathlib
 import subprocess
 import sys
 import threading
+import time
 import uuid
 
 import pytest
@@ -70,7 +71,8 @@ def postgres_store(migrated_postgres_dsn):
                      producer_operations, causal_lane_state, bridge_operations,
                      scheduler_accounts, observed_report_outbox,
                      zulip_provider_events, zulip_event_cursors,
-                     bridge_health CASCADE
+                     scheduler_provider_event_lanes,
+                     external_chat_catalog_state, bridge_health CASCADE
             """
         )
         session.execute(
@@ -117,6 +119,7 @@ def test_provider_account_breaker_survives_restart_and_reopens_on_generation(
                     jsonb_build_object(
                         'uuid', %s::text,
                         'generation', 1,
+                        'projection_reset_generation', 1,
                         'synchronization_enabled', true
                     ),
                     false
@@ -125,6 +128,15 @@ def test_provider_account_breaker_survives_restart_and_reopens_on_generation(
                 (account_uuid, account_uuid),
             )
     postgres_store.reconcile_participant_sync()
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE scheduler_accounts
+            SET projection_reset_generation = 1
+            WHERE account_uuid IN (%s, %s)
+            """,
+            (blocked_uuid, healthy_uuid),
+        )
     postgres_store.record_provider_event(
         blocked_uuid, "blocked-queue", {"id": 1, "type": "realm_user"}
     )
@@ -144,6 +156,15 @@ def test_provider_account_breaker_survives_restart_and_reopens_on_generation(
     assert raced is not None
     assert raced["provider_state"] == "auth_required"
     assert raced["provider_error_code"] == "unauthorized_account"
+    with postgres_store.session() as session:
+        reset_state = session.execute(
+            """
+            SELECT projection_reset_generation
+            FROM scheduler_accounts WHERE account_uuid = %s
+            """,
+            (blocked_uuid,),
+        ).fetchone()
+    assert reset_state == {"projection_reset_generation": 1}
     assert postgres_store.eligible_account_uuids() == [healthy_uuid]
     assert not postgres_store.record_provider_account_success(blocked_uuid, 1)
     assert [
@@ -379,6 +400,206 @@ def _insert_account_and_assignment(
         True,
     )
     return account_uuid, project_uuid
+
+
+def test_projection_reset_restarts_large_completed_import(postgres_store):
+    account_uuid, project_uuid = _insert_account_and_assignment(
+        postgres_store, history_depth="all"
+    )
+    identity_uuid = str(uuid.uuid4())
+    old_record = _provider_record(account_uuid, project_uuid)
+    old_record["causal_lane"] = "channel:42"
+    old_record["sequence"] = 1
+    old_record["operation_sha256"] = canonical.operation_digest(old_record)
+    postgres_store.reconcile_backfill_jobs()
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE zulip_backfill_jobs
+            SET state = 'complete', next_anchor = 999
+            WHERE account_uuid = %s AND provider_chat_key = 'channel:42'
+            """,
+            (account_uuid,),
+        )
+        session.execute(
+            """
+            INSERT INTO provider_mappings (
+                account_uuid, entity_kind, workspace_uuid, provider_id
+            ) VALUES (%s, 'identity', %s, '1')
+            """,
+            (account_uuid, identity_uuid),
+        )
+        session.execute(
+            """
+            INSERT INTO producer_operations (
+                operation_uuid, origin, causal_lane, lane_sequence,
+                predecessor_operation_uuid
+            ) VALUES (%s, 'zulip', 'channel:42', 1, NULL)
+            """,
+            (old_record["operation_uuid"],),
+        )
+        session.execute(
+            """
+            INSERT INTO producer_lane_counters (
+                origin, causal_lane, last_sequence, last_operation_uuid
+            ) VALUES ('zulip', 'channel:42', 1, %s)
+            """,
+            (old_record["operation_uuid"],),
+        )
+        session.execute(
+            """
+            INSERT INTO causal_lane_state (
+                origin, causal_lane, last_sequence, last_operation_uuid
+            ) VALUES ('zulip', 'channel:42', 1, %s)
+            """,
+            (old_record["operation_uuid"],),
+        )
+        session.execute(
+            """
+            INSERT INTO bridge_operations (
+                record_uuid, operation_uuid, attempt, operation_sha256,
+                account_uuid, project_uuid, origin, causal_lane, lane_sequence,
+                priority, state, record
+            ) VALUES (
+                %s, %s, 1, %s, %s, %s, 'zulip', 'channel:42', 1,
+                0, 'committed', %s::jsonb
+            )
+            """,
+            (
+                old_record["record_uuid"],
+                old_record["operation_uuid"],
+                old_record["operation_sha256"],
+                account_uuid,
+                project_uuid,
+                json.dumps(old_record),
+            ),
+        )
+        session.execute(
+            """
+            INSERT INTO provider_mappings (
+                account_uuid, entity_kind, workspace_uuid, provider_id,
+                metadata
+            )
+            SELECT %s, 'message', md5(%s || value::text)::uuid,
+                   value::text,
+                   jsonb_build_object('chat_key', 'channel:42')
+            FROM generate_series(1, 100000) AS value
+            """,
+            (account_uuid, account_uuid),
+        )
+        account = session.execute(
+            """
+            SELECT body FROM desired_resources
+            WHERE resource_type = 'external_account' AND resource_uuid = %s
+            """,
+            (account_uuid,),
+        ).fetchone()["body"]
+    account.update(
+        {
+            "resource_type": "external_account",
+            "generation": 2,
+            "projection_reset_generation": 1,
+        }
+    )
+    started_at = time.monotonic()
+    postgres_store.apply_desired_changes(
+        [
+            {
+                "change_uuid": str(uuid.uuid4()),
+                "sequence": 2,
+                "resource_type": "external_account",
+                "resource_uuid": account_uuid,
+                "operation": "upsert",
+                "generation": 2,
+                "required_capabilities": {},
+                "resource": account,
+            }
+        ],
+        "cursor-reset-1",
+    )
+    reset_seconds = time.monotonic() - started_at
+    postgres_store.reconcile_backfill_jobs()
+
+    with postgres_store.session() as session:
+        mappings = session.execute(
+            """
+            SELECT entity_kind, count(*) AS count
+            FROM provider_mappings WHERE account_uuid = %s
+            GROUP BY entity_kind ORDER BY entity_kind
+            """,
+            (account_uuid,),
+        ).fetchall()
+        job = session.execute(
+            """
+            SELECT state, next_anchor, retry_count, last_error_code
+            FROM zulip_backfill_jobs
+            WHERE account_uuid = %s AND provider_chat_key = 'channel:42'
+            """,
+            (account_uuid,),
+        ).fetchone()
+        scheduler_row = session.execute(
+            """
+            SELECT provider_generation, projection_reset_generation
+            FROM scheduler_accounts WHERE account_uuid = %s
+            """,
+            (account_uuid,),
+        ).fetchone()
+        cursor_count = session.execute(
+            "SELECT count(*) AS count FROM zulip_event_cursors WHERE account_uuid = %s",
+            (account_uuid,),
+        ).fetchone()["count"]
+        producer_count = session.execute(
+            "SELECT count(*) AS count FROM producer_operations WHERE operation_uuid = %s",
+            (old_record["operation_uuid"],),
+        ).fetchone()["count"]
+        lane_counter = session.execute(
+            """
+            SELECT last_sequence, last_operation_uuid
+            FROM producer_lane_counters
+            WHERE origin = 'zulip' AND causal_lane = 'channel:42'
+            """
+        ).fetchone()
+        lane_state = session.execute(
+            """
+            SELECT last_sequence, last_operation_uuid
+            FROM causal_lane_state
+            WHERE origin = 'zulip' AND causal_lane = 'channel:42'
+            """
+        ).fetchone()
+
+    assert mappings == [{"entity_kind": "identity", "count": 1}]
+    assert job == {
+        "state": "pending",
+        "next_anchor": None,
+        "retry_count": 0,
+        "last_error_code": None,
+    }
+    assert scheduler_row == {
+        "provider_generation": 2,
+        "projection_reset_generation": 1,
+    }
+    assert cursor_count == 0
+    assert producer_count == 0
+    assert lane_counter == {
+        "last_sequence": 1,
+        "last_operation_uuid": uuid.UUID(str(old_record["operation_uuid"])),
+    }
+    assert lane_state == lane_counter
+    assert reset_seconds < 30
+
+    reimport_record = _provider_record(account_uuid, project_uuid)
+    reimport_record["causal_lane"] = "channel:42"
+    reimport_record["operation_sha256"] = canonical.operation_digest(reimport_record)
+    with postgres_store.session() as session:
+        postgres_store._allocate_producer_lane(session, reimport_record)
+    assert reimport_record["sequence"] == 2
+    assert reimport_record["predecessor_operation_uuid"] == str(
+        old_record["operation_uuid"]
+    )
+    assert postgres_store.enqueue(reimport_record, 0)
+    claimed = postgres_store.claim("projection-reset-reimport")
+    assert claimed is not None
+    assert claimed.record["operation_uuid"] == reimport_record["operation_uuid"]
 
 
 def _enable_zulip_provider(store: storage.RestAlchemyStore) -> None:
@@ -2017,9 +2238,7 @@ def test_pending_observed_reports_prioritize_chat_materialization_over_status(
     assert postgres_store.enqueue_observed_report(materialization_report)
 
     assert postgres_store.has_pending_chat_materializations()
-    assert postgres_store.pending_observed_reports(limit=1) == [
-        materialization_report
-    ]
+    assert postgres_store.pending_observed_reports(limit=1) == [materialization_report]
 
     postgres_store.apply_observed_report_results(
         [
@@ -2352,18 +2571,19 @@ def test_registration_membership_finds_omitted_channel_topology(postgres_store):
         stale_chat_key,
     )
 
-    assert not postgres_store.provider_chat_is_cataloged(
-        account_uuid, stale_chat_key
-    )
+    assert not postgres_store.provider_chat_is_cataloged(account_uuid, stale_chat_key)
     with postgres_store.session() as session:
-        assert session.execute(
-            """
+        assert (
+            session.execute(
+                """
             SELECT count(*) AS total
             FROM observed_report_outbox
             WHERE report_uuid = %s
             """,
-            (report_uuid,),
-        ).fetchone()["total"] == 1
+                (report_uuid,),
+            ).fetchone()["total"]
+            == 1
+        )
         assert not session.execute(
             """
             SELECT available_at > now() AS delayed
@@ -2692,10 +2912,7 @@ def test_observed_report_hot_queries_use_migration_indexes(postgres_store):
     assert "observed_report_outbox_resource_observed_idx" in dedup_plan
     assert "observed_report_outbox_pending_order_idx" in pending_rank_plan
     assert "observed_report_outbox_pending_order_idx" in pending_order_plan
-    assert (
-        "observed_report_outbox_chat_materialization_idx"
-        in materialization_plan
-    )
+    assert "observed_report_outbox_chat_materialization_idx" in materialization_plan
     assert "observed_report_outbox_catalog_readiness_idx" in catalog_readiness_plan
     assert _max_plan_actual_rows(catalog_readiness_actual_plan) <= 5_000
     assert "observed_report_outbox_terminal_history_idx" in prune_plan
@@ -3070,9 +3287,7 @@ def test_rejected_topic_projection_does_not_suppress_fresh_retry(postgres_store)
 
     rejected = topic_record()
     assert postgres_store.enqueue_workspace_delivery(rejected, 0, "queue", 1)
-    assert postgres_store.mark_workspace_delivery_submitting(
-        rejected["record_uuid"]
-    )
+    assert postgres_store.mark_workspace_delivery_submitting(rejected["record_uuid"])
     assert postgres_store.reject_provider_event_submission(
         rejected["record_uuid"],
         "provider_api_http_422",
@@ -3094,8 +3309,7 @@ def test_rejected_topic_projection_does_not_suppress_fresh_retry(postgres_store)
         },
     )
     assert any(
-        record["operation"]["kind"] == "topic.upsert"
-        for record in later_records
+        record["operation"]["kind"] == "topic.upsert" for record in later_records
     )
 
     retry = topic_record()
@@ -4327,6 +4541,112 @@ def test_outbound_commit_suppresses_queue_loss_history_duplicate(postgres_store)
             """
         ).fetchall()
     assert duplicate == []
+
+
+def test_outbound_unmaterialized_topic_create_and_rename_persist_mapping(
+    postgres_store,
+):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    stream_uuid, _existing_topic_uuid, _author_uuid = (
+        _materialize_channel_projection(postgres_store, account_uuid, project_uuid)
+    )
+    topic_uuid = str(uuid.uuid4())
+    created = _provider_record(
+        account_uuid,
+        project_uuid,
+        kind="topic.create",
+    )
+    created["origin"] = "workspace"
+    created["operation"]["entity_uuid"] = topic_uuid
+    created["operation"]["payload"] = {
+        "uuid": topic_uuid,
+        "stream_uuid": stream_uuid,
+        "name": "new topic",
+    }
+    created["operation_sha256"] = canonical.operation_digest(created)
+
+    with postgres_store.session() as session:
+        postgres_store._persist_committed_mapping(
+            session,
+            created,
+            "42:new topic",
+            None,
+        )
+
+    mapped = postgres_store.workspace_mapping(account_uuid, "topic", topic_uuid)
+    assert mapped["provider_id"] == "42:new topic"
+    assert mapped["metadata"]["workspace_delivery_state"] == "committed"
+
+    renamed = json.loads(json.dumps(created))
+    renamed["operation"]["kind"] = "topic.upsert"
+    renamed["operation"]["provider"]["entity_id"] = "42:new topic"
+    renamed["operation"]["payload"]["name"] = "renamed topic"
+    with postgres_store.session() as session:
+        postgres_store._persist_committed_mapping(
+            session,
+            renamed,
+            "42:renamed topic",
+            None,
+        )
+
+    mapped = postgres_store.workspace_mapping(account_uuid, "topic", topic_uuid)
+    assert mapped["provider_id"] == "42:renamed topic"
+    assert mapped["metadata"]["name"] == "renamed topic"
+    old_name = postgres_store.provider_mapping(
+        account_uuid, "topic", "42:new topic"
+    )
+    assert str(old_name["workspace_uuid"]) == topic_uuid
+    assert old_name["provider_id"] == "42:new topic"
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "topic",
+        "42:new topic",
+        topic_uuid,
+        {**old_name["metadata"], "late_old_name_event": True},
+    )
+    current_after_late_event = postgres_store.workspace_mapping(
+        account_uuid, "topic", topic_uuid
+    )
+    assert current_after_late_event["provider_id"] == "42:renamed topic"
+    assert current_after_late_event["metadata"]["late_old_name_event"] is True
+
+    deleted = json.loads(json.dumps(renamed))
+    deleted["operation"]["kind"] = "topic.delete"
+    deleted["operation"]["provider"]["entity_id"] = "42:renamed topic"
+    with postgres_store.session() as session:
+        postgres_store._persist_committed_mapping(session, deleted, None, None)
+
+    assert postgres_store.workspace_mapping(account_uuid, "topic", topic_uuid) is None
+    assert (
+        postgres_store.provider_mapping(
+            account_uuid, "topic", "42:renamed topic"
+        )
+        is None
+    )
+    assert postgres_store.tombstoned_workspace_mapping(
+        account_uuid, "topic", topic_uuid
+    )["provider_id"] == "42:renamed topic"
+
+    recreated_topic_uuid = str(uuid.uuid4())
+    recreated = json.loads(json.dumps(created))
+    recreated["operation"]["entity_uuid"] = recreated_topic_uuid
+    recreated["operation"]["payload"]["uuid"] = recreated_topic_uuid
+    with postgres_store.session() as session:
+        postgres_store._persist_committed_mapping(
+            session,
+            recreated,
+            "42:renamed topic",
+            None,
+        )
+
+    recreated_mapping = postgres_store.provider_mapping(
+        account_uuid, "topic", "42:renamed topic"
+    )
+    assert str(recreated_mapping["workspace_uuid"]) == recreated_topic_uuid
+    assert postgres_store.workspace_mapping(
+        account_uuid, "topic", recreated_topic_uuid
+    )["provider_id"] == "42:renamed topic"
+    assert postgres_store.workspace_mapping(account_uuid, "topic", topic_uuid) is None
 
 
 def test_content_only_update_preserves_workspace_origin_topic_mapping(postgres_store):
@@ -6746,9 +7066,7 @@ def test_acknowledged_read_operations_are_pruned_without_losing_idempotency(
 
 def test_pruned_terminal_operation_cannot_be_enqueued_again(postgres_store):
     account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
-    record = _provider_record(
-        account_uuid, project_uuid, kind="read_state.set"
-    )
+    record = _provider_record(account_uuid, project_uuid, kind="read_state.set")
     record["sequence"] = 1
     record["operation_sha256"] = canonical.operation_digest(record)
     with postgres_store.session() as session:
@@ -6779,9 +7097,7 @@ def test_pruned_terminal_operation_cannot_be_enqueued_again(postgres_store):
 
 def test_nonterminal_read_operation_still_rejects_changed_digest(postgres_store):
     account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
-    record = _provider_record(
-        account_uuid, project_uuid, kind="read_state.set"
-    )
+    record = _provider_record(account_uuid, project_uuid, kind="read_state.set")
     record["sequence"] = 1
     record["operation_sha256"] = canonical.operation_digest(record)
     with postgres_store.session() as session:
@@ -7700,9 +8016,7 @@ def test_provider_journal_terminalization_rechecks_lane_after_refresh_race(
     instance.file_client = None
     instance.provider_adapters = lambda _account_uuid: Adapter()
     instance._queue_event_catalog = lambda *_args, **_kwargs: False
-    instance._event_records_with_pending_delete_recreations = (
-        lambda *_args, **_kwargs: []
-    )
+    instance._event_records_with_pending_delete_recreations = lambda *_args, **_kwargs: []
 
     refresh = postgres_store.refresh_provider_event_causal_lane
     refresh_count = 0
@@ -7815,9 +8129,9 @@ def test_provider_journal_guard_rechecks_resolved_lane_after_mapping_move(
     instance.file_client = None
     instance.provider_adapters = lambda _account_uuid: Adapter()
     instance._queue_event_catalog = lambda *_args, **_kwargs: False
-    instance._event_records_with_pending_delete_recreations = (
-        lambda *_args, **_kwargs: [{"record_uuid": str(uuid.uuid4())}]
-    )
+    instance._event_records_with_pending_delete_recreations = lambda *_args, **_kwargs: [
+        {"record_uuid": str(uuid.uuid4())}
+    ]
 
     refresh = postgres_store.refresh_provider_event_causal_lane
     refresh_count = 0
@@ -7897,9 +8211,7 @@ def test_provider_journal_guard_resolves_grouped_global_lane_before_finalize(
     instance.file_client = None
     instance.provider_adapters = lambda _account_uuid: Adapter()
     instance._queue_event_catalog = lambda *_args, **_kwargs: False
-    instance._event_records_with_pending_delete_recreations = (
-        lambda *_args, **_kwargs: []
-    )
+    instance._event_records_with_pending_delete_recreations = lambda *_args, **_kwargs: []
 
     refresh = postgres_store.refresh_provider_event_causal_lane
     refresh_count = 0
@@ -7919,9 +8231,7 @@ def test_provider_journal_guard_resolves_grouped_global_lane_before_finalize(
                 )
         return lane
 
-    postgres_store.refresh_provider_event_causal_lane = (
-        refresh_then_commit_mappings
-    )
+    postgres_store.refresh_provider_event_causal_lane = refresh_then_commit_mappings
 
     assert instance.process_provider_journal(selected) == 0
     assert refresh_count == 2
@@ -8593,9 +8903,7 @@ def test_assignment_change_replays_quarantined_rejected_message(
         prepared,
     )
     message_record = next(
-        record
-        for record in prepared
-        if record["operation"]["kind"] == "message.create"
+        record for record in prepared if record["operation"]["kind"] == "message.create"
     )
     assert postgres_store.enqueue_workspace_delivery(
         message_record,
@@ -9091,16 +9399,12 @@ def test_assignment_reset_replays_event_with_rebound_ambiguous_sibling(
         queue_id,
         event_id,
     )
-    assert postgres_store.mark_workspace_delivery_submitting(
-        rejected["record_uuid"]
-    )
+    assert postgres_store.mark_workspace_delivery_submitting(rejected["record_uuid"])
     assert postgres_store.reject_provider_event_submission(
         rejected["record_uuid"],
         "provider_api_http_422",
     )
-    assert postgres_store.mark_workspace_delivery_submitting(
-        ambiguous["record_uuid"]
-    )
+    assert postgres_store.mark_workspace_delivery_submitting(ambiguous["record_uuid"])
     assert postgres_store.mark_interrupted_workspace_deliveries_ambiguous() == 1
     with postgres_store.session() as session:
         session.execute(
@@ -9574,7 +9878,9 @@ def test_assignment_reset_quarantines_changed_setup_projection(
             "chat_kind": "channel",
             "participant_uuids": sorted(
                 [
-                    str(postgres_store.account_resource(account_uuid)["owner_user_uuid"]),
+                    str(
+                        postgres_store.account_resource(account_uuid)["owner_user_uuid"]
+                    ),
                     author_uuid,
                 ]
             ),
@@ -10763,9 +11069,7 @@ def test_grouped_flags_finish_without_unblocking_older_chat_delivery(
     instance.file_client = None
     instance.provider_adapters = lambda _account_uuid: Adapter()
     instance._queue_event_catalog = lambda *_args, **_kwargs: False
-    instance._event_records_with_pending_delete_recreations = (
-        lambda *_args, **_kwargs: []
-    )
+    instance._event_records_with_pending_delete_recreations = lambda *_args, **_kwargs: []
     instance._workspace_delivery_recovery_done = True
 
     processed = instance.process_provider_journal(selected)
@@ -10780,20 +11084,23 @@ def test_grouped_flags_finish_without_unblocking_older_chat_delivery(
             """,
             (account_uuid,),
         ).fetchall()
-    assert (processed, states) == (1, [
-        {
-            "event_id": 1,
-            "processing_state": "delivering",
-            "processing_reason": None,
-            "causal_lane": "channel:42",
-        },
-        {
-            "event_id": 2,
-            "processing_state": "processed",
-            "processing_reason": None,
-            "causal_lane": None,
-        },
-    ])
+    assert (processed, states) == (
+        1,
+        [
+            {
+                "event_id": 1,
+                "processing_state": "delivering",
+                "processing_reason": None,
+                "causal_lane": "channel:42",
+            },
+            {
+                "event_id": 2,
+                "processing_state": "processed",
+                "processing_reason": None,
+                "causal_lane": None,
+            },
+        ],
+    )
 
     selected = postgres_store.pending_provider_events()
     assert [row["event_id"] for row in selected] == [3]
@@ -10804,12 +11111,10 @@ def test_rejected_message_dependency_does_not_stall_grouped_flags(
 ):
     account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
     _enable_zulip_provider(postgres_store)
-    first_stream_uuid, first_topic_uuid, author_uuid = (
-        _materialize_channel_projection(
-            postgres_store,
-            account_uuid,
-            project_uuid,
-        )
+    first_stream_uuid, first_topic_uuid, author_uuid = _materialize_channel_projection(
+        postgres_store,
+        account_uuid,
+        project_uuid,
     )
     second_stream_uuid, second_topic_uuid = _materialize_destination_channel(
         postgres_store,
@@ -11068,9 +11373,7 @@ def test_finalized_rejection_does_not_quarantine_later_grouped_read(
     rejected["operation"]["provider"]["entity_id"] = "601"
     rejected["operation_sha256"] = canonical.operation_digest(rejected)
     assert postgres_store.enqueue_workspace_delivery(rejected, 0, "queue", 1)
-    assert postgres_store.mark_workspace_delivery_submitting(
-        rejected["record_uuid"]
-    )
+    assert postgres_store.mark_workspace_delivery_submitting(rejected["record_uuid"])
     assert postgres_store.reject_provider_event_submission(
         rejected["record_uuid"],
         "provider_api_http_422",
@@ -11537,9 +11840,12 @@ def test_rejection_serializes_stale_grouped_read_preparation(
     instance._workspace_delivery_recovery_done = True
     selected = postgres_store.pending_provider_events()
     assert {row["event_id"] for row in selected} == {2, 3}
-    assert instance.process_provider_journal(
-        [row for row in selected if row["event_id"] == 2]
-    ) == 1
+    assert (
+        instance.process_provider_journal(
+            [row for row in selected if row["event_id"] == 2]
+        )
+        == 1
+    )
 
     with postgres_store.session() as session:
         grouped = session.execute(
@@ -11554,9 +11860,7 @@ def test_rejection_serializes_stale_grouped_read_preparation(
         "processing_state": "processed",
         "processing_reason": None,
     }
-    assert [
-        row["event_id"] for row in postgres_store.pending_provider_events()
-    ] == [3]
+    assert [row["event_id"] for row in postgres_store.pending_provider_events()] == [3]
 
 
 def test_rejected_create_filters_only_affected_same_topic_grouped_read(
@@ -11640,9 +11944,7 @@ def test_rejected_create_filters_only_affected_same_topic_grouped_read(
         "reader_uuid": str(
             postgres_store.account_resource(account_uuid)["owner_user_uuid"]
         ),
-        "message_uuids": sorted(
-            [rejected_message_uuid, committed_message_uuid]
-        ),
+        "message_uuids": sorted([rejected_message_uuid, committed_message_uuid]),
         "read": True,
     }
     read["operation_sha256"] = canonical.operation_digest(read)
@@ -11673,9 +11975,7 @@ def test_rejected_create_filters_only_affected_same_topic_grouped_read(
     assert original_read["record"]["operation"]["payload"]["message_uuids"] == sorted(
         [rejected_message_uuid, committed_message_uuid]
     )
-    assert postgres_store.mark_workspace_delivery_submitting(
-        create["record_uuid"]
-    )
+    assert postgres_store.mark_workspace_delivery_submitting(create["record_uuid"])
     assert postgres_store.reject_provider_event_submission(
         create["record_uuid"],
         "provider_api_http_422",
@@ -11719,9 +12019,7 @@ def test_rejected_create_filters_only_affected_same_topic_grouped_read(
     assert postgres_store.provider_mapping(account_uuid, "message", "601") is None
     assert postgres_store.pending_workspace_deliveries() == [filtered["record"]]
 
-    assert postgres_store.mark_workspace_delivery_submitting(
-        filtered["record_uuid"]
-    )
+    assert postgres_store.mark_workspace_delivery_submitting(filtered["record_uuid"])
     postgres_store.accept_result(_committed_result(filtered["record"]))
     assert postgres_store.finalize_ready_provider_events() == 1
     with postgres_store.session() as session:
@@ -11832,9 +12130,7 @@ def test_assignment_reset_grouped_read_snapshot_rebuilds_after_mapping_rejection
         "queue",
         2,
     )
-    assert postgres_store.mark_workspace_delivery_submitting(
-        create["record_uuid"]
-    )
+    assert postgres_store.mark_workspace_delivery_submitting(create["record_uuid"])
     assert postgres_store.reject_provider_event_submission(
         create["record_uuid"],
         "provider_api_http_422",
@@ -11902,9 +12198,9 @@ def test_assignment_reset_grouped_read_snapshot_rebuilds_after_mapping_rejection
     assert retry["processing_reason"] == "provider_message_mapping_changed"
     assert retry["retry_count"] == 1
     assert len(retry["prepared_records"]) == 1
-    assert retry["prepared_records"][0]["operation"]["payload"][
-        "message_uuids"
-    ] == [committed_message_uuid]
+    assert retry["prepared_records"][0]["operation"]["payload"]["message_uuids"] == [
+        committed_message_uuid
+    ]
     assert queued == 0
 
     selected = postgres_store.pending_provider_events()
@@ -11944,9 +12240,7 @@ def test_assignment_reset_grouped_read_snapshot_rebuilds_after_mapping_rejection
         "stream_id": 44,
     }
     assert postgres_store.record_provider_event(account_uuid, "queue", later_event)
-    assert [
-        row["event_id"] for row in postgres_store.pending_provider_events()
-    ] == [3]
+    assert [row["event_id"] for row in postgres_store.pending_provider_events()] == [3]
 
 
 def test_mapping_retry_preserves_surviving_group_operation_identity(postgres_store):
