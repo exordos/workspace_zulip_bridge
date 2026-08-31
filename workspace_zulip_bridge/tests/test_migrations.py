@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import pathlib
 import shutil
@@ -10,7 +11,7 @@ import uuid
 import pytest
 from restalchemy.storage.sql import migrations
 
-from workspace_zulip_bridge import storage
+from workspace_zulip_bridge import canonical, storage
 
 ROOT = pathlib.Path(__file__).parents[2]
 MIGRATIONS = ROOT / "migrations"
@@ -68,6 +69,16 @@ def test_semantic_report_indexes_upgrade_an_applied_archive_chain(tmp_path):
             "0025-bound-provider-result-delivery-state-3cd8cf.py",
             "0026-compare-observed-report-timestamps-chronologically-00f58f.py",
             "0027-track-Workspace-projection-resets-a627d4.py",
+            "0028-track-private-catalog-scan-generation-670844.py",
+            "0029-replay-exact-provider-read-snapshots-72f1cf.py",
+            "0030-converge-shared-realm-message-mappings-75632b.py",
+            "0031-replay-versioned-provider-read-snapshots-724065.py",
+            "0032-replay-exact-provider-read-snapshots-v3-797e62.py",
+            "0033-replay-versioned-provider-snapshots-v4-d87fa7.py",
+            "0034-rekey-pending-authoritative-message-dependents-dc6abe.py",
+            "0035-Replay-provider-read-snapshots-after-owner-state-repair-e4b510.py",
+            "0036-replay-canonical-provider-quotes-6ea4c2.py",
+            "0037-replay-independent-provider-read-snapshots-ae38ad.py",
         }:
             shutil.copy2(migration_path, archive_migrations / migration_path.name)
     admin_store = storage.RestAlchemyStore(connection_url)
@@ -129,7 +140,7 @@ def test_semantic_report_indexes_upgrade_an_applied_archive_chain(tmp_path):
                   AND column_name = 'result_record_uuid'
                 """
             ).fetchone()
-        assert applied["count"] == 28
+        assert applied["count"] == 38
         assert [row["indexname"] for row in indexes] == [
             "bridge_operations_pending_result_idx",
             "bridge_operations_result_record_uuid_idx",
@@ -162,9 +173,19 @@ def test_projection_reset_upgrade_forces_snapshot_after_old_bridge_consumed_chan
     old_bridge_migrations = tmp_path / "old-bridge-migrations"
     old_bridge_migrations.mkdir()
     for migration_path in MIGRATIONS.glob("*.py"):
-        if migration_path.name != (
-            "0027-track-Workspace-projection-resets-a627d4.py"
-        ):
+        if migration_path.name not in {
+            "0027-track-Workspace-projection-resets-a627d4.py",
+            "0028-track-private-catalog-scan-generation-670844.py",
+            "0029-replay-exact-provider-read-snapshots-72f1cf.py",
+            "0030-converge-shared-realm-message-mappings-75632b.py",
+            "0031-replay-versioned-provider-read-snapshots-724065.py",
+            "0032-replay-exact-provider-read-snapshots-v3-797e62.py",
+            "0033-replay-versioned-provider-snapshots-v4-d87fa7.py",
+            "0034-rekey-pending-authoritative-message-dependents-dc6abe.py",
+            "0035-Replay-provider-read-snapshots-after-owner-state-repair-e4b510.py",
+            "0036-replay-canonical-provider-quotes-6ea4c2.py",
+            "0037-replay-independent-provider-read-snapshots-ae38ad.py",
+        }:
             shutil.copy2(migration_path, old_bridge_migrations / migration_path.name)
     admin_store = storage.RestAlchemyStore(connection_url)
     scoped_store = storage.RestAlchemyStore(scoped_url)
@@ -315,11 +336,21 @@ def test_migrations_have_one_versioned_dependency_chain():
         "0025-bound-provider-result-delivery-state-3cd8cf.py",
         "0026-compare-observed-report-timestamps-chronologically-00f58f.py",
         "0027-track-Workspace-projection-resets-a627d4.py",
+        "0028-track-private-catalog-scan-generation-670844.py",
+        "0029-replay-exact-provider-read-snapshots-72f1cf.py",
+        "0030-converge-shared-realm-message-mappings-75632b.py",
+        "0031-replay-versioned-provider-read-snapshots-724065.py",
+        "0032-replay-exact-provider-read-snapshots-v3-797e62.py",
+        "0033-replay-versioned-provider-snapshots-v4-d87fa7.py",
+        "0034-rekey-pending-authoritative-message-dependents-dc6abe.py",
+        "0035-Replay-provider-read-snapshots-after-owner-state-repair-e4b510.py",
+        "0036-replay-canonical-provider-quotes-6ea4c2.py",
+        "0037-replay-independent-provider-read-snapshots-ae38ad.py",
     ]
     assert engine.get_latest_migration() == (
-        "0027-track-Workspace-projection-resets-a627d4.py"
+        "0037-replay-independent-provider-read-snapshots-ae38ad.py"
     )
-    assert len({step["uuid"] for step in all_migrations.values()}) == 28
+    assert len({step["uuid"] for step in all_migrations.values()}) == 38
     assert all_migrations["0001-add-Zulip-provider-scheduler-state-143113.py"][
         "depends"
     ] == ["0000-initialize-bridge-operational-state-18f707.py"]
@@ -401,6 +432,187 @@ def test_migrations_have_one_versioned_dependency_chain():
     assert all_migrations["0027-track-Workspace-projection-resets-a627d4.py"][
         "depends"
     ] == ["0026-compare-observed-report-timestamps-chronologically-00f58f.py"]
+    assert all_migrations["0028-track-private-catalog-scan-generation-670844.py"][
+        "depends"
+    ] == ["0027-track-Workspace-projection-resets-a627d4.py"]
+    assert all_migrations["0029-replay-exact-provider-read-snapshots-72f1cf.py"][
+        "depends"
+    ] == ["0028-track-private-catalog-scan-generation-670844.py"]
+    assert all_migrations["0030-converge-shared-realm-message-mappings-75632b.py"][
+        "depends"
+    ] == ["0029-replay-exact-provider-read-snapshots-72f1cf.py"]
+    assert all_migrations["0031-replay-versioned-provider-read-snapshots-724065.py"][
+        "depends"
+    ] == ["0030-converge-shared-realm-message-mappings-75632b.py"]
+    assert all_migrations["0032-replay-exact-provider-read-snapshots-v3-797e62.py"][
+        "depends"
+    ] == ["0031-replay-versioned-provider-read-snapshots-724065.py"]
+    assert all_migrations["0033-replay-versioned-provider-snapshots-v4-d87fa7.py"][
+        "depends"
+    ] == ["0032-replay-exact-provider-read-snapshots-v3-797e62.py"]
+    assert all_migrations[
+        "0034-rekey-pending-authoritative-message-dependents-dc6abe.py"
+    ]["depends"] == ["0033-replay-versioned-provider-snapshots-v4-d87fa7.py"]
+    assert all_migrations[
+        "0035-Replay-provider-read-snapshots-after-owner-state-repair-e4b510.py"
+    ]["depends"] == ["0034-rekey-pending-authoritative-message-dependents-dc6abe.py"]
+    assert all_migrations["0036-replay-canonical-provider-quotes-6ea4c2.py"][
+        "depends"
+    ] == ["0035-Replay-provider-read-snapshots-after-owner-state-repair-e4b510.py"]
+    assert all_migrations[
+        "0037-replay-independent-provider-read-snapshots-ae38ad.py"
+    ]["depends"] == ["0036-replay-canonical-provider-quotes-6ea4c2.py"]
+
+
+def test_pending_authoritative_message_dependency_migration_rekeys_alias(
+    tmp_path,
+):
+    connection_url = os.environ.get("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN")
+    if not connection_url:
+        pytest.skip("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN is not configured")
+    schema = f"bridge_authoritative_dependency_{uuid.uuid4().hex}"
+    scoped_url = _schema_connection_url(connection_url, schema)
+    config_path = tmp_path / "bridge.conf"
+    admin_store = storage.RestAlchemyStore(connection_url)
+    scoped_store = storage.RestAlchemyStore(scoped_url)
+    migration_path = (
+        MIGRATIONS / "0034-rekey-pending-authoritative-message-dependents-dc6abe.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "pending_authoritative_message_dependents",
+        migration_path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    account_uuid = str(uuid.uuid4())
+    project_uuid = str(uuid.uuid4())
+    stream_uuid = str(uuid.uuid4())
+    topic_uuid = str(uuid.uuid4())
+    provisional_message_uuid = str(uuid.uuid4())
+    canonical_message_uuid = str(uuid.uuid4())
+    operation_uuid = str(uuid.uuid4())
+    actor_uuid = str(uuid.uuid4())
+    record = {
+        "schema": "workspace.provider",
+        "schema_version": 1,
+        "record_kind": "operation",
+        "record_uuid": str(uuid.uuid4()),
+        "operation_uuid": operation_uuid,
+        "attempt": 1,
+        "operation_sha256": "",
+        "account_uuid": account_uuid,
+        "project_uuid": project_uuid,
+        "origin": "zulip",
+        "causal_lane": f"chat:{account_uuid}:channel:42",
+        "sequence": 1,
+        "predecessor_operation_uuid": None,
+        "created_at": "2026-09-01T00:00:00Z",
+        "expires_at": None,
+        "operation": {
+            "kind": "reaction.upsert",
+            "entity_uuid": str(uuid.uuid4()),
+            "actor_uuid": actor_uuid,
+            "occurred_at": "2026-09-01T00:00:00Z",
+            "provider": {
+                "kind": "zulip",
+                "chat_id": "channel:42",
+                "entity_id": "101:2:unicode_emoji:1f44d",
+                "revision": None,
+            },
+            "payload": {
+                "stream_uuid": stream_uuid,
+                "topic_uuid": topic_uuid,
+                "message_uuid": provisional_message_uuid,
+                "user_uuid": actor_uuid,
+                "emoji_name": "thumbs_up",
+            },
+            "extensions": {"provider_badge": "zulip"},
+        },
+    }
+    record["operation_sha256"] = canonical.operation_digest(record)
+    original_digest = record["operation_sha256"]
+
+    with admin_store.session() as session:
+        session.execute(f'CREATE SCHEMA "{schema}"')
+    try:
+        _apply_migrations(scoped_url, config_path)
+        with scoped_store.session() as session:
+            session.execute(
+                """
+                INSERT INTO provider_mappings (
+                    account_uuid, entity_kind, workspace_uuid, provider_id,
+                    metadata, deleted
+                ) VALUES (
+                    %s, 'message', %s, '101',
+                    jsonb_build_object(
+                        'workspace_delivery_state', 'committed'
+                    ), false
+                )
+                """,
+                (account_uuid, canonical_message_uuid),
+            )
+            session.execute(
+                """
+                INSERT INTO provider_mapping_aliases (
+                    account_uuid, entity_kind, workspace_uuid, provider_id,
+                    metadata, deleted
+                ) VALUES (
+                    %s, 'message', %s, '101',
+                    jsonb_build_object(
+                        'workspace_delivery_state', 'committed'
+                    ), false
+                )
+                """,
+                (account_uuid, provisional_message_uuid),
+            )
+            session.execute(
+                """
+                INSERT INTO operation_idempotency (
+                    operation_uuid, operation_sha256
+                ) VALUES (%s, %s)
+                """,
+                (operation_uuid, original_digest),
+            )
+            session.execute(
+                """
+                INSERT INTO workspace_delivery_outbox (
+                    record_uuid, operation_uuid, account_uuid, priority, record
+                ) VALUES (%s, %s, %s, 2, %s)
+                """,
+                (
+                    record["record_uuid"],
+                    operation_uuid,
+                    account_uuid,
+                    json.dumps(record),
+                ),
+            )
+
+            module.migration_step.upgrade(session)
+            module.migration_step.upgrade(session)
+            repaired = session.execute(
+                """
+                SELECT delivery.record, idempotency.operation_sha256
+                FROM workspace_delivery_outbox AS delivery
+                JOIN operation_idempotency AS idempotency
+                  ON idempotency.operation_uuid = delivery.operation_uuid
+                WHERE delivery.operation_uuid = %s
+                """,
+                (operation_uuid,),
+            ).fetchone()
+
+        assert repaired["record"]["operation"]["payload"]["message_uuid"] == (
+            canonical_message_uuid
+        )
+        assert repaired["record"]["operation_sha256"] != original_digest
+        assert repaired["record"]["operation_sha256"] == (
+            canonical.operation_digest(repaired["record"])
+        )
+        assert repaired["operation_sha256"] == repaired["record"]["operation_sha256"]
+    finally:
+        with admin_store.session() as session:
+            session.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
 
 
 def test_reaction_provider_prefix_migration_adds_pattern_index():
@@ -929,6 +1141,344 @@ def test_reaction_emoji_migration_replays_new_history_to_original_cutoff(tmp_pat
             session.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
 
 
+@pytest.mark.parametrize(
+    "migration_name",
+    [
+        "0029-replay-exact-provider-read-snapshots-72f1cf.py",
+        "0031-replay-versioned-provider-read-snapshots-724065.py",
+        "0032-replay-exact-provider-read-snapshots-v3-797e62.py",
+        "0033-replay-versioned-provider-snapshots-v4-d87fa7.py",
+        "0035-Replay-provider-read-snapshots-after-owner-state-repair-e4b510.py",
+        "0036-replay-canonical-provider-quotes-6ea4c2.py",
+        "0037-replay-independent-provider-read-snapshots-ae38ad.py",
+    ],
+)
+def test_exact_read_snapshot_migration_requeues_only_selected_live_history(
+    tmp_path, migration_name
+):
+    connection_url = os.environ.get("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN")
+    if not connection_url:
+        pytest.skip("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN is not configured")
+    schema = f"bridge_exact_read_replay_{uuid.uuid4().hex}"
+    scoped_url = _schema_connection_url(connection_url, schema)
+    config_path = tmp_path / "bridge.conf"
+    admin_store = storage.RestAlchemyStore(connection_url)
+    scoped_store = storage.RestAlchemyStore(scoped_url)
+    migration_path = MIGRATIONS / migration_name
+    spec = importlib.util.spec_from_file_location(
+        f"exact_read_replay_{migration_name[:4]}", migration_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    account_uuid = str(uuid.uuid4())
+    disabled_account_uuid = str(uuid.uuid4())
+
+    with admin_store.session() as session:
+        session.execute(f'CREATE SCHEMA "{schema}"')
+    try:
+        _apply_migrations(scoped_url, config_path)
+        with scoped_store.session() as session:
+            session.execute(
+                """
+                INSERT INTO desired_resources (
+                    resource_type, resource_uuid, generation, body, deleted
+                ) VALUES
+                ('external_account', %s, 1, jsonb_build_object(
+                    'uuid', %s::text, 'synchronization_enabled', true
+                ), false),
+                ('external_account', %s, 1, jsonb_build_object(
+                    'uuid', %s::text, 'synchronization_enabled', false
+                ), false),
+                ('external_chat_assignment', %s, 1, jsonb_build_object(
+                    'external_account_uuid', %s::text, 'selected', true,
+                    'provider_chat', jsonb_build_object(
+                        'provider_chat_key', 'channel:42'
+                    )
+                ), false),
+                ('external_chat_assignment', %s, 1, jsonb_build_object(
+                    'external_account_uuid', %s::text, 'selected', false,
+                    'provider_chat', jsonb_build_object(
+                        'provider_chat_key', 'channel:43'
+                    )
+                ), false),
+                ('external_chat_assignment', %s, 1, jsonb_build_object(
+                    'external_account_uuid', %s::text, 'selected', true,
+                    'provider_chat', jsonb_build_object(
+                        'provider_chat_key', 'channel:44'
+                    )
+                ), false)
+                """,
+                (
+                    account_uuid,
+                    account_uuid,
+                    disabled_account_uuid,
+                    disabled_account_uuid,
+                    str(uuid.uuid4()),
+                    account_uuid,
+                    str(uuid.uuid4()),
+                    account_uuid,
+                    str(uuid.uuid4()),
+                    disabled_account_uuid,
+                ),
+            )
+            session.execute(
+                """
+                INSERT INTO zulip_backfill_jobs (
+                    account_uuid, provider_chat_key, history_depth, state,
+                    next_anchor, retry_count, last_error_code
+                ) VALUES
+                (%s, 'channel:42', 'all', 'complete', 99, 3, 'old_error'),
+                (%s, 'channel:43', 'all', 'complete', 99, 3, 'old_error'),
+                (%s, 'channel:44', 'all', 'complete', 99, 3, 'old_error')
+                """,
+                (account_uuid, account_uuid, disabled_account_uuid),
+            )
+            module.migration_step.upgrade(session)
+            jobs = session.execute(
+                """
+                SELECT provider_chat_key, state, next_anchor, retry_count,
+                       last_error_code
+                FROM zulip_backfill_jobs ORDER BY provider_chat_key
+                """
+            ).fetchall()
+
+        assert jobs == [
+            {
+                "provider_chat_key": "channel:42",
+                "state": "pending",
+                "next_anchor": None,
+                "retry_count": 0,
+                "last_error_code": None,
+            },
+            {
+                "provider_chat_key": "channel:43",
+                "state": "complete",
+                "next_anchor": 99,
+                "retry_count": 3,
+                "last_error_code": "old_error",
+            },
+            {
+                "provider_chat_key": "channel:44",
+                "state": "complete",
+                "next_anchor": 99,
+                "retry_count": 3,
+                "last_error_code": "old_error",
+            },
+        ]
+    finally:
+        with admin_store.session() as session:
+            session.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+
+def test_shared_realm_convergence_requeues_and_removes_only_unattempted_reactions(
+    tmp_path,
+):
+    connection_url = os.environ.get("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN")
+    if not connection_url:
+        pytest.skip("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN is not configured")
+    schema = f"bridge_shared_realm_convergence_{uuid.uuid4().hex}"
+    scoped_url = _schema_connection_url(connection_url, schema)
+    config_path = tmp_path / "bridge.conf"
+    admin_store = storage.RestAlchemyStore(connection_url)
+    scoped_store = storage.RestAlchemyStore(scoped_url)
+    migration_path = (
+        MIGRATIONS / "0030-converge-shared-realm-message-mappings-75632b.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "shared_realm_convergence", migration_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    source_account_uuid = str(uuid.uuid4())
+    target_account_uuid = str(uuid.uuid4())
+    project_uuid = str(uuid.uuid4())
+    realm_uuid = str(uuid.uuid4())
+    canonical_message_uuid = str(uuid.uuid4())
+    provisional_message_uuid = str(uuid.uuid4())
+    pending_operation_uuid = str(uuid.uuid4())
+    attempted_operation_uuid = str(uuid.uuid4())
+
+    with admin_store.session() as session:
+        session.execute(f'CREATE SCHEMA "{schema}"')
+    try:
+        _apply_migrations(scoped_url, config_path)
+        with scoped_store.session() as session:
+            for account_uuid in (source_account_uuid, target_account_uuid):
+                session.execute(
+                    """
+                    INSERT INTO desired_resources (
+                        resource_type, resource_uuid, generation, body
+                    ) VALUES (
+                        'external_account', %s, 1,
+                        jsonb_build_object(
+                            'uuid', %s::text,
+                            'synchronization_enabled', true
+                        )
+                    )
+                    """,
+                    (account_uuid, account_uuid),
+                )
+                session.execute(
+                    """
+                    INSERT INTO desired_resources (
+                        resource_type, resource_uuid, generation, body
+                    ) VALUES (
+                        'external_chat_assignment', %s, 1,
+                        jsonb_build_object(
+                            'external_account_uuid', %s::text,
+                            'project_id', %s::text,
+                            'selected', true,
+                            'provider_chat', jsonb_build_object(
+                                'provider_chat_key', 'channel:42'
+                            )
+                        )
+                    )
+                    """,
+                    (str(uuid.uuid4()), account_uuid, project_uuid),
+                )
+                session.execute(
+                    """
+                    INSERT INTO zulip_event_cursors (
+                        account_uuid, queue_id, last_event_id,
+                        provider_realm_uuid, provider_owner_user_id,
+                        provider_account_generation
+                    ) VALUES (%s, %s, 1, %s, %s, 1)
+                    """,
+                    (account_uuid, f"queue-{account_uuid}", realm_uuid, "1"),
+                )
+                session.execute(
+                    """
+                    INSERT INTO zulip_backfill_jobs (
+                        account_uuid, provider_chat_key, history_depth,
+                        state, next_anchor, retry_count, last_error_code
+                    ) VALUES (
+                        %s, 'channel:42', 'all', 'complete', 99, 3, 'old_error'
+                    )
+                    """,
+                    (account_uuid,),
+                )
+
+            session.execute(
+                """
+                INSERT INTO provider_mappings (
+                    account_uuid, entity_kind, workspace_uuid, provider_id,
+                    metadata
+                ) VALUES
+                (%s, 'message', %s, '601', jsonb_build_object(
+                    'project_uuid', %s::text,
+                    'chat_key', 'channel:42',
+                    'workspace_delivery_state', 'committed'
+                )),
+                (%s, 'message', %s, '601', jsonb_build_object(
+                    'project_uuid', %s::text,
+                    'chat_key', 'channel:42',
+                    'workspace_delivery_state', 'pending'
+                ))
+                """,
+                (
+                    source_account_uuid,
+                    canonical_message_uuid,
+                    project_uuid,
+                    target_account_uuid,
+                    provisional_message_uuid,
+                    project_uuid,
+                ),
+            )
+            for operation_uuid, submission_attempts in (
+                (pending_operation_uuid, 0),
+                (attempted_operation_uuid, 1),
+            ):
+                session.execute(
+                    """
+                    INSERT INTO operation_idempotency (
+                        operation_uuid, operation_sha256
+                    ) VALUES (%s, %s)
+                    """,
+                    (operation_uuid, "0" * 64),
+                )
+                session.execute(
+                    """
+                    INSERT INTO workspace_delivery_outbox (
+                        record_uuid, operation_uuid, account_uuid,
+                        submission_state, submission_attempts, priority, record
+                    ) VALUES (
+                        %s, %s, %s, 'pending', %s, 0,
+                        jsonb_build_object(
+                            'operation', jsonb_build_object(
+                                'kind', 'reaction.upsert',
+                                'payload', jsonb_build_object(
+                                    'message_uuid', %s::text
+                                )
+                            )
+                        )
+                    )
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        operation_uuid,
+                        target_account_uuid,
+                        submission_attempts,
+                        provisional_message_uuid,
+                    ),
+                )
+
+            module.migration_step.upgrade(session)
+            deliveries = session.execute(
+                """
+                SELECT operation_uuid, submission_attempts
+                FROM workspace_delivery_outbox ORDER BY operation_uuid
+                """
+            ).fetchall()
+            idempotency = session.execute(
+                """
+                SELECT operation_uuid FROM operation_idempotency
+                ORDER BY operation_uuid
+                """
+            ).fetchall()
+            jobs = session.execute(
+                """
+                SELECT account_uuid, state, next_anchor, retry_count,
+                       last_error_code
+                FROM zulip_backfill_jobs ORDER BY account_uuid
+                """
+            ).fetchall()
+            mapping_index = session.execute(
+                """
+                SELECT indexdef FROM pg_indexes
+                WHERE schemaname = current_schema()
+                  AND indexname =
+                      'provider_mappings_message_provider_id_idx'
+                """
+            ).fetchone()
+
+        assert deliveries == [
+            {
+                "operation_uuid": uuid.UUID(attempted_operation_uuid),
+                "submission_attempts": 1,
+            }
+        ]
+        assert idempotency == [{"operation_uuid": uuid.UUID(attempted_operation_uuid)}]
+        assert jobs == [
+            {
+                "account_uuid": uuid.UUID(account_uuid),
+                "state": "pending",
+                "next_anchor": None,
+                "retry_count": 0,
+                "last_error_code": None,
+            }
+            for account_uuid in sorted((source_account_uuid, target_account_uuid))
+        ]
+        assert mapping_index is not None
+        assert "(provider_id, account_uuid)" in mapping_index["indexdef"]
+        assert "entity_kind = 'message'" in mapping_index["indexdef"]
+        assert "NOT deleted" in mapping_index["indexdef"]
+    finally:
+        with admin_store.session() as session:
+            session.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+
 def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
     connection_url = os.environ.get("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN")
     if not connection_url:
@@ -988,7 +1538,16 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                   AND indexname = 'zulip_provider_events_account_head_idx'
                 """
             ).fetchone()
-            assert applied["count"] == 28
+            private_catalog_marker = session.execute(
+                """
+                SELECT data_type FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'zulip_event_cursors'
+                  AND column_name = 'private_catalog_scanned_generation'
+                """
+            ).fetchone()
+            assert applied["count"] == 38
+            assert private_catalog_marker == {"data_type": "bigint"}
             assert [row["indexname"] for row in indexes] == [
                 "bridge_operations_active_local_echo_idx",
                 "desired_resources_assignment_chat_idx",
@@ -1046,7 +1605,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
             provider_cursor_count = session.execute(
                 "SELECT count(*) AS count FROM zulip_event_cursors"
             ).fetchone()
-            assert applied["count"] == 28
+            assert applied["count"] == 38
             assert cursor["control_cursor"] == "preserved"
             assert provider_cursor_count["count"] == 0
     finally:

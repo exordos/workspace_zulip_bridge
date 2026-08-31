@@ -3247,6 +3247,324 @@ def test_message_delivery_waits_for_one_durable_topic_projection(postgres_store)
     ) == [message_records[1], update_message]
 
 
+def test_authoritative_workspace_message_target_rekeys_zulip_mapping(
+    postgres_store,
+):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    _enable_zulip_provider(postgres_store)
+    _materialize_channel_projection(postgres_store, account_uuid, project_uuid)
+    records = converter.event_records(
+        postgres_store,
+        account_uuid,
+        "live:channel:42",
+        {
+            "id": 101,
+            "type": "message",
+            "message": _provider_history_message(101),
+        },
+        "live",
+    )
+    topic_record = next(
+        record for record in records if record["operation"]["kind"] == "topic.upsert"
+    )
+    message_record = next(
+        record for record in records if record["operation"]["kind"] == "message.create"
+    )
+    generated_uuid = str(message_record["operation"]["entity_uuid"])
+    authoritative_uuid = str(uuid.uuid4())
+    assert postgres_store.enqueue_workspace_delivery(topic_record, 0)
+    postgres_store.accept_result(_committed_result(topic_record))
+    assert postgres_store.enqueue_workspace_delivery(message_record, 0)
+
+    reaction_record = _provider_record(
+        account_uuid,
+        project_uuid,
+        kind="reaction.upsert",
+    )
+    reaction_operation = reaction_record["operation"]
+    reaction_operation["payload"] = {
+        "stream_uuid": message_record["operation"]["payload"]["stream_uuid"],
+        "topic_uuid": message_record["operation"]["payload"]["topic_uuid"],
+        "message_uuid": generated_uuid,
+        "user_uuid": reaction_operation["actor_uuid"],
+        "emoji_name": "thumbs_up",
+    }
+    reaction_record["causal_lane"] = message_record["causal_lane"]
+    reaction_record["sequence"] = int(message_record["sequence"]) + 1
+    reaction_record["predecessor_operation_uuid"] = message_record["operation_uuid"]
+    reaction_record["operation_sha256"] = canonical.operation_digest(reaction_record)
+    original_reaction_digest = reaction_record["operation_sha256"]
+    assert postgres_store.enqueue_workspace_delivery(reaction_record, 0)
+
+    postgres_store.accept_result(
+        _committed_result(message_record, provider_entity_id="101"),
+        workspace_target_uuid=authoritative_uuid,
+    )
+
+    primary = postgres_store.provider_mapping(account_uuid, "message", "101")
+    assert primary is not None
+    assert str(primary["workspace_uuid"]) == authoritative_uuid
+    assert primary["metadata"]["workspace_target_confirmed"] is True
+    old_route = postgres_store.workspace_mapping(
+        account_uuid, "message", generated_uuid
+    )
+    assert old_route is not None
+    assert old_route["provider_id"] == "101"
+    assert (
+        postgres_store.workspace_mapping(account_uuid, "message", authoritative_uuid)[
+            "provider_id"
+        ]
+        == "101"
+    )
+    pending = postgres_store.pending_workspace_deliveries(0, 0)
+    assert len(pending) == 1
+    rekeyed_reaction = pending[0]
+    assert rekeyed_reaction["operation"]["payload"]["message_uuid"] == (
+        authoritative_uuid
+    )
+    assert rekeyed_reaction["operation_sha256"] != original_reaction_digest
+    assert rekeyed_reaction["operation_sha256"] == canonical.operation_digest(
+        rekeyed_reaction
+    )
+    with postgres_store.session() as session:
+        idempotency = session.execute(
+            """
+            SELECT operation_sha256
+            FROM operation_idempotency
+            WHERE operation_uuid = %s
+            """,
+            (reaction_record["operation_uuid"],),
+        ).fetchone()
+    assert idempotency["operation_sha256"] == rekeyed_reaction["operation_sha256"]
+    postgres_store.accept_result(_committed_result(rekeyed_reaction))
+    assert postgres_store.pending_workspace_deliveries(0, 0) == []
+
+
+def test_authoritative_workspace_message_target_marks_matching_mapping_confirmed(
+    postgres_store,
+):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    _enable_zulip_provider(postgres_store)
+    _materialize_channel_projection(postgres_store, account_uuid, project_uuid)
+    records = converter.event_records(
+        postgres_store,
+        account_uuid,
+        "live:channel:42",
+        {
+            "id": 101,
+            "type": "message",
+            "message": _provider_history_message(101),
+        },
+        "live",
+    )
+    topic_record = next(
+        record for record in records if record["operation"]["kind"] == "topic.upsert"
+    )
+    message_record = next(
+        record for record in records if record["operation"]["kind"] == "message.create"
+    )
+    generated_uuid = str(message_record["operation"]["entity_uuid"])
+    assert postgres_store.enqueue_workspace_delivery(topic_record, 0)
+    postgres_store.accept_result(_committed_result(topic_record))
+    assert postgres_store.enqueue_workspace_delivery(message_record, 0)
+
+    postgres_store.accept_result(
+        _committed_result(message_record, provider_entity_id="101"),
+        workspace_target_uuid=generated_uuid,
+    )
+
+    primary = postgres_store.provider_mapping(account_uuid, "message", "101")
+    assert primary is not None
+    assert str(primary["workspace_uuid"]) == generated_uuid
+    assert primary["metadata"]["workspace_target_confirmed"] is True
+
+
+def test_authoritative_workspace_topic_target_rekeys_queued_dependents(
+    postgres_store,
+):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    _enable_zulip_provider(postgres_store)
+    stream_uuid, _topic_uuid, author_uuid = _materialize_channel_projection(
+        postgres_store,
+        account_uuid,
+        project_uuid,
+    )
+    generated_uuid = str(uuid.uuid4())
+    authoritative_uuid = str(uuid.uuid4())
+    provider_topic_id = "42:queued-topic"
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "topic",
+        provider_topic_id,
+        generated_uuid,
+        {
+            "project_uuid": project_uuid,
+            "stream_uuid": stream_uuid,
+            "chat_key": "channel:42",
+            "name": "Queued topic",
+            "workspace_delivery_state": "pending",
+        },
+    )
+
+    topic_record = _provider_record(
+        account_uuid,
+        project_uuid,
+        kind="topic.upsert",
+    )
+    topic_record["operation"]["entity_uuid"] = generated_uuid
+    topic_record["operation"]["provider"]["entity_id"] = provider_topic_id
+    topic_record["operation"]["payload"] = {
+        "stream_uuid": stream_uuid,
+        "name": "Queued topic",
+    }
+    topic_record["operation_sha256"] = canonical.operation_digest(topic_record)
+
+    topic_followup = copy.deepcopy(topic_record)
+    topic_followup["record_uuid"] = str(uuid.uuid4())
+    topic_followup["operation_uuid"] = str(uuid.uuid4())
+    topic_followup["sequence"] = 1
+    topic_followup["predecessor_operation_uuid"] = topic_record["operation_uuid"]
+    topic_followup["operation"]["payload"]["name"] = "Renamed queued topic"
+    topic_followup["operation_sha256"] = canonical.operation_digest(topic_followup)
+
+    message_record = _provider_record(
+        account_uuid,
+        project_uuid,
+        chat_id="channel:42",
+    )
+    message_record["sequence"] = 2
+    message_record["predecessor_operation_uuid"] = topic_followup["operation_uuid"]
+    message_record["operation"]["provider"]["entity_id"] = "dependent-message"
+    message_record["operation"]["payload"].update(
+        {
+            "stream_uuid": stream_uuid,
+            "topic_uuid": generated_uuid,
+            "author_uuid": author_uuid,
+        }
+    )
+    message_record["operation_sha256"] = canonical.operation_digest(message_record)
+
+    assert postgres_store.enqueue_workspace_delivery(topic_record, 0)
+    assert postgres_store.enqueue_workspace_delivery(topic_followup, 0)
+    assert postgres_store.enqueue_workspace_delivery(message_record, 0)
+
+    postgres_store.accept_result(
+        _committed_result(topic_record),
+        workspace_target_uuid=authoritative_uuid,
+    )
+
+    with postgres_store.session() as session:
+        rows = session.execute(
+            """
+            SELECT operation_uuid, record
+            FROM workspace_delivery_outbox
+            WHERE operation_uuid IN (%s, %s)
+            """,
+            (
+                topic_followup["operation_uuid"],
+                message_record["operation_uuid"],
+            ),
+        ).fetchall()
+        digests = {
+            str(row["operation_uuid"]): row["operation_sha256"]
+            for row in session.execute(
+                """
+                SELECT operation_uuid, operation_sha256
+                FROM operation_idempotency
+                WHERE operation_uuid IN (%s, %s)
+                """,
+                (
+                    topic_followup["operation_uuid"],
+                    message_record["operation_uuid"],
+                ),
+            ).fetchall()
+        }
+    queued = {str(row["operation_uuid"]): row["record"] for row in rows}
+    rekeyed_topic = queued[str(topic_followup["operation_uuid"])]
+    rekeyed_message = queued[str(message_record["operation_uuid"])]
+    assert rekeyed_topic["operation"]["entity_uuid"] == authoritative_uuid
+    assert rekeyed_message["operation"]["payload"]["topic_uuid"] == (authoritative_uuid)
+    for record in (rekeyed_topic, rekeyed_message):
+        assert record["operation_sha256"] == canonical.operation_digest(record)
+        assert digests[str(record["operation_uuid"])] == record["operation_sha256"]
+
+    primary = postgres_store.provider_mapping(
+        account_uuid,
+        "topic",
+        provider_topic_id,
+    )
+    assert primary is not None
+    assert str(primary["workspace_uuid"]) == authoritative_uuid
+
+
+def test_authoritative_workspace_message_update_target_converges_mapping(
+    postgres_store,
+):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    _enable_zulip_provider(postgres_store)
+    _materialize_channel_projection(postgres_store, account_uuid, project_uuid)
+    records = converter.event_records(
+        postgres_store,
+        account_uuid,
+        "live:channel:42",
+        {
+            "id": 101,
+            "type": "message",
+            "message": _provider_history_message(101),
+        },
+        "live",
+    )
+    topic_record = next(
+        record for record in records if record["operation"]["kind"] == "topic.upsert"
+    )
+    message_record = next(
+        record for record in records if record["operation"]["kind"] == "message.create"
+    )
+    generated_uuid = str(message_record["operation"]["entity_uuid"])
+    authoritative_uuid = str(uuid.uuid4())
+    update_record = copy.deepcopy(message_record)
+    update_record["record_uuid"] = str(uuid.uuid4())
+    update_record["operation_uuid"] = str(uuid.uuid4())
+    update_record["sequence"] = int(message_record["sequence"]) + 1
+    update_record["predecessor_operation_uuid"] = message_record["operation_uuid"]
+    update_operation = update_record["operation"]
+    update_operation["kind"] = "message.update"
+    update_operation["payload"]["topic_uuid"] = str(uuid.uuid4())
+    update_record["operation_sha256"] = canonical.operation_digest(update_record)
+
+    assert postgres_store.enqueue_workspace_delivery(topic_record, 0)
+    postgres_store.accept_result(_committed_result(topic_record))
+    assert postgres_store.enqueue_workspace_delivery(message_record, 0)
+    assert postgres_store.enqueue_workspace_delivery(update_record, 0)
+
+    postgres_store.accept_result(
+        _committed_result(message_record, provider_entity_id="101"),
+        workspace_target_uuid=authoritative_uuid,
+    )
+    pending = postgres_store.pending_workspace_deliveries(0, 0)
+    assert len(pending) == 1
+    rekeyed_update = pending[0]
+    assert rekeyed_update["operation"]["entity_uuid"] == authoritative_uuid
+    postgres_store.accept_result(
+        _committed_result(rekeyed_update, provider_entity_id="101"),
+        workspace_target_uuid=authoritative_uuid,
+    )
+
+    primary = postgres_store.provider_mapping(account_uuid, "message", "101")
+    assert primary is not None
+    assert str(primary["workspace_uuid"]) == authoritative_uuid
+    assert (
+        primary["metadata"]["topic_uuid"] == update_operation["payload"]["topic_uuid"]
+    )
+    old_route = postgres_store.workspace_mapping(
+        account_uuid, "message", generated_uuid
+    )
+    assert old_route is not None
+    assert (
+        old_route["metadata"]["topic_uuid"] == update_operation["payload"]["topic_uuid"]
+    )
+
+
 def test_rejected_topic_projection_does_not_suppress_fresh_retry(postgres_store):
     account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
     _enable_zulip_provider(postgres_store)
@@ -4543,12 +4861,287 @@ def test_outbound_commit_suppresses_queue_loss_history_duplicate(postgres_store)
     assert duplicate == []
 
 
+def test_quote_reference_mapping_uses_committed_realm_peer_before_local_projection(
+    postgres_store,
+):
+    source_account_uuid, source_project_uuid = _insert_account_and_assignment(
+        postgres_store
+    )
+    target_account_uuid, _target_project_uuid = _insert_account_and_assignment(
+        postgres_store
+    )
+    with postgres_store.session() as session:
+        source_realm = session.execute(
+            """
+            SELECT provider_realm_uuid
+            FROM zulip_event_cursors
+            WHERE account_uuid = %s
+            """,
+            (source_account_uuid,),
+        ).fetchone()["provider_realm_uuid"]
+        session.execute(
+            """
+            UPDATE zulip_event_cursors
+            SET provider_realm_uuid = %s
+            WHERE account_uuid = %s
+            """,
+            (source_realm, target_account_uuid),
+        )
+
+    canonical_message_uuid = str(uuid.uuid4())
+    postgres_store.remember_provider_mapping(
+        source_account_uuid,
+        "message",
+        "601",
+        canonical_message_uuid,
+        {
+            "project_uuid": source_project_uuid,
+            "stream_uuid": str(uuid.uuid4()),
+            "topic_uuid": str(uuid.uuid4()),
+            "author_uuid": str(uuid.uuid4()),
+            "chat_key": "channel:42",
+            "workspace_delivery_state": "committed",
+            "workspace_target_confirmed": True,
+        },
+    )
+
+    assert postgres_store.provider_message_mapping(target_account_uuid, "601") is None
+    reference = postgres_store.provider_message_reference_mapping(
+        target_account_uuid, "601"
+    )
+    assert reference is not None
+    assert str(reference["workspace_uuid"]) == canonical_message_uuid
+    assert reference["convergent_alias"] is True
+
+
+@pytest.mark.parametrize("pending_local_mapping", [False, True])
+def test_shared_realm_backfill_rekeys_pending_message_before_reactions(
+    postgres_store,
+    pending_local_mapping,
+):
+    source_account_uuid, source_project_uuid = _insert_account_and_assignment(
+        postgres_store
+    )
+    target_account_uuid, _target_project_uuid = _insert_account_and_assignment(
+        postgres_store
+    )
+    source_stream_uuid, source_topic_uuid, source_author_uuid = (
+        _materialize_channel_projection(
+            postgres_store,
+            source_account_uuid,
+            source_project_uuid,
+        )
+    )
+    with postgres_store.session() as session:
+        source_realm = session.execute(
+            """
+            SELECT provider_realm_uuid
+            FROM zulip_event_cursors
+            WHERE account_uuid = %s
+            """,
+            (source_account_uuid,),
+        ).fetchone()["provider_realm_uuid"]
+        session.execute(
+            """
+            UPDATE zulip_event_cursors
+            SET provider_realm_uuid = %s
+            WHERE account_uuid = %s
+            """,
+            (source_realm, target_account_uuid),
+        )
+        session.execute(
+            """
+            UPDATE desired_resources
+            SET body = jsonb_set(body, '{project_id}', to_jsonb(%s::text))
+            WHERE resource_type = 'external_chat_assignment'
+              AND body->>'external_account_uuid' = %s
+            """,
+            (source_project_uuid, target_account_uuid),
+        )
+    target_project_uuid = source_project_uuid
+    target_stream_uuid, target_topic_uuid, target_author_uuid = (
+        _materialize_channel_projection(
+            postgres_store,
+            target_account_uuid,
+            target_project_uuid,
+        )
+    )
+
+    canonical_message_uuid = str(uuid.uuid4())
+    stale_target_uuid = str(uuid.uuid4())
+    postgres_store.remember_provider_mapping(
+        source_account_uuid,
+        "message",
+        "601",
+        canonical_message_uuid,
+        {
+            "project_uuid": source_project_uuid,
+            "stream_uuid": source_stream_uuid,
+            "topic_uuid": source_topic_uuid,
+            "author_uuid": source_author_uuid,
+            "chat_key": "channel:42",
+            "causal_lane": f"chat:{source_account_uuid}:{source_stream_uuid}",
+            "workspace_delivery_state": "committed",
+        },
+    )
+    if pending_local_mapping:
+        postgres_store.remember_provider_mapping(
+            target_account_uuid,
+            "message",
+            "601",
+            stale_target_uuid,
+            {
+                "project_uuid": target_project_uuid,
+                "stream_uuid": target_stream_uuid,
+                "topic_uuid": target_topic_uuid,
+                "author_uuid": target_author_uuid,
+                "chat_key": "channel:42",
+                "causal_lane": f"chat:{target_account_uuid}:{target_stream_uuid}",
+                "workspace_delivery_state": "pending",
+            },
+        )
+
+    inherited = postgres_store.provider_message_mapping(target_account_uuid, "601")
+    assert str(inherited["workspace_uuid"]) == canonical_message_uuid
+    assert inherited["convergent_alias"] is True
+    assert inherited["metadata"]["project_uuid"] == target_project_uuid
+    assert inherited["metadata"]["stream_uuid"] == target_stream_uuid
+    assert inherited["metadata"]["topic_uuid"] == target_topic_uuid
+    assert inherited["metadata"]["author_uuid"] == target_author_uuid
+    assert inherited["metadata"]["chat_key"] == "channel:42"
+    assert inherited["metadata"]["causal_lane"] == (
+        f"chat:{target_account_uuid}:{target_stream_uuid}"
+    )
+    assert inherited["metadata"]["provider_realm_convergent"] is True
+
+    reaction_records = converter.event_records(
+        postgres_store,
+        target_account_uuid,
+        "queue",
+        {
+            "id": 2,
+            "type": "reaction",
+            "op": "add",
+            "message_id": 601,
+            "user_id": 2,
+            "emoji_name": "thumbs_up",
+            "emoji_code": "1f44d",
+            "reaction_type": "unicode_emoji",
+            "timestamp": 1_700_000_001,
+        },
+    )
+    assert reaction_records[-1]["operation"]["kind"] == "reaction.upsert"
+    assert reaction_records[-1]["operation"]["payload"]["message_uuid"] == (
+        canonical_message_uuid
+    )
+    updated_content = uuid.uuid4().hex
+    update_records = converter.event_records(
+        postgres_store,
+        target_account_uuid,
+        "queue",
+        {
+            "id": 3,
+            "type": "update_message",
+            "message_id": 601,
+            "message_ids": [601],
+            "content": updated_content,
+            "edit_timestamp": 1_700_000_002,
+        },
+    )
+    assert any(
+        record["operation"]["kind"] == "message.update" for record in update_records
+    )
+    read_records = converter.event_records(
+        postgres_store,
+        target_account_uuid,
+        "queue",
+        {
+            "id": 4,
+            "type": "update_message_flags",
+            "messages": [601],
+            "flag": "read",
+            "op": "add",
+            "timestamp": 1_700_000_003,
+        },
+    )
+    assert read_records[-1]["operation"]["kind"] == "read_state.set"
+    delete_records = converter.event_records(
+        postgres_store,
+        target_account_uuid,
+        "queue",
+        {
+            "id": 5,
+            "type": "delete_message",
+            "message_ids": [601],
+            "timestamp": 1_700_000_004,
+        },
+    )
+    assert delete_records[-1]["operation"]["kind"] == "message.delete"
+
+    message = _provider_history_message(601)
+    message["reactions"] = [
+        {
+            "user_id": 2,
+            "emoji_name": "thumbs_up",
+            "emoji_code": "1f44d",
+            "reaction_type": "unicode_emoji",
+        }
+    ]
+    _backfill_service(postgres_store).enqueue_backfill(
+        target_account_uuid,
+        "channel:42",
+        [message],
+    )
+
+    mapped = postgres_store.provider_mapping(target_account_uuid, "message", "601")
+    assert str(mapped["workspace_uuid"]) == canonical_message_uuid
+    assert mapped["metadata"]["workspace_delivery_state"] == "committed"
+    with postgres_store.session() as session:
+        alias = session.execute(
+            """
+            SELECT provider_id
+            FROM provider_mapping_aliases
+            WHERE account_uuid = %s AND entity_kind = 'message'
+              AND workspace_uuid = %s AND NOT deleted
+            """,
+            (target_account_uuid, stale_target_uuid),
+        ).fetchone()
+        records = session.execute(
+            """
+            SELECT record
+            FROM workspace_delivery_outbox
+            WHERE account_uuid = %s
+              AND record->'operation'->>'kind' IN (
+                  'message.update', 'reaction.upsert'
+              )
+            ORDER BY record->>'sequence'
+            """,
+            (target_account_uuid,),
+        ).fetchall()
+    if pending_local_mapping:
+        assert alias["provider_id"] == "601"
+    else:
+        assert alias is None
+    message_update = next(
+        row["record"]
+        for row in records
+        if row["record"]["operation"]["kind"] == "message.update"
+    )
+    reaction = next(
+        row["record"]
+        for row in records
+        if row["record"]["operation"]["kind"] == "reaction.upsert"
+    )
+    assert message_update["operation"]["entity_uuid"] == canonical_message_uuid
+    assert reaction["operation"]["payload"]["message_uuid"] == (canonical_message_uuid)
+
+
 def test_outbound_unmaterialized_topic_create_and_rename_persist_mapping(
     postgres_store,
 ):
     account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
-    stream_uuid, _existing_topic_uuid, _author_uuid = (
-        _materialize_channel_projection(postgres_store, account_uuid, project_uuid)
+    stream_uuid, _existing_topic_uuid, _author_uuid = _materialize_channel_projection(
+        postgres_store, account_uuid, project_uuid
     )
     topic_uuid = str(uuid.uuid4())
     created = _provider_record(
@@ -4592,9 +5185,7 @@ def test_outbound_unmaterialized_topic_create_and_rename_persist_mapping(
     mapped = postgres_store.workspace_mapping(account_uuid, "topic", topic_uuid)
     assert mapped["provider_id"] == "42:renamed topic"
     assert mapped["metadata"]["name"] == "renamed topic"
-    old_name = postgres_store.provider_mapping(
-        account_uuid, "topic", "42:new topic"
-    )
+    old_name = postgres_store.provider_mapping(account_uuid, "topic", "42:new topic")
     assert str(old_name["workspace_uuid"]) == topic_uuid
     assert old_name["provider_id"] == "42:new topic"
     postgres_store.remember_provider_mapping(
@@ -4618,14 +5209,15 @@ def test_outbound_unmaterialized_topic_create_and_rename_persist_mapping(
 
     assert postgres_store.workspace_mapping(account_uuid, "topic", topic_uuid) is None
     assert (
-        postgres_store.provider_mapping(
-            account_uuid, "topic", "42:renamed topic"
-        )
+        postgres_store.provider_mapping(account_uuid, "topic", "42:renamed topic")
         is None
     )
-    assert postgres_store.tombstoned_workspace_mapping(
-        account_uuid, "topic", topic_uuid
-    )["provider_id"] == "42:renamed topic"
+    assert (
+        postgres_store.tombstoned_workspace_mapping(account_uuid, "topic", topic_uuid)[
+            "provider_id"
+        ]
+        == "42:renamed topic"
+    )
 
     recreated_topic_uuid = str(uuid.uuid4())
     recreated = json.loads(json.dumps(created))
@@ -4643,9 +5235,12 @@ def test_outbound_unmaterialized_topic_create_and_rename_persist_mapping(
         account_uuid, "topic", "42:renamed topic"
     )
     assert str(recreated_mapping["workspace_uuid"]) == recreated_topic_uuid
-    assert postgres_store.workspace_mapping(
-        account_uuid, "topic", recreated_topic_uuid
-    )["provider_id"] == "42:renamed topic"
+    assert (
+        postgres_store.workspace_mapping(account_uuid, "topic", recreated_topic_uuid)[
+            "provider_id"
+        ]
+        == "42:renamed topic"
+    )
     assert postgres_store.workspace_mapping(account_uuid, "topic", topic_uuid) is None
 
 
@@ -6294,10 +6889,11 @@ def test_rejected_backfill_reaction_cleanup_is_requeued_on_replay(
         }
     ]
     event = {"id": 601, "type": "message", "message": message}
+    history_queue_id = "backfill:channel:42:assignment:1:snapshot:4"
     records = converter.event_records(
         postgres_store,
         account_uuid,
-        "history",
+        history_queue_id,
         event,
         "backfill",
     )
@@ -6335,7 +6931,7 @@ def test_rejected_backfill_reaction_cleanup_is_requeued_on_replay(
     replay_records = converter.event_records(
         postgres_store,
         account_uuid,
-        "history-replay",
+        history_queue_id,
         event,
         "backfill",
     )
@@ -6491,10 +7087,17 @@ def test_provider_mapping_written_before_event_delivery_recovers_same_message(
     account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
     _materialize_channel_projection(postgres_store, account_uuid, project_uuid)
     message = _provider_history_message(602)
+    assignment = postgres_store.assignment_for_provider_chat(account_uuid, "channel:42")
+    assert assignment is not None
+    queue_id = (
+        f"backfill:channel:42:{assignment['uuid']}:"
+        f"{assignment['generation']}:"
+        f"snapshot:{service.BACKFILL_SNAPSHOT_PROJECTION_VERSION}"
+    )
     first_records = converter.event_records(
         postgres_store,
         account_uuid,
-        "provider-message:602",
+        queue_id,
         {"id": 602, "type": "message", "message": message},
         "backfill",
     )
@@ -7171,6 +7774,266 @@ def test_committed_message_fast_path_keeps_flagged_snapshots_pending(
         {"event_id": 2, "processing_state": "pending"},
         {"event_id": 3, "processing_state": "processed"},
     ]
+
+
+def test_committed_flagless_message_projects_owner_unread_snapshot(postgres_store):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    _enable_zulip_provider(postgres_store)
+    stream_uuid, topic_uuid, author_uuid = _materialize_channel_projection(
+        postgres_store,
+        account_uuid,
+        project_uuid,
+    )
+    message_uuid = str(uuid.uuid4())
+    postgres_store.remember_provider_mapping(
+        account_uuid,
+        "message",
+        "601",
+        message_uuid,
+        {
+            "project_uuid": project_uuid,
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "author_uuid": author_uuid,
+            "chat_key": "channel:42",
+            "causal_lane": f"chat:{account_uuid}:{stream_uuid}",
+            "workspace_delivery_state": "committed",
+        },
+    )
+    assert postgres_store.record_provider_event(
+        account_uuid,
+        "queue",
+        {
+            "id": 1,
+            "type": "message",
+            "message": {
+                "id": 601,
+                "type": "stream",
+                "stream_id": 42,
+                "timestamp": 1_700_000_000,
+            },
+        },
+    )
+
+    class Adapter:
+        server_url = "https://zulip.example.invalid"
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = postgres_store
+    instance.file_client = None
+    instance.provider_adapters = lambda _account_uuid: Adapter()
+    instance._queue_event_catalog = lambda *_args, **_kwargs: False
+    instance._workspace_delivery_recovery_done = True
+
+    assert instance.process_provider_journal() == 1
+
+    with postgres_store.session() as session:
+        delivery = session.execute(
+            """
+            SELECT record
+            FROM workspace_delivery_outbox
+            WHERE account_uuid = %s AND provider_queue_id = 'queue'
+              AND provider_event_id = 1
+            """,
+            (account_uuid,),
+        ).fetchone()
+        state = session.execute(
+            """
+            SELECT processing_state
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = 'queue' AND event_id = 1
+            """,
+            (account_uuid,),
+        ).fetchone()
+
+    operation = delivery["record"]["operation"]
+    assert operation["kind"] == "read_state.set"
+    assert operation["payload"]["read"] is False
+    assert operation["payload"]["message_uuids"] == [message_uuid]
+    assert state == {"processing_state": "delivering"}
+
+
+def test_shared_message_read_materializes_or_quarantines_mapping(postgres_store):
+    source_account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    target_account_uuid, _target_project_uuid = _insert_account_and_assignment(
+        postgres_store
+    )
+    _enable_zulip_provider(postgres_store)
+    source_stream_uuid, source_topic_uuid, source_author_uuid = (
+        _materialize_channel_projection(
+            postgres_store,
+            source_account_uuid,
+            project_uuid,
+        )
+    )
+    _materialize_channel_projection(
+        postgres_store,
+        target_account_uuid,
+        project_uuid,
+    )
+    with postgres_store.session() as session:
+        source_realm = session.execute(
+            """
+            SELECT provider_realm_uuid
+            FROM zulip_event_cursors
+            WHERE account_uuid = %s
+            """,
+            (source_account_uuid,),
+        ).fetchone()["provider_realm_uuid"]
+        session.execute(
+            """
+            UPDATE zulip_event_cursors
+            SET provider_realm_uuid = %s
+            WHERE account_uuid = %s
+            """,
+            (source_realm, target_account_uuid),
+        )
+        session.execute(
+            """
+            UPDATE desired_resources
+            SET body = jsonb_set(body, '{project_id}', to_jsonb(%s::text))
+            WHERE resource_type = 'external_chat_assignment'
+              AND body->>'external_account_uuid' = %s
+            """,
+            (project_uuid, target_account_uuid),
+        )
+
+    message_uuid = str(uuid.uuid4())
+    postgres_store.remember_provider_mapping(
+        source_account_uuid,
+        "message",
+        "601",
+        message_uuid,
+        {
+            "project_uuid": project_uuid,
+            "stream_uuid": source_stream_uuid,
+            "topic_uuid": source_topic_uuid,
+            "author_uuid": source_author_uuid,
+            "chat_key": "channel:42",
+            "workspace_delivery_state": "committed",
+            "workspace_target_confirmed": True,
+        },
+    )
+    assert postgres_store.record_provider_event(
+        target_account_uuid,
+        "queue",
+        {
+            "id": 1,
+            "type": "message",
+            "message": {
+                "id": 601,
+                "type": "stream",
+                "stream_id": 42,
+                "timestamp": 1_700_000_000,
+            },
+        },
+    )
+
+    class Adapter:
+        server_url = "https://zulip.example.invalid"
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = postgres_store
+    instance.file_client = None
+    instance.provider_adapters = lambda _account_uuid: Adapter()
+    instance._queue_event_catalog = lambda *_args, **_kwargs: False
+    instance._workspace_delivery_recovery_done = True
+
+    assert instance.process_provider_journal() == 1
+
+    exact = postgres_store.provider_mapping(
+        target_account_uuid,
+        "message",
+        "601",
+    )
+    assert exact is not None
+    assert str(exact["workspace_uuid"]) == message_uuid
+    assert exact["metadata"]["workspace_delivery_state"] == "committed"
+    ready = postgres_store.pending_workspace_deliveries(0, 0, 10)
+    assert len(ready) == 1
+    assert ready[0]["operation"]["kind"] == "read_state.set"
+
+    stale_placeholder_uuid = str(uuid.uuid4())
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE provider_mappings
+            SET workspace_uuid = %s,
+                metadata = jsonb_set(
+                metadata,
+                '{workspace_delivery_state}',
+                '"pending"'::jsonb
+            )
+            WHERE account_uuid = %s AND entity_kind = 'message'
+              AND provider_id = '601'
+            """,
+            (stale_placeholder_uuid, target_account_uuid),
+        )
+        session.execute(
+            """
+            UPDATE provider_mappings
+            SET deleted = true
+            WHERE account_uuid = %s AND entity_kind = 'message'
+              AND provider_id = '601'
+            """,
+            (source_account_uuid,),
+        )
+        session.execute(
+            """
+            UPDATE zulip_provider_events
+            SET body = jsonb_set(body, '{message,flags}', '[]'::jsonb)
+            WHERE account_uuid = %s AND queue_id = 'queue' AND event_id = 1
+            """,
+            (target_account_uuid,),
+        )
+        session.execute(
+            """
+            UPDATE workspace_delivery_outbox
+            SET created_at = now() - interval '1 minute'
+            WHERE account_uuid = %s AND provider_queue_id = 'queue'
+              AND provider_event_id = 1
+            """,
+            (target_account_uuid,),
+        )
+    assert postgres_store.pending_workspace_deliveries(0, 0, 10) == []
+    assert postgres_store.materialize_pending_provider_message_reads() == 1
+    assert postgres_store.pending_workspace_deliveries(0, 0, 10) == []
+    repaired = postgres_store.provider_mapping(
+        target_account_uuid,
+        "message",
+        "601",
+    )
+    assert repaired is not None
+    assert str(repaired["workspace_uuid"]) == stale_placeholder_uuid
+    assert repaired["metadata"]["workspace_delivery_state"] == "pending"
+    with postgres_store.session() as session:
+        delivery = session.execute(
+            """
+            SELECT submission_state, submission_error_code
+            FROM workspace_delivery_outbox
+            WHERE account_uuid = %s AND provider_queue_id = 'queue'
+              AND provider_event_id = 1
+            """,
+            (target_account_uuid,),
+        ).fetchone()
+    assert delivery == {
+        "submission_state": "rejected",
+        "submission_error_code": "provider_message_mapping_missing",
+    }
+    assert postgres_store.finalize_ready_provider_events() == 1
+    with postgres_store.session() as session:
+        event = session.execute(
+            """
+            SELECT processing_state, processing_reason
+            FROM zulip_provider_events
+            WHERE account_uuid = %s AND queue_id = 'queue' AND event_id = 1
+            """,
+            (target_account_uuid,),
+        ).fetchone()
+    assert event == {
+        "processing_state": "invalid",
+        "processing_reason": "workspace_delivery_rejected",
+    }
 
 
 def test_pending_provider_probe_waits_for_each_accounts_head(postgres_store):

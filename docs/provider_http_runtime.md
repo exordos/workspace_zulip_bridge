@@ -107,6 +107,16 @@ Zulip topics are discovered from messages. The durable provider mapping table
 is the local processed-topic cache: a missing topic queues an idempotent catalog
 report, message delivery waits for the resulting Workspace topic mapping, and
 then an idempotent `topic.upsert` precedes `message.create`.
+For shared messages, an account with only a provisional local mapping inherits
+the committed Workspace target from another selected account in the same
+verified Zulip realm, provider chat, and Workspace project. The provisional UUID
+is retained as an alias, while replayed message updates, reactions, and reads use
+the canonical target. A bounded selected-chat replay repairs provisional
+reaction dependencies created before this convergence rule.
+Backfill queue identities include a snapshot projection version. When the
+message snapshot contract changes, its migration restarts every selected
+history window under fresh operation identities so terminal deliveries from a
+previous scan cannot suppress the new read/unread state.
 If an assignment exists but its local stream or topic mapping was lost, the
 bridge rematerializes that mapping from the durable assignment and immediately
 wakes assignment-blocked journal events. Read-state events whose historical

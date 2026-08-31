@@ -30,6 +30,11 @@ from workspace_zulip_bridge import (
     zulip_adapter,
 )
 
+# A backfill message is a current provider snapshot, not an immutable copy of
+# the first history scan. Bump this only when the snapshot projection contract
+# changes and pair it with a migration that restarts selected history jobs.
+BACKFILL_SNAPSHOT_PROJECTION_VERSION = 7
+
 
 class AdapterRegistry:
     def __init__(
@@ -205,6 +210,9 @@ class _BackfillConversionStore:
         self.provider_message_mappings: dict[
             tuple[str, str], dict[str, object] | None
         ] = {}
+        self.provider_message_reference_mappings: dict[
+            tuple[str, str], dict[str, object] | None
+        ] = {}
         self.provider_mappings_by_name: dict[
             tuple[str, str, str], dict[str, object] | None
         ] = {}
@@ -250,6 +258,16 @@ class _BackfillConversionStore:
                 *key
             )
         return self.provider_message_mappings[key]
+
+    def provider_message_reference_mapping(
+        self, account_uuid: str, provider_id: str
+    ) -> dict[str, object] | None:
+        key = (account_uuid, provider_id)
+        if key not in self.provider_message_reference_mappings:
+            self.provider_message_reference_mappings[key] = (
+                self.store.provider_message_reference_mapping(*key)
+            )
+        return self.provider_message_reference_mappings[key]
 
     def provider_mapping_by_name(
         self, account_uuid: str, entity_kind: str, name: str
@@ -792,6 +810,50 @@ class BridgeService:
         self.store.finalize_provider_result_responses(acknowledgements)
         return sent
 
+    def _register_provider_event_queue(
+        self,
+        account_uuid: str,
+        adapter: zulip_adapter.OfficialZulipAdapter,
+        provider_account_generation: int | None,
+    ) -> tuple[str, int, int | None]:
+        """Register and durably publish one account-owned event queue."""
+        adapter.invalidate_queue()
+        queue_id, last_event_id = adapter.ensure_queue()
+        self.store.update_provider_event_cursor(
+            account_uuid,
+            queue_id,
+            last_event_id,
+        )
+        registration = adapter.take_registration_snapshot()
+        if registration is None:
+            return queue_id, last_event_id, provider_account_generation
+        if provider_account_generation is None:
+            account = self.store.account_resource(account_uuid)
+            if account is None:
+                raise ValueError("Zulip provider account is unavailable")
+            provider_account_generation = int(account["generation"])
+        provider_realm_uuid = str(uuid.UUID(str(registration["realm_uuid"])))
+        provider_owner_user_id = str(int(registration["user_id"]))
+        self.store.update_provider_event_cursor(
+            account_uuid,
+            queue_id,
+            last_event_id,
+            provider_realm_uuid,
+            provider_owner_user_id,
+            provider_account_generation,
+        )
+        self._queue_registration_reports(
+            account_uuid,
+            registration,
+            getattr(adapter, "server_url", ""),
+        )
+        self._record_registration_notification_snapshots(
+            account_uuid,
+            queue_id,
+            registration,
+        )
+        return queue_id, last_event_id, provider_account_generation
+
     def _poll_provider_account(
         self,
         account_uuid: str,
@@ -818,51 +880,135 @@ class BridgeService:
                 )
                 getattr(self, "initial_sync_probe_after", {}).pop(account_uuid, None)
                 cursor = None
+            scanner = getattr(adapter, "private_conversation_catalog", None)
+            mark_scanned = getattr(
+                self.store,
+                "mark_private_catalog_scanned",
+                None,
+            )
+            private_catalog = None
+            provider_account_generation = None
+            scan_private_catalog = False
+            if callable(scanner) and callable(mark_scanned):
+                account = self.store.account_resource(account_uuid)
+                if account is None:
+                    raise ValueError("Zulip provider account is unavailable")
+                provider_account_generation = int(account["generation"])
+                scan_private_catalog = cursor is None or (
+                    cursor.get("private_catalog_scanned_generation")
+                    != provider_account_generation
+                )
             if cursor is None:
-                adapter.invalidate_queue()
-                queue_id, last_event_id = adapter.ensure_queue()
                 # Persist the queue before catalog, participant, or history work.
                 # A restart can then resume the same queue instead of opening a
                 # gap while the initial synchronization is still in progress.
-                self.store.update_provider_event_cursor(
-                    account_uuid, queue_id, last_event_id
+                (
+                    queue_id,
+                    last_event_id,
+                    provider_account_generation,
+                ) = self._register_provider_event_queue(
+                    account_uuid,
+                    adapter,
+                    provider_account_generation,
                 )
-                registration = adapter.take_registration_snapshot()
-                if registration is not None:
-                    account = self.store.account_resource(account_uuid)
-                    if account is None:
-                        raise ValueError("Zulip provider account is unavailable")
-                    provider_account_generation = int(account["generation"])
-                    provider_realm_uuid = str(
-                        uuid.UUID(str(registration["realm_uuid"]))
-                    )
-                    provider_owner_user_id = str(int(registration["user_id"]))
-                    self.store.update_provider_event_cursor(
-                        account_uuid,
-                        queue_id,
-                        last_event_id,
-                        provider_realm_uuid,
-                        provider_owner_user_id,
-                        provider_account_generation,
-                    )
-                    self._queue_registration_reports(
-                        account_uuid,
-                        registration,
-                        getattr(adapter, "server_url", ""),
-                    )
-                    self._record_registration_notification_snapshots(
-                        account_uuid,
-                        queue_id,
-                        registration,
-                    )
             else:
                 queue_id = str(cursor["queue_id"])
                 last_event_id = int(cursor["last_event_id"])
                 adapter.restore_queue(queue_id, last_event_id)
-            if getattr(self, "provider_event_long_polling", False):
-                events = adapter.events(queue_id, last_event_id, long_polling=True)
-            else:
-                events = adapter.events(queue_id, last_event_id)
+            def scan_and_queue_private_catalog() -> dict[str, object]:
+                if not callable(scanner) or provider_account_generation is None:
+                    raise ValueError("Zulip provider generation is unavailable")
+                # Poll with the persisted boundary after every provider page.
+                # Reusing last_event_id does not acknowledge unseen events, but
+                # it does keep the overlapping queue alive until the catalog is
+                # complete and the normal event poll can advance the cursor.
+                catalog = scanner(
+                    keep_queue_alive=lambda: adapter.events(
+                        queue_id,
+                        last_event_id,
+                    )
+                )
+                cursor = self.store.provider_event_cursor(account_uuid)
+                if cursor is None or provider_account_generation is None:
+                    raise ValueError("Zulip provider cursor is unavailable")
+                if (
+                    cursor.get("provider_account_generation")
+                    != provider_account_generation
+                ):
+                    self.store.update_provider_event_cursor(
+                        account_uuid,
+                        queue_id,
+                        last_event_id,
+                        str(cursor["provider_realm_uuid"]),
+                        str(cursor["provider_owner_user_id"]),
+                        provider_account_generation,
+                    )
+                    cursor = self.store.provider_event_cursor(account_uuid)
+                    if cursor is None:
+                        raise ValueError("Zulip provider cursor is unavailable")
+                catalog["realm_uuid"] = str(
+                    uuid.UUID(str(cursor["provider_realm_uuid"]))
+                )
+                self._queue_registration_reports(
+                    account_uuid,
+                    catalog,
+                    getattr(adapter, "server_url", ""),
+                    assignments={},
+                )
+                return catalog
+
+            try:
+                if scan_private_catalog:
+                    # Existing accounts retain their current queue; new accounts
+                    # persist a guard queue before the first catalog page.
+                    private_catalog = scan_and_queue_private_catalog()
+                if getattr(self, "provider_event_long_polling", False):
+                    events = adapter.events(
+                        queue_id,
+                        last_event_id,
+                        long_polling=True,
+                    )
+                else:
+                    events = adapter.events(queue_id, last_event_id)
+            except zulip_adapter.ZulipOperationError as queue_error:
+                if queue_error.code != "bad_event_queue_id":
+                    raise
+                self.store.begin_provider_queue_catchup(account_uuid)
+                self.store.invalidate_provider_event_cursor(account_uuid)
+                getattr(self, "initial_sync_ready_accounts", set()).discard(
+                    account_uuid
+                )
+                getattr(self, "initial_sync_probe_after", {}).pop(account_uuid, None)
+                (
+                    queue_id,
+                    last_event_id,
+                    provider_account_generation,
+                ) = self._register_provider_event_queue(
+                    account_uuid,
+                    adapter,
+                    provider_account_generation,
+                )
+                if callable(scanner) and callable(mark_scanned):
+                    # Any expired queue may have contained the first event for
+                    # a previously unknown chat. Repeat the catalog snapshot
+                    # only after the replacement queue is durable so unknown
+                    # chats are covered by the new boundary.
+                    private_catalog = scan_and_queue_private_catalog()
+                if getattr(self, "provider_event_long_polling", False):
+                    events = adapter.events(
+                        queue_id,
+                        last_event_id,
+                        long_polling=True,
+                    )
+                else:
+                    events = adapter.events(queue_id, last_event_id)
+            if private_catalog is not None:
+                if provider_account_generation is None or not callable(mark_scanned):
+                    raise ValueError("Zulip provider generation is unavailable")
+                # The catalog generation is durable only after the overlapping
+                # queue has been polled successfully. A restart before this
+                # point repeats the scan instead of trusting an expired guard.
+                mark_scanned(account_uuid, provider_account_generation)
         except zulip_adapter.ZulipOperationError as exc:
             if exc.code == "bad_event_queue_id":
                 self.store.begin_provider_queue_catchup(account_uuid)
@@ -2813,8 +2959,6 @@ class BridgeService:
             self.store.reset_stale_workspace_deliveries()
         if hasattr(self.store, "finalize_ready_provider_events"):
             self.store.finalize_ready_provider_events()
-        if hasattr(self.store, "finalize_redundant_provider_message_events"):
-            self.store.finalize_redundant_provider_message_events()
         self._workspace_delivery_recovery_done = True
 
     def _contain_provider_event_failure(
@@ -2934,6 +3078,13 @@ class BridgeService:
                 ):
                     processed += 1
                 continue
+            compacted_message_event = converter.committed_message_read_state_event(
+                self.store,
+                account_uuid,
+                event,
+            )
+            if compacted_message_event is not None:
+                event = compacted_message_event
             finalize_redundant_message = getattr(
                 self.store,
                 "finalize_redundant_provider_message_event",
@@ -3474,7 +3625,8 @@ class BridgeService:
             raise ValueError("provider_chat_participants_pending")
         queue_id = (
             f"backfill:{provider_chat_key}:"
-            f"{assignment['uuid']}:{assignment['generation']}"
+            f"{assignment['uuid']}:{assignment['generation']}:"
+            f"snapshot:{BACKFILL_SNAPSHOT_PROJECTION_VERSION}"
         )
         topic_cache = getattr(self, "backfill_topic_cache", set())
         self.backfill_topic_cache = topic_cache
@@ -3906,14 +4058,17 @@ class BridgeService:
             raise ValueError("Provider event response does not match request order")
         if any(result["status"] != "applied" for result in results):
             raise ValueError("Provider event batch was not applied atomically")
-        for record, _event in event_records:
+        for (record, _event), response_result in zip(event_records, results):
+            target_uuid = response_result.get("target_uuid")
+            if target_uuid is not None:
+                target_uuid = str(target_uuid)
             result = scheduler.result_record(
                 record,
                 "committed",
                 scheduler.TargetCommit(None, None),
                 None,
             )
-            self.store.accept_result(result)
+            self.store.accept_result(result, workspace_target_uuid=target_uuid)
         return len(event_records)
 
     def tick(self) -> bool:
@@ -4202,6 +4357,23 @@ class BridgeService:
                 if delivered:
                     self._clear_live_delivery_stall()
                 else:
+                    materialize_reads = getattr(
+                        self.store,
+                        "materialize_pending_provider_message_reads",
+                        None,
+                    )
+                    if callable(materialize_reads) and materialize_reads(
+                        self._live_delivery_batch_size()
+                    ):
+                        finalize_events = getattr(
+                            self.store,
+                            "finalize_ready_provider_events",
+                            None,
+                        )
+                        if callable(finalize_events):
+                            finalize_events()
+                        self._clear_live_delivery_stall()
+                        continue
                     self._record_live_delivery_stall()
                     # The cheap readiness probe intentionally ignores causal
                     # dependencies.  Avoid hot-looping the full selector while

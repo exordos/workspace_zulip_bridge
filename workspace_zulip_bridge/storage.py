@@ -95,6 +95,9 @@ def _provider_event_static_causal_lane(event: dict[str, object]) -> str | None:
 
 def _provider_event_message_ids(event: dict[str, object]) -> list[str]:
     values: list[object] = []
+    message = event.get("message")
+    if isinstance(message, dict) and message.get("id") is not None:
+        values.append(message["id"])
     if event.get("message_id") is not None:
         values.append(event["message_id"])
     message_ids = event.get("message_ids", event.get("messages", []))
@@ -362,6 +365,10 @@ class QueueStore(typing.Protocol):
         provider_owner_user_id: str | None = None,
         provider_account_generation: int | None = None,
     ) -> None: ...
+
+    def mark_private_catalog_scanned(
+        self, account_uuid: str, provider_account_generation: int
+    ) -> bool: ...
 
     def record_provider_event(
         self, account_uuid: str, queue_id: str, event: dict[str, object]
@@ -1564,55 +1571,335 @@ class RestAlchemyStore:
         account_uuid: str,
         provider_id: str,
     ) -> dict[str, object] | None:
-        """Include a tombstone only while a later recreation is nonterminal."""
+        """Resolve an account message, including a committed realm peer target."""
         with self.session() as session:
             return session.execute(
                 """
-                SELECT mapping.workspace_uuid, mapping.provider_id,
-                       mapping.provider_revision, mapping.metadata,
-                       mapping.deleted AS pending_tombstone,
-                       EXISTS (
-                           SELECT 1 FROM provider_mapping_aliases AS alias
-                           WHERE alias.account_uuid = mapping.account_uuid
-                             AND alias.entity_kind = mapping.entity_kind
-                             AND alias.workspace_uuid = mapping.workspace_uuid
-                             AND alias.provider_id = mapping.provider_id
-                             AND NOT alias.deleted
-                       ) AS convergent_alias
-                FROM provider_mappings AS mapping
-                WHERE mapping.account_uuid = %s
-                  AND mapping.entity_kind = 'message'
-                  AND mapping.provider_id = %s
-                  AND (
-                      NOT mapping.deleted
-                      OR EXISTS (
-                          SELECT 1
-                          FROM zulip_provider_events AS event
-                          WHERE event.account_uuid = mapping.account_uuid
-                            AND event.processing_state IN (
-                                'pending', 'delivering'
-                            )
-                            AND event.provider_message_context->>'context_kind' =
-                                'pending_delete_recreations'
-                            AND event.provider_message_context->'messages' ?
-                                mapping.provider_id
+                WITH requested_realm AS MATERIALIZED (
+                    SELECT provider_realm_uuid
+                    FROM zulip_event_cursors
+                    WHERE account_uuid = %s
+                      AND provider_realm_uuid IS NOT NULL
+                ), exact_mapping AS MATERIALIZED (
+                    SELECT mapping.workspace_uuid, mapping.provider_id,
+                           mapping.provider_revision, mapping.metadata,
+                           mapping.deleted AS pending_tombstone,
+                           EXISTS (
+                               SELECT 1
+                               FROM provider_mapping_aliases AS alias
+                               WHERE alias.account_uuid = mapping.account_uuid
+                                 AND alias.entity_kind = mapping.entity_kind
+                                 AND alias.workspace_uuid = mapping.workspace_uuid
+                                 AND alias.provider_id = mapping.provider_id
+                                 AND NOT alias.deleted
+                           ) AS convergent_alias
+                    FROM provider_mappings AS mapping
+                    WHERE mapping.account_uuid = %s
+                      AND mapping.entity_kind = 'message'
+                      AND mapping.provider_id = %s
+                      AND (
+                          NOT mapping.deleted
+                          OR EXISTS (
+                              SELECT 1
+                              FROM zulip_provider_events AS event
+                              WHERE event.account_uuid = mapping.account_uuid
+                                AND event.processing_state IN (
+                                    'pending', 'delivering'
+                                )
+                                AND event.provider_message_context
+                                        ->>'context_kind' =
+                                    'pending_delete_recreations'
+                                AND event.provider_message_context->'messages' ?
+                                    mapping.provider_id
+                          )
+                          OR EXISTS (
+                              SELECT 1
+                              FROM workspace_delivery_outbox AS delivery
+                              JOIN operation_idempotency AS operation
+                                ON operation.operation_uuid =
+                                   delivery.operation_uuid
+                              WHERE delivery.account_uuid = mapping.account_uuid
+                                AND delivery.record->'operation'
+                                        ->>'entity_uuid' =
+                                    mapping.workspace_uuid::text
+                                AND delivery.record->'operation'->>'kind' =
+                                    'message.create'
+                                AND operation.terminal_outcome IS NULL
+                          )
                       )
-                      OR EXISTS (
+                ), realm_mapping AS MATERIALIZED (
+                    SELECT mapping.workspace_uuid, mapping.provider_id,
+                           mapping.provider_revision,
+                           COALESCE(
+                               (
+                                   SELECT exact.metadata
+                                   FROM exact_mapping AS exact
+                                   WHERE NOT exact.pending_tombstone
+                                   LIMIT 1
+                               ),
+                               mapping.metadata || jsonb_build_object(
+                                   'project_uuid',
+                                       assignment.body->>'project_id',
+                                   'stream_uuid',
+                                       local_stream.workspace_uuid::text,
+                                   'topic_uuid',
+                                       local_topic.workspace_uuid::text,
+                                   'author_uuid',
+                                       local_author.workspace_uuid::text,
+                                   'chat_key', mapping.metadata->>'chat_key',
+                                   'causal_lane',
+                                       'chat:' || %s::text || ':' ||
+                                       local_stream.workspace_uuid::text
+                               )
+                           ) || jsonb_build_object(
+                               'workspace_delivery_state', 'committed',
+                               'workspace_target_confirmed', true,
+                               'provider_realm_convergent', true
+                           ) AS metadata,
+                           false AS pending_tombstone,
+                           true AS convergent_alias
+                    FROM provider_mappings AS mapping
+                    JOIN zulip_event_cursors AS source_cursor
+                      ON source_cursor.account_uuid = mapping.account_uuid
+                    JOIN requested_realm AS requested
+                      ON requested.provider_realm_uuid =
+                         source_cursor.provider_realm_uuid
+                    JOIN desired_resources AS assignment
+                      ON assignment.resource_type =
+                         'external_chat_assignment'
+                     AND NOT assignment.deleted
+                     AND assignment.body
+                             ->>'external_account_uuid' = %s
+                     AND assignment.body->'provider_chat'
+                             ->>'provider_chat_key' =
+                         mapping.metadata->>'chat_key'
+                     AND assignment.body->>'project_id' =
+                         mapping.metadata->>'project_uuid'
+                     AND COALESCE(
+                         (assignment.body->>'selected')::boolean,
+                         true
+                     )
+                    LEFT JOIN provider_mappings AS source_topic
+                      ON source_topic.account_uuid = mapping.account_uuid
+                     AND source_topic.entity_kind = 'topic'
+                     AND source_topic.workspace_uuid::text =
+                         mapping.metadata->>'topic_uuid'
+                     AND NOT source_topic.deleted
+                    LEFT JOIN provider_mappings AS local_topic
+                      ON local_topic.account_uuid = %s
+                     AND local_topic.entity_kind = 'topic'
+                     AND local_topic.provider_id = source_topic.provider_id
+                     AND NOT local_topic.deleted
+                    LEFT JOIN provider_mappings AS source_author
+                      ON source_author.account_uuid = mapping.account_uuid
+                     AND source_author.entity_kind = 'identity'
+                     AND source_author.workspace_uuid::text =
+                         mapping.metadata->>'author_uuid'
+                     AND NOT source_author.deleted
+                    LEFT JOIN provider_mappings AS local_author
+                      ON local_author.account_uuid = %s
+                     AND local_author.entity_kind = 'identity'
+                     AND local_author.provider_id = source_author.provider_id
+                     AND NOT local_author.deleted
+                    LEFT JOIN provider_mappings AS local_stream
+                      ON local_stream.account_uuid = %s
+                     AND local_stream.entity_kind = 'stream'
+                     AND local_stream.provider_id =
+                         mapping.metadata->>'chat_key'
+                     AND NOT local_stream.deleted
+                    WHERE mapping.account_uuid <> %s
+                      AND mapping.entity_kind = 'message'
+                      AND mapping.provider_id = %s
+                      AND NOT mapping.deleted
+                      AND mapping.metadata->>'workspace_delivery_state' =
+                          'committed'
+                      AND (
+                          EXISTS (SELECT 1 FROM exact_mapping)
+                          OR (
+                              local_stream.workspace_uuid IS NOT NULL
+                              AND local_topic.workspace_uuid IS NOT NULL
+                              AND local_author.workspace_uuid IS NOT NULL
+                          )
+                      )
+                    ORDER BY
+                        COALESCE(
+                            (
+                                mapping.metadata
+                                    ->>'workspace_target_confirmed'
+                            )::boolean,
+                            false
+                        ) DESC,
+                        mapping.updated_at,
+                        mapping.workspace_uuid
+                    LIMIT 1
+                ), candidates AS (
+                    SELECT exact.*, 0 AS source_rank
+                    FROM exact_mapping AS exact
+                    WHERE exact.pending_tombstone
+                       OR exact.metadata->>'workspace_delivery_state' =
+                          'committed'
+                       OR NOT EXISTS (SELECT 1 FROM realm_mapping)
+                    UNION ALL
+                    SELECT realm.*, 1 AS source_rank
+                    FROM realm_mapping AS realm
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM exact_mapping AS exact
+                        WHERE exact.pending_tombstone
+                           OR exact.metadata->>'workspace_delivery_state' =
+                              'committed'
+                    )
+                )
+                SELECT workspace_uuid, provider_id, provider_revision,
+                       metadata, pending_tombstone, convergent_alias
+                FROM candidates
+                ORDER BY source_rank
+                LIMIT 1
+                """,
+                (
+                    account_uuid,
+                    account_uuid,
+                    provider_id,
+                    account_uuid,
+                    account_uuid,
+                    account_uuid,
+                    account_uuid,
+                    account_uuid,
+                    account_uuid,
+                    provider_id,
+                ),
+            ).fetchone()
+
+    def materialize_provider_message_mapping(
+        self,
+        account_uuid: str,
+        provider_id: str,
+    ) -> dict[str, object] | None:
+        """Persist a realm-convergent message target for dependency checks."""
+        exact = self.provider_mapping(account_uuid, "message", provider_id)
+        if exact is not None and (
+            exact["metadata"].get("workspace_delivery_state") == "committed"
+        ):
+            return exact
+        resolved = self.provider_message_mapping(account_uuid, provider_id)
+        if resolved is None or resolved.get("pending_tombstone") is True:
+            return resolved
+        metadata = dict(typing.cast(dict[str, object], resolved["metadata"]))
+        if metadata.get("workspace_delivery_state") != "committed":
+            return resolved
+        provider_revision = resolved.get("provider_revision")
+        self.remember_provider_mapping(
+            account_uuid,
+            "message",
+            provider_id,
+            str(resolved["workspace_uuid"]),
+            metadata,
+            None if provider_revision is None else str(provider_revision),
+        )
+        return self.provider_mapping(account_uuid, "message", provider_id)
+
+    def materialize_pending_provider_message_reads(self, limit: int = 100) -> int:
+        """Repair or quarantine live reads missing their local message alias."""
+        with self.session() as session:
+            rows = session.execute(
+                """
+                SELECT DISTINCT ON (delivery.account_uuid, provider.provider_id)
+                       delivery.account_uuid, provider.provider_id,
+                       delivery.record_uuid, delivery.record
+                FROM workspace_delivery_outbox AS delivery
+                JOIN zulip_provider_events AS event
+                  ON event.account_uuid = delivery.account_uuid
+                 AND event.queue_id = delivery.provider_queue_id
+                 AND event.event_id = delivery.provider_event_id
+                CROSS JOIN LATERAL (
+                    SELECT event.body->'message'->>'id' AS provider_id
+                ) AS provider
+                WHERE delivery.sent_at IS NULL
+                  AND delivery.priority = 0
+                  AND delivery.submission_state IN (
+                      'pending', 'ambiguous', 'awaiting_result'
+                  )
+                  AND delivery.record->'operation'->>'kind' = 'read_state.set'
+                  AND event.event_type = 'message'
+                  AND event.processing_state = 'delivering'
+                  AND provider.provider_id IS NOT NULL
+                  AND delivery.created_at <= now() - interval '30 seconds'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM workspace_delivery_outbox AS message_delivery
+                      WHERE message_delivery.sent_at IS NULL
+                        AND message_delivery.submission_state IN (
+                            'pending', 'submitting', 'ambiguous',
+                            'awaiting_result'
+                        )
+                        AND message_delivery.account_uuid =
+                            delivery.account_uuid
+                        AND message_delivery.record->'operation'->>'kind' IN (
+                            'message.create', 'message.update'
+                        )
+                        AND message_delivery.record->'operation'
+                                ->>'entity_uuid' IN (
+                            SELECT jsonb_array_elements_text(
+                                delivery.record->'operation'->'payload'
+                                    ->'message_uuids'
+                            )
+                        )
+                  )
+                  AND EXISTS (
+                      SELECT 1
+                      FROM jsonb_array_elements_text(
+                          delivery.record->'operation'->'payload'
+                              ->'message_uuids'
+                      ) AS read_message(message_uuid)
+                      WHERE NOT EXISTS (
                           SELECT 1
-                          FROM workspace_delivery_outbox AS delivery
-                          JOIN operation_idempotency AS operation
-                            ON operation.operation_uuid = delivery.operation_uuid
-                          WHERE delivery.account_uuid = mapping.account_uuid
-                            AND delivery.record->'operation'->>'entity_uuid' =
-                                mapping.workspace_uuid::text
-                            AND delivery.record->'operation'->>'kind' =
-                                'message.create'
-                            AND operation.terminal_outcome IS NULL
+                          FROM provider_mappings AS mapping
+                          WHERE mapping.account_uuid = delivery.account_uuid
+                            AND mapping.entity_kind = 'message'
+                            AND mapping.workspace_uuid =
+                                read_message.message_uuid::uuid
+                            AND NOT mapping.deleted
+                            AND mapping.metadata->>'workspace_delivery_state' =
+                                'committed'
                       )
                   )
+                ORDER BY delivery.account_uuid, provider.provider_id,
+                         delivery.created_at
+                LIMIT %s
                 """,
-                (account_uuid, provider_id),
-            ).fetchone()
+                (limit,),
+            ).fetchall()
+        repaired = 0
+        for row in rows:
+            record = typing.cast(dict[str, object], row["record"])
+            operation = typing.cast(dict[str, object], record["operation"])
+            payload = typing.cast(dict[str, object], operation["payload"])
+            raw_message_uuids = payload.get("message_uuids")
+            target_uuid = (
+                str(raw_message_uuids[0])
+                if isinstance(raw_message_uuids, list) and len(raw_message_uuids) == 1
+                else None
+            )
+            mapping = self.materialize_provider_message_mapping(
+                str(row["account_uuid"]),
+                str(row["provider_id"]),
+            )
+            if mapping is not None and (
+                mapping["metadata"].get("workspace_delivery_state") == "committed"
+                and target_uuid is not None
+                and str(mapping["workspace_uuid"]) == target_uuid
+            ):
+                repaired += 1
+                continue
+            record_uuid = str(row["record_uuid"])
+            if self.mark_workspace_delivery_submitting(
+                record_uuid
+            ) and self.reject_provider_event_submission(
+                record_uuid,
+                "provider_message_mapping_missing",
+            ):
+                repaired += 1
+        return repaired
 
     def provider_message_tombstone(
         self,
@@ -1630,6 +1917,78 @@ class RestAlchemyStore:
                   AND provider_id = %s AND deleted
                 """,
                 (account_uuid, provider_id),
+            ).fetchone()
+
+    def provider_message_reference_mapping(
+        self,
+        account_uuid: str,
+        provider_id: str,
+    ) -> dict[str, object] | None:
+        """Resolve the canonical quote target before its local projection commits."""
+        with self.session() as session:
+            return session.execute(
+                """
+                WITH requested_realm AS MATERIALIZED (
+                    SELECT provider_realm_uuid
+                    FROM zulip_event_cursors
+                    WHERE account_uuid = %s
+                      AND provider_realm_uuid IS NOT NULL
+                ), candidates AS (
+                    SELECT mapping.workspace_uuid, mapping.provider_id,
+                           mapping.provider_revision, mapping.metadata,
+                           false AS pending_tombstone,
+                           false AS convergent_alias,
+                           CASE
+                               WHEN mapping.metadata->>'workspace_delivery_state' =
+                                    'committed'
+                               THEN 0
+                               ELSE 2
+                           END AS source_rank,
+                           mapping.updated_at
+                    FROM provider_mappings AS mapping
+                    WHERE mapping.account_uuid = %s
+                      AND mapping.entity_kind = 'message'
+                      AND mapping.provider_id = %s
+                      AND NOT mapping.deleted
+                    UNION ALL
+                    SELECT mapping.workspace_uuid, mapping.provider_id,
+                           mapping.provider_revision, mapping.metadata,
+                           false AS pending_tombstone,
+                           true AS convergent_alias,
+                           1 AS source_rank,
+                           mapping.updated_at
+                    FROM provider_mappings AS mapping
+                    JOIN zulip_event_cursors AS source_cursor
+                      ON source_cursor.account_uuid = mapping.account_uuid
+                    JOIN requested_realm AS requested
+                      ON requested.provider_realm_uuid =
+                         source_cursor.provider_realm_uuid
+                    WHERE mapping.account_uuid <> %s
+                      AND mapping.entity_kind = 'message'
+                      AND mapping.provider_id = %s
+                      AND NOT mapping.deleted
+                      AND mapping.metadata->>'workspace_delivery_state' =
+                          'committed'
+                )
+                SELECT workspace_uuid, provider_id, provider_revision, metadata,
+                       pending_tombstone, convergent_alias
+                FROM candidates
+                ORDER BY source_rank,
+                         COALESCE(
+                             (metadata->>'workspace_target_confirmed')::boolean,
+                             false
+                         ) DESC,
+                         updated_at,
+                         workspace_uuid
+                LIMIT 1
+                """,
+                (
+                    account_uuid,
+                    account_uuid,
+                    provider_id,
+                    account_uuid,
+                    provider_id,
+                ),
             ).fetchone()
 
     def provider_mapping_by_name(
@@ -1972,6 +2331,74 @@ class RestAlchemyStore:
                         ),
                     ),
                 )
+                existing_message = session.execute(
+                    """
+                    SELECT workspace_uuid, provider_revision, metadata, deleted
+                    FROM provider_mappings
+                    WHERE account_uuid = %s AND entity_kind = 'message'
+                      AND provider_id = %s
+                    FOR UPDATE
+                    """,
+                    (account_uuid, provider_id),
+                ).fetchone()
+                if (
+                    existing_message is not None
+                    and not existing_message["deleted"]
+                    and existing_message["metadata"].get("workspace_delivery_state")
+                    != "committed"
+                    and str(existing_message["workspace_uuid"]) != str(workspace_uuid)
+                ):
+                    # A second account in the same Zulip realm can discover a
+                    # message after another account already received the
+                    # authoritative Workspace UUID. Rekey only an uncommitted
+                    # local placeholder and retain it as an alias for records
+                    # that were prepared before convergence.
+                    session.execute(
+                        """
+                        INSERT INTO provider_mapping_aliases (
+                            account_uuid, entity_kind, workspace_uuid,
+                            provider_id, metadata, deleted
+                        ) VALUES (%s, 'message', %s, %s, %s, false)
+                        ON CONFLICT (
+                            account_uuid, entity_kind, workspace_uuid
+                        ) DO UPDATE SET
+                            provider_id = EXCLUDED.provider_id,
+                            metadata = EXCLUDED.metadata,
+                            deleted = false,
+                            updated_at = now()
+                        """,
+                        (
+                            account_uuid,
+                            str(existing_message["workspace_uuid"]),
+                            provider_id,
+                            json.dumps(existing_message["metadata"]),
+                        ),
+                    )
+                    session.execute(
+                        """
+                        UPDATE provider_mappings
+                        SET workspace_uuid = %s,
+                            provider_revision = COALESCE(
+                                %s, provider_revision
+                            ),
+                            metadata = %s,
+                            deleted = false,
+                            updated_at = now()
+                        WHERE account_uuid = %s
+                          AND entity_kind = 'message'
+                          AND provider_id = %s
+                          AND metadata->>'workspace_delivery_state'
+                              IS DISTINCT FROM 'committed'
+                        """,
+                        (
+                            workspace_uuid,
+                            provider_revision,
+                            json.dumps(metadata),
+                            account_uuid,
+                            provider_id,
+                        ),
+                    )
+                    return
             if entity_kind == "topic":
                 # A late event can still carry a pre-rename topic name. In that
                 # case refresh the canonical row reached through its durable
@@ -3975,8 +4402,6 @@ class RestAlchemyStore:
         records: list[dict[str, object]],
     ) -> None:
         """Reject grouped reads converted from a stale mapping snapshot."""
-        if event.get("type") != "update_message_flags":
-            return
         provider_message_ids = _provider_event_message_ids(event)
         if not provider_message_ids:
             return
@@ -9103,7 +9528,8 @@ class RestAlchemyStore:
             return session.execute(
                 """
                 SELECT queue_id, last_event_id, provider_realm_uuid,
-                       provider_owner_user_id, provider_account_generation
+                       provider_owner_user_id, provider_account_generation,
+                       private_catalog_scanned_generation
                 FROM zulip_event_cursors
                 WHERE account_uuid = %s
                 """,
@@ -9159,6 +9585,29 @@ class RestAlchemyStore:
                     provider_owner_user_id,
                     provider_account_generation,
                 ),
+            )
+
+    def mark_private_catalog_scanned(
+        self, account_uuid: str, provider_account_generation: int
+    ) -> bool:
+        with self.session() as session:
+            return (
+                session.execute(
+                    """
+                    UPDATE zulip_event_cursors
+                    SET private_catalog_scanned_generation = %s,
+                        updated_at = now()
+                    WHERE account_uuid = %s
+                      AND provider_account_generation = %s
+                    RETURNING account_uuid
+                    """,
+                    (
+                        provider_account_generation,
+                        account_uuid,
+                        provider_account_generation,
+                    ),
+                ).fetchone()
+                is not None
             )
 
     @staticmethod
@@ -9677,7 +10126,378 @@ class RestAlchemyStore:
                 (operation_uuids, matched_statuses, semantic_sha256s),
             )
 
-    def accept_result(self, result: dict[str, object]) -> None:
+    @staticmethod
+    def _rekey_pending_workspace_message_dependents(
+        session: sessions.PgSQLSession,
+        account_uuid: str,
+        source_uuid: str,
+        target_uuid: str,
+    ) -> int:
+        """Move unsubmitted follow-up records to a confirmed message UUID."""
+        rows = session.execute(
+            """
+            SELECT delivery.record_uuid, delivery.operation_uuid,
+                   delivery.provider_queue_id, delivery.provider_event_id,
+                   delivery.record
+            FROM workspace_delivery_outbox AS delivery
+            JOIN operation_idempotency AS idempotency
+              ON idempotency.operation_uuid = delivery.operation_uuid
+            WHERE delivery.account_uuid = %s
+              AND delivery.sent_at IS NULL
+              AND delivery.submission_state = 'pending'
+              AND delivery.submission_attempts = 0
+              AND idempotency.terminal_outcome IS NULL
+              AND (
+                  (
+                      delivery.record->'operation'->>'kind' IN (
+                          'message.update', 'message.delete'
+                      )
+                      AND delivery.record->'operation'->>'entity_uuid' = %s
+                  )
+                  OR delivery.record->'operation'->'payload'
+                         ->>'message_uuid' = %s
+                  OR delivery.record->'operation'->'payload'
+                         ->>'reply_to_message_uuid' = %s
+                  OR delivery.record->'operation'->'payload'
+                         ->'message_uuids' ? %s
+              )
+            FOR UPDATE OF delivery, idempotency
+            """,
+            (
+                account_uuid,
+                source_uuid,
+                source_uuid,
+                source_uuid,
+                source_uuid,
+            ),
+        ).fetchall()
+        updated_count = 0
+        for row in rows:
+            record = copy.deepcopy(typing.cast(dict[str, object], row["record"]))
+            operation = typing.cast(dict[str, object], record["operation"])
+            payload = typing.cast(dict[str, object], operation["payload"])
+            changed = False
+            if (
+                operation.get("kind") in {"message.update", "message.delete"}
+                and str(operation.get("entity_uuid")) == source_uuid
+            ):
+                operation["entity_uuid"] = target_uuid
+                changed = True
+            for field in ("message_uuid", "reply_to_message_uuid"):
+                if str(payload.get(field)) == source_uuid:
+                    payload[field] = target_uuid
+                    changed = True
+            message_uuids = payload.get("message_uuids")
+            if isinstance(message_uuids, list) and source_uuid in {
+                str(value) for value in message_uuids
+            }:
+                payload["message_uuids"] = list(
+                    dict.fromkeys(
+                        target_uuid if str(value) == source_uuid else str(value)
+                        for value in message_uuids
+                    )
+                )
+                changed = True
+            if not changed:
+                continue
+            record["operation_sha256"] = canonical.operation_digest(record)
+            session.execute(
+                """
+                UPDATE workspace_delivery_outbox
+                SET record = %s
+                WHERE record_uuid = %s AND sent_at IS NULL
+                  AND submission_state = 'pending'
+                  AND submission_attempts = 0
+                """,
+                (json.dumps(record), row["record_uuid"]),
+            )
+            session.execute(
+                """
+                UPDATE operation_idempotency
+                SET operation_sha256 = %s, updated_at = now()
+                WHERE operation_uuid = %s AND terminal_outcome IS NULL
+                """,
+                (record["operation_sha256"], row["operation_uuid"]),
+            )
+            if (
+                row["provider_queue_id"] is not None
+                and row["provider_event_id"] is not None
+            ):
+                session.execute(
+                    """
+                    UPDATE zulip_provider_events AS event
+                    SET prepared_records = (
+                        SELECT jsonb_agg(
+                                   CASE
+                                       WHEN prepared.value->>'operation_uuid' = %s
+                                       THEN %s::jsonb
+                                       ELSE prepared.value
+                                   END
+                                   ORDER BY prepared.position
+                               )
+                        FROM jsonb_array_elements(event.prepared_records)
+                             WITH ORDINALITY AS prepared(value, position)
+                    )
+                    WHERE event.account_uuid = %s AND event.queue_id = %s
+                      AND event.event_id = %s
+                      AND event.prepared_records IS NOT NULL
+                    """,
+                    (
+                        str(row["operation_uuid"]),
+                        json.dumps(record),
+                        account_uuid,
+                        str(row["provider_queue_id"]),
+                        int(row["provider_event_id"]),
+                    ),
+                )
+            updated_count += 1
+        return updated_count
+
+    @staticmethod
+    def _rekey_pending_workspace_topic_dependents(
+        session: sessions.PgSQLSession,
+        account_uuid: str,
+        source_uuid: str,
+        target_uuid: str,
+    ) -> int:
+        """Move unsubmitted topic operations and references to a confirmed UUID."""
+        rows = session.execute(
+            """
+            SELECT delivery.record_uuid, delivery.operation_uuid,
+                   delivery.provider_queue_id, delivery.provider_event_id,
+                   delivery.record
+            FROM workspace_delivery_outbox AS delivery
+            JOIN operation_idempotency AS idempotency
+              ON idempotency.operation_uuid = delivery.operation_uuid
+            WHERE delivery.account_uuid = %s
+              AND delivery.sent_at IS NULL
+              AND delivery.submission_state = 'pending'
+              AND delivery.submission_attempts = 0
+              AND idempotency.terminal_outcome IS NULL
+              AND (
+                  (
+                      delivery.record->'operation'->>'kind' IN (
+                          'topic.upsert', 'topic.delete'
+                      )
+                      AND delivery.record->'operation'->>'entity_uuid' = %s
+                  )
+                  OR delivery.record->'operation'->'payload'
+                         ->>'topic_uuid' = %s
+                  OR delivery.record->'operation'->'payload'
+                         ->>'default_topic_uuid' = %s
+              )
+            FOR UPDATE OF delivery, idempotency
+            """,
+            (account_uuid, source_uuid, source_uuid, source_uuid),
+        ).fetchall()
+        updated_count = 0
+        for row in rows:
+            record = copy.deepcopy(typing.cast(dict[str, object], row["record"]))
+            operation = typing.cast(dict[str, object], record["operation"])
+            payload = typing.cast(dict[str, object], operation["payload"])
+            changed = False
+            if (
+                operation.get("kind") in {"topic.upsert", "topic.delete"}
+                and str(operation.get("entity_uuid")) == source_uuid
+            ):
+                operation["entity_uuid"] = target_uuid
+                changed = True
+            for field in ("topic_uuid", "default_topic_uuid"):
+                if str(payload.get(field)) == source_uuid:
+                    payload[field] = target_uuid
+                    changed = True
+            if not changed:
+                continue
+            record["operation_sha256"] = canonical.operation_digest(record)
+            session.execute(
+                """
+                UPDATE workspace_delivery_outbox
+                SET record = %s
+                WHERE record_uuid = %s AND sent_at IS NULL
+                  AND submission_state = 'pending'
+                  AND submission_attempts = 0
+                """,
+                (json.dumps(record), row["record_uuid"]),
+            )
+            session.execute(
+                """
+                UPDATE operation_idempotency
+                SET operation_sha256 = %s, updated_at = now()
+                WHERE operation_uuid = %s AND terminal_outcome IS NULL
+                """,
+                (record["operation_sha256"], row["operation_uuid"]),
+            )
+            if (
+                row["provider_queue_id"] is not None
+                and row["provider_event_id"] is not None
+            ):
+                session.execute(
+                    """
+                    UPDATE zulip_provider_events AS event
+                    SET prepared_records = (
+                        SELECT jsonb_agg(
+                                   CASE
+                                       WHEN prepared.value->>'operation_uuid' = %s
+                                       THEN %s::jsonb
+                                       ELSE prepared.value
+                                   END
+                                   ORDER BY prepared.position
+                               )
+                        FROM jsonb_array_elements(event.prepared_records)
+                             WITH ORDINALITY AS prepared(value, position)
+                    )
+                    WHERE event.account_uuid = %s AND event.queue_id = %s
+                      AND event.event_id = %s
+                      AND event.prepared_records IS NOT NULL
+                    """,
+                    (
+                        str(row["operation_uuid"]),
+                        json.dumps(record),
+                        account_uuid,
+                        str(row["provider_queue_id"]),
+                        int(row["provider_event_id"]),
+                    ),
+                )
+            updated_count += 1
+        return updated_count
+
+    @staticmethod
+    def _reconcile_authoritative_workspace_target(
+        session: sessions.PgSQLSession,
+        operation_record: dict[str, object],
+        workspace_target_uuid: str | None,
+    ) -> None:
+        """Redirect a local Zulip ingress mapping to Workspace's UUID.
+
+        A Provider Event response is authoritative: another account may have
+        already materialized the same provider message under its canonical
+        Workspace UUID.  Keep the generated local UUID as an alias so queued
+        follow-up operations remain routable, while all future ingress uses the
+        server-selected primary mapping.
+        """
+        if workspace_target_uuid is None or operation_record.get("origin") != "zulip":
+            return
+        operation = typing.cast(
+            dict[str, object] | None, operation_record.get("operation")
+        )
+        if operation is None:
+            return
+        kind = str(operation.get("kind"))
+        if kind not in {"message.create", "message.update", "topic.upsert"}:
+            return
+        entity_kind = kind.partition(".")[0]
+        provider = typing.cast(dict[str, object], operation.get("provider", {}))
+        provider_id = provider.get("entity_id")
+        if provider_id is None:
+            raise ValueError("Provider event mapping has no provider identifier")
+        target_uuid = str(uuid.UUID(workspace_target_uuid))
+        workspace_uuid = str(operation["entity_uuid"])
+        account_uuid = str(operation_record["account_uuid"])
+        session.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (_provider_mapping_lock_key(account_uuid, entity_kind, str(provider_id)),),
+        )
+        mapping = session.execute(
+            """
+            SELECT workspace_uuid, provider_id, metadata
+            FROM provider_mappings
+            WHERE account_uuid = %s AND entity_kind = %s AND provider_id = %s
+            FOR UPDATE
+            """,
+            (account_uuid, entity_kind, str(provider_id)),
+        ).fetchone()
+        if mapping is None:
+            raise ValueError("Committed provider event mapping is missing")
+        current_uuid = str(mapping["workspace_uuid"])
+        if current_uuid not in {workspace_uuid, target_uuid}:
+            raise ValueError("Provider event mapping points to another Workspace UUID")
+        conflicting = session.execute(
+            """
+            SELECT provider_id
+            FROM provider_mappings
+            WHERE account_uuid = %s AND entity_kind = %s
+              AND workspace_uuid = %s AND NOT deleted
+            FOR UPDATE
+            """,
+            (account_uuid, entity_kind, target_uuid),
+        ).fetchone()
+        if conflicting is not None and conflicting["provider_id"] != str(provider_id):
+            raise ValueError(
+                "Authoritative Workspace UUID belongs to another provider object"
+            )
+        metadata = typing.cast(dict[str, object], mapping["metadata"])
+        if workspace_uuid != target_uuid:
+            session.execute(
+                """
+                INSERT INTO provider_mapping_aliases (
+                    account_uuid, entity_kind, workspace_uuid, provider_id,
+                    metadata, deleted
+                ) VALUES (%s, %s, %s, %s, %s, false)
+                ON CONFLICT (account_uuid, entity_kind, workspace_uuid) DO UPDATE SET
+                    provider_id = EXCLUDED.provider_id,
+                    metadata = EXCLUDED.metadata,
+                    deleted = false,
+                    updated_at = now()
+                """,
+                (
+                    account_uuid,
+                    entity_kind,
+                    workspace_uuid,
+                    str(provider_id),
+                    json.dumps(metadata),
+                ),
+            )
+        if current_uuid != target_uuid:
+            session.execute(
+                """
+                UPDATE provider_mappings
+                SET workspace_uuid = %s,
+                    metadata = jsonb_set(
+                        metadata,
+                        '{workspace_target_confirmed}',
+                        'true'::jsonb,
+                        true
+                    ),
+                    updated_at = now()
+                WHERE account_uuid = %s AND entity_kind = %s AND provider_id = %s
+                """,
+                (target_uuid, account_uuid, entity_kind, str(provider_id)),
+            )
+        else:
+            session.execute(
+                """
+                UPDATE provider_mappings
+                SET metadata = jsonb_set(
+                        metadata,
+                        '{workspace_target_confirmed}',
+                        'true'::jsonb,
+                        true
+                    ),
+                    updated_at = now()
+                WHERE account_uuid = %s AND entity_kind = %s AND provider_id = %s
+                """,
+                (account_uuid, entity_kind, str(provider_id)),
+            )
+        if entity_kind == "message" and workspace_uuid != target_uuid:
+            RestAlchemyStore._rekey_pending_workspace_message_dependents(
+                session,
+                account_uuid,
+                workspace_uuid,
+                target_uuid,
+            )
+        if entity_kind == "topic" and workspace_uuid != target_uuid:
+            RestAlchemyStore._rekey_pending_workspace_topic_dependents(
+                session,
+                account_uuid,
+                workspace_uuid,
+                target_uuid,
+            )
+
+    def accept_result(
+        self,
+        result: dict[str, object],
+        workspace_target_uuid: str | None = None,
+    ) -> None:
         result_body = typing.cast(dict[str, object], result["result"])
         outcome = str(result_body["outcome"])
         with self.session() as session:
@@ -9751,6 +10571,11 @@ class RestAlchemyStore:
                         """,
                         (str(result["operation_uuid"]),),
                     )
+                    self._reconcile_authoritative_workspace_target(
+                        session,
+                        operation_record,
+                        workspace_target_uuid,
+                    )
                     return
                 raise ValueError("Stale result cannot replace terminal outcome")
             session.execute(
@@ -9812,11 +10637,11 @@ class RestAlchemyStore:
                         UPDATE provider_mapping_aliases
                         SET deleted = true, updated_at = now()
                         WHERE account_uuid = %s AND entity_kind = 'message'
-                          AND workspace_uuid = %s AND NOT deleted
+                          AND provider_id = %s AND NOT deleted
                         """,
                         (
                             str(operation_record["account_uuid"]),
-                            str(operation["entity_uuid"]),
+                            str(provider["entity_id"]),
                         ),
                     )
                 elif kind == "message.update":
@@ -9841,7 +10666,7 @@ class RestAlchemyStore:
                             ),
                             updated_at = now()
                         WHERE account_uuid = %s AND entity_kind = 'message'
-                          AND workspace_uuid = %s AND NOT deleted
+                          AND provider_id = %s AND NOT deleted
                         """,
                         (
                             str(operation_record["project_uuid"]),
@@ -9851,7 +10676,7 @@ class RestAlchemyStore:
                             str(operation_record["causal_lane"]),
                             extensions.get("subject"),
                             str(operation_record["account_uuid"]),
-                            str(operation["entity_uuid"]),
+                            str(provider["entity_id"]),
                         ),
                     )
                     session.execute(
@@ -9871,7 +10696,7 @@ class RestAlchemyStore:
                             ),
                             updated_at = now()
                         WHERE account_uuid = %s AND entity_kind = 'message'
-                          AND workspace_uuid = %s AND NOT deleted
+                          AND provider_id = %s AND NOT deleted
                         """,
                         (
                             str(operation_record["project_uuid"]),
@@ -9881,7 +10706,7 @@ class RestAlchemyStore:
                             str(operation_record["causal_lane"]),
                             extensions.get("subject"),
                             str(operation_record["account_uuid"]),
-                            str(operation["entity_uuid"]),
+                            str(provider["entity_id"]),
                         ),
                     )
                 elif kind == "message.create":
@@ -9918,6 +10743,11 @@ class RestAlchemyStore:
                             str(operation["entity_uuid"]),
                         ),
                     )
+            self._reconcile_authoritative_workspace_target(
+                session,
+                operation_record,
+                workspace_target_uuid,
+            )
 
     @staticmethod
     def _enqueue_observed_report_in_session(

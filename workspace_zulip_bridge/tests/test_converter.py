@@ -1190,6 +1190,70 @@ def test_message_mutations_and_topic_rename_reuse_stable_mappings():
     assert "through_message_uuid" not in read[0]["payload"]
 
 
+def test_committed_flagless_live_message_becomes_owner_unread_event():
+    store = FakeStore()
+    message_uuid = str(uuid.uuid4())
+    store.remember_provider_mapping(
+        ACCOUNT_UUID,
+        "message",
+        "601",
+        message_uuid,
+        {
+            "workspace_delivery_state": "committed",
+            "project_uuid": PROJECT_UUID,
+            "stream_uuid": str(uuid.uuid4()),
+            "topic_uuid": str(uuid.uuid4()),
+            "chat_key": "channel:42",
+        },
+    )
+    event = {
+        "id": 13,
+        "type": "message",
+        "message": {"id": 601, "timestamp": 1_700_000_010},
+    }
+
+    compacted = converter.committed_message_read_state_event(
+        store,
+        ACCOUNT_UUID,
+        event,
+    )
+
+    assert compacted == {
+        "id": 13,
+        "type": "update_message_flags",
+        "flag": "read",
+        "op": "remove",
+        "messages": [601],
+        "timestamp": 1_700_000_010,
+        "_workspace_compacted_message_event": True,
+    }
+
+
+@pytest.mark.parametrize("flags", [["read"], []])
+def test_committed_live_message_keeps_explicit_owner_flags(flags):
+    store = FakeStore()
+    store.remember_provider_mapping(
+        ACCOUNT_UUID,
+        "message",
+        "601",
+        str(uuid.uuid4()),
+        {"workspace_delivery_state": "committed"},
+    )
+
+    assert (
+        converter.committed_message_read_state_event(
+            store,
+            ACCOUNT_UUID,
+            {
+                "id": 13,
+                "type": "message",
+                "message": {"id": 601, "flags": flags},
+            },
+        )
+        is None
+    )
+
+
 def test_repeated_topic_rename_reuses_existing_target_mapping():
     store = FakeStore()
     stream_uuid = str(uuid.uuid4())
@@ -2107,10 +2171,11 @@ def test_backfill_reaction_uses_versioned_projection_operation_identity():
         }
     ]
 
+    queue_id = "backfill:channel:42:assignment:1:snapshot:4"
     records = converter.event_records(
         store,
         ACCOUNT_UUID,
-        "history",
+        queue_id,
         {"id": 601, "type": "message", "message": message},
         "backfill",
     )
@@ -2120,7 +2185,7 @@ def test_backfill_reaction_uses_versioned_projection_operation_identity():
     )
     reaction_index = records.index(reaction)
     source = (
-        "provider-message:601:reconcile-generation:1:"
+        f"provider-message:601:reconcile-generation:1:{queue_id}:"
         f"reaction-projection:{converter.REACTION_PROJECTION_VERSION}"
     )
     assert reaction["operation_uuid"] == converter.operation_uuid_for(
@@ -2134,10 +2199,24 @@ def test_backfill_reaction_uses_versioned_projection_operation_identity():
     )
     assert message_record["operation_uuid"] == converter.operation_uuid_for(
         ACCOUNT_UUID,
-        "provider-message:601:reconcile-generation:1",
+        f"provider-message:601:reconcile-generation:1:{queue_id}",
         601,
         records.index(message_record),
     )
+
+    previous_records = converter.event_records(
+        FakeStore(),
+        ACCOUNT_UUID,
+        "backfill:channel:42:assignment:1:snapshot:3",
+        {"id": 601, "type": "message", "message": message},
+        "backfill",
+    )
+    previous_message = next(
+        record
+        for record in previous_records
+        if record["operation"]["kind"] == "message.create"
+    )
+    assert previous_message["operation_uuid"] != message_record["operation_uuid"]
 
 
 def test_reaction_event_rejects_unknown_operation():
@@ -2464,6 +2543,130 @@ def test_inbound_zulip_reply_accepts_localized_quote_link_label():
     assert message["extensions"]["unresolved_reply_provider_id"] is None
 
 
+def test_inbound_zulip_reply_remains_canonical_after_content_edit():
+    store = FakeStore()
+    quoted_token = uuid.uuid4().hex
+    initial_reply_token = uuid.uuid4().hex
+    edited_reply_token = uuid.uuid4().hex
+    converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {"id": 10, "type": "message", "message": _stream_message(601)},
+    )
+    original = store.provider_mapping(ACCOUNT_UUID, "message", "601")
+    reply = _stream_message(602)
+    reply["content"] = (
+        "@_**Other User|2** "
+        "[said](https://zulip.example.invalid/#narrow/near/601):\n"
+        f"```quote\n{quoted_token}\n```\n\n{initial_reply_token}"
+    )
+    converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "queue",
+        {"id": 11, "type": "message", "message": reply},
+    )
+
+    updated = _operations(
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "queue",
+            {
+                "id": 12,
+                "type": "update_message",
+                "message_id": 602,
+                "message_ids": [602],
+                "stream_id": 42,
+                "content": (
+                    "@_**Other User|2** "
+                    "[said](https://zulip.example.invalid/#narrow/near/601):\n"
+                    f"```quote\n{quoted_token}\n```\n\n{edited_reply_token}"
+                ),
+                "edit_timestamp": 1_700_000_010,
+            },
+        )
+    )
+    message = next(
+        operation for operation in updated if operation["kind"] == "message.update"
+    )
+
+    assert message["payload"]["payload"]["content"] == (
+        f"[Other User](urn:quote:{original['workspace_uuid']})\n\n{edited_reply_token}"
+    )
+
+
+def test_inbound_zulip_reply_edit_uses_reference_mapping_before_local_projection():
+    class ReferenceStore(FakeStore):
+        def __init__(self):
+            super().__init__()
+            self.reference_mapping = None
+
+        def provider_message_reference_mapping(self, account_uuid, provider_id):
+            if provider_id == "601":
+                return self.reference_mapping
+            return self.provider_mapping(account_uuid, "message", provider_id)
+
+    store = ReferenceStore()
+    source_uuid = str(uuid.uuid4())
+    quoted_token = uuid.uuid4().hex
+    edited_reply_token = uuid.uuid4().hex
+    store.reference_mapping = {
+        "workspace_uuid": source_uuid,
+        "provider_id": "601",
+        "provider_revision": None,
+        "metadata": {},
+        "convergent_alias": True,
+    }
+    store.remember_provider_mapping(
+        ACCOUNT_UUID,
+        "message",
+        "602",
+        str(uuid.uuid4()),
+        {
+            "project_uuid": PROJECT_UUID,
+            "stream_uuid": store.provider_mapping(ACCOUNT_UUID, "stream", "channel:42")[
+                "workspace_uuid"
+            ],
+            "topic_uuid": store.provider_mapping(ACCOUNT_UUID, "topic", "42:Topic")[
+                "workspace_uuid"
+            ],
+            "author_uuid": converter.stable_entity_uuid(ACCOUNT_UUID, "identity", "2"),
+            "chat_key": "channel:42",
+            "workspace_delivery_state": "committed",
+        },
+    )
+
+    updated = _operations(
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "queue",
+            {
+                "id": 12,
+                "type": "update_message",
+                "message_id": 602,
+                "message_ids": [602],
+                "stream_id": 42,
+                "content": (
+                    "@_**Other User|2** "
+                    "[said](https://zulip.example.invalid/#narrow/near/601):\n"
+                    f"```quote\n{quoted_token}\n```\n\n{edited_reply_token}"
+                ),
+                "edit_timestamp": 1_700_000_010,
+            },
+        )
+    )
+    message = next(
+        operation for operation in updated if operation["kind"] == "message.update"
+    )
+
+    assert message["payload"]["payload"]["content"] == (
+        f"[Quoted message](urn:quote:{source_uuid})\n\n{edited_reply_token}"
+    )
+
+
 def test_inbound_zulip_reply_resolves_within_each_account_projection():
     second_account_uuid = str(uuid.uuid4())
     stores = (
@@ -2588,9 +2791,18 @@ def test_convergent_workspace_alias_replays_idempotent_backfill_upsert():
     )
     assert message["entity_uuid"] == workspace_uuid
     assert message["payload"]["read"] is True
-    assert not any(
-        operation["kind"] == "read_state.set" for operation in _operations(records)
+    read = next(
+        operation
+        for operation in _operations(records)
+        if operation["kind"] == "read_state.set"
     )
+    assert read["payload"] == {
+        "stream_uuid": message["payload"]["stream_uuid"],
+        "topic_uuid": message["payload"]["topic_uuid"],
+        "reader_uuid": OWNER_UUID,
+        "message_uuids": [workspace_uuid],
+        "read": True,
+    }
     assert (
         store.provider_mapping(ACCOUNT_UUID, "message", "601")["workspace_uuid"]
         == workspace_uuid
@@ -3038,9 +3250,7 @@ def test_user_topic_visibility_policy_maps_to_workspace_mode(
     assert operations[0]["payload"]["notification_updated_at"] == (
         "2027-01-15T08:00:20Z"
     )
-    metadata = store.provider_mapping(
-        ACCOUNT_UUID, "topic", "42:bridge"
-    )["metadata"]
+    metadata = store.provider_mapping(ACCOUNT_UUID, "topic", "42:bridge")["metadata"]
     assert metadata["notification_provider_updated_at"] == 1_800_000_020
     assert (
         converter.event_records(

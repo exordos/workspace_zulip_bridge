@@ -23,6 +23,7 @@ UNAVAILABLE_USER_DISPLAY_NAME = "Unavailable Zulip user"
 # should amortize one request across a useful batch while the delivery outbox
 # still drains it in bounded Provider API quanta.
 HISTORY_PAGE_SIZE = 100
+PRIVATE_CATALOG_PAGE_SIZE = 1000
 ZULIP_EMOJI_DATA_PATH = "/static/generated/emoji/emoji_api.json"
 TRANSFER_NAMESPACE = uuid.UUID("8aa58582-d782-4e98-bfc3-7b5ee96e3bd6")
 WORKSPACE_FILE_URN_RE = re.compile(
@@ -318,13 +319,13 @@ class OfficialZulipAdapter:
         self,
         users: dict[int, dict[str, object]],
         referenced_user_ids: set[int],
+        *,
+        keep_queue_alive: typing.Callable[[], None] | None = None,
     ) -> dict[int, dict[str, object]]:
         try:
             for user_id in sorted(referenced_user_ids - set(users)):
                 try:
-                    user = _successful(self.client.get_user_by_id(user_id)).get(
-                        "user"
-                    )
+                    user = _successful(self.client.get_user_by_id(user_id)).get("user")
                 except ZulipOperationError as exc:
                     # Restored and long-lived realms can retain references to
                     # users that the provider directory no longer exposes.
@@ -334,6 +335,8 @@ class OfficialZulipAdapter:
                     if exc.code != "bad_request":
                         raise
                     user = self._unavailable_user(user_id)
+                if keep_queue_alive is not None:
+                    keep_queue_alive()
                 if (
                     not isinstance(user, dict)
                     or user.get("user_id") != user_id
@@ -810,6 +813,114 @@ class OfficialZulipAdapter:
             raise ZulipOperationError("invalid_record", False)
         return typing.cast(list[dict[str, object]], subscriptions)
 
+    def private_conversation_catalog(
+        self,
+        *,
+        keep_queue_alive: typing.Callable[[], None] | None = None,
+    ) -> dict[str, object]:
+        """Return every historical DM participant set without message bodies."""
+        def keep_alive() -> None:
+            if keep_queue_alive is not None:
+                keep_queue_alive()
+
+        try:
+            profile = _successful(self.client.get_profile())
+            keep_alive()
+            members = _successful(
+                self.client.get_users({"include_deactivated": True})
+            ).get("members")
+            keep_alive()
+            provider_user_id = profile.get("user_id")
+            if (
+                not isinstance(provider_user_id, int)
+                or not isinstance(members, list)
+                or not all(
+                    isinstance(member, dict)
+                    and isinstance(member.get("user_id"), int)
+                    and isinstance(member.get("full_name"), str)
+                    for member in members
+                )
+            ):
+                raise ZulipOperationError("invalid_record", False)
+            realm_users = {
+                int(member["user_id"]): member
+                for member in typing.cast(list[dict[str, object]], members)
+            }
+            if isinstance(profile.get("full_name"), str):
+                realm_users[provider_user_id] = profile
+            conversations: dict[tuple[int, ...], int] = {}
+            referenced_user_ids = {provider_user_id}
+            anchor: str | int = "newest"
+            while True:
+                result = _successful(
+                    self.client.get_messages(
+                        {
+                            "anchor": anchor,
+                            "num_before": PRIVATE_CATALOG_PAGE_SIZE,
+                            "num_after": 0,
+                            "apply_markdown": False,
+                            "narrow": [{"operator": "is", "operand": "dm"}],
+                        }
+                    )
+                )
+                keep_alive()
+                messages = result.get("messages")
+                if not isinstance(messages, list):
+                    raise ZulipOperationError("invalid_record", False)
+                message_ids: list[int] = []
+                for message in messages:
+                    if (
+                        not isinstance(message, dict)
+                        or not isinstance(message.get("id"), int)
+                        or message.get("type") != "private"
+                        or not isinstance(message.get("display_recipient"), list)
+                    ):
+                        raise ZulipOperationError("invalid_record", False)
+                    recipients = typing.cast(list[object], message["display_recipient"])
+                    if not all(
+                        isinstance(recipient, dict)
+                        and isinstance(recipient.get("id"), int)
+                        for recipient in recipients
+                    ):
+                        raise ZulipOperationError("invalid_record", False)
+                    participant_ids = {
+                        int(typing.cast(dict[str, object], recipient)["id"])
+                        for recipient in recipients
+                    }
+                    participant_ids.add(provider_user_id)
+                    ordered = tuple(sorted(participant_ids))
+                    message_id = int(message["id"])
+                    message_ids.append(message_id)
+                    referenced_user_ids.update(ordered)
+                    conversations[ordered] = max(
+                        conversations.get(ordered, message_id),
+                        message_id,
+                    )
+                if len(messages) < PRIVATE_CATALOG_PAGE_SIZE:
+                    break
+                next_anchor = min(message_ids) - 1
+                if next_anchor < 0 or (
+                    isinstance(anchor, int) and next_anchor >= anchor
+                ):
+                    raise ZulipOperationError("invalid_record", False)
+                anchor = next_anchor
+        except PROVIDER_NETWORK_ERRORS as exc:
+            raise ZulipOperationError("provider_unavailable", True) from exc
+        self._hydrate_referenced_users(
+            realm_users,
+            referenced_user_ids,
+            keep_queue_alive=keep_queue_alive,
+        )
+        keep_alive()
+        return {
+            "user_id": provider_user_id,
+            "realm_users": [realm_users[user_id] for user_id in sorted(realm_users)],
+            "recent_private_conversations": [
+                {"user_ids": list(user_ids), "max_message_id": max_message_id}
+                for user_ids, max_message_id in sorted(conversations.items())
+            ],
+        }
+
     def channel_catalog(self, provider_chat_key: str) -> dict[str, object]:
         return self.channel_catalogs([provider_chat_key])
 
@@ -875,9 +986,7 @@ class OfficialZulipAdapter:
         )
         return {
             "subscriptions": selected_subscriptions,
-            "realm_users": [
-                realm_users[user_id] for user_id in sorted(realm_users)
-            ],
+            "realm_users": [realm_users[user_id] for user_id in sorted(realm_users)],
             "user_id": profile["user_id"],
         }
 
@@ -1571,14 +1680,29 @@ class OfficialZulipAdapter:
                 if self.routing is None:
                     raise ZulipOperationError("not_found", False)
                 workspace_uuids = [str(value) for value in exact_uuids]
-                mappings = self.routing.workspace_mappings(
-                    "message", workspace_uuids
-                )
-                provider_ids = []
-                for workspace_uuid in workspace_uuids:
-                    mapping = mappings.get(workspace_uuid)
-                    if mapping is not None:
-                        provider_ids.append(int(str(mapping["provider_id"])))
+                direct_provider_ids = payload.get("provider_message_ids")
+                if direct_provider_ids is not None:
+                    if (
+                        not isinstance(direct_provider_ids, list)
+                        or len(direct_provider_ids) != len(workspace_uuids)
+                        or any(
+                            isinstance(value, bool)
+                            or not str(value).isdecimal()
+                            or (len(str(value)) > 1 and str(value).startswith("0"))
+                            for value in direct_provider_ids
+                        )
+                    ):
+                        raise ZulipOperationError("invalid_provider_payload", False)
+                    provider_ids = [int(str(value)) for value in direct_provider_ids]
+                else:
+                    mappings = self.routing.workspace_mappings(
+                        "message", workspace_uuids
+                    )
+                    provider_ids = [
+                        int(str(mappings[workspace_uuid]["provider_id"]))
+                        for workspace_uuid in workspace_uuids
+                        if workspace_uuid in mappings
+                    ]
                 if not provider_ids:
                     return None, None
                 _successful(
@@ -1762,9 +1886,7 @@ class OfficialZulipAdapter:
                 raise ZulipOperationError("invalid_record", False)
             if self.routing is None:
                 raise ZulipOperationError("not_found", False)
-            message = self.routing.topic_message_mapping(
-                str(operation["entity_uuid"])
-            )
+            message = self.routing.topic_message_mapping(str(operation["entity_uuid"]))
             if message is not None:
                 _successful(
                     self.client.update_message(
@@ -1798,9 +1920,7 @@ class OfficialZulipAdapter:
                 self.client.call_endpoint(
                     url=f"streams/{stream_id}/delete_topic",
                     method="POST",
-                    request={
-                        "topic_name": topic_name
-                    },
+                    request={"topic_name": topic_name},
                 )
             )
             if result.get("complete") is not True:

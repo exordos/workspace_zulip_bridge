@@ -249,6 +249,77 @@ def provider_message_mapping(
     return store.provider_mapping(account_uuid, "message", provider_message_id)
 
 
+def provider_message_reference_mapping(
+    store: ConversionStore,
+    account_uuid: str,
+    provider_message_id: str,
+) -> dict[str, object] | None:
+    """Resolve a quote target without requiring its local projection to be ready."""
+    reference_lookup = getattr(store, "provider_message_reference_mapping", None)
+    if callable(reference_lookup):
+        return reference_lookup(account_uuid, provider_message_id)
+    return provider_message_mapping(store, account_uuid, provider_message_id)
+
+
+def committed_message_read_state_event(
+    store: ConversionStore,
+    account_uuid: str,
+    event: dict[str, object],
+) -> dict[str, object] | None:
+    """Reduce a shared live message replay to its owner unread snapshot.
+
+    Zulip's live ``message`` event does not always include personal flags.
+    Messages start unread and a later ``update_message_flags`` event carries
+    any transition to read.  Once another account has already committed the
+    realm-canonical message, replaying its full payload is unnecessary, but
+    dropping the event also drops this account owner's initial unread state.
+    """
+    if event.get("type") != "message":
+        return None
+    message = event.get("message")
+    if not isinstance(message, dict):
+        return None
+    flags = message.get("flags", event.get("flags"))
+    if isinstance(flags, list):
+        return None
+    provider_message_id = message.get("id")
+    if isinstance(provider_message_id, bool) or provider_message_id is None:
+        return None
+    normalized_provider_message_id = str(int(str(provider_message_id)))
+    message_lookup = getattr(store, "materialize_provider_message_mapping", None)
+    if not callable(message_lookup):
+        message_lookup = getattr(store, "provider_message_mapping", None)
+    if callable(message_lookup):
+        mapping = message_lookup(account_uuid, normalized_provider_message_id)
+    else:
+        mapping_lookup = getattr(store, "provider_mapping", None)
+        if not callable(mapping_lookup):
+            return None
+        mapping = mapping_lookup(
+            account_uuid,
+            "message",
+            normalized_provider_message_id,
+        )
+    if mapping is None or mapping.get("pending_tombstone") is True:
+        return None
+    metadata = typing.cast(dict[str, object], mapping.get("metadata", {}))
+    if not (
+        mapping.get("convergent_alias") is True
+        or metadata.get("mapping_origin") == "workspace"
+        or metadata.get("workspace_delivery_state") == "committed"
+    ):
+        return None
+    return {
+        "id": event["id"],
+        "type": "update_message_flags",
+        "flag": "read",
+        "op": "remove",
+        "messages": [int(str(provider_message_id))],
+        "timestamp": message.get("timestamp", event.get("timestamp")),
+        "_workspace_compacted_message_event": True,
+    }
+
+
 def _reconcile_assignment_projection(
     store: ConversionStore,
     account_uuid: str,
@@ -432,11 +503,7 @@ def _same_provider_url(target: str, provider_site: str) -> bool:
     ):
         return True
     parsed = _safe_urlsplit(target)
-    if (
-        parsed is None
-        or parsed.scheme not in {"http", "https"}
-        or not parsed.netloc
-    ):
+    if parsed is None or parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return False
     if not provider_site:
         return False
@@ -655,7 +722,7 @@ def _canonicalize_semantic_quotes(
         provider_id = _reply_provider_id(link)
         if provider_id is None:
             return None
-        message = provider_message_mapping(store, account_uuid, provider_id)
+        message = provider_message_reference_mapping(store, account_uuid, provider_id)
         if message is None:
             return None
         metadata = message.get("metadata")
@@ -1436,7 +1503,7 @@ def message_event_records(
         ZulipLinkResolver(store, account_uuid, owner_uuid),
     )
     reply_mapping = (
-        provider_message_mapping(store, account_uuid, reply_provider_id)
+        provider_message_reference_mapping(store, account_uuid, reply_provider_id)
         if reply_provider_id is not None
         else None
     )
@@ -1536,14 +1603,13 @@ def message_event_records(
     )
     if message_operation_included:
         operations.append(message_operation)
-    if (
-        isinstance(flags, list)
-        and delivery_class != "backfill"
-        and not message_operation_included
+    if isinstance(flags, list) and (
+        delivery_class == "backfill" or not message_operation_included
     ):
-        # The message snapshot already carries the owner's exact read flag.
-        # Emit a separate read operation only when a previously committed
-        # message projection makes this conversion skip the message upsert.
+        # Keep the owner's exact read flag independent from the message
+        # snapshot.  Backend freshness fencing may correctly discard an older
+        # history message update after a newer live edit, but that must not
+        # discard the current per-account Zulip read state with it.
         operations.append(
             {
                 "kind": "read_state.set",
@@ -1676,16 +1742,24 @@ def message_event_records(
         # A live project move changes the target and therefore the operation
         # digests. Scope these deterministic UUIDs to that target so a
         # retained submitted prefix from the old project cannot collide with
-        # the journal replay required for the new project. Backfill keeps its
-        # established source to preserve upgrade-time page idempotency.
+        # the journal replay required for the new project.
         record_source = f"{record_source}:project:{project_uuid}"
     elif delivery_class == "backfill":
+        # History queue ids are stable within one assignment snapshot and carry
+        # the projection version selected by the service. Keep page retries
+        # idempotent while allowing a newer projection contract to publish a
+        # fresh authoritative message/read snapshot for every active account.
         record_source = (
-            f"{record_source}:reconcile-generation:{int(account['generation'])}"
+            f"{record_source}:reconcile-generation:{int(account['generation'])}:"
+            f"{queue_id}"
         )
     records = []
     for index, operation in enumerate(operations):
         operation_record_source = record_source
+        if delivery_class == "backfill" and operation["kind"] == "read_state.set":
+            operation_record_source = (
+                f"{record_source}:owner-read-projection:1"
+            )
         if delivery_class == "backfill" and str(operation["kind"]).startswith(
             "reaction."
         ):
@@ -2181,8 +2255,13 @@ def _mapped_event_records(
                     )
                 )
                 next_subindex += 1
-            markdown, lossy = convert_markdown(
+            canonical_content = _canonicalize_semantic_quotes(
                 str(event["content"]),
+                store,
+                account_uuid,
+            )
+            markdown, lossy = convert_markdown(
+                canonical_content,
                 mention_uuids,
                 message_url,
                 file_resolver,

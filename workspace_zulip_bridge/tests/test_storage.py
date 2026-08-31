@@ -482,9 +482,7 @@ def test_provider_result_page_uses_two_bulk_statements_in_one_session():
     )
     store = _store_with_session(session)
 
-    store.finalize_provider_result_responses(
-        [(result_record_uuid, "applied", None)]
-    )
+    store.finalize_provider_result_responses([(result_record_uuid, "applied", None)])
 
     assert len(session.statements) == 2
     select_statement, select_parameters = session.statements[0]
@@ -782,11 +780,14 @@ def test_authoritative_catalog_participants_keep_rich_name_over_id_placeholder()
         }
     ]
 
-    assert storage._merge_catalog_participants(
-        current,
-        observed,
-        authoritative=True,
-    ) == current
+    assert (
+        storage._merge_catalog_participants(
+            current,
+            observed,
+            authoritative=True,
+        )
+        == current
+    )
 
 
 @pytest.mark.parametrize(
@@ -887,6 +888,35 @@ def test_applied_account_generation_invalidates_provider_event_cursor():
         if "DELETE FROM zulip_event_cursors" in item[0]
     )
     assert invalidation[1] == (resource_uuid,)
+
+
+def test_provider_event_cursor_includes_private_catalog_scan_generation():
+    row = {
+        "queue_id": "queue-1",
+        "last_event_id": 7,
+        "provider_realm_uuid": str(uuid.uuid4()),
+        "provider_owner_user_id": "9",
+        "provider_account_generation": 2,
+        "private_catalog_scanned_generation": 2,
+    }
+    session = Session((row,))
+    store = _store_with_session(session)
+
+    assert store.provider_event_cursor("account-1") == row
+    statement, parameters = session.statements[0]
+    assert "private_catalog_scanned_generation" in statement
+    assert parameters == ("account-1",)
+
+
+def test_private_catalog_scan_marker_is_fenced_by_account_generation():
+    session = Session(({"account_uuid": uuid.uuid4()},))
+    store = _store_with_session(session)
+
+    assert store.mark_private_catalog_scanned("account-1", 2)
+    statement, parameters = session.statements[0]
+    assert "private_catalog_scanned_generation = %s" in statement
+    assert "provider_account_generation = %s" in statement
+    assert parameters == (2, "account-1", 2)
 
 
 def test_snapshot_invalidates_cursors_from_other_account_generations():
@@ -1999,9 +2029,7 @@ def test_committed_message_update_mapping_uses_provider_mapping_lock():
     lock_statement, lock_parameters = session.statements[0]
     assert "pg_advisory_xact_lock" in lock_statement
     assert lock_parameters == (
-        storage._provider_mapping_lock_key(
-            record["account_uuid"], "message", "601"
-        ),
+        storage._provider_mapping_lock_key(record["account_uuid"], "message", "601"),
     )
     assert "UPDATE provider_mappings" in session.statements[1][0]
 
@@ -2023,7 +2051,8 @@ def test_remembered_message_mapping_uses_provider_mapping_lock():
     assert lock_parameters == (
         storage._provider_mapping_lock_key("account", "message", "601"),
     )
-    assert "INSERT INTO provider_mappings" in session.statements[1][0]
+    assert "FOR UPDATE" in session.statements[1][0]
+    assert "INSERT INTO provider_mappings" in session.statements[2][0]
 
 
 def test_committed_reaction_mapping_preserves_workspace_identity():
