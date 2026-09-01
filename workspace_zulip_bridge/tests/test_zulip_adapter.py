@@ -335,9 +335,8 @@ class FakeRouting:
         return {
             workspace_uuid: mapping
             for workspace_uuid in workspace_uuids
-            if (
-                mapping := self.workspace.get((entity_kind, workspace_uuid))
-            ) is not None
+            if (mapping := self.workspace.get((entity_kind, workspace_uuid)))
+            is not None
         }
 
     def topic_message_mapping(self, topic_uuid):
@@ -471,9 +470,7 @@ def test_selected_channel_catalog_marks_missing_subscriber_unavailable():
     assert client.user_requests == [(3, {})]
 
 
-@pytest.mark.parametrize(
-    "chat_kind", ["channel", "personal_dm", "group_dm", "self_dm"]
-)
+@pytest.mark.parametrize("chat_kind", ["channel", "personal_dm", "group_dm", "self_dm"])
 def test_zb_msg_001_message_mapping_uses_official_client_semantics(chat_kind):
     client = FakeClient()
     adapter = _adapter(client)
@@ -488,11 +485,14 @@ def test_zb_msg_001_message_mapping_uses_official_client_semantics(chat_kind):
         assert request["to"] == "engineering"
         assert request["topic"] == "bridge"
     else:
-        assert request["to"] == {
-            "personal_dm": [2],
-            "group_dm": [2, 3],
-            "self_dm": [1],
-        }[chat_kind]
+        assert (
+            request["to"]
+            == {
+                "personal_dm": [2],
+                "group_dm": [2, 3],
+                "self_dm": [1],
+            }[chat_kind]
+        )
 
 
 def test_outbound_mentions_and_attachments_use_provider_formats_without_raw_urns():
@@ -1306,7 +1306,7 @@ def test_exact_read_state_does_not_reinterpret_workspace_order_as_provider_bound
     assert client.flags == [{"messages": [9002, 1001], "op": "add", "flag": "read"}]
 
 
-def test_exact_read_state_applies_mapped_prefix_when_terminal_message_is_unmapped():
+def test_exact_read_state_updates_mapped_messages_when_one_message_is_unmapped():
     mapped_workspace_uuid = "10000000-0000-0000-0000-000000000010"
     terminal_unmapped_uuid = "20000000-0000-0000-0000-000000000020"
 
@@ -1335,6 +1335,54 @@ def test_exact_read_state_applies_mapped_prefix_when_terminal_message_is_unmappe
 
     assert adapter.apply(operation) == ("9002", None)
     assert client.flags == [{"messages": [9002], "op": "add", "flag": "read"}]
+
+
+def test_exact_read_state_succeeds_as_noop_when_all_messages_are_unmapped():
+    class Routing(FakeRouting):
+        workspace = {
+            key: value
+            for key, value in FakeRouting.workspace.items()
+            if key[0] != "message"
+        }
+
+    client = FakeClient()
+    adapter = _adapter(client, routing=Routing())
+    operation = {
+        "kind": "read_state.set",
+        "provider": {"kind": "zulip", "chat_id": "channel:42"},
+        "payload": {
+            "stream_uuid": STREAM_UUID,
+            "topic_uuid": TOPIC_UUID,
+            "reader_uuid": OWNER_UUID,
+            "message_uuids": [MESSAGE_UUID],
+            "read": True,
+        },
+    }
+
+    assert adapter.apply(operation) == (None, None)
+    assert client.flags == []
+
+
+def test_exact_read_state_uses_server_bound_provider_message_ids():
+    first_workspace_uuid = "10000000-0000-0000-0000-000000000010"
+    second_workspace_uuid = "20000000-0000-0000-0000-000000000020"
+    client = FakeClient()
+    adapter = _adapter(client, routing=FakeRouting())
+    operation = {
+        "kind": "read_state.set",
+        "provider": {"kind": "zulip", "chat_id": "channel:42"},
+        "payload": {
+            "stream_uuid": STREAM_UUID,
+            "topic_uuid": TOPIC_UUID,
+            "reader_uuid": OWNER_UUID,
+            "message_uuids": [first_workspace_uuid, second_workspace_uuid],
+            "provider_message_ids": ["9002", "1001"],
+            "read": True,
+        },
+    }
+
+    assert adapter.apply(operation) == ("9002", None)
+    assert client.flags == [{"messages": [9002, 1001], "op": "add", "flag": "read"}]
 
 
 def test_official_unrecoverable_network_error_is_retryable():
@@ -1917,6 +1965,89 @@ def test_registration_requests_and_retains_catalog_snapshot_fields():
         zulip_adapter.PROVIDER_QUEUE_IDLE_TIMEOUT_SECONDS
     )
     assert adapter.take_registration_snapshot() is None
+
+
+def test_private_conversation_catalog_pages_all_historical_dm_sets(monkeypatch):
+    monkeypatch.setattr(zulip_adapter, "PRIVATE_CATALOG_PAGE_SIZE", 2)
+
+    class Client(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.message_requests = []
+            self.members.extend(
+                [
+                    {"user_id": 3, "full_name": "Third User"},
+                    {"user_id": 4, "full_name": "Fourth User"},
+                ]
+            )
+
+        def get_messages(self, request):
+            self.message_requests.append(request)
+            pages = {
+                "newest": [
+                    {
+                        "id": 11,
+                        "type": "private",
+                        "display_recipient": [{"id": 1}, {"id": 2}, {"id": 3}],
+                    },
+                    {
+                        "id": 10,
+                        "type": "private",
+                        "display_recipient": [{"id": 1}, {"id": 2}],
+                    },
+                ],
+                9: [
+                    {
+                        "id": 9,
+                        "type": "private",
+                        "display_recipient": [{"id": 1}, {"id": 2}, {"id": 3}],
+                    },
+                    {
+                        "id": 8,
+                        "type": "private",
+                        "display_recipient": [{"id": 1}, {"id": 4}],
+                    },
+                ],
+                7: [
+                    {
+                        "id": 7,
+                        "type": "private",
+                        "display_recipient": [{"id": 1}],
+                    }
+                ],
+            }
+            return {"result": "success", "messages": pages[request["anchor"]]}
+
+    client = Client()
+    keepalive_anchors = []
+    catalog = zulip_adapter.OfficialZulipAdapter(
+        client=client
+    ).private_conversation_catalog(
+        keep_queue_alive=lambda: keepalive_anchors.append(
+            client.message_requests[-1]["anchor"]
+            if client.message_requests
+            else None
+        )
+    )
+
+    assert catalog["user_id"] == 1
+    assert catalog["recent_private_conversations"] == [
+        {"user_ids": [1], "max_message_id": 7},
+        {"user_ids": [1, 2], "max_message_id": 10},
+        {"user_ids": [1, 2, 3], "max_message_id": 11},
+        {"user_ids": [1, 4], "max_message_id": 8},
+    ]
+    assert [request["anchor"] for request in client.message_requests] == [
+        "newest",
+        9,
+        7,
+    ]
+    assert all(
+        request["narrow"] == [{"operator": "is", "operand": "dm"}]
+        and request["apply_markdown"] is False
+        for request in client.message_requests
+    )
+    assert keepalive_anchors == [None, None, "newest", 9, 7, 7]
 
 
 def test_notification_subscriptions_validate_current_overrides():

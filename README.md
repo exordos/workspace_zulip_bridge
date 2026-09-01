@@ -108,6 +108,12 @@ The current implementation provides:
   file;
 - exact owner read/unread projection from both Zulip message snapshots and live
   flag events, ordered after the corresponding Workspace message projection;
+  snapshot projection versions give contract migrations fresh operation
+  identities, so a selected-chat replay cannot be hidden by terminal results
+  from an older history scan;
+- canonical Workspace quote references for Zulip replies on both create and
+  edit, including history replay before the local account has materialized a
+  realm-shared quote target;
 - automatic removal of queue-recovery jobs when their chats are deselected, so
   stale recovery state cannot keep an account in backfill forever;
 - stable history cutoffs and reconciliation checkpoints across unchanged

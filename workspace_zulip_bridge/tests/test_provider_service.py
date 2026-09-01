@@ -22,6 +22,7 @@ class Store:
         self.sent = []
         self.finalized = []
         self.accepted = []
+        self.accepted_targets = []
         self.released = []
         self.rejected = []
         self.health = []
@@ -89,8 +90,9 @@ class Store:
     def mark_workspace_delivery_submitting(self, record_uuid):
         return True
 
-    def accept_result(self, result):
+    def accept_result(self, result, workspace_target_uuid=None):
         self.accepted.append(result)
+        self.accepted_targets.append(workspace_target_uuid)
 
     def finalize_ready_provider_events(self):
         return 0
@@ -421,6 +423,28 @@ def test_flush_provider_events_applies_atomic_http_batch_then_commits_outbox():
     assert instance.flush_provider_events() == 1
     assert instance.provider_api.events[0]["kind"] == "message.upsert"
     assert instance.store.accepted[0]["result"]["outcome"] == "committed"
+
+
+def test_provider_event_response_converges_to_authoritative_workspace_target():
+    instance = _instance()
+    instance.store.deliveries = [_inbound_record()]
+    authoritative_uuid = str(uuid.uuid4())
+
+    def apply(commands):
+        return {
+            "results": [
+                {
+                    "provider_event_key": commands[0]["provider_event_key"],
+                    "status": "applied",
+                    "target_uuid": authoritative_uuid,
+                }
+            ]
+        }
+
+    instance.provider_api.apply_commands = apply
+
+    assert instance.flush_provider_events() == 1
+    assert instance.store.accepted_targets == [authoritative_uuid]
 
 
 def test_retryable_provider_event_failure_releases_idempotent_http_submission():

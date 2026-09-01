@@ -291,6 +291,9 @@ def result_payload(result: dict[str, object]) -> dict[str, object]:
     }
     if status == "manual_reconciliation_required":
         payload["reconciliation"] = body["reconciliation"]
+    provider_entity_id = body.get("provider_entity_id")
+    if status == "succeeded" and isinstance(provider_entity_id, str):
+        payload["provider_entity_id"] = provider_entity_id
     return payload
 
 

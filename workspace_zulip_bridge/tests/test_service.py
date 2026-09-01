@@ -274,9 +274,10 @@ def test_adapter_registry_combines_system_and_managed_provider_ca(
     registry("00000000-0000-0000-0000-000000000001")
 
     assert validated == [custom_ca, rotated_ca]
-    assert registry.validated_ca_digest == hashlib.sha256(
-        rotated_ca.encode("ascii")
-    ).hexdigest()
+    assert (
+        registry.validated_ca_digest
+        == hashlib.sha256(rotated_ca.encode("ascii")).hexdigest()
+    )
     assert [path.name for path in (tmp_path / "ca").glob("zulip-*.pem")] == [
         pathlib.Path(created[-1].cert_bundle).name
     ]
@@ -854,7 +855,7 @@ def test_provider_journal_recovers_interrupted_deliveries_only_once():
     assert store.ambiguous_recoveries == 1
     assert store.stale_recoveries == 1
     assert store.finalized_recoveries == 1
-    assert store.redundant_message_recoveries == 1
+    assert store.redundant_message_recoveries == 0
 
 
 def test_provider_journal_processes_distinct_account_heads_in_parallel():
@@ -1064,6 +1065,53 @@ def test_live_delivery_dependency_stall_updates_health_once_and_recovers():
     instance._clear_live_delivery_stall()
     assert health[-1] == ("provider_delivery", "healthy", None)
     assert len(health) == 2
+
+
+def test_live_delivery_lane_materializes_blocked_provider_reads_first():
+    class StopLane(Exception):
+        pass
+
+    calls = []
+
+    class Store:
+        def has_pending_workspace_deliveries(self, minimum, maximum):
+            calls.append(("pending", minimum, maximum))
+            return True
+
+        def materialize_pending_provider_message_reads(self, limit):
+            calls.append(("materialize", limit))
+            return 1
+
+        def finalize_ready_provider_events(self):
+            calls.append(("finalize",))
+
+    outcomes = iter((0, StopLane()))
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance.provider_batch_size = 20
+    instance._provider_delivery_delay = lambda: 0
+    instance._clear_live_delivery_stall = lambda: calls.append(("clear",))
+    instance._record_live_delivery_stall = lambda: (_ for _ in ()).throw(
+        AssertionError("a repaired dependency is progress")
+    )
+
+    def flush(**_kwargs):
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    instance.flush_provider_events = flush
+
+    instance._run_background_live_delivery_lane()
+
+    assert calls[:4] == [
+        ("pending", 0, 0),
+        ("materialize", 20),
+        ("finalize",),
+        ("clear",),
+    ]
+    assert isinstance(instance.background_live_delivery_error, StopLane)
 
 
 def test_background_heartbeat_lane_surfaces_unexpected_failure(monkeypatch):
@@ -2019,9 +2067,7 @@ def test_selected_reaction_is_reselected_after_provisional_lane_resolves():
             self.message_context = message_context
             return message_context
 
-        def refresh_provider_event_causal_lane(
-            self, account, queue, event_id, event
-        ):
+        def refresh_provider_event_causal_lane(self, account, queue, event_id, event):
             self.lane_refreshes.append((account, queue, event_id, event))
             return "channel:42"
 
@@ -2082,9 +2128,7 @@ def test_selected_event_rechecks_provisional_lane_after_conversion():
         def refresh_provider_event_causal_lane(
             self, account, queue, event_id, provider_event
         ):
-            self.lane_refreshes.append(
-                (account, queue, event_id, provider_event)
-            )
+            self.lane_refreshes.append((account, queue, event_id, provider_event))
             return "channel:42" if self.mapping_committed else "message:601"
 
     store = Store()
@@ -2146,9 +2190,7 @@ def test_empty_event_uses_atomic_lane_finalization():
     store = Store()
     instance = _delivery_service(store)
     instance._queue_event_catalog = lambda *_args, **_kwargs: False
-    instance._event_records_with_pending_delete_recreations = (
-        lambda *_args, **_kwargs: []
-    )
+    instance._event_records_with_pending_delete_recreations = lambda *_args, **_kwargs: []
 
     assert instance.process_provider_journal() == 0
     assert store.atomic_finalizations == [
@@ -2558,9 +2600,7 @@ def test_provider_journal_retries_changed_mapping_plan(monkeypatch, reason):
     )
 
     assert _delivery_service(store).process_provider_journal() == 0
-    assert store.retried == [
-        (account_uuid, "queue", 7, reason)
-    ]
+    assert store.retried == [(account_uuid, "queue", 7, reason)]
     assert store.enqueued == []
     assert store.invalid == []
 
@@ -3050,8 +3090,7 @@ def test_registration_snapshot_retires_omitted_channel_catalogs():
     )
 
     assert [
-        (args[4], args[8] if len(args) > 8 else "upsert")
-        for args, _kwargs in reports
+        (args[4], args[8] if len(args) > 8 else "upsert") for args, _kwargs in reports
     ] == [
         ("channel:12", "delete"),
         ("channel:42", "upsert"),
@@ -3104,9 +3143,7 @@ def test_catalog_delete_uses_atomic_store_retention_when_available():
             *,
             provider_event_marker=None,
         ):
-            calls.append(
-                (report, account_uuid, chat_key, provider_event_marker)
-            )
+            calls.append((report, account_uuid, chat_key, provider_event_marker))
             return True
 
         def delete_catalog_topology(self, *_args):
@@ -3745,6 +3782,8 @@ def test_catalog_report_adds_authenticated_owner_to_empty_channel_topology():
             "is_owner": True,
         }
     ]
+
+
 def test_direct_message_event_catalog_excludes_authenticated_owner_from_name():
     class Store:
         def __init__(self):
@@ -4808,7 +4847,8 @@ def test_backfill_is_discovered_newest_first_and_queued_at_priority_two(
     ]
     assert {priority for _, priority in store.enqueued} == {2}
     assert set(queue_ids) == {
-        "backfill:channel:42:00000000-0000-4000-8000-000000000090:1"
+        "backfill:channel:42:00000000-0000-4000-8000-000000000090:1:"
+        f"snapshot:{service.BACKFILL_SNAPSHOT_PROJECTION_VERSION}"
     }
 
 
@@ -4855,7 +4895,9 @@ def test_backfill_conversion_store_caches_reads_and_identical_writes():
     cached = service._BackfillConversionStore(store)
     account_uuid = "00000000-0000-4000-8000-000000000001"
 
-    assert cached.account_resource(account_uuid) is cached.account_resource(account_uuid)
+    assert cached.account_resource(account_uuid) is cached.account_resource(
+        account_uuid
+    )
     assert cached.assignment_for_provider_chat(
         account_uuid, "channel:42"
     ) is cached.assignment_for_provider_chat(account_uuid, "channel:42")
@@ -5191,9 +5233,7 @@ def test_backfill_marks_permanently_unavailable_attachment_and_enqueues_message(
     )
     instance._file_resolver = lambda *args: (
         lambda *resolver_args: (_ for _ in ()).throw(
-            zulip_adapter.ZulipOperationError(
-                "provider_file_unavailable", False
-            )
+            zulip_adapter.ZulipOperationError("provider_file_unavailable", False)
         )
     )
 
@@ -5511,9 +5551,7 @@ def test_delivery_selector_controls_chat_materialization_scoping():
     instance.provider_batch_size = 100
     instance._live_workspace_delivery_pending = lambda: False
     instance._provider_delivery_delay = lambda: 0.0
-    instance._flush_provider_events_locked = (
-        lambda **kwargs: calls.append(kwargs) or 1
-    )
+    instance._flush_provider_events_locked = lambda **kwargs: calls.append(kwargs) or 1
 
     assert instance.flush_provider_events(0, 0, 20) == 1
     assert instance._flush_history_events() == (
@@ -5538,8 +5576,8 @@ def test_idle_history_uses_full_large_profile_delivery_batch():
     instance = object.__new__(service.BridgeService)
     instance.provider_batch_size = 100
     instance._live_workspace_delivery_pending = lambda: False
-    instance._flush_provider_events_locked = (
-        lambda **kwargs: calls.append(kwargs) or 100
+    instance._flush_provider_events_locked = lambda **kwargs: (
+        calls.append(kwargs) or 100
     )
     instance._run_history_quantum_once = lambda: False
 
@@ -5609,9 +5647,7 @@ def test_live_turn_fills_journal_lanes_before_polling_provider_operations():
     instance.background_live_delivery_enabled = True
     instance.scheduler = Scheduler()
     instance.process_provider_journal = lambda: calls.append("journal") or 1
-    instance.poll_provider_operations = (
-        lambda: calls.append("provider-operations") or 0
-    )
+    instance.poll_provider_operations = lambda: calls.append("provider-operations") or 0
     instance.flush_provider_results = lambda: 0
 
     assert service.BridgeService.PROVIDER_JOURNAL_QUANTA_PER_LIVE_TURN == 1
@@ -5684,9 +5720,7 @@ def test_history_rechecks_live_work_after_waiting_for_provider_mutex(monkeypatch
     instance.last_history_quantum = now[0] - 1.0
     instance.provider_delivery_lock = threading.Lock()
     instance._live_workspace_delivery_pending = lambda: live_pending[0]
-    instance._flush_provider_events_locked = (
-        lambda **kwargs: calls.append(kwargs) or 1
-    )
+    instance._flush_provider_events_locked = lambda **kwargs: calls.append(kwargs) or 1
 
     instance.provider_delivery_lock.acquire()
 
@@ -5702,9 +5736,7 @@ def test_history_rechecks_live_work_after_waiting_for_provider_mutex(monkeypatch
     worker.join(timeout=1.0)
 
     assert not worker.is_alive()
-    assert result == [
-        (1, service.BridgeService.HISTORY_LIVE_DELIVERY_BATCH_SIZE, True)
-    ]
+    assert result == [(1, service.BridgeService.HISTORY_LIVE_DELIVERY_BATCH_SIZE, True)]
     assert calls == [
         {
             "minimum_priority": 2,
@@ -5946,8 +5978,7 @@ def test_full_history_delivery_batch_defers_more_provider_io(tmp_path, monkeypat
     instance.flush_provider_results = lambda: 0
     instance.flush_provider_events = (
         lambda minimum_priority=0, maximum_priority=2, limit=100: (
-            calls.append(f"delivery:{minimum_priority}:{maximum_priority}:{limit}")
-            or 0
+            calls.append(f"delivery:{minimum_priority}:{maximum_priority}:{limit}") or 0
         )
     )
     instance._flush_history_events = lambda: (
@@ -7092,6 +7123,217 @@ def test_live_global_notification_snapshot_failure_keeps_event_unacknowledged():
     assert processed == 0
     assert error is not None and error.code == "provider_unavailable"
     assert cursor_updates == []
+
+
+@pytest.mark.parametrize(
+    ("existing_cursor", "already_scanned"),
+    [(False, False), (True, False), (True, True)],
+)
+def test_private_catalog_scan_keeps_an_overlapping_queue_boundary(
+    existing_cursor, already_scanned
+):
+    account_uuid = "00000000-0000-0000-0000-000000000001"
+    realm_uuid = "00000000-0000-0000-0000-000000000002"
+    queued_reports = []
+    successful_polls = []
+
+    class Store:
+        def __init__(self):
+            self.cursor = (
+                {
+                    "queue_id": "queue-1",
+                    "last_event_id": 7,
+                    "provider_realm_uuid": realm_uuid,
+                    "provider_owner_user_id": "9",
+                    "provider_account_generation": 2,
+                    "private_catalog_scanned_generation": 2
+                    if already_scanned
+                    else None,
+                }
+                if existing_cursor
+                else None
+            )
+            self.catchups = 0
+
+        def provider_event_cursor(self, requested):
+            assert requested == account_uuid
+            return self.cursor
+
+        def account_resource(self, requested):
+            assert requested == account_uuid
+            return {"generation": 2}
+
+        def begin_provider_queue_catchup(self, requested):
+            assert requested == account_uuid
+            self.catchups += 1
+
+        def invalidate_provider_event_cursor(self, requested):
+            assert requested == account_uuid
+            self.cursor = None
+
+        def update_provider_event_cursor(
+            self,
+            requested,
+            queue_id,
+            last_event_id,
+            provider_realm_uuid=None,
+            provider_owner_user_id=None,
+            provider_account_generation=None,
+        ):
+            assert requested == account_uuid
+            if self.cursor is None:
+                self.cursor = {
+                    "private_catalog_scanned_generation": None,
+                }
+            self.cursor.update(
+                {
+                    "queue_id": queue_id,
+                    "last_event_id": last_event_id,
+                }
+            )
+            if provider_realm_uuid is not None:
+                self.cursor.update(
+                    {
+                        "provider_realm_uuid": provider_realm_uuid,
+                        "provider_owner_user_id": provider_owner_user_id,
+                        "provider_account_generation": provider_account_generation,
+                    }
+                )
+
+        def mark_private_catalog_scanned(self, requested, generation):
+            assert requested == account_uuid
+            assert generation == 2
+            assert successful_polls
+            self.cursor["private_catalog_scanned_generation"] = generation
+            return True
+
+    class Adapter:
+        server_url = "https://zulip.example.invalid"
+
+        def __init__(self):
+            self.calls = []
+
+        def invalidate_queue(self):
+            self.calls.append("invalidate")
+
+        def ensure_queue(self):
+            self.calls.append("register")
+            return "queue-2", 8
+
+        def take_registration_snapshot(self):
+            self.calls.append("snapshot")
+            return {
+                "realm_uuid": realm_uuid,
+                "user_id": 9,
+                "subscriptions": [],
+                "realm_users": [],
+                "recent_private_conversations": [],
+            }
+
+        def restore_queue(self, queue_id, last_event_id):
+            self.calls.append("restore")
+            assert (queue_id, last_event_id) in {
+                ("queue-1", 7),
+                ("queue-2", 8),
+            }
+
+        def private_conversation_catalog(self, *, keep_queue_alive):
+            self.calls.append("scan")
+            self.calls.append("catalog-page")
+            keep_queue_alive()
+            self.calls.append("catalog-page")
+            keep_queue_alive()
+            return {
+                "user_id": 9,
+                "realm_users": [],
+                "recent_private_conversations": [
+                    {"user_ids": [8, 9, 10], "max_message_id": 42}
+                ],
+            }
+
+        def events(self, queue_id, last_event_id):
+            self.calls.append("events")
+            if existing_cursor and queue_id == "queue-1":
+                assert last_event_id == 7
+                raise zulip_adapter.ZulipOperationError(
+                    "bad_event_queue_id",
+                    True,
+                )
+            assert (queue_id, last_event_id) == ("queue-2", 8)
+            successful_polls.append(queue_id)
+            return []
+
+    adapter = Adapter()
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance._queue_registration_reports = (
+        lambda account, report, server_url, assignments=None: queued_reports.append(
+            (account, report, server_url, assignments)
+        )
+    )
+    instance._initial_sync_ready = lambda _account_uuid: False
+    instance._queue_account_report = lambda *_args: None
+    instance._record_registration_notification_snapshots = lambda *_args: None
+
+    assert instance._poll_provider_account(account_uuid, adapter) == (0, None)
+    assert instance._poll_provider_account(account_uuid, adapter) == (0, None)
+
+    if existing_cursor and not already_scanned:
+        assert adapter.calls == [
+            "restore",
+            "scan",
+            "catalog-page",
+            "events",
+            "invalidate",
+            "register",
+            "snapshot",
+            "scan",
+            "catalog-page",
+            "events",
+            "catalog-page",
+            "events",
+            "events",
+            "restore",
+            "events",
+        ]
+        assert instance.store.catchups == 1
+    elif existing_cursor:
+        assert adapter.calls == [
+            "restore",
+            "events",
+            "invalidate",
+            "register",
+            "snapshot",
+            "scan",
+            "catalog-page",
+            "events",
+            "catalog-page",
+            "events",
+            "events",
+            "restore",
+            "events",
+        ]
+        assert instance.store.catchups == 1
+    else:
+        assert adapter.calls == [
+            "invalidate",
+            "register",
+            "snapshot",
+            "scan",
+            "catalog-page",
+            "events",
+            "catalog-page",
+            "events",
+            "events",
+            "restore",
+            "events",
+        ]
+        assert instance.store.catchups == 0
+    catalog_reports = [report for report in queued_reports if report[3] == {}]
+    assert len(catalog_reports) == 1
+    assert catalog_reports[0][0] == account_uuid
+    assert catalog_reports[0][1]["realm_uuid"] == realm_uuid
+    assert catalog_reports[0][2] == adapter.server_url
 
 
 def test_certificate_renewal_failure_is_degraded_without_stopping_message_work():

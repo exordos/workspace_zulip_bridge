@@ -677,6 +677,23 @@ def test_terminal_result_is_bound_to_exact_provider_lease():
     assert payload["status"] == "succeeded"
 
 
+def test_committed_message_result_reports_provider_assigned_identifier():
+    leased = _lease()
+    record = provider_protocol.leased_operation_record(Store(), leased)
+    result = {
+        **record,
+        "record_kind": "result",
+        "record_uuid": str(uuid.uuid4()),
+        "result": {
+            "outcome": "committed",
+            "provider_entity_id": "14019",
+            "safe_error": None,
+        },
+    }
+
+    assert provider_protocol.result_payload(result)["provider_entity_id"] == "14019"
+
+
 def test_exact_read_lease_adapts_without_reinterpreting_message_order():
     first_message_uuid = "70000000-0000-0000-0000-000000000007"
     last_message_uuid = "80000000-0000-0000-0000-000000000008"
