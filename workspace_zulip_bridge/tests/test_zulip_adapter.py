@@ -495,6 +495,65 @@ def test_zb_msg_001_message_mapping_uses_official_client_semantics(chat_kind):
         )
 
 
+@pytest.mark.parametrize("entrypoint", ["prepare", "apply", "reconcile"])
+def test_message_create_rejects_author_different_from_account_owner(entrypoint):
+    client = FakeClient()
+    adapter = _adapter(client)
+    operation = _operation()
+    operation["payload"]["author_uuid"] = USER_2_UUID
+
+    with pytest.raises(zulip_adapter.ZulipOperationError) as error:
+        if entrypoint == "prepare":
+            adapter.prepare(operation, "operation-1")
+        elif entrypoint == "apply":
+            adapter.apply(
+                operation,
+                zulip_adapter.SendCorrelation("queue-1", "operation-1", 7, "hello"),
+            )
+        else:
+            adapter.reconcile_message(operation, datetime.datetime.now(datetime.UTC))
+
+    assert error.value.code == "permission_denied"
+    assert not error.value.retryable
+    assert client.sent == []
+    assert not hasattr(client, "last_get_messages")
+
+
+def test_message_author_mismatch_is_rejected_before_attachment_export():
+    class FileClient:
+        def __init__(self):
+            self.exports = []
+
+        def export_file(self, *args, **kwargs):
+            self.exports.append((args, kwargs))
+            return "report.pdf", "application/pdf", b"pdf-bytes"
+
+    client = FakeClient()
+    file_client = FileClient()
+    adapter = zulip_adapter.OfficialZulipAdapter(
+        client=client,
+        routing=FakeRouting(),
+        owner_user_uuid=OWNER_UUID,
+        account_uuid=OWNER_UUID,
+        file_client=file_client,
+        file_limit=lambda: 1024,
+    )
+    adapter.restore_queue("queue-1", 7)
+    operation = _operation()
+    operation["payload"]["author_uuid"] = USER_2_UUID
+    operation["payload"]["payload"]["content"] = (
+        "[report.pdf](urn:file:10000000-0000-4000-8000-000000000008)"
+    )
+
+    with pytest.raises(zulip_adapter.ZulipOperationError) as error:
+        adapter.prepare(operation, "operation-1")
+
+    assert error.value.code == "permission_denied"
+    assert file_client.exports == []
+    assert client.uploads == []
+    assert client.sent == []
+
+
 def test_outbound_mentions_and_attachments_use_provider_formats_without_raw_urns():
     class FileClient:
         def __init__(self):

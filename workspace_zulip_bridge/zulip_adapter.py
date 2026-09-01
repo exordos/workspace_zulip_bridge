@@ -639,9 +639,11 @@ class OfficialZulipAdapter:
         operation_uuid: str,
         provider_rendered_content: str | None = None,
     ) -> SendCorrelation | None:
-        self._prepared_operation_uuid = operation_uuid
         if operation["kind"] != "message.create":
+            self._prepared_operation_uuid = operation_uuid
             return None
+        self._require_message_author(operation)
+        self._prepared_operation_uuid = operation_uuid
         if self._queue_id is None or self._last_event_id is None:
             # The long-lived provider poller owns queue registration and its
             # durable cursor. A one-shot outbound adapter must never replace it.
@@ -651,6 +653,14 @@ class OfficialZulipAdapter:
             operation, operation_uuid
         )
         return SendCorrelation(queue_id, operation_uuid, last_event_id, rendered)
+
+    def _require_message_author(self, operation: dict[str, object]) -> None:
+        payload = typing.cast(dict[str, object], operation["payload"])
+        if str(payload["author_uuid"]) != self.owner_user_uuid:
+            # Zulip assigns authorship from the API key and exposes no sender
+            # override on message creation. Fail closed instead of publishing a
+            # Workspace participant's content as the linked account owner.
+            raise ZulipOperationError("permission_denied", False)
 
     def register_queue(self) -> tuple[str, int, dict[str, object]]:
         register_request: dict[str, object] = {
@@ -1381,6 +1391,7 @@ class OfficialZulipAdapter:
     ) -> ReconciliationEvidence:
         if operation["kind"] != "message.create":
             raise ZulipOperationError("unsupported_reconciliation", False)
+        self._require_message_author(operation)
         if self._user_id is None:
             try:
                 profile = _successful(self.client.get_profile())
@@ -1606,6 +1617,7 @@ class OfficialZulipAdapter:
         payload = typing.cast(dict[str, object], operation["payload"])
         provider = typing.cast(dict[str, object], operation["provider"])
         if kind == "message.create":
+            self._require_message_author(operation)
             if correlation is None:
                 raise ZulipOperationError("missing_send_correlation", False)
             target, _ = self._message_target(operation)
