@@ -64,6 +64,135 @@ def test_transaction_reuses_one_session_for_nested_store_calls(monkeypatch):
     assert engine.opens == 1
 
 
+def test_confirmed_delivery_index_survives_restart_and_isolates_accounts():
+    account_a = str(uuid.uuid4())
+    account_b = str(uuid.uuid4())
+    reader_uuid = str(uuid.uuid4())
+    rows = (
+        {
+            "account_uuid": account_a,
+            "entity_kind": "message",
+            "provider_id": "42",
+            "metadata": {
+                "workspace_delivery_state": "committed",
+                "confirmed_message_fingerprint": "fingerprint-a",
+                "confirmed_message_token": "message-token-a",
+                "confirmed_message_components": {"chat_id": "channel:1"},
+                "confirmed_message_unresolved_reply_provider_id": "41",
+                "confirmed_message_projection_fingerprint": "projection-a",
+                "confirmed_message_projection_pending": True,
+                "confirmed_read_states": {reader_uuid: True},
+                "confirmed_read_tokens": {reader_uuid: "read-token-a"},
+                "confirmed_read_message_uuids": {
+                    reader_uuid: "11111111-1111-1111-1111-111111111111"
+                },
+            },
+            "deleted": False,
+        },
+        {
+            "account_uuid": account_b,
+            "entity_kind": "message",
+            "provider_id": "42",
+            "metadata": {
+                "workspace_delivery_state": "committed",
+                "confirmed_message_fingerprint": "fingerprint-b",
+                "confirmed_message_token": "message-token-b",
+                "confirmed_read_states": {reader_uuid: False},
+                "confirmed_read_tokens": {reader_uuid: "read-token-b"},
+                "confirmed_read_message_uuids": {
+                    reader_uuid: "22222222-2222-2222-2222-222222222222"
+                },
+            },
+            "deleted": False,
+        },
+        {
+            "account_uuid": account_a,
+            "entity_kind": "reaction",
+            "provider_id": "42:3:unicode_emoji:270d",
+            "metadata": {
+                "provider_message_id": "42",
+                "provider_user_id": "3",
+                "normalized_emoji_code": "unicode_emoji:270d",
+                "confirmed_reaction_state": "present",
+                "confirmed_reaction_token": "reaction-token-a",
+            },
+            "deleted": False,
+        },
+        {
+            "account_uuid": account_b,
+            "entity_kind": "reaction",
+            "provider_id": "42:3:unicode_emoji:270d",
+            "metadata": {
+                "provider_message_id": "42",
+                "provider_user_id": "3",
+                "normalized_emoji_code": "unicode_emoji:270d",
+                "confirmed_reaction_state": "absent",
+                "confirmed_reaction_token": "reaction-token-b",
+            },
+            "deleted": True,
+        },
+        {
+            "account_uuid": account_a,
+            "entity_kind": "reaction",
+            "provider_id": "43:3:unicode_emoji:270d",
+            "metadata": {
+                "provider_message_id": "43",
+                "provider_user_id": "3",
+                "normalized_emoji_code": "unicode_emoji:270d",
+                "reaction_type": "unicode_emoji",
+                "emoji_code": "270d",
+            },
+            "deleted": False,
+        },
+    )
+
+    for _restart in range(2):
+        session = Session(rows)
+        store = _store_with_session(session)
+        store.load_confirmed_delivery_state()
+
+        assert store.confirmed_message_state(account_a, "42") == {
+            "fingerprint": "fingerprint-a",
+            "token": "message-token-a",
+            "unresolved_reply_provider_id": "41",
+            "projection_fingerprint": "projection-a",
+            "projection_pending": True,
+            "components": {"chat_id": "channel:1"},
+        }
+        assert store.confirmed_message_state(account_b, "42")["fingerprint"] == (
+            "fingerprint-b"
+        )
+        assert store.confirmed_read_state(account_a, "42", reader_uuid)["read"] is True
+        assert store.confirmed_read_state(account_b, "42", reader_uuid)["read"] is False
+        assert store.confirmed_read_state(account_a, "42", reader_uuid)[
+            "message_uuid"
+        ] == "11111111-1111-1111-1111-111111111111"
+        assert store.confirmed_reaction_state(
+            account_a, "42", "3", "unicode_emoji:270d"
+        )["state"] == "present"
+        assert store.confirmed_reaction_state(
+            account_b, "42", "3", "unicode_emoji:270d"
+        )["state"] == "absent"
+        assert (
+            store.confirmed_reaction_state(
+                account_a, "43", "3", "unicode_emoji:270d"
+            )
+            is None
+        )
+        store.record_confirmed_delivery_skip("message")
+        metrics = store.confirmed_delivery_metrics(reset=True)
+        assert metrics["index_loads"] == 1
+        assert metrics["message_entries"] == 2
+        assert metrics["message_lookups"] == 2
+        assert metrics["message_hits"] == 2
+        assert metrics["message_hit_ratio"] == 1.0
+        assert metrics["message_skips"] == 1
+        assert metrics["read_entries"] == 2
+        assert metrics["reaction_entries"] == 2
+        assert store.confirmed_delivery_metrics()["message_lookups"] == 0
+        assert len(session.statements) == 1
+
+
 def test_pending_provider_event_probe_checks_ready_and_delivering_live_rows():
     session = Session(({"pending": True},))
     store = _store_with_session(session)
@@ -139,7 +268,9 @@ def test_redundant_provider_message_event_requires_committed_mapping():
     session = Session(({"event_id": 7},))
     store = _store_with_session(session)
 
-    assert store.finalize_redundant_provider_message_event("account", "queue", 7)
+    assert store.finalize_redundant_provider_message_event(
+        "account", "queue", 7, "fingerprint"
+    )
     statement, parameters = session.statements[0]
     assert "event.event_type = 'message'" in statement
     assert "event.processing_state = 'pending'" in statement
@@ -148,22 +279,10 @@ def test_redundant_provider_message_event_requires_committed_mapping():
     assert "mapping.entity_kind = 'message'" in statement
     assert "NOT mapping.deleted" in statement
     assert "workspace_delivery_state" in statement
-    assert parameters == ("account", "queue", 7)
-
-
-def test_redundant_provider_message_events_are_finalized_in_bulk():
-    session = Session(({"count": 9},))
-    store = _store_with_session(session)
-
-    assert store.finalize_redundant_provider_message_events() == 9
-    statement, parameters = session.statements[0]
-    assert "WITH finalized AS" in statement
-    assert "event.event_type = 'message'" in statement
-    assert "event.processing_state = 'pending'" in statement
-    assert "jsonb_typeof(event.body->'message'->'flags')" in statement
-    assert "IS DISTINCT FROM 'array'" in statement
-    assert "workspace_delivery_state" in statement
-    assert parameters is None
+    assert "confirmed_message_fingerprint" in statement
+    assert "confirmed_message_unresolved_reply_provider_id" in statement
+    assert "confirmed_message_projection_pending" in statement
+    assert parameters == ("account", "queue", 7, "fingerprint")
 
 
 def test_provider_event_catalog_report_marks_equivalent_message_topic(monkeypatch):

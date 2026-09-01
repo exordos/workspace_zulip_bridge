@@ -5,6 +5,7 @@ import datetime
 import hashlib
 import json
 import threading
+import time
 import typing
 import uuid
 
@@ -182,6 +183,30 @@ def _provider_read_semantic_sha256(record: dict[str, object]) -> str | None:
     ):
         value.pop(key, None)
     return hashlib.sha256(canonical.canonical_json(value)).hexdigest()
+
+
+def _narrow_confirmed_read_items(
+    record: dict[str, object], remaining_message_uuids: list[str]
+) -> None:
+    """Keep ACK metadata aligned with a narrowed grouped read payload."""
+
+    transport = record.get("transport")
+    if not isinstance(transport, dict):
+        return
+    confirmed = transport.get("confirmed_delivery_state")
+    if not isinstance(confirmed, dict) or confirmed.get("kind") != "read_state":
+        return
+    items = confirmed.get("items")
+    if not isinstance(items, list):
+        raise ValueError("invalid_confirmed_read_state")
+    remaining = set(remaining_message_uuids)
+    confirmed["items"] = [
+        item
+        for item in items
+        if isinstance(item, dict) and str(item.get("message_uuid")) in remaining
+    ]
+    if len(typing.cast(list[object], confirmed["items"])) != len(remaining):
+        raise ValueError("invalid_confirmed_read_state")
 
 
 def _merge_catalog_participants(
@@ -441,6 +466,357 @@ class RestAlchemyStore:
     def __init__(self, connection_url: str):
         self.connection_url = connection_url
         self._transaction_state = threading.local()
+        self._confirmed_delivery_state_lock = threading.RLock()
+        self._confirmed_delivery_state_loaded = False
+        self._confirmed_messages: dict[
+            tuple[str, str], dict[str, object]
+        ] = {}
+        self._confirmed_reads: dict[
+            tuple[str, str, str], dict[str, object]
+        ] = {}
+        self._confirmed_reactions: dict[
+            tuple[str, str, str, str], dict[str, object]
+        ] = {}
+        self._confirmed_delivery_counters: dict[str, float] = {
+            name: 0.0
+            for name in (
+                "index_loads",
+                "index_rows_scanned",
+                "index_load_ms",
+                "message_lookups",
+                "message_hits",
+                "message_misses",
+                "message_skips",
+                "message_acks",
+                "read_lookups",
+                "read_hits",
+                "read_misses",
+                "read_skips",
+                "read_acks",
+                "reaction_lookups",
+                "reaction_hits",
+                "reaction_misses",
+                "reaction_skips",
+                "reaction_acks",
+            )
+        }
+
+    def load_confirmed_delivery_state(self, *, force: bool = False) -> None:
+        """Build the O(1) ACK-confirmed state index from durable mappings."""
+
+        started_at = time.monotonic()
+        with self._confirmed_delivery_state_lock:
+            if self._confirmed_delivery_state_loaded and not force:
+                return
+            with self.session() as session:
+                rows = session.execute(
+                    """
+                    SELECT account_uuid, entity_kind, provider_id, metadata,
+                           deleted
+                    FROM provider_mappings
+                    WHERE entity_kind IN ('message', 'reaction')
+                    ORDER BY account_uuid, entity_kind, provider_id,
+                             updated_at, workspace_uuid
+                    """
+                ).fetchall()
+            confirmed_messages: dict[
+                tuple[str, str], dict[str, object]
+            ] = {}
+            confirmed_reads: dict[
+                tuple[str, str, str], dict[str, object]
+            ] = {}
+            confirmed_reactions: dict[
+                tuple[str, str, str, str], dict[str, object]
+            ] = {}
+            for row in rows:
+                account_uuid = str(row["account_uuid"])
+                provider_id = str(row["provider_id"])
+                metadata = row.get("metadata")
+                if not isinstance(metadata, dict):
+                    continue
+                if row["entity_kind"] == "message":
+                    if bool(row["deleted"]) or metadata.get(
+                        "workspace_delivery_state"
+                    ) != "committed":
+                        continue
+                    fingerprint = metadata.get("confirmed_message_fingerprint")
+                    token = metadata.get("confirmed_message_token")
+                    components = metadata.get("confirmed_message_components")
+                    unresolved_reply = metadata.get(
+                        "confirmed_message_unresolved_reply_provider_id"
+                    )
+                    projection_fingerprint = metadata.get(
+                        "confirmed_message_projection_fingerprint"
+                    )
+                    projection_pending = metadata.get(
+                        "confirmed_message_projection_pending"
+                    )
+                    if (
+                        fingerprint is None or isinstance(fingerprint, str)
+                    ) and isinstance(token, str) and (
+                        unresolved_reply is None
+                        or isinstance(unresolved_reply, str)
+                    ) and (
+                        projection_fingerprint is None
+                        or isinstance(projection_fingerprint, str)
+                    ) and (
+                        projection_pending is None
+                        or isinstance(projection_pending, bool)
+                    ):
+                        confirmed_messages[(account_uuid, provider_id)] = {
+                            "fingerprint": fingerprint,
+                            "token": token,
+                            "unresolved_reply_provider_id": unresolved_reply,
+                            "projection_fingerprint": projection_fingerprint,
+                            "projection_pending": projection_pending,
+                            "components": (
+                                copy.deepcopy(components)
+                                if isinstance(components, dict)
+                                else None
+                            ),
+                        }
+                    read_states = metadata.get("confirmed_read_states")
+                    read_tokens = metadata.get("confirmed_read_tokens")
+                    read_message_uuids = metadata.get(
+                        "confirmed_read_message_uuids"
+                    )
+                    if not isinstance(read_states, dict):
+                        continue
+                    for reader_uuid, read in read_states.items():
+                        if not isinstance(read, bool):
+                            continue
+                        read_token = (
+                            read_tokens.get(reader_uuid)
+                            if isinstance(read_tokens, dict)
+                            else None
+                        )
+                        if not isinstance(read_token, str):
+                            continue
+                        read_message_uuid = (
+                            read_message_uuids.get(reader_uuid)
+                            if isinstance(read_message_uuids, dict)
+                            else None
+                        )
+                        if not isinstance(read_message_uuid, str):
+                            continue
+                        confirmed_reads[
+                            (account_uuid, provider_id, str(reader_uuid))
+                        ] = {
+                            "read": read,
+                            "token": read_token,
+                            "message_uuid": read_message_uuid,
+                        }
+                    continue
+                reaction_parts = provider_id.split(":", 3)
+                provider_message_id = metadata.get("provider_message_id")
+                provider_user_id = metadata.get("provider_user_id")
+                normalized_code = metadata.get("normalized_emoji_code")
+                if provider_message_id is None and len(reaction_parts) == 4:
+                    provider_message_id = reaction_parts[0]
+                if provider_user_id is None and len(reaction_parts) == 4:
+                    provider_user_id = reaction_parts[1]
+                if normalized_code is None:
+                    reaction_type = metadata.get("reaction_type")
+                    emoji_code = metadata.get("emoji_code")
+                    if reaction_type is not None and emoji_code is not None:
+                        try:
+                            normalized_code = emoji.normalized_reaction_code(
+                                str(reaction_type), str(emoji_code)
+                            )
+                        except ValueError:
+                            normalized_code = None
+                if (
+                    provider_message_id is None
+                    or provider_user_id is None
+                    or not isinstance(normalized_code, str)
+                ):
+                    continue
+                key = (
+                    account_uuid,
+                    str(provider_message_id),
+                    str(provider_user_id),
+                    normalized_code,
+                )
+                state = metadata.get("confirmed_reaction_state")
+                token = metadata.get("confirmed_reaction_token")
+                persisted_state = (
+                    "absent" if bool(row["deleted"]) else "present"
+                )
+                if (
+                    state not in {"present", "absent"}
+                    or not isinstance(token, str)
+                    or state != persisted_state
+                ):
+                    continue
+                current = confirmed_reactions.get(key)
+                if current is not None and current["state"] == "present":
+                    continue
+                confirmed_reactions[key] = {
+                    "state": state,
+                    "token": token,
+                }
+            self._confirmed_messages = confirmed_messages
+            self._confirmed_reads = confirmed_reads
+            self._confirmed_reactions = confirmed_reactions
+            self._confirmed_delivery_state_loaded = True
+            self._confirmed_delivery_counters["index_loads"] += 1
+            self._confirmed_delivery_counters["index_rows_scanned"] += len(rows)
+            self._confirmed_delivery_counters["index_load_ms"] += (
+                time.monotonic() - started_at
+            ) * 1000.0
+
+    def record_confirmed_delivery_skip(self, kind: str, count: int = 1) -> None:
+        key = f"{kind}_skips"
+        with self._confirmed_delivery_state_lock:
+            if key not in self._confirmed_delivery_counters:
+                raise ValueError("invalid_confirmed_delivery_metric")
+            self._confirmed_delivery_counters[key] += count
+
+    def confirmed_delivery_metrics(self, *, reset: bool = False) -> dict[str, object]:
+        """Return low-cardinality cache counters for periodic operational logs."""
+
+        with self._confirmed_delivery_state_lock:
+            counters = dict(self._confirmed_delivery_counters)
+            snapshot: dict[str, object] = {
+                **{
+                    key: int(value) if value.is_integer() else round(value, 3)
+                    for key, value in counters.items()
+                },
+                "message_entries": len(self._confirmed_messages),
+                "read_entries": len(self._confirmed_reads),
+                "reaction_entries": len(self._confirmed_reactions),
+            }
+            for kind in ("message", "read", "reaction"):
+                lookups = counters[f"{kind}_lookups"]
+                hits = counters[f"{kind}_hits"]
+                snapshot[f"{kind}_hit_ratio"] = (
+                    round(hits / lookups, 4) if lookups else None
+                )
+            if reset:
+                for key in self._confirmed_delivery_counters:
+                    self._confirmed_delivery_counters[key] = 0.0
+            return snapshot
+
+    def _ensure_confirmed_delivery_state(self) -> None:
+        if self._confirmed_delivery_state_loaded:
+            return
+        self.load_confirmed_delivery_state()
+
+    def confirmed_message_state(
+        self, account_uuid: str, provider_message_id: str
+    ) -> dict[str, object] | None:
+        self._ensure_confirmed_delivery_state()
+        with self._confirmed_delivery_state_lock:
+            value = self._confirmed_messages.get(
+                (account_uuid, provider_message_id)
+            )
+            self._confirmed_delivery_counters["message_lookups"] += 1
+            self._confirmed_delivery_counters[
+                "message_hits" if value is not None else "message_misses"
+            ] += 1
+            return None if value is None else copy.deepcopy(value)
+
+    def confirmed_read_state(
+        self,
+        account_uuid: str,
+        provider_message_id: str,
+        reader_uuid: str,
+    ) -> dict[str, object] | None:
+        self._ensure_confirmed_delivery_state()
+        with self._confirmed_delivery_state_lock:
+            value = self._confirmed_reads.get(
+                (account_uuid, provider_message_id, reader_uuid)
+            )
+            self._confirmed_delivery_counters["read_lookups"] += 1
+            self._confirmed_delivery_counters[
+                "read_hits" if value is not None else "read_misses"
+            ] += 1
+            return None if value is None else dict(value)
+
+    def confirmed_reaction_state(
+        self,
+        account_uuid: str,
+        provider_message_id: str,
+        provider_user_id: str,
+        normalized_emoji_code: str,
+    ) -> dict[str, object] | None:
+        self._ensure_confirmed_delivery_state()
+        with self._confirmed_delivery_state_lock:
+            value = self._confirmed_reactions.get(
+                (
+                    account_uuid,
+                    provider_message_id,
+                    provider_user_id,
+                    normalized_emoji_code,
+                )
+            )
+            self._confirmed_delivery_counters["reaction_lookups"] += 1
+            self._confirmed_delivery_counters[
+                "reaction_hits" if value is not None else "reaction_misses"
+            ] += 1
+            return None if value is None else dict(value)
+
+    def _cache_confirmed_message(
+        self,
+        account_uuid: str,
+        provider_message_id: str,
+        fingerprint: str | None,
+        token: str,
+        components: dict[str, object] | None,
+        unresolved_reply_provider_id: str | None,
+        projection_fingerprint: str | None,
+        projection_pending: bool | None,
+    ) -> None:
+        with self._confirmed_delivery_state_lock:
+            key = (account_uuid, provider_message_id)
+            self._confirmed_messages[key] = {
+                "fingerprint": fingerprint,
+                "token": token,
+                "unresolved_reply_provider_id": unresolved_reply_provider_id,
+                "projection_fingerprint": projection_fingerprint,
+                "projection_pending": projection_pending,
+                "components": copy.deepcopy(components),
+            }
+            self._confirmed_delivery_counters["message_acks"] += 1
+
+    def _cache_confirmed_read(
+        self,
+        account_uuid: str,
+        provider_message_id: str,
+        reader_uuid: str,
+        read: bool,
+        token: str,
+        message_uuid: str,
+    ) -> None:
+        with self._confirmed_delivery_state_lock:
+            self._confirmed_reads[
+                (account_uuid, provider_message_id, reader_uuid)
+            ] = {
+                "read": read,
+                "token": token,
+                "message_uuid": message_uuid,
+            }
+            self._confirmed_delivery_counters["read_acks"] += 1
+
+    def _cache_confirmed_reaction(
+        self,
+        account_uuid: str,
+        provider_message_id: str,
+        provider_user_id: str,
+        normalized_emoji_code: str,
+        state: str,
+        token: str,
+    ) -> None:
+        with self._confirmed_delivery_state_lock:
+            self._confirmed_reactions[
+                (
+                    account_uuid,
+                    provider_message_id,
+                    provider_user_id,
+                    normalized_emoji_code,
+                )
+            ] = {"state": state, "token": token}
+            self._confirmed_delivery_counters["reaction_acks"] += 1
 
     @contextlib.contextmanager
     def session(self) -> typing.Iterator[sessions.PgSQLSession]:
@@ -3716,6 +4092,7 @@ class RestAlchemyStore:
             if not remaining:
                 continue
             payload["message_uuids"] = remaining
+            _narrow_confirmed_read_items(record, remaining)
             record["operation_sha256"] = canonical.operation_digest(record)
             narrowed.append(record)
         if not changed:
@@ -3962,8 +4339,9 @@ class RestAlchemyStore:
         account_uuid: str,
         queue_id: str,
         event_id: int,
+        message_fingerprint: str,
     ) -> bool:
-        """Finish a replayed create after its message is already committed."""
+        """Finish a replayed create only after an exact confirmed-state match."""
         with self.session() as session:
             row = session.execute(
                 """
@@ -3989,45 +4367,21 @@ class RestAlchemyStore:
                         AND NOT mapping.deleted
                         AND mapping.metadata->>'workspace_delivery_state' =
                             'committed'
+                        AND NOT (
+                            mapping.metadata ?
+                            'confirmed_message_unresolved_reply_provider_id'
+                        )
+                        AND mapping.metadata
+                                ->>'confirmed_message_projection_pending'
+                                IS DISTINCT FROM 'true'
+                        AND mapping.metadata
+                                ->>'confirmed_message_fingerprint' = %s
                   )
                 RETURNING event.event_id
                 """,
-                (account_uuid, queue_id, event_id),
+                (account_uuid, queue_id, event_id, message_fingerprint),
             ).fetchone()
             return row is not None
-
-    def finalize_redundant_provider_message_events(self) -> int:
-        """Bulk-finish replayed creates already materialized by backfill."""
-        with self.session() as session:
-            row = session.execute(
-                """
-                WITH finalized AS (
-                    UPDATE zulip_provider_events AS event
-                    SET processing_state = 'processed', processing_reason = NULL
-                    WHERE event.event_type = 'message'
-                      AND event.processing_state = 'pending'
-                      AND CASE
-                              WHEN event.body->'message' ? 'flags' THEN
-                                  jsonb_typeof(event.body->'message'->'flags')
-                              ELSE jsonb_typeof(event.body->'flags')
-                          END IS DISTINCT FROM 'array'
-                      AND EXISTS (
-                          SELECT 1
-                          FROM provider_mappings AS mapping
-                          WHERE mapping.account_uuid = event.account_uuid
-                            AND mapping.entity_kind = 'message'
-                            AND mapping.provider_id =
-                                event.body->'message'->>'id'
-                            AND NOT mapping.deleted
-                            AND mapping.metadata
-                                    ->>'workspace_delivery_state' = 'committed'
-                      )
-                    RETURNING 1
-                )
-                SELECT count(*) AS count FROM finalized
-                """
-            ).fetchone()
-            return int(row["count"])
 
     def finalize_provider_event(
         self,
@@ -4411,6 +4765,24 @@ class RestAlchemyStore:
             if isinstance(record.get("operation"), dict)
             and typing.cast(dict[str, object], record["operation"]).get("kind")
             == "read_state.set"
+        ]
+        if not reads:
+            return
+        terminal_reads = {
+            str(row["operation_uuid"])
+            for row in session.execute(
+                """
+                SELECT operation_uuid
+                FROM workspace_delivery_outbox
+                WHERE operation_uuid = ANY(%s) AND sent_at IS NOT NULL
+                """,
+                ([str(record["operation_uuid"]) for record in reads],),
+            ).fetchall()
+        }
+        reads = [
+            record
+            for record in reads
+            if str(record["operation_uuid"]) not in terminal_reads
         ]
         if not reads:
             return
@@ -6386,6 +6758,7 @@ class RestAlchemyStore:
             ]
             if remaining:
                 payload["message_uuids"] = remaining
+                _narrow_confirmed_read_items(record, remaining)
                 record["operation_sha256"] = canonical.operation_digest(record)
                 updated = session.execute(
                     """
@@ -10493,6 +10866,273 @@ class RestAlchemyStore:
                 target_uuid,
             )
 
+    @staticmethod
+    def _persist_confirmed_delivery_state(
+        session: sessions.PgSQLSession,
+        record: dict[str, object],
+    ) -> list[dict[str, object]]:
+        """Persist semantic state only inside the successful ACK transaction."""
+
+        transport = record.get("transport")
+        if not isinstance(transport, dict):
+            return []
+        confirmed = transport.get("confirmed_delivery_state")
+        if not isinstance(confirmed, dict):
+            return []
+        account_uuid = str(record["account_uuid"])
+        operation_uuid = str(record["operation_uuid"])
+        operation = record.get("operation")
+        if not isinstance(operation, dict):
+            raise ValueError("invalid_confirmed_delivery_state")
+        state_kind = confirmed.get("kind")
+        if state_kind == "message":
+            provider_message_id = confirmed.get("provider_message_id")
+            fingerprint = confirmed.get("fingerprint")
+            components = confirmed.get("components")
+            unresolved_reply = confirmed.get("unresolved_reply_provider_id")
+            projection_fingerprint = confirmed.get("projection_fingerprint")
+            projection_pending = confirmed.get("projection_pending")
+            if provider_message_id is None or (
+                fingerprint is not None and not isinstance(fingerprint, str)
+            ):
+                raise ValueError("invalid_confirmed_message_state")
+            if components is not None and not isinstance(components, dict):
+                raise ValueError("invalid_confirmed_message_state")
+            if unresolved_reply is not None and not isinstance(
+                unresolved_reply, str
+            ):
+                raise ValueError("invalid_confirmed_message_state")
+            if projection_fingerprint is not None and not isinstance(
+                projection_fingerprint, str
+            ):
+                raise ValueError("invalid_confirmed_message_state")
+            if projection_pending is not None and not isinstance(
+                projection_pending, bool
+            ):
+                raise ValueError("invalid_confirmed_message_state")
+            updated = session.execute(
+                """
+                UPDATE provider_mappings
+                SET metadata = (
+                        metadata
+                        - 'confirmed_message_fingerprint'
+                        - 'confirmed_message_components'
+                        - 'confirmed_message_unresolved_reply_provider_id'
+                        - 'confirmed_message_projection_fingerprint'
+                        - 'confirmed_message_projection_pending'
+                    ) || jsonb_strip_nulls(jsonb_build_object(
+                        'confirmed_message_fingerprint', %s::text,
+                        'confirmed_message_components', %s::jsonb,
+                        'confirmed_message_unresolved_reply_provider_id',
+                            %s::text,
+                        'confirmed_message_projection_fingerprint', %s::text,
+                        'confirmed_message_projection_pending', %s::boolean,
+                        'confirmed_message_token', %s::text
+                    )),
+                    updated_at = now()
+                WHERE account_uuid = %s AND entity_kind = 'message'
+                  AND provider_id = %s AND NOT deleted
+                RETURNING provider_id
+                """,
+                (
+                    fingerprint,
+                    json.dumps(components) if components is not None else None,
+                    unresolved_reply,
+                    projection_fingerprint,
+                    projection_pending,
+                    operation_uuid,
+                    account_uuid,
+                    str(provider_message_id),
+                ),
+            ).fetchone()
+            if updated is None:
+                raise ValueError("confirmed_message_mapping_missing")
+            session.execute(
+                """
+                UPDATE provider_mapping_aliases
+                SET metadata = (
+                        metadata
+                        - 'confirmed_message_fingerprint'
+                        - 'confirmed_message_components'
+                        - 'confirmed_message_unresolved_reply_provider_id'
+                        - 'confirmed_message_projection_fingerprint'
+                        - 'confirmed_message_projection_pending'
+                    ) || jsonb_strip_nulls(jsonb_build_object(
+                        'confirmed_message_fingerprint', %s::text,
+                        'confirmed_message_components', %s::jsonb,
+                        'confirmed_message_unresolved_reply_provider_id',
+                            %s::text,
+                        'confirmed_message_projection_fingerprint', %s::text,
+                        'confirmed_message_projection_pending', %s::boolean,
+                        'confirmed_message_token', %s::text
+                    )),
+                    updated_at = now()
+                WHERE account_uuid = %s AND entity_kind = 'message'
+                  AND provider_id = %s AND NOT deleted
+                """,
+                (
+                    fingerprint,
+                    json.dumps(components) if components is not None else None,
+                    unresolved_reply,
+                    projection_fingerprint,
+                    projection_pending,
+                    operation_uuid,
+                    account_uuid,
+                    str(provider_message_id),
+                ),
+            )
+            return [
+                {
+                    "kind": "message",
+                    "account_uuid": account_uuid,
+                    "provider_message_id": str(provider_message_id),
+                    "fingerprint": fingerprint,
+                    "components": copy.deepcopy(components),
+                    "unresolved_reply_provider_id": unresolved_reply,
+                    "projection_fingerprint": projection_fingerprint,
+                    "projection_pending": projection_pending,
+                    "token": operation_uuid,
+                }
+            ]
+        if state_kind == "read_state":
+            reader_uuid = confirmed.get("reader_uuid")
+            read = confirmed.get("read")
+            items = confirmed.get("items")
+            if (
+                reader_uuid is None
+                or not isinstance(read, bool)
+                or not isinstance(items, list)
+                or not items
+            ):
+                raise ValueError("invalid_confirmed_read_state")
+            provider_message_ids = sorted(
+                {
+                    str(item["provider_message_id"])
+                    for item in items
+                    if isinstance(item, dict)
+                    and item.get("provider_message_id") is not None
+                }
+            )
+            if len(provider_message_ids) != len(items):
+                raise ValueError("invalid_confirmed_read_state")
+            message_uuids_by_provider_id = {
+                str(item["provider_message_id"]): str(item["message_uuid"])
+                for item in items
+                if isinstance(item, dict)
+                and item.get("provider_message_id") is not None
+                and item.get("message_uuid") is not None
+            }
+            if len(message_uuids_by_provider_id) != len(items):
+                raise ValueError("invalid_confirmed_read_state")
+            rows = session.execute(
+                """
+                UPDATE provider_mappings
+                SET metadata = metadata || jsonb_build_object(
+                        'confirmed_read_states',
+                        COALESCE(
+                            metadata->'confirmed_read_states', '{}'::jsonb
+                        ) || jsonb_build_object(%s::text, %s::boolean),
+                        'confirmed_read_tokens',
+                        COALESCE(
+                            metadata->'confirmed_read_tokens', '{}'::jsonb
+                        ) || jsonb_build_object(%s::text, %s::text),
+                        'confirmed_read_message_uuids',
+                        COALESCE(
+                            metadata->'confirmed_read_message_uuids', '{}'::jsonb
+                        ) || jsonb_build_object(
+                            %s::text,
+                            (%s::jsonb)->>provider_id
+                        )
+                    ),
+                    updated_at = now()
+                WHERE account_uuid = %s AND entity_kind = 'message'
+                  AND provider_id = ANY(%s) AND NOT deleted
+                RETURNING provider_id
+                """,
+                (
+                    str(reader_uuid),
+                    read,
+                    str(reader_uuid),
+                    operation_uuid,
+                    str(reader_uuid),
+                    json.dumps(message_uuids_by_provider_id),
+                    account_uuid,
+                    provider_message_ids,
+                ),
+            ).fetchall()
+            updated_ids = sorted(str(row["provider_id"]) for row in rows)
+            if updated_ids != provider_message_ids:
+                raise ValueError("confirmed_read_mapping_missing")
+            return [
+                {
+                    "kind": "read_state",
+                    "account_uuid": account_uuid,
+                    "provider_message_id": provider_message_id,
+                    "reader_uuid": str(reader_uuid),
+                    "read": read,
+                    "token": operation_uuid,
+                    "message_uuid": message_uuids_by_provider_id[
+                        provider_message_id
+                    ],
+                }
+                for provider_message_id in provider_message_ids
+            ]
+        if state_kind == "reaction":
+            required = (
+                "provider_message_id",
+                "provider_user_id",
+                "provider_id",
+                "normalized_emoji_code",
+                "state",
+            )
+            if any(confirmed.get(field) is None for field in required) or confirmed.get(
+                "state"
+            ) not in {"present", "absent"}:
+                raise ValueError("invalid_confirmed_reaction_state")
+            updated = session.execute(
+                """
+                UPDATE provider_mappings
+                SET metadata = metadata || jsonb_build_object(
+                        'provider_message_id', %s::text,
+                        'provider_user_id', %s::text,
+                        'normalized_emoji_code', %s::text,
+                        'confirmed_reaction_state', %s::text,
+                        'confirmed_reaction_token', %s::text
+                    ),
+                    updated_at = now()
+                WHERE account_uuid = %s AND entity_kind = 'reaction'
+                  AND provider_id = %s
+                RETURNING provider_id
+                """,
+                (
+                    str(confirmed["provider_message_id"]),
+                    str(confirmed["provider_user_id"]),
+                    str(confirmed["normalized_emoji_code"]),
+                    str(confirmed["state"]),
+                    operation_uuid,
+                    account_uuid,
+                    str(confirmed["provider_id"]),
+                ),
+            ).fetchone()
+            if updated is None:
+                raise ValueError("confirmed_reaction_mapping_missing")
+            return [
+                {
+                    "kind": "reaction",
+                    "account_uuid": account_uuid,
+                    "provider_message_id": str(
+                        confirmed["provider_message_id"]
+                    ),
+                    "provider_user_id": str(confirmed["provider_user_id"]),
+                    "normalized_emoji_code": str(
+                        confirmed["normalized_emoji_code"]
+                    ),
+                    "state": str(confirmed["state"]),
+                    "token": operation_uuid,
+                }
+            ]
+        raise ValueError("invalid_confirmed_delivery_state")
+
     def accept_result(
         self,
         result: dict[str, object],
@@ -10500,6 +11140,7 @@ class RestAlchemyStore:
     ) -> None:
         result_body = typing.cast(dict[str, object], result["result"])
         outcome = str(result_body["outcome"])
+        cache_updates: list[dict[str, object]] = []
         with self.session() as session:
             delivery = session.execute(
                 """
@@ -10743,11 +11384,64 @@ class RestAlchemyStore:
                             str(operation["entity_uuid"]),
                         ),
                     )
+                cache_updates = self._persist_confirmed_delivery_state(
+                    session,
+                    operation_record,
+                )
             self._reconcile_authoritative_workspace_target(
                 session,
                 operation_record,
                 workspace_target_uuid,
             )
+        for update in cache_updates:
+            if update["kind"] == "message":
+                self._cache_confirmed_message(
+                    str(update["account_uuid"]),
+                    str(update["provider_message_id"]),
+                    (
+                        str(update["fingerprint"])
+                        if update.get("fingerprint") is not None
+                        else None
+                    ),
+                    str(update["token"]),
+                    typing.cast(
+                        dict[str, object] | None,
+                        update.get("components"),
+                    ),
+                    (
+                        str(update["unresolved_reply_provider_id"])
+                        if update.get("unresolved_reply_provider_id") is not None
+                        else None
+                    ),
+                    (
+                        str(update["projection_fingerprint"])
+                        if update.get("projection_fingerprint") is not None
+                        else None
+                    ),
+                    (
+                        bool(update["projection_pending"])
+                        if update.get("projection_pending") is not None
+                        else None
+                    ),
+                )
+            elif update["kind"] == "read_state":
+                self._cache_confirmed_read(
+                    str(update["account_uuid"]),
+                    str(update["provider_message_id"]),
+                    str(update["reader_uuid"]),
+                    bool(update["read"]),
+                    str(update["token"]),
+                    str(update["message_uuid"]),
+                )
+            elif update["kind"] == "reaction":
+                self._cache_confirmed_reaction(
+                    str(update["account_uuid"]),
+                    str(update["provider_message_id"]),
+                    str(update["provider_user_id"]),
+                    str(update["normalized_emoji_code"]),
+                    str(update["state"]),
+                    str(update["token"]),
+                )
 
     @staticmethod
     def _enqueue_observed_report_in_session(

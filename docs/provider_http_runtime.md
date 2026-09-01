@@ -120,8 +120,60 @@ previous scan cannot suppress the new read/unread state.
 If an assignment exists but its local stream or topic mapping was lost, the
 bridge rematerializes that mapping from the durable assignment and immediately
 wakes assignment-blocked journal events. Read-state events whose historical
-message mappings point at a retired stream are omitted; message snapshots remain
-the convergent read-state source for those retired projections.
+message mappings point at a retired stream are omitted. A later full message
+snapshot rematerializes the current projection and emits its read state as a
+separate dependent command.
+
+### ACK-confirmed history convergence
+
+History and queue-recovery snapshots are compared with state stored in the
+existing `provider_mappings.metadata` JSONB. No sidecar file, table, or second
+source of truth is introduced. At startup the bridge builds account-scoped
+in-memory indexes from those durable mappings; lookups include the Zulip
+account UUID and are constant-time after the normal message-mapping lookup.
+Control snapshot/reset changes rebuild the indexes.
+
+A message snapshot is represented by a SHA-256 fingerprint of canonical JSON.
+The canonical state contains chat type and provider chat identifier, sender ID,
+the unmodified Zulip content, and edit timestamp when supplied. Channel state
+also contains stream ID and normalized topic; direct-message state contains the
+sorted unique participant IDs. Creation time, read flags, and reactions are not
+part of the fingerprint. A committed mapping with the same fingerprint emits
+no `message.create` or `message.update`; a significant change emits one update.
+Backfill status alone never forces an update.
+
+The SHA-256 fingerprint of the rendered Workspace payload is tracked alongside,
+rather than folded into, that raw Zulip fingerprint. If a newest-first page
+initially applies a reply or native Zulip link before its target is mapped, the
+ACK records both the applied projection and that it still has a resolution
+dependency. A later snapshot emits one update when the rendered target becomes
+resolvable, then converges normally. Pending projections bypass the journal's
+raw-fingerprint shortcut so they are always reconsidered. History-derived
+message updates also forward the Zulip edit timestamp as the provider revision
+so the backend freshness fence can order them against live edits.
+
+Owner read state is stored per account, provider message ID, and Workspace
+reader UUID, together with the Workspace message UUID that accepted the state.
+Message snapshots and `update_message_flags` events discard already-confirmed
+values only while that target UUID still matches, omit empty batches, and group
+remaining messages by current stream and topic. Both read-to-unread and
+unread-to-read transitions remain deliverable. Reactions are stored per
+account, provider message ID, provider user ID, and collision-safe normalized
+`reaction_type:emoji_code`. A confirmed-present add is omitted only while its
+stored Workspace projection still matches the current message, stream, topic,
+user, and emoji. This makes both read state and active reactions replay once if
+Workspace replaces a provisional message UUID with the canonical target.
+Repeated removals of confirmed-absent reactions are still omitted; the opposite
+transition is independent and remains deliverable.
+
+The confirmed fingerprint or state token is written in the same PostgreSQL
+transaction that accepts a successful Workspace result. The in-memory index is
+updated only after that transaction commits. Transport failure, rejection, or
+process interruption before the ACK therefore leaves the operation retryable.
+Legacy mappings without confirmed metadata are deliberately replayed once,
+including reaction mappings that predate explicit ACK state and token metadata.
+This prefers a safe duplicate over losing a new state. Topic and message
+dependencies remain ahead of read and reaction commands.
 
 If Zulip rejects a persisted queue, the bridge records a catch-up boundary,
 invalidates only that queue cursor, and opens a replacement queue. Selected
@@ -207,6 +259,23 @@ deferral.
 Non-retryable history errors mark only the affected account/chat job as
 `failed`, retain its safe error code, and emit scoped degraded health plus an
 account observed report. Other accounts continue polling and synchronizing.
+
+### Periodic operational statistics
+
+The worker emits one INFO-level `bridge_interval_stats` JSON record every 60
+seconds. It contains only aggregate, low-cardinality counters: confirmed-state
+index sizes and rebuild duration; message/read/reaction cache lookups, hits,
+misses, skips, and ACK updates; history and queue-catch-up pages, messages, and
+provider fetch time; and backfill generated, enqueued, no-op, and suppressed
+operations with per-second rates. Counters reset after each record while index
+sizes remain gauges. The record contains no message text, account UUID, chat
+identifier, or other per-entity label, so it is useful for capacity analysis
+without turning routine imports into per-event log noise.
+
+INFO logging is enabled only for the `workspace_zulip_bridge` logger namespace.
+The root logger and the `httpx`/`httpcore` request stack remain at WARNING so
+presigned file-transfer URLs and their query credentials never enter routine
+request logs.
 
 `RestAlchemyStore` obtains each transaction from the RestAlchemy PostgreSQL
 engine and scopes it with `session_manager()`. The engine pool may reuse

@@ -248,6 +248,49 @@ class FakeStore:
     def mark_provider_mapping_deleted(self, account_uuid, entity_kind, provider_id):
         self.mappings.pop((entity_kind, provider_id), None)
 
+    def confirmed_reaction_state(
+        self,
+        account_uuid,
+        provider_message_id,
+        provider_user_id,
+        normalized_emoji_code,
+    ):
+        if account_uuid != self.account_uuid:
+            return None
+        prefix = f"{provider_message_id}:{provider_user_id}:"
+        candidates = [
+            mapping
+            for (entity_kind, provider_id), mapping in self.mappings.items()
+            if entity_kind == "reaction" and provider_id.startswith(prefix)
+            and mapping.get("metadata", {}).get("normalized_emoji_code")
+            == normalized_emoji_code
+        ]
+        if not candidates:
+            return None
+        active = next(
+            (
+                mapping
+                for mapping in candidates
+                if not mapping.get("deleted", False)
+            ),
+            None,
+        )
+        mapping = active or candidates[-1]
+        metadata = mapping.get("metadata", {})
+        state = metadata.get("confirmed_reaction_state")
+        token = metadata.get("confirmed_reaction_token")
+        persisted_state = "present" if active is not None else "absent"
+        if (
+            state not in {"present", "absent"}
+            or not isinstance(token, str)
+            or state != persisted_state
+        ):
+            return None
+        return {
+            "state": state,
+            "token": token,
+        }
+
 
 def _dm_message(message_id=501):
     return {
@@ -298,6 +341,134 @@ def _stream_message(message_id=601, subject="Topic"):
 
 def _operations(records):
     return [record["operation"] for record in records]
+
+
+def _confirm_records(store, records):
+    """Apply the mapping metadata written by a successful Workspace ACK."""
+
+    for record in records:
+        operation = record["operation"]
+        provider = operation["provider"]
+        if operation["kind"] == "topic.upsert":
+            mapping = store.mappings[("topic", str(provider["entity_id"]))]
+            mapping["metadata"]["workspace_delivery_state"] = "committed"
+        transport = record.get("transport", {})
+        confirmed = transport.get("confirmed_delivery_state")
+        if not isinstance(confirmed, dict):
+            continue
+        if confirmed["kind"] == "message":
+            mapping = store.mappings[
+                ("message", str(confirmed["provider_message_id"]))
+            ]
+            metadata = mapping["metadata"]
+            metadata["workspace_delivery_state"] = "committed"
+            fingerprint = confirmed.get("fingerprint")
+            if fingerprint is None:
+                metadata.pop("confirmed_message_fingerprint", None)
+            else:
+                metadata["confirmed_message_fingerprint"] = fingerprint
+            metadata["confirmed_message_components"] = copy.deepcopy(
+                confirmed.get("components")
+            )
+            unresolved_reply = confirmed.get("unresolved_reply_provider_id")
+            if unresolved_reply is None:
+                metadata.pop(
+                    "confirmed_message_unresolved_reply_provider_id", None
+                )
+            else:
+                metadata[
+                    "confirmed_message_unresolved_reply_provider_id"
+                ] = unresolved_reply
+            projection_fingerprint = confirmed.get("projection_fingerprint")
+            if projection_fingerprint is None:
+                metadata.pop("confirmed_message_projection_fingerprint", None)
+            else:
+                metadata[
+                    "confirmed_message_projection_fingerprint"
+                ] = projection_fingerprint
+            projection_pending = confirmed.get("projection_pending")
+            if projection_pending is None:
+                metadata.pop("confirmed_message_projection_pending", None)
+            else:
+                metadata[
+                    "confirmed_message_projection_pending"
+                ] = projection_pending
+            metadata["confirmed_message_token"] = record["operation_uuid"]
+        elif confirmed["kind"] == "read_state":
+            for item in confirmed["items"]:
+                mapping = store.mappings[
+                    ("message", str(item["provider_message_id"]))
+                ]
+                metadata = mapping["metadata"]
+                metadata.setdefault("confirmed_read_states", {})[
+                    str(confirmed["reader_uuid"])
+                ] = bool(confirmed["read"])
+                metadata.setdefault("confirmed_read_tokens", {})[
+                    str(confirmed["reader_uuid"])
+                ] = record["operation_uuid"]
+                metadata.setdefault("confirmed_read_message_uuids", {})[
+                    str(confirmed["reader_uuid"])
+                ] = str(item["message_uuid"])
+        elif confirmed["kind"] == "reaction":
+            provider_id = str(confirmed["provider_id"])
+            plan = transport.get("reaction_mapping")
+            mapping = store.mappings.get(("reaction", provider_id))
+            if mapping is None and isinstance(plan, dict):
+                mapping = {
+                    "workspace_uuid": str(plan["workspace_uuid"]),
+                    "provider_id": provider_id,
+                    "provider_revision": None,
+                    "metadata": copy.deepcopy(plan["metadata"]),
+                    "convergent_alias": False,
+                }
+                store.mappings[("reaction", provider_id)] = mapping
+            assert mapping is not None
+            mapping["deleted"] = confirmed["state"] == "absent"
+            if isinstance(plan, dict):
+                mapping["metadata"].update(copy.deepcopy(plan["metadata"]))
+            mapping["metadata"].update(
+                provider_message_id=str(confirmed["provider_message_id"]),
+                provider_user_id=str(confirmed["provider_user_id"]),
+                normalized_emoji_code=str(confirmed["normalized_emoji_code"]),
+                confirmed_reaction_state=str(confirmed["state"]),
+                confirmed_reaction_token=record["operation_uuid"],
+            )
+
+
+def test_message_fingerprint_uses_only_significant_canonical_state():
+    message = _stream_message()
+    baseline = converter.provider_message_fingerprint(message)
+    incidental = {
+        **message,
+        "timestamp": message["timestamp"] + 100,
+        "flags": ["read"],
+        "reactions": [{"emoji_code": "270d"}],
+    }
+
+    assert converter.provider_message_fingerprint(incidental) == baseline
+    assert converter.provider_message_fingerprint(
+        {**message, "content": "changed"}
+    ) != baseline
+    assert converter.provider_message_fingerprint(
+        {**message, "last_edit_timestamp": 1_700_000_010}
+    ) != baseline
+    empty_topic = {**message, "subject": ""}
+    fallback_topic = {
+        **message,
+        "subject": converter.ZULIP_EMPTY_TOPIC_FALLBACK_NAME.upper(),
+    }
+    assert converter.provider_message_fingerprint(empty_topic) == (
+        converter.provider_message_fingerprint(fallback_topic)
+    )
+
+    direct = _dm_message()
+    reordered = {
+        **direct,
+        "display_recipient": list(reversed(direct["display_recipient"])),
+    }
+    assert converter.provider_message_fingerprint(reordered) == (
+        converter.provider_message_fingerprint(direct)
+    )
 
 
 def test_dm_conversion_has_owner_membership_identity_urn_and_copied_file():
@@ -2159,7 +2330,7 @@ def test_custom_reaction_keeps_provider_name_and_uses_typed_code_identity():
     }
 
 
-def test_backfill_reaction_uses_versioned_projection_operation_identity():
+def test_backfill_reaction_retry_reuses_transition_operation_identity():
     store = FakeStore()
     message = _stream_message()
     message["reactions"] = [
@@ -2183,26 +2354,27 @@ def test_backfill_reaction_uses_versioned_projection_operation_identity():
     reaction = next(
         record for record in records if record["operation"]["kind"] == "reaction.upsert"
     )
-    reaction_index = records.index(reaction)
-    source = (
-        f"provider-message:601:reconcile-generation:1:{queue_id}:"
-        f"reaction-projection:{converter.REACTION_PROJECTION_VERSION}"
-    )
-    assert reaction["operation_uuid"] == converter.operation_uuid_for(
+    replay = converter.event_records(
+        store,
         ACCOUNT_UUID,
-        source,
-        601,
-        reaction_index,
+        queue_id,
+        {"id": 601, "type": "message", "message": message},
+        "backfill",
     )
-    message_record = next(
-        record for record in records if record["operation"]["kind"] == "message.create"
+    replay_reaction = next(
+        record for record in replay if record["operation"]["kind"] == "reaction.upsert"
     )
-    assert message_record["operation_uuid"] == converter.operation_uuid_for(
-        ACCOUNT_UUID,
-        f"provider-message:601:reconcile-generation:1:{queue_id}",
-        601,
-        records.index(message_record),
-    )
+
+    assert replay_reaction["operation_uuid"] == reaction["operation_uuid"]
+    assert reaction["transport"]["confirmed_delivery_state"] == {
+        "kind": "reaction",
+        "provider_message_id": "601",
+        "provider_user_id": "3",
+        "normalized_emoji_code": "unicode_emoji:270d",
+        "provider_id": "601:3:unicode_emoji:270d",
+        "state": "present",
+        "prior_token": None,
+    }
 
     previous_records = converter.event_records(
         FakeStore(),
@@ -2211,12 +2383,12 @@ def test_backfill_reaction_uses_versioned_projection_operation_identity():
         {"id": 601, "type": "message", "message": message},
         "backfill",
     )
-    previous_message = next(
+    previous_reaction = next(
         record
         for record in previous_records
-        if record["operation"]["kind"] == "message.create"
+        if record["operation"]["kind"] == "reaction.upsert"
     )
-    assert previous_message["operation_uuid"] != message_record["operation_uuid"]
+    assert previous_reaction["operation_uuid"] != reaction["operation_uuid"]
 
 
 def test_reaction_event_rejects_unknown_operation():
@@ -2259,8 +2431,11 @@ def test_message_snapshot_carries_exact_owner_read_state(flags, expected_read):
     created = next(
         operation for operation in operations if operation["kind"] == "message.create"
     )
-    assert created["payload"]["read"] is expected_read
-    assert not any(operation["kind"] == "read_state.set" for operation in operations)
+    assert "read" not in created["payload"]
+    read_state = next(
+        operation for operation in operations if operation["kind"] == "read_state.set"
+    )
+    assert read_state["payload"]["read"] is expected_read
 
 
 @pytest.mark.parametrize(("flags", "expected_read"), [(["read"], True), ([], False)])
@@ -2280,8 +2455,375 @@ def test_live_message_event_carries_top_level_owner_read_state(flags, expected_r
     created = next(
         operation for operation in operations if operation["kind"] == "message.create"
     )
-    assert created["payload"]["read"] is expected_read
-    assert not any(operation["kind"] == "read_state.set" for operation in operations)
+    assert "read" not in created["payload"]
+    read_state = next(
+        operation for operation in operations if operation["kind"] == "read_state.set"
+    )
+    assert read_state["payload"]["read"] is expected_read
+
+
+def test_confirmed_backfill_snapshot_emits_no_repeated_state_operations():
+    store = FakeStore()
+    message = _stream_message()
+    message["flags"] = ["read"]
+    message["reactions"] = [
+        {
+            "user_id": 3,
+            "emoji_name": "writing",
+            "emoji_code": "270D-FE0F",
+            "reaction_type": "unicode_emoji",
+        }
+    ]
+    event = {"id": 601, "type": "message", "message": message}
+
+    records = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "backfill:channel:42:assignment:1:snapshot:1",
+        event,
+        "backfill",
+    )
+    assert {
+        record["operation"]["kind"] for record in records
+    }.issuperset({"message.create", "read_state.set", "reaction.upsert"})
+
+    _confirm_records(store, records)
+
+    assert (
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "backfill:channel:42:assignment:1:snapshot:2",
+            event,
+            "backfill",
+        )
+        == []
+    )
+
+
+def test_changed_message_state_emits_one_update_then_converges():
+    store = FakeStore()
+    original = _stream_message()
+    initial = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "backfill:channel:42:assignment:1:snapshot:1",
+        {"id": 601, "type": "message", "message": original},
+        "backfill",
+    )
+    _confirm_records(store, initial)
+    edited = {**original, "content": "edited", "last_edit_timestamp": 1_700_000_010}
+
+    changed = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "backfill:channel:42:assignment:1:snapshot:2",
+        {"id": 601, "type": "message", "message": edited},
+        "backfill",
+    )
+
+    assert [
+        record["operation"]["kind"] for record in changed
+    ] == ["message.update"]
+    assert changed[0]["operation"]["provider"]["revision"] == "1700000010"
+    _confirm_records(store, changed)
+    assert (
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "backfill:channel:42:assignment:1:snapshot:3",
+            {"id": 601, "type": "message", "message": edited},
+            "backfill",
+        )
+        == []
+    )
+
+
+def test_read_only_snapshot_change_does_not_update_message():
+    store = FakeStore()
+    unread = _stream_message()
+    unread["flags"] = []
+    initial = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "backfill:channel:42:assignment:1:snapshot:1",
+        {"id": 601, "type": "message", "message": unread},
+        "backfill",
+    )
+    _confirm_records(store, initial)
+    read = copy.deepcopy(unread)
+    read["flags"] = ["read"]
+
+    changed = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "backfill:channel:42:assignment:1:snapshot:2",
+        {"id": 601, "type": "message", "message": read},
+        "backfill",
+    )
+
+    assert [record["operation"]["kind"] for record in changed] == [
+        "read_state.set"
+    ]
+    _confirm_records(store, changed)
+    assert (
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "backfill:channel:42:assignment:1:snapshot:3",
+            {"id": 601, "type": "message", "message": read},
+            "backfill",
+        )
+        == []
+    )
+
+
+def test_grouped_read_replay_filters_confirmed_items_and_preserves_unread():
+    store = FakeStore()
+    for message_id in (601, 602):
+        initial = converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            f"backfill:channel:42:message:{message_id}",
+            {
+                "id": message_id,
+                "type": "message",
+                "message": _stream_message(message_id),
+            },
+            "backfill",
+        )
+        _confirm_records(store, initial)
+
+    first_read = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "history-flags-1",
+        {
+            "id": 900,
+            "type": "update_message_flags",
+            "op": "add",
+            "flag": "read",
+            "messages": [601],
+        },
+        "backfill",
+    )
+    _confirm_records(store, first_read)
+
+    remaining = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "history-flags-2",
+        {
+            "id": 901,
+            "type": "update_message_flags",
+            "op": "add",
+            "flag": "read",
+            "messages": [601, 602],
+        },
+        "backfill",
+    )
+    assert len(remaining) == 1
+    assert remaining[0]["operation"]["payload"]["message_uuids"] == [
+        store.mappings[("message", "602")]["workspace_uuid"]
+    ]
+    _confirm_records(store, remaining)
+    assert (
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "history-flags-3",
+            {
+                "id": 902,
+                "type": "update_message_flags",
+                "op": "add",
+                "flag": "read",
+                "messages": [601, 602],
+            },
+            "backfill",
+        )
+        == []
+    )
+
+    unread = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "history-flags-4",
+        {
+            "id": 903,
+            "type": "update_message_flags",
+            "op": "remove",
+            "flag": "read",
+            "messages": [601, 602],
+        },
+        "backfill",
+    )
+    assert len(unread) == 1
+    assert unread[0]["operation"]["payload"]["read"] is False
+    assert set(unread[0]["operation"]["payload"]["message_uuids"]) == {
+        store.mappings[("message", "601")]["workspace_uuid"],
+        store.mappings[("message", "602")]["workspace_uuid"],
+    }
+
+
+def test_reaction_add_remove_replays_only_until_each_ack():
+    store = FakeStore()
+    initial = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "history",
+        {"id": 601, "type": "message", "message": _stream_message()},
+        "backfill",
+    )
+    _confirm_records(store, initial)
+    reaction = {
+        "type": "reaction",
+        "message_id": 601,
+        "user_id": 3,
+        "emoji_name": "writing",
+        "emoji_code": "270D-FE0F",
+        "reaction_type": "unicode_emoji",
+    }
+
+    added = converter.event_records(
+        store, ACCOUNT_UUID, "queue", {**reaction, "id": 10, "op": "add"}
+    )
+    assert any(
+        record["operation"]["kind"] == "reaction.upsert" for record in added
+    )
+    _confirm_records(store, added)
+    assert (
+        converter.event_records(
+            store, ACCOUNT_UUID, "queue-2", {**reaction, "id": 11, "op": "add"}
+        )
+        == []
+    )
+
+    removed = converter.event_records(
+        store, ACCOUNT_UUID, "queue-3", {**reaction, "id": 12, "op": "remove"}
+    )
+    assert [record["operation"]["kind"] for record in removed] == [
+        "reaction.delete"
+    ]
+    _confirm_records(store, removed)
+    assert (
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "queue-4",
+            {**reaction, "id": 13, "op": "remove"},
+        )
+        == []
+    )
+
+
+def test_confirmed_read_and_reaction_follow_recanonicalized_message_target():
+    store = FakeStore()
+    message = _stream_message()
+    message["flags"] = ["read"]
+    message["reactions"] = [
+        {
+            "user_id": 3,
+            "emoji_name": "writing",
+            "emoji_code": "270d",
+            "reaction_type": "unicode_emoji",
+        }
+    ]
+    event = {"id": 601, "type": "message", "message": message}
+    initial = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "backfill:channel:42:assignment:1:snapshot:1",
+        event,
+        "backfill",
+    )
+    _confirm_records(store, initial)
+    assert (
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "backfill:channel:42:assignment:1:snapshot:2",
+            event,
+            "backfill",
+        )
+        == []
+    )
+
+    canonical_message_uuid = str(uuid.uuid4())
+    store.mappings[("message", "601")]["workspace_uuid"] = (
+        canonical_message_uuid
+    )
+    replay = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "backfill:channel:42:assignment:1:snapshot:3",
+        event,
+        "backfill",
+    )
+
+    assert [record["operation"]["kind"] for record in replay] == [
+        "read_state.set",
+        "reaction.upsert",
+    ]
+    assert all(
+        record["operation"]["payload"]["message_uuid"]
+        == canonical_message_uuid
+        for record in replay
+        if record["operation"]["kind"] == "reaction.upsert"
+    )
+    read = next(
+        record["operation"]
+        for record in replay
+        if record["operation"]["kind"] == "read_state.set"
+    )
+    assert read["payload"]["message_uuids"] == [canonical_message_uuid]
+
+    _confirm_records(store, replay)
+    assert (
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "backfill:channel:42:assignment:1:snapshot:4",
+            event,
+            "backfill",
+        )
+        == []
+    )
+
+
+def test_state_operations_remain_retryable_before_workspace_ack():
+    store = FakeStore()
+    message = _stream_message()
+    message["flags"] = ["read"]
+    message["reactions"] = [
+        {
+            "user_id": 3,
+            "emoji_name": "writing",
+            "emoji_code": "270d",
+            "reaction_type": "unicode_emoji",
+        }
+    ]
+    event = {"id": 601, "type": "message", "message": message}
+
+    first = converter.event_records(
+        store, ACCOUNT_UUID, "backfill:snapshot:1", event, "backfill"
+    )
+    retry = converter.event_records(
+        store, ACCOUNT_UUID, "backfill:snapshot:1", event, "backfill"
+    )
+    first_state = {
+        record["operation"]["kind"]: record["operation_uuid"]
+        for record in first
+        if record["operation"]["kind"]
+        in {"message.create", "read_state.set", "reaction.upsert"}
+    }
+    retry_state = {
+        record["operation"]["kind"]: record["operation_uuid"]
+        for record in retry
+        if record["operation"]["kind"]
+        in {"message.create", "read_state.set", "reaction.upsert"}
+    }
+
+    assert retry_state == first_state
 
 
 def test_committed_live_message_uses_read_state_without_replaying_message():
@@ -2790,13 +3332,13 @@ def test_convergent_workspace_alias_replays_idempotent_backfill_upsert():
         if operation["kind"] == "message.update"
     )
     assert message["entity_uuid"] == workspace_uuid
-    assert message["payload"]["read"] is True
-    read = next(
+    assert "read" not in message["payload"]
+    read_state = next(
         operation
         for operation in _operations(records)
         if operation["kind"] == "read_state.set"
     )
-    assert read["payload"] == {
+    assert read_state["payload"] == {
         "stream_uuid": message["payload"]["stream_uuid"],
         "topic_uuid": message["payload"]["topic_uuid"],
         "reader_uuid": OWNER_UUID,
@@ -2931,7 +3473,7 @@ def test_live_message_replay_rejects_partial_accepted_sequence():
     }
     event["message"]["flags"] = ["read"]
     accepted = converter.event_records(store, ACCOUNT_UUID, "queue", event)
-    assert accepted[-1]["operation"]["kind"] == "message.create"
+    assert accepted[-1]["operation"]["kind"] == "read_state.set"
     accepted_message = next(
         record for record in accepted if record["operation"]["kind"] == "message.create"
     )
@@ -3045,6 +3587,165 @@ def test_unresolved_inbound_zulip_reply_is_preserved_as_safe_fallback():
     assert message["payload"]["reply_to_message_uuid"] is None
     assert message["extensions"]["unresolved_reply_provider_id"] == "999"
     assert "missing" in message["payload"]["payload"]["content"]
+
+
+def test_backfill_repairs_reply_after_quoted_message_becomes_resolvable():
+    store = FakeStore()
+    reply = _stream_message(602)
+    reply["content"] = (
+        "@_**Other User|2** "
+        "[said](https://zulip.example.invalid/#narrow/near/601):\n"
+        "```quote\noriginal\n```\n\nreply"
+    )
+    reply_event = {"id": 11, "type": "message", "message": reply}
+    initial = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "backfill:channel:42:assignment:1:snapshot:1",
+        reply_event,
+        "backfill",
+    )
+    initial_message = next(
+        operation
+        for operation in _operations(initial)
+        if operation["kind"] == "message.create"
+    )
+    assert initial_message["payload"]["reply_to_message_uuid"] is None
+    assert initial_message["extensions"]["unresolved_reply_provider_id"] == "601"
+    _confirm_records(store, initial)
+
+    assert (
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "backfill:channel:42:assignment:1:snapshot:2",
+            reply_event,
+            "backfill",
+        )
+        == []
+    )
+
+    original_records = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "backfill:channel:42:assignment:1:snapshot:2",
+        {"id": 10, "type": "message", "message": _stream_message(601)},
+        "backfill",
+    )
+    _confirm_records(store, original_records)
+    original = store.provider_mapping(ACCOUNT_UUID, "message", "601")
+
+    repaired = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "backfill:channel:42:assignment:1:snapshot:3",
+        reply_event,
+        "backfill",
+    )
+    assert [record["operation"]["kind"] for record in repaired] == [
+        "message.update"
+    ]
+    repaired_message = repaired[0]["operation"]
+    assert (
+        repaired_message["payload"]["reply_to_message_uuid"]
+        == original["workspace_uuid"]
+    )
+    assert repaired_message["payload"]["payload"]["content"] == (
+        f"[Other User](urn:quote:{original['workspace_uuid']})\n\nreply"
+    )
+    assert repaired_message["extensions"]["unresolved_reply_provider_id"] is None
+    _confirm_records(store, repaired)
+
+    assert (
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "backfill:channel:42:assignment:1:snapshot:4",
+            reply_event,
+            "backfill",
+        )
+        == []
+    )
+
+
+def test_backfill_repairs_native_link_after_target_becomes_resolvable():
+    store = FakeStore()
+    source = _stream_message(602)
+    source["content"] = "See #**Engineering>Topic@601**"
+    source_event = {"id": 11, "type": "message", "message": source}
+    original_url = "https://zulip.example.invalid/#narrow/near/602"
+    initial = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "backfill:channel:42:assignment:1:snapshot:1",
+        source_event,
+        "backfill",
+        original_url,
+    )
+    initial_message = next(
+        operation
+        for operation in _operations(initial)
+        if operation["kind"] == "message.create"
+    )
+    assert "#**Engineering>Topic@601**" in initial_message["payload"][
+        "payload"
+    ]["content"]
+    assert initial_message["extensions"]["lossy_conversion"] is True
+    _confirm_records(store, initial)
+
+    assert (
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "backfill:channel:42:assignment:1:snapshot:2",
+            source_event,
+            "backfill",
+            original_url,
+        )
+        == []
+    )
+
+    target_records = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "backfill:channel:42:assignment:1:snapshot:2",
+        {"id": 10, "type": "message", "message": _stream_message(601)},
+        "backfill",
+        "https://zulip.example.invalid/#narrow/near/601",
+    )
+    _confirm_records(store, target_records)
+    target = store.provider_mapping(ACCOUNT_UUID, "message", "601")
+
+    repaired = converter.event_records(
+        store,
+        ACCOUNT_UUID,
+        "backfill:channel:42:assignment:1:snapshot:3",
+        source_event,
+        "backfill",
+        original_url,
+    )
+    assert [record["operation"]["kind"] for record in repaired] == [
+        "message.update"
+    ]
+    repaired_message = repaired[0]["operation"]
+    assert (
+        f"urn:message:{target['workspace_uuid']}"
+        in repaired_message["payload"]["payload"]["content"]
+    )
+    assert repaired_message["extensions"]["lossy_conversion"] is False
+    _confirm_records(store, repaired)
+
+    assert (
+        converter.event_records(
+            store,
+            ACCOUNT_UUID,
+            "backfill:channel:42:assignment:1:snapshot:4",
+            source_event,
+            "backfill",
+            original_url,
+        )
+        == []
+    )
 
 
 def test_subscription_rename_reuses_stream_uuid():

@@ -1,4 +1,5 @@
 import argparse
+import logging
 import pathlib
 
 from workspace_zulip_bridge import (
@@ -19,6 +20,7 @@ def build(
     certificate_renewer=None,
 ) -> service.BridgeService:
     store = storage.RestAlchemyStore(runtime.database.connection_url)
+    store.load_confirmed_delivery_state()
     decryptor = credentials.CredentialDecryptor(
         runtime.control.credential_private_key_file,
         runtime.identity.realm_uuid,
@@ -53,7 +55,21 @@ def build(
     )
 
 
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    logging.getLogger("workspace_zulip_bridge").setLevel(logging.INFO)
+    # httpx logs the complete request URL at INFO. File transfers use signed
+    # URLs, so keep the HTTP stack above INFO even if an embedding runtime has
+    # already configured a more verbose root logger.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
 def main() -> None:
+    configure_logging()
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--config",
