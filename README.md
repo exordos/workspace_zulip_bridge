@@ -107,10 +107,21 @@ The current implementation provides:
   one-message fallback while live work is pending or the message transfers a
   file;
 - exact owner read/unread projection from both Zulip message snapshots and live
-  flag events, ordered after the corresponding Workspace message projection;
-  snapshot projection versions give contract migrations fresh operation
-  identities, so a selected-chat replay cannot be hidden by terminal results
-  from an older history scan;
+  flag events, emitted independently and ordered after the corresponding
+  Workspace message projection;
+- ACK-confirmed history convergence for message bodies, owner read state, and
+  reactions. The existing PostgreSQL mapping metadata stores the last accepted
+  semantic state, while an account-scoped in-memory index gives constant-time
+  checks during catch-up. Missing legacy state is replayed safely and only a
+  successful Workspace result advances the index. Resolution-dependent reply
+  and native-link projections are reconsidered when their target mappings
+  become available. Confirmed read and reaction projections are also rebound
+  once if Workspace replaces a provisional message UUID with its canonical
+  target;
+- one structured `bridge_interval_stats` log record per minute with cache
+  entries, hit/miss/skip and ACK counts, index-build time, backfill/catch-up
+  page and message counts, generated/enqueued/suppressed operations, fetch
+  duration, and calculated import rates;
 - canonical Workspace quote references for Zulip replies on both create and
   edit, including history replay before the local account has materialized a
   realm-shared quote target;

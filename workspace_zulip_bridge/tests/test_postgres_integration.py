@@ -3031,6 +3031,121 @@ def _committed_result(
     }
 
 
+def test_confirmed_history_state_persists_only_after_ack_and_survives_restart(
+    postgres_store,
+):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    _materialize_channel_projection(postgres_store, account_uuid, project_uuid)
+    message = _provider_history_message(601)
+    message["flags"] = ["read"]
+    message["reactions"] = [
+        {
+            "user_id": 3,
+            "emoji_name": "writing",
+            "emoji_code": "270D-FE0F",
+            "reaction_type": "unicode_emoji",
+        }
+    ]
+    event = {"id": 601, "type": "message", "message": message}
+    queue_id = "backfill:channel:42:assignment:1:snapshot:7"
+    records = converter.event_records(
+        postgres_store, account_uuid, queue_id, event, "backfill"
+    )
+
+    before_ack = storage.RestAlchemyStore(postgres_store.connection_url)
+    before_ack.load_confirmed_delivery_state()
+    retry = converter.event_records(
+        before_ack, account_uuid, queue_id, event, "backfill"
+    )
+    assert {
+        record["operation"]["kind"] for record in retry
+    }.issuperset({"message.create", "read_state.set", "reaction.upsert"})
+
+    for record in records:
+        assert postgres_store.enqueue_workspace_delivery(record, 2)
+        provider_entity_id = (
+            "601" if record["operation"]["kind"] == "message.create" else None
+        )
+        postgres_store.accept_result(_committed_result(record, provider_entity_id))
+
+    restarted = storage.RestAlchemyStore(postgres_store.connection_url)
+    restarted.load_confirmed_delivery_state()
+    assert (
+        converter.event_records(
+            restarted,
+            account_uuid,
+            "backfill:channel:42:assignment:1:snapshot:8",
+            event,
+            "backfill",
+        )
+        == []
+    )
+    assert restarted.confirmed_delivery_metrics()["message_entries"] == 1
+    assert restarted.confirmed_delivery_metrics()["read_entries"] == 1
+    assert restarted.confirmed_delivery_metrics()["reaction_entries"] == 1
+
+    edited_message = copy.deepcopy(message)
+    edited_message["content"] = "edited after canonical convergence"
+    edited_message["last_edit_timestamp"] = 1_700_000_100
+    edited_event = {"id": 602, "type": "message", "message": edited_message}
+    update_records = converter.event_records(
+        restarted,
+        account_uuid,
+        "backfill:channel:42:assignment:1:snapshot:9",
+        edited_event,
+        "backfill",
+    )
+    assert [record["operation"]["kind"] for record in update_records] == [
+        "message.update"
+    ]
+    canonical_message_uuid = str(uuid.uuid4())
+    update_record = update_records[0]
+    assert restarted.enqueue_workspace_delivery(update_record, 2)
+    restarted.accept_result(
+        _committed_result(update_record, provider_entity_id="601"),
+        workspace_target_uuid=canonical_message_uuid,
+    )
+
+    recanonicalized = storage.RestAlchemyStore(postgres_store.connection_url)
+    recanonicalized.load_confirmed_delivery_state()
+    rebound = converter.event_records(
+        recanonicalized,
+        account_uuid,
+        "backfill:channel:42:assignment:1:snapshot:10",
+        edited_event,
+        "backfill",
+    )
+    assert [record["operation"]["kind"] for record in rebound] == [
+        "read_state.set",
+        "reaction.upsert",
+    ]
+    read_record = rebound[0]
+    reaction_record = rebound[1]
+    assert read_record["operation"]["payload"]["message_uuids"] == [
+        canonical_message_uuid
+    ]
+    assert (
+        reaction_record["operation"]["payload"]["message_uuid"]
+        == canonical_message_uuid
+    )
+
+    for record in rebound:
+        assert recanonicalized.enqueue_workspace_delivery(record, 2)
+        recanonicalized.accept_result(_committed_result(record))
+    converged = storage.RestAlchemyStore(postgres_store.connection_url)
+    converged.load_confirmed_delivery_state()
+    assert (
+        converter.event_records(
+            converged,
+            account_uuid,
+            "backfill:channel:42:assignment:1:snapshot:11",
+            edited_event,
+            "backfill",
+        )
+        == []
+    )
+
+
 def test_workspace_delivery_probe_ignores_inactive_accounts_and_provider(
     postgres_store,
 ):
@@ -7156,8 +7271,10 @@ def test_live_message_replay_reuses_accepted_link_after_topic_recanonicalization
     accepted = postgres_store.prepare_provider_event_records(
         account_uuid, queue_id, event_id, accepted
     )
-    assert accepted[-1]["operation"]["kind"] == "message.create"
-    for record in accepted[:-1]:
+    assert accepted[-1]["operation"]["kind"] == "read_state.set"
+    for record in accepted:
+        if record["operation"]["kind"] == "message.create":
+            continue
         assert postgres_store.enqueue_workspace_delivery(record, 0, queue_id, event_id)
     accepted_message = next(
         record for record in accepted if record["operation"]["kind"] == "message.create"
@@ -7219,7 +7336,9 @@ def test_live_message_replay_reuses_accepted_link_after_topic_recanonicalization
         postgres_store.enqueue_workspace_delivery(record, 0, queue_id, event_id)
         for record in replay
     ]
-    assert enqueue_results == [False] * (len(replay) - 1) + [True]
+    assert enqueue_results == [
+        record["operation"]["kind"] == "message.create" for record in replay
+    ]
     with postgres_store.session() as session:
         stored_kinds = [
             row["kind"]
@@ -7234,7 +7353,11 @@ def test_live_message_replay_reuses_accepted_link_after_topic_recanonicalization
                 (account_uuid, queue_id, event_id),
             ).fetchall()
         ]
-    assert stored_kinds == [record["operation"]["kind"] for record in accepted]
+    assert stored_kinds == [
+        record["operation"]["kind"]
+        for record in accepted
+        if record["operation"]["kind"] != "message.create"
+    ] + ["message.create"]
 
     # A sent prefix can survive an assignment replacement while an unsent tail
     # is discarded as stale. Keep the prepared snapshot through delivering so
@@ -7286,7 +7409,10 @@ def test_live_message_replay_reuses_accepted_link_after_topic_recanonicalization
         postgres_store.enqueue_workspace_delivery(record, 0, queue_id, event_id)
         for record in assignment_replay
     ]
-    assert assignment_enqueue_results == [False] * (len(accepted) - 1) + [True]
+    assert assignment_enqueue_results == [
+        record["operation"]["kind"] == "message.create"
+        for record in assignment_replay
+    ]
     with postgres_store.session() as session:
         restored = session.execute(
             """
@@ -7306,7 +7432,7 @@ def test_live_message_replay_reuses_accepted_link_after_topic_recanonicalization
     assert restored == {
         "total": len(accepted),
         "messages": 1,
-        "read_states": 0,
+        "read_states": 1,
     }
     postgres_store.mark_provider_event_delivering(account_uuid, queue_id, event_id)
     with postgres_store.session() as session:
@@ -7439,7 +7565,7 @@ def test_partial_live_event_finishes_when_assignment_target_is_removed(
         "total": len(prepared) - 1,
         "unsent": 0,
         "messages": 0,
-        "read_states": 0,
+        "read_states": 1,
     }
     pending = postgres_store.pending_provider_events()
     if assignment_change == "project":
@@ -7727,37 +7853,69 @@ def test_committed_message_fast_path_keeps_flagged_snapshots_pending(
 ):
     account_uuid = str(uuid.uuid4())
     message_uuid = str(uuid.uuid4())
+    message = {
+        "id": 42,
+        "type": "stream",
+        "stream_id": 9,
+        "subject": "Topic",
+        "sender_id": 2,
+        "content": "hello",
+    }
+    fingerprint = converter.provider_message_fingerprint(message)
     postgres_store.remember_provider_mapping(
         account_uuid,
         "message",
         "42",
         message_uuid,
-        {"workspace_delivery_state": "committed"},
+        {
+            "workspace_delivery_state": "committed",
+            "confirmed_message_fingerprint": fingerprint,
+            "confirmed_message_token": str(uuid.uuid4()),
+        },
     )
     events = [
         {
             "id": 1,
             "type": "message",
             "flags": ["read"],
-            "message": {"id": 42},
+            "message": message,
         },
         {
             "id": 2,
             "type": "message",
-            "message": {"id": 42, "flags": []},
+            "message": {**message, "flags": []},
         },
-        {"id": 3, "type": "message", "message": {"id": 42}},
+        {"id": 3, "type": "message", "message": message},
     ]
     for event in events:
         assert postgres_store.record_provider_event(account_uuid, "queue", event)
 
     assert not postgres_store.finalize_redundant_provider_message_event(
-        account_uuid, "queue", 1
+        account_uuid, "queue", 1, fingerprint
     )
     assert postgres_store.finalize_redundant_provider_message_event(
-        account_uuid, "queue", 3
+        account_uuid, "queue", 3, fingerprint
     )
-    assert postgres_store.finalize_redundant_provider_message_events() == 0
+
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE provider_mappings
+            SET metadata = metadata || jsonb_build_object(
+                    'confirmed_message_projection_pending', true
+                )
+            WHERE account_uuid = %s AND entity_kind = 'message'
+              AND provider_id = '42' AND NOT deleted
+            """,
+            (account_uuid,),
+        )
+    unresolved_event = {"id": 4, "type": "message", "message": message}
+    assert postgres_store.record_provider_event(
+        account_uuid, "queue", unresolved_event
+    )
+    assert not postgres_store.finalize_redundant_provider_message_event(
+        account_uuid, "queue", 4, fingerprint
+    )
 
     with postgres_store.session() as session:
         states = session.execute(
@@ -7773,6 +7931,7 @@ def test_committed_message_fast_path_keeps_flagged_snapshots_pending(
         {"event_id": 1, "processing_state": "pending"},
         {"event_id": 2, "processing_state": "pending"},
         {"event_id": 3, "processing_state": "processed"},
+        {"event_id": 4, "processing_state": "pending"},
     ]
 
 

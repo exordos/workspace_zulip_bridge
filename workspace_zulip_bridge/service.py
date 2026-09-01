@@ -4,6 +4,8 @@ import copy
 import dataclasses
 import datetime
 import hashlib
+import json
+import logging
 import pathlib
 import queue
 import random
@@ -29,6 +31,8 @@ from workspace_zulip_bridge import (
     storage,
     zulip_adapter,
 )
+
+logger = logging.getLogger(__name__)
 
 # A backfill message is a current provider snapshot, not an immutable copy of
 # the first history scan. Bump this only when the snapshot projection contract
@@ -407,6 +411,7 @@ class BridgeService:
     # Desired-state changes reconcile immediately. This slower sweep is only a
     # recovery guard for state left behind by a prior process interruption.
     CONTROL_STATE_RECONCILE_INTERVAL_SECONDS = 60.0
+    STATS_LOG_INTERVAL_SECONDS = 60.0
     HISTORY_QUANTUM_INTERVAL_SECONDS = 1.0
     HISTORY_PROGRESS_YIELD_SECONDS = 0.01
     TERMINAL_STATE_PRUNE_INTERVAL_SECONDS = 10.0
@@ -492,6 +497,9 @@ class BridgeService:
         self.provider_delivery_random = random.Random()
         self.provider_delivery_retry_lock = threading.Lock()
         self.provider_delivery_lock = threading.Lock()
+        self._stats_lock = threading.Lock()
+        self._stats_last_log = time.monotonic()
+        self._stats_counters: dict[str, float] = {}
         self.control_lane_health: dict[str, bool | None] = {
             "heartbeat": None,
             "control": None,
@@ -504,6 +512,53 @@ class BridgeService:
         }
         self.scheduler.account_failure_handler = self._handle_provider_account_error
         self.scheduler.account_success_handler = self._record_provider_account_success
+
+    def _record_interval_stat(self, name: str, value: float = 1.0) -> None:
+        lock = getattr(self, "_stats_lock", None)
+        if lock is None:
+            return
+        with lock:
+            counters = self._stats_counters
+            counters[name] = counters.get(name, 0.0) + value
+
+    def _log_periodic_stats(self, now: float) -> bool:
+        last_log = getattr(self, "_stats_last_log", now)
+        interval = now - last_log
+        if interval < self.STATS_LOG_INTERVAL_SECONDS:
+            return False
+        lock = getattr(self, "_stats_lock", None)
+        if lock is None:
+            return False
+        with lock:
+            import_stats = dict(self._stats_counters)
+            self._stats_counters.clear()
+            self._stats_last_log = now
+        cache_metrics = getattr(self.store, "confirmed_delivery_metrics", None)
+        cache_stats = (
+            cache_metrics(reset=True) if callable(cache_metrics) else {}
+        )
+        backfill_messages = import_stats.get("backfill_messages", 0.0)
+        backfill_operations = import_stats.get("backfill_operations_enqueued", 0.0)
+        import_stats["backfill_messages_per_second"] = round(
+            backfill_messages / interval, 3
+        )
+        import_stats["backfill_operations_per_second"] = round(
+            backfill_operations / interval, 3
+        )
+        payload = {
+            "event": "bridge_interval_stats",
+            "interval_seconds": round(interval, 3),
+            "cache": cache_stats,
+            "import": {
+                key: int(value) if value.is_integer() else round(value, 3)
+                for key, value in sorted(import_stats.items())
+            },
+        }
+        logger.info(
+            "bridge_interval_stats %s",
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
+        return True
 
     def synchronize_control(self) -> bool:
         cursor = self.store.control_cursor()
@@ -528,6 +583,11 @@ class BridgeService:
             return False
         self.store.clear_blocked_batch()
         if changes:
+            reload_confirmed_state = getattr(
+                self.store, "load_confirmed_delivery_state", None
+            )
+            if callable(reload_confirmed_state):
+                reload_confirmed_state(force=True)
             reset_stale_deliveries = getattr(
                 self.store,
                 "reset_stale_workspace_deliveries",
@@ -570,6 +630,11 @@ class BridgeService:
                 raise ValueError("Control snapshot page cursor repeated")
             seen_page_cursors.add(page_cursor)
         self.store.install_snapshot(resources, str(session["anchor_cursor"]))
+        reload_confirmed_state = getattr(
+            self.store, "load_confirmed_delivery_state", None
+        )
+        if callable(reload_confirmed_state):
+            reload_confirmed_state(force=True)
         reset_stale_deliveries = getattr(
             self.store,
             "reset_stale_workspace_deliveries",
@@ -2472,7 +2537,14 @@ class BridgeService:
             )
             return False
         anchor = "newest" if job["next_anchor"] is None else int(job["next_anchor"])
+        fetch_started_at = time.monotonic()
         messages = adapter.message_history(chat_key, anchor=anchor)
+        self._record_interval_stat("catchup_pages")
+        self._record_interval_stat("catchup_messages", len(messages))
+        self._record_interval_stat(
+            "catchup_provider_fetch_ms",
+            (time.monotonic() - fetch_started_at) * 1000.0,
+        )
         checkpoint = (
             None
             if job["checkpoint_provider_message_id"] is None
@@ -2486,71 +2558,13 @@ class BridgeService:
         )
         complete = reached_checkpoint or len(messages) < zulip_adapter.HISTORY_PAGE_SIZE
 
-        unmapped_messages = []
-        for message in converter.newest_first(messages):
-            provider_message_id = str(message["id"])
-            mapping = converter.provider_message_mapping(
-                self.store,
-                account_uuid,
-                provider_message_id,
-            )
-            if mapping is None:
-                unmapped_messages.append(message)
-                continue
-            metadata = typing.cast(dict[str, object], mapping["metadata"])
-            workspace_delivery_committed = (
-                mapping.get("convergent_alias") is True
-                or metadata.get("mapping_origin") == "workspace"
-                or metadata.get("workspace_delivery_state") == "committed"
-            )
-            if not workspace_delivery_committed:
-                unmapped_messages.append(message)
-                continue
-            provider_content_sha256 = hashlib.sha256(
-                str(message["content"]).encode("utf-8")
-            ).hexdigest()
-            current_subject = converter.channel_topic_name(
-                str(message.get("subject", ""))
-            )
-            mapped_subject = converter.channel_topic_name(
-                str(metadata.get("subject", ""))
-            )
-            if (
-                metadata.get("provider_content_sha256") == provider_content_sha256
-                and mapped_subject == current_subject
-            ):
-                continue
-            event = {
-                "id": int(message["id"]),
-                "type": "update_message",
-                "message_id": int(message["id"]),
-                "message_ids": [int(message["id"])],
-                "content": message["content"],
-                "edit_timestamp": message.get(
-                    "last_edit_timestamp", message["timestamp"]
-                ),
-                "stream_id": message.get("stream_id"),
-                "orig_subject": mapped_subject,
-                "subject": current_subject,
-            }
-            records = self._event_records_with_file_fallback(
-                adapter,
-                account_uuid,
-                converter.stable_entity_uuid(
-                    account_uuid,
-                    "external_chat",
-                    str(metadata["chat_key"]),
-                ),
-                f"catchup:{chat_key}",
-                event,
-                "backfill",
-            )
-            for record in records:
-                self._enqueue_queue_recovery_delivery(record)
-
-        if unmapped_messages:
+        if messages:
             try:
-                self.enqueue_backfill(account_uuid, chat_key, unmapped_messages)
+                self.enqueue_backfill(
+                    account_uuid,
+                    chat_key,
+                    converter.newest_first(messages),
+                )
             except ValueError as exc:
                 if str(exc) not in {
                     "provider_chat_assignment_pending",
@@ -2598,6 +2612,8 @@ class BridgeService:
             next_anchor,
             complete,
         )
+        if complete:
+            self._record_interval_stat("catchup_completed")
         return complete and self.store.provider_catchup_ready(account_uuid)
 
     def run_provider_catchup_once(self) -> bool:
@@ -3096,11 +3112,21 @@ class BridgeService:
                 if isinstance(message, dict)
                 else event.get("flags")
             )
+            message_reactions = (
+                message.get("reactions") if isinstance(message, dict) else None
+            )
             if (
                 event.get("type") == "message"
+                and isinstance(message, dict)
                 and not isinstance(message_flags, list)
+                and not isinstance(message_reactions, list)
                 and callable(finalize_redundant_message)
-                and finalize_redundant_message(account_uuid, queue_id, event_id)
+                and finalize_redundant_message(
+                    account_uuid,
+                    queue_id,
+                    event_id,
+                    converter.provider_message_fingerprint(message),
+                )
             ):
                 processed += 1
                 continue
@@ -3612,8 +3638,11 @@ class BridgeService:
         messages: list[dict[str, object]],
     ) -> int:
         """Discover historical messages newest-first without outranking live work."""
+        started_at = time.monotonic()
         adapter = self.provider_adapters(account_uuid)
         enqueued = 0
+        generated_records = 0
+        noop_messages = 0
         assignment = self.store.assignment_for_provider_chat(
             account_uuid, provider_chat_key
         )
@@ -3675,6 +3704,9 @@ class BridgeService:
                         "backfill",
                         conversion_store,
                     )
+                    generated_records += len(records)
+                    if not records:
+                        noop_messages += 1
                     for record in records:
                         operation = typing.cast(
                             dict[str, object],
@@ -3713,6 +3745,18 @@ class BridgeService:
             # Cache only keys committed by the transaction. A retry after rollback
             # must still be able to enqueue the first durable topic projection.
             topic_cache.update(durable_topic_cache_keys)
+        self._record_interval_stat("backfill_calls")
+        self._record_interval_stat("backfill_messages", len(ordered_messages))
+        self._record_interval_stat("backfill_noop_messages", noop_messages)
+        self._record_interval_stat("backfill_operations_generated", generated_records)
+        self._record_interval_stat("backfill_operations_enqueued", enqueued)
+        self._record_interval_stat(
+            "backfill_operations_suppressed",
+            max(0, generated_records - enqueued),
+        )
+        self._record_interval_stat(
+            "backfill_enqueue_ms", (time.monotonic() - started_at) * 1000.0
+        )
         return enqueued
 
     def run_backfill_once(self) -> bool:
@@ -3728,7 +3772,14 @@ class BridgeService:
         try:
             adapter = self.provider_adapters(account_uuid)
             anchor = "newest" if job["next_anchor"] is None else int(job["next_anchor"])
+            fetch_started_at = time.monotonic()
             messages = adapter.message_history(provider_chat_key, anchor=anchor)
+            self._record_interval_stat("history_pages")
+            self._record_interval_stat("history_messages", len(messages))
+            self._record_interval_stat(
+                "history_provider_fetch_ms",
+                (time.monotonic() - fetch_started_at) * 1000.0,
+            )
         except zulip_adapter.ZulipOperationError as exc:
             authentication = self._handle_provider_account_error(
                 account_uuid, exc, self._adapter_generation(adapter)
@@ -3842,6 +3893,8 @@ class BridgeService:
             next_anchor,
             complete,
         )
+        if complete:
+            self._record_interval_stat("history_completed")
         self._record_provider_account_success(
             account_uuid, self._adapter_generation(adapter)
         )
@@ -4160,6 +4213,7 @@ class BridgeService:
             datetime.datetime.now(datetime.UTC).isoformat(),
             encoding="utf-8",
         )
+        self._log_periodic_stats(now)
         return progressed
 
     def _run_live_lane_once(self, *, before_provider_poll: bool | None = None) -> bool:

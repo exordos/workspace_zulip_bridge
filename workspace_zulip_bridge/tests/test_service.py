@@ -2,6 +2,7 @@ import collections
 import contextlib
 import datetime
 import hashlib
+import json
 import pathlib
 import threading
 import time
@@ -17,6 +18,44 @@ from workspace_zulip_bridge import (
     service,
     zulip_adapter,
 )
+
+
+def test_periodic_stats_log_is_aggregated_and_rate_limited(monkeypatch):
+    class Store:
+        def __init__(self):
+            self.reset_values = []
+
+        def confirmed_delivery_metrics(self, *, reset=False):
+            self.reset_values.append(reset)
+            return {"message_hits": 4, "message_lookups": 5}
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance._stats_lock = threading.Lock()
+    instance._stats_last_log = 10.0
+    instance._stats_counters = {
+        "backfill_messages": 120.0,
+        "backfill_operations_enqueued": 60.0,
+    }
+    logged = []
+    monkeypatch.setattr(
+        service.logger,
+        "info",
+        lambda template, payload: logged.append((template, payload)),
+    )
+
+    assert not instance._log_periodic_stats(69.0)
+    assert instance._log_periodic_stats(70.0)
+
+    assert len(logged) == 1
+    assert logged[0][0] == "bridge_interval_stats %s"
+    payload = json.loads(logged[0][1])
+    assert payload["interval_seconds"] == 60.0
+    assert payload["cache"] == {"message_hits": 4, "message_lookups": 5}
+    assert payload["import"]["backfill_messages_per_second"] == 2
+    assert payload["import"]["backfill_operations_per_second"] == 1
+    assert instance.store.reset_values == [True]
+    assert instance._stats_counters == {}
 
 
 class SnapshotControl:
@@ -833,7 +872,6 @@ def test_provider_journal_recovers_interrupted_deliveries_only_once():
             self.ambiguous_recoveries = 0
             self.stale_recoveries = 0
             self.finalized_recoveries = 0
-            self.redundant_message_recoveries = 0
 
         def mark_interrupted_workspace_deliveries_ambiguous(self):
             self.ambiguous_recoveries += 1
@@ -844,9 +882,6 @@ def test_provider_journal_recovers_interrupted_deliveries_only_once():
         def finalize_ready_provider_events(self):
             self.finalized_recoveries += 1
 
-        def finalize_redundant_provider_message_events(self):
-            self.redundant_message_recoveries += 1
-
     store = Store()
     instance = _delivery_service(store)
 
@@ -855,7 +890,6 @@ def test_provider_journal_recovers_interrupted_deliveries_only_once():
     assert store.ambiguous_recoveries == 1
     assert store.stale_recoveries == 1
     assert store.finalized_recoveries == 1
-    assert store.redundant_message_recoveries == 0
 
 
 def test_provider_journal_processes_distinct_account_heads_in_parallel():
@@ -1201,6 +1235,14 @@ def test_inactive_account_event_is_terminalized_without_provider_access():
 
 def test_committed_message_event_skips_replay_and_provider_access():
     account_uuid = "00000000-0000-4000-8000-000000000001"
+    message = {
+        "id": 42,
+        "type": "stream",
+        "stream_id": 9,
+        "subject": "Topic",
+        "sender_id": 2,
+        "content": "hello",
+    }
 
     class Store(DeliveryStore):
         def __init__(self):
@@ -1213,7 +1255,7 @@ def test_committed_message_event_skips_replay_and_provider_access():
                         "body": {
                             "id": 7,
                             "type": "message",
-                            "message": {"id": 42},
+                            "message": message,
                         },
                     }
                 ]
@@ -1221,9 +1263,11 @@ def test_committed_message_event_skips_replay_and_provider_access():
             self.finalized = []
 
         def finalize_redundant_provider_message_event(
-            self, requested, queue_id, event_id
+            self, requested, queue_id, event_id, message_fingerprint
         ):
-            self.finalized.append((requested, queue_id, event_id))
+            self.finalized.append(
+                (requested, queue_id, event_id, message_fingerprint)
+            )
             return True
 
     store = Store()
@@ -1233,7 +1277,14 @@ def test_committed_message_event_skips_replay_and_provider_access():
     )
 
     assert instance.process_provider_journal() == 1
-    assert store.finalized == [(account_uuid, "queue-1", 7)]
+    assert store.finalized == [
+        (
+            account_uuid,
+            "queue-1",
+            7,
+            converter.provider_message_fingerprint(message),
+        )
+    ]
     assert store.enqueued == []
 
 
@@ -5328,12 +5379,11 @@ def test_queue_loss_catchup_recovers_create_edit_delete_before_live_ready(
     assert instance._run_provider_queue_catchup(
         "00000000-0000-0000-0000-000000000001", CatchupAdapter()
     )
-    assert created_batches == [[13, 12]]
-    assert store.created == [13, 12]
+    assert created_batches == [[13, 12, 10]]
+    assert store.created == [13, 12, 10]
     assert [
         (event_type, message_id) for event_type, message_id, _ in converted_events
     ] == [
-        ("update_message", 10),
         ("delete_message", None),
     ]
     assert {priority for _, priority in store.enqueued} == {2}
@@ -5367,7 +5417,7 @@ def test_queue_loss_catchup_keeps_first_accepted_recovery_operations(monkeypatch
     assert instance._run_provider_queue_catchup(
         "00000000-0000-0000-0000-000000000001", CatchupAdapter()
     )
-    assert attempted == [("update_message:10", 2), ("delete_message:11", 2)]
+    assert attempted == [("delete_message:11", 2)]
     assert store.advanced == [([10, 12, 13], 9, True, None)]
 
 

@@ -224,6 +224,200 @@ def provider_chat_reference(message: dict[str, object]) -> tuple[str, str]:
     return chat_type, f"{chat_type}:{','.join(map(str, participant_ids))}"
 
 
+def provider_message_state(message: dict[str, object]) -> dict[str, object]:
+    """Return the canonical significant Zulip message state."""
+
+    chat_type, chat_id = provider_chat_reference(message)
+    state: dict[str, object] = {
+        "chat_type": chat_type,
+        "chat_id": chat_id,
+        "sender_id": int(str(message["sender_id"])),
+        "content": str(message["content"]),
+    }
+    if chat_type == "channel":
+        state.update(
+            stream_id=int(str(message["stream_id"])),
+            topic=channel_topic_name(str(message.get("subject", ""))),
+        )
+    else:
+        recipients = typing.cast(
+            list[dict[str, object]], message["display_recipient"]
+        )
+        state["participant_ids"] = sorted(
+            {int(str(recipient["id"])) for recipient in recipients}
+        )
+    edit_timestamp = message.get(
+        "last_edit_timestamp", message.get("edit_timestamp")
+    )
+    if edit_timestamp is not None:
+        state["edit_timestamp"] = str(edit_timestamp)
+    return state
+
+
+def provider_message_fingerprint(message: dict[str, object]) -> str:
+    return hashlib.sha256(
+        canonical.canonical_json(provider_message_state(message))
+    ).hexdigest()
+
+
+def _message_state_components(state: dict[str, object]) -> dict[str, object]:
+    return {key: copy.deepcopy(value) for key, value in state.items() if key != "content"}
+
+
+def _confirmed_message_entry(
+    store: ConversionStore,
+    account_uuid: str,
+    provider_message_id: str,
+    mapping: dict[str, object] | None,
+) -> dict[str, object] | None:
+    if mapping is None:
+        return None
+    metadata = typing.cast(dict[str, object], mapping.get("metadata", {}))
+    if metadata.get("workspace_delivery_state") != "committed":
+        return None
+    lookup = getattr(store, "confirmed_message_state", None)
+    cached = (
+        lookup(account_uuid, provider_message_id) if callable(lookup) else None
+    )
+    persisted_fingerprint = metadata.get("confirmed_message_fingerprint")
+    persisted_token = metadata.get("confirmed_message_token")
+    persisted_unresolved_reply = metadata.get(
+        "confirmed_message_unresolved_reply_provider_id"
+    )
+    persisted_projection_fingerprint = metadata.get(
+        "confirmed_message_projection_fingerprint"
+    )
+    persisted_projection_pending = metadata.get(
+        "confirmed_message_projection_pending"
+    )
+    if (
+        persisted_fingerprint is not None
+        and not isinstance(persisted_fingerprint, str)
+    ) or not isinstance(persisted_token, str) or (
+        persisted_unresolved_reply is not None
+        and not isinstance(persisted_unresolved_reply, str)
+    ) or (
+        persisted_projection_fingerprint is not None
+        and not isinstance(persisted_projection_fingerprint, str)
+    ) or (
+        persisted_projection_pending is not None
+        and not isinstance(persisted_projection_pending, bool)
+    ):
+        return None
+    if (
+        isinstance(cached, dict)
+        and cached.get("fingerprint") == persisted_fingerprint
+        and cached.get("token") == persisted_token
+        and cached.get("unresolved_reply_provider_id")
+        == persisted_unresolved_reply
+        and cached.get("projection_fingerprint")
+        == persisted_projection_fingerprint
+        and cached.get("projection_pending") is persisted_projection_pending
+    ):
+        return cached
+    components = metadata.get("confirmed_message_components")
+    return {
+        "fingerprint": persisted_fingerprint,
+        "token": persisted_token,
+        "unresolved_reply_provider_id": persisted_unresolved_reply,
+        "projection_fingerprint": persisted_projection_fingerprint,
+        "projection_pending": persisted_projection_pending,
+        "components": (
+            copy.deepcopy(components) if isinstance(components, dict) else None
+        ),
+    }
+
+
+def _confirmed_read_entry(
+    store: ConversionStore,
+    account_uuid: str,
+    provider_message_id: str,
+    reader_uuid: str,
+    mapping: dict[str, object],
+) -> dict[str, object] | None:
+    metadata = typing.cast(dict[str, object], mapping.get("metadata", {}))
+    if metadata.get("workspace_delivery_state") != "committed":
+        return None
+    lookup = getattr(store, "confirmed_read_state", None)
+    cached = (
+        lookup(account_uuid, provider_message_id, reader_uuid)
+        if callable(lookup)
+        else None
+    )
+    read_states = metadata.get("confirmed_read_states")
+    read_tokens = metadata.get("confirmed_read_tokens")
+    read_message_uuids = metadata.get("confirmed_read_message_uuids")
+    if (
+        not isinstance(read_states, dict)
+        or not isinstance(read_tokens, dict)
+        or not isinstance(read_message_uuids, dict)
+    ):
+        return None
+    read = read_states.get(reader_uuid)
+    token = read_tokens.get(reader_uuid)
+    message_uuid = read_message_uuids.get(reader_uuid)
+    if (
+        not isinstance(read, bool)
+        or not isinstance(token, str)
+        or not isinstance(message_uuid, str)
+    ):
+        return None
+    if (
+        isinstance(cached, dict)
+        and cached.get("read") is read
+        and cached.get("token") == token
+        and cached.get("message_uuid") == message_uuid
+    ):
+        return cached
+    return {"read": read, "token": token, "message_uuid": message_uuid}
+
+
+def _confirmed_reaction_entry(
+    store: ConversionStore,
+    account_uuid: str,
+    provider_message_id: str,
+    provider_user_id: str,
+    normalized_emoji_code: str,
+) -> dict[str, object] | None:
+    lookup = getattr(store, "confirmed_reaction_state", None)
+    value = (
+        lookup(
+            account_uuid,
+            provider_message_id,
+            provider_user_id,
+            normalized_emoji_code,
+        )
+        if callable(lookup)
+        else None
+    )
+    return value if isinstance(value, dict) else None
+
+
+def _record_confirmed_skip(store: ConversionStore, kind: str) -> None:
+    recorder = getattr(store, "record_confirmed_delivery_skip", None)
+    if callable(recorder):
+        recorder(kind)
+
+
+def _reaction_projection_matches(
+    mapping: dict[str, object], expected: dict[str, object]
+) -> bool:
+    metadata = mapping.get("metadata")
+    if not isinstance(metadata, dict):
+        return False
+    return all(
+        metadata.get(field) == expected.get(field)
+        for field in (
+            "project_uuid",
+            "stream_uuid",
+            "topic_uuid",
+            "message_uuid",
+            "user_uuid",
+            "emoji_name",
+        )
+    )
+
+
 def provider_chat_assignment(
     store: ConversionStore, account_uuid: str, provider_chat_key: str
 ) -> tuple[str, bool]:
@@ -399,7 +593,20 @@ def _record(
 ) -> dict[str, object]:
     mapping_plan = operation.pop("_mapping_plan", None)
     mapping_delete = operation.pop("_mapping_delete", None)
-    operation_uuid = operation_uuid_for(account_uuid, queue_id, event_id, subindex)
+    confirmed_state = operation.pop("_confirmed_state", None)
+    operation_source = queue_id
+    operation_subindex = subindex
+    if delivery_class == "backfill" and isinstance(confirmed_state, dict):
+        transition_digest = hashlib.sha256(
+            canonical.canonical_json(confirmed_state)
+        ).hexdigest()
+        operation_source = (
+            f"{queue_id}:confirmed-delivery-state-v1:{transition_digest}"
+        )
+        operation_subindex = 0
+    operation_uuid = operation_uuid_for(
+        account_uuid, operation_source, event_id, operation_subindex
+    )
     sequence, predecessor = store.producer_lane_position(
         operation_uuid, "zulip", causal_lane
     )
@@ -426,6 +633,8 @@ def _record(
         transport["reaction_mapping"] = mapping_plan
     if isinstance(mapping_delete, dict):
         transport["reaction_mapping_delete"] = mapping_delete
+    if isinstance(confirmed_state, dict):
+        transport["confirmed_delivery_state"] = confirmed_state
     if transport:
         record["transport"] = transport
     extensions = typing.cast(dict[str, object], operation.setdefault("extensions", {}))
@@ -938,10 +1147,14 @@ def _reaction_operations(
     kind: str,
     occurred_at: str,
 ) -> list[dict[str, object]]:
+    provider_message_id = str(int(str(provider_message_id)))
     provider_user_id = str(int(str(reaction["user_id"])))
     emoji_name = str(reaction["emoji_name"])
     emoji_code = str(reaction["emoji_code"])
     reaction_type = str(reaction["reaction_type"])
+    normalized_emoji_code = emoji.normalized_reaction_code(
+        reaction_type, emoji_code
+    )
     workspace_emoji_name = (
         emoji.unicode_emoji_from_code(emoji_code)
         if reaction_type == "unicode_emoji"
@@ -969,6 +1182,9 @@ def _reaction_operations(
         emoji_code,
     )
     reaction_metadata = {
+        "provider_message_id": provider_message_id,
+        "provider_user_id": provider_user_id,
+        "normalized_emoji_code": normalized_emoji_code,
         "project_uuid": project_uuid,
         "stream_uuid": stream_uuid,
         "topic_uuid": topic_uuid,
@@ -985,10 +1201,17 @@ def _reaction_operations(
         provider_user_id,
         emoji_name,
     )
+    confirmed_reaction = _confirmed_reaction_entry(
+        store,
+        account_uuid,
+        provider_message_id,
+        provider_user_id,
+        normalized_emoji_code,
+    )
     create_if_missing = kind != "reaction.delete"
     existing, displaced = store.plan_reaction_mapping(
         account_uuid,
-        str(int(str(provider_message_id))),
+        provider_message_id,
         provider_user_id,
         provider_reaction_id,
         legacy_provider_reaction_id,
@@ -997,7 +1220,30 @@ def _reaction_operations(
         create_if_missing,
     )
     if existing is None:
+        if (
+            kind == "reaction.delete"
+            and confirmed_reaction is not None
+            and confirmed_reaction.get("state") == "absent"
+        ):
+            _record_confirmed_skip(store, "reaction")
         return []
+    if (
+        kind == "reaction.upsert"
+        and confirmed_reaction is not None
+        and confirmed_reaction.get("state") == "present"
+        and existing.get("deleted") is not True
+        and str(existing.get("provider_id")) == provider_reaction_id
+        and not displaced
+        and _reaction_projection_matches(existing, reaction_metadata)
+    ):
+        _record_confirmed_skip(store, "reaction")
+        return []
+    prior_token = (
+        confirmed_reaction.get("token")
+        if isinstance(confirmed_reaction, dict)
+        and isinstance(confirmed_reaction.get("token"), str)
+        else None
+    )
     if identity is None:
         identity_metadata = _unavailable_zulip_identity_metadata(provider_user_id)
         store.remember_provider_mapping(
@@ -1050,6 +1296,15 @@ def _reaction_operations(
                     "workspace_uuid": str(duplicate["workspace_uuid"]),
                     "provider_id": str(duplicate["provider_id"]),
                 },
+                "_confirmed_state": {
+                    "kind": "reaction",
+                    "provider_message_id": provider_message_id,
+                    "provider_user_id": provider_user_id,
+                    "provider_id": str(duplicate["provider_id"]),
+                    "normalized_emoji_code": normalized_emoji_code,
+                    "state": "absent",
+                    "prior_token": prior_token,
+                },
             }
         )
     operations.append(
@@ -1073,7 +1328,7 @@ def _reaction_operations(
                 "reaction_type": reaction_type,
             },
             "_mapping_plan": {
-                "provider_message_id": str(int(str(provider_message_id))),
+                "provider_message_id": provider_message_id,
                 "provider_user_id": provider_user_id,
                 "provider_id": provider_reaction_id,
                 "legacy_provider_id": legacy_provider_reaction_id,
@@ -1087,6 +1342,15 @@ def _reaction_operations(
                     }
                     for mapping in displaced
                 ],
+            },
+            "_confirmed_state": {
+                "kind": "reaction",
+                "provider_message_id": provider_message_id,
+                "provider_user_id": provider_user_id,
+                "provider_id": provider_reaction_id,
+                "normalized_emoji_code": normalized_emoji_code,
+                "state": "present" if kind == "reaction.upsert" else "absent",
+                "prior_token": prior_token,
             },
         }
     )
@@ -1321,6 +1585,11 @@ def message_event_records(
         raise ValueError("unknown_external_account")
     owner_uuid = str(account["owner_user_uuid"])
     provider_message_id = str(message["id"])
+    current_message_state = provider_message_state(message)
+    current_message_fingerprint = hashlib.sha256(
+        canonical.canonical_json(current_message_state)
+    ).hexdigest()
+    current_message_components = _message_state_components(current_message_state)
     existing_message = provider_message_mapping(
         store,
         account_uuid,
@@ -1414,6 +1683,12 @@ def message_event_records(
             or existing_message_metadata.get("workspace_delivery_state") == "committed"
         )
         and not pending_delete
+    )
+    confirmed_message = _confirmed_message_entry(
+        store,
+        account_uuid,
+        provider_message_id,
+        existing_message,
     )
     occurred_at_dt = datetime.datetime.fromtimestamp(
         float(message["timestamp"]), datetime.UTC
@@ -1528,29 +1803,64 @@ def message_event_records(
         "payload": {"kind": "markdown", "content": markdown},
         "reply_to_message_uuid": reply_to_message_uuid,
     }
-    if isinstance(flags, list):
-        # History catch-up can race ahead of an earlier live read-state event.
-        # Carry the snapshot value on the message projection as the convergent
-        # source of truth instead of relying only on a separate flag operation.
-        message_payload["read"] = "read" in flags
+    unresolved_reply_provider_id = (
+        reply_provider_id
+        if reply_provider_id is not None and reply_mapping is None
+        else None
+    )
+    current_projection_fingerprint = hashlib.sha256(
+        canonical.canonical_json(message_payload)
+    ).hexdigest()
+    current_projection_pending = bool(lossy or unresolved_reply_provider_id)
+    message_upsert_required = (
+        not workspace_delivery_committed
+        or confirmed_message is None
+        or confirmed_message.get("fingerprint") != current_message_fingerprint
+        or confirmed_message.get("unresolved_reply_provider_id")
+        != unresolved_reply_provider_id
+        or confirmed_message.get("projection_fingerprint")
+        != current_projection_fingerprint
+        or confirmed_message.get("projection_pending")
+        is not current_projection_pending
+    )
+    if not message_upsert_required and not same_live_event_replay:
+        _record_confirmed_skip(store, "message")
+    message_revision = (
+        current_message_components.get("edit_timestamp")
+        if workspace_delivery_committed
+        else None
+    )
     message_operation = {
         "kind": (
-            "message.update"
-            if delivery_class == "backfill" and workspace_delivery_committed
-            else "message.create"
+            "message.update" if workspace_delivery_committed else "message.create"
         ),
         "entity_uuid": message_uuid,
         "actor_uuid": author_uuid,
         "occurred_at": occurred_at,
-        "provider": _provider(chat_key, provider_message_id),
+        "provider": _provider(
+            chat_key,
+            provider_message_id,
+            str(message_revision) if message_revision is not None else None,
+        ),
         "payload": message_payload,
         "extensions": {
             "provider_badge": "zulip",
             "provider_original_url": message_url,
             "lossy_conversion": lossy,
-            "unresolved_reply_provider_id": (
-                reply_provider_id
-                if reply_provider_id is not None and reply_mapping is None
+            "unresolved_reply_provider_id": unresolved_reply_provider_id,
+        },
+        "_confirmed_state": {
+            "kind": "message",
+            "provider_message_id": provider_message_id,
+            "fingerprint": current_message_fingerprint,
+            "components": current_message_components,
+            "unresolved_reply_provider_id": unresolved_reply_provider_id,
+            "projection_fingerprint": current_projection_fingerprint,
+            "projection_pending": current_projection_pending,
+            "prior_token": (
+                confirmed_message.get("token")
+                if isinstance(confirmed_message, dict)
+                and isinstance(confirmed_message.get("token"), str)
                 else None
             ),
         },
@@ -1562,6 +1872,44 @@ def message_event_records(
         # topic mappings, so rendering them again after recanonicalization can
         # otherwise change the digest of the same deterministic operation UUID.
         message_operation = copy.deepcopy(accepted_message_operation)
+        accepted_extensions = message_operation.get("extensions")
+        accepted_unresolved_reply = (
+            accepted_extensions.get("unresolved_reply_provider_id")
+            if isinstance(accepted_extensions, dict)
+            else None
+        )
+        accepted_payload = message_operation.get("payload")
+        accepted_projection_fingerprint = (
+            hashlib.sha256(canonical.canonical_json(accepted_payload)).hexdigest()
+            if isinstance(accepted_payload, dict)
+            else None
+        )
+        accepted_projection_pending = bool(
+            isinstance(accepted_extensions, dict)
+            and (
+                accepted_extensions.get("lossy_conversion") is True
+                or accepted_unresolved_reply is not None
+            )
+        )
+        message_operation["_confirmed_state"] = {
+            "kind": "message",
+            "provider_message_id": provider_message_id,
+            "fingerprint": current_message_fingerprint,
+            "components": current_message_components,
+            "unresolved_reply_provider_id": (
+                str(accepted_unresolved_reply)
+                if accepted_unresolved_reply is not None
+                else None
+            ),
+            "projection_fingerprint": accepted_projection_fingerprint,
+            "projection_pending": accepted_projection_pending,
+            "prior_token": (
+                confirmed_message.get("token")
+                if isinstance(confirmed_message, dict)
+                and isinstance(confirmed_message.get("token"), str)
+                else None
+            ),
+        }
     # Control-plane assignments materialize the stream projection. The first
     # provider message still confirms that the backend-owned topic exists, but
     # repeating the same durable upsert for every later message doubles live
@@ -1597,36 +1945,69 @@ def message_event_records(
             }
         )
     message_operation_included = (
-        not workspace_delivery_committed
-        or delivery_class == "backfill"
-        or same_live_event_replay
+        message_upsert_required or same_live_event_replay
     )
     if message_operation_included:
         operations.append(message_operation)
-    if isinstance(flags, list) and (
-        delivery_class == "backfill" or not message_operation_included
-    ):
-        # Keep the owner's exact read flag independent from the message
-        # snapshot.  Backend freshness fencing may correctly discard an older
-        # history message update after a newer live edit, but that must not
-        # discard the current per-account Zulip read state with it.
-        operations.append(
-            {
-                "kind": "read_state.set",
-                "entity_uuid": stream_uuid,
-                "actor_uuid": owner_uuid,
-                "occurred_at": occurred_at,
-                "provider": _provider(chat_key, None),
-                "payload": {
-                    "stream_uuid": stream_uuid,
-                    "topic_uuid": topic_uuid,
-                    "reader_uuid": owner_uuid,
-                    "message_uuids": [message_uuid],
-                    "read": "read" in flags,
-                },
-                "extensions": {"provider_badge": "zulip"},
-            }
+    # Keep the owner's exact read flag independent from the message snapshot.
+    # Backend freshness fencing may discard an older history message update,
+    # but that must not discard the current per-account Zulip read state.
+    if isinstance(flags, list):
+        desired_read = "read" in flags
+        confirmed_read = (
+            _confirmed_read_entry(
+                store,
+                account_uuid,
+                provider_message_id,
+                owner_uuid,
+                existing_message,
+            )
+            if existing_message is not None
+            else None
         )
+        if (
+            confirmed_read is None
+            or confirmed_read.get("read") is not desired_read
+            or confirmed_read.get("message_uuid") != message_uuid
+        ):
+            prior_read_token = (
+                confirmed_read.get("token")
+                if isinstance(confirmed_read, dict)
+                and isinstance(confirmed_read.get("token"), str)
+                else None
+            )
+            read_state = {
+                "kind": "read_state",
+                "reader_uuid": owner_uuid,
+                "read": desired_read,
+                "items": [
+                    {
+                        "provider_message_id": provider_message_id,
+                        "message_uuid": message_uuid,
+                        "prior_token": prior_read_token,
+                    }
+                ],
+            }
+            operations.append(
+                {
+                    "kind": "read_state.set",
+                    "entity_uuid": stream_uuid,
+                    "actor_uuid": owner_uuid,
+                    "occurred_at": occurred_at,
+                    "provider": _provider(chat_key, None),
+                    "payload": {
+                        "stream_uuid": stream_uuid,
+                        "topic_uuid": topic_uuid,
+                        "reader_uuid": owner_uuid,
+                        "message_uuids": [message_uuid],
+                        "read": desired_read,
+                    },
+                    "extensions": {"provider_badge": "zulip"},
+                    "_confirmed_state": read_state,
+                }
+            )
+        else:
+            _record_confirmed_skip(store, "read")
     store.remember_provider_mapping(
         account_uuid,
         "stream",
@@ -2103,12 +2484,21 @@ def _mapped_event_records(
             next_subindex += 1
         return records
     if event_type == "update_message_flags" and event.get("flag") == "read":
-        grouped: dict[tuple[str, str, str, str], list[dict[str, object]]] = {}
+        desired_read = event.get("op") == "add"
+        grouped: dict[
+            tuple[str, str, str, str],
+            list[tuple[dict[str, object], dict[str, object] | None]],
+        ] = {}
+        seen_provider_message_ids: set[str] = set()
         for provider_message_id_raw in typing.cast(list[object], message_ids or []):
+            provider_message_id = str(provider_message_id_raw)
+            if provider_message_id in seen_provider_message_ids:
+                continue
+            seen_provider_message_ids.add(provider_message_id)
             mapping = provider_message_mapping(
                 store,
                 account_uuid,
-                str(provider_message_id_raw),
+                provider_message_id,
             )
             if mapping is None:
                 continue
@@ -2133,18 +2523,49 @@ def _mapped_event_records(
                 # the convergent read-state source; do not submit a permanently
                 # invalid read event against the retired projection.
                 continue
+            confirmed_read = _confirmed_read_entry(
+                store,
+                account_uuid,
+                provider_message_id,
+                owner_uuid,
+                mapping,
+            )
+            if (
+                confirmed_read is not None
+                and confirmed_read.get("read") is desired_read
+                and confirmed_read.get("message_uuid")
+                == str(mapping["workspace_uuid"])
+            ):
+                _record_confirmed_skip(store, "read")
+                continue
             key = (
                 str(metadata["project_uuid"]),
                 str(metadata["stream_uuid"]),
                 str(metadata["topic_uuid"]),
                 chat_key,
             )
-            grouped.setdefault(key, []).append(mapping)
-        for (project_uuid, stream_uuid, topic_uuid, chat_key), mappings in sorted(
+            grouped.setdefault(key, []).append((mapping, confirmed_read))
+        for (project_uuid, stream_uuid, topic_uuid, chat_key), entries in sorted(
             grouped.items()
         ):
             message_uuids = sorted(
-                str(mapping["workspace_uuid"]) for mapping in mappings
+                str(mapping["workspace_uuid"]) for mapping, _confirmed in entries
+            )
+            confirmed_items = sorted(
+                (
+                    {
+                        "provider_message_id": str(mapping["provider_id"]),
+                        "message_uuid": str(mapping["workspace_uuid"]),
+                        "prior_token": (
+                            confirmed.get("token")
+                            if isinstance(confirmed, dict)
+                            and isinstance(confirmed.get("token"), str)
+                            else None
+                        ),
+                    }
+                    for mapping, confirmed in entries
+                ),
+                key=lambda item: str(item["provider_message_id"]),
             )
             operation = {
                 "kind": "read_state.set",
@@ -2157,9 +2578,15 @@ def _mapped_event_records(
                     "topic_uuid": topic_uuid,
                     "reader_uuid": owner_uuid,
                     "message_uuids": message_uuids,
-                    "read": event.get("op") == "add",
+                    "read": desired_read,
                 },
                 "extensions": {"provider_badge": "zulip"},
+                "_confirmed_state": {
+                    "kind": "read_state",
+                    "reader_uuid": owner_uuid,
+                    "read": desired_read,
+                    "items": confirmed_items,
+                },
             }
             records.append(
                 _record(
@@ -2394,6 +2821,64 @@ def _mapped_event_records(
             }
         else:
             continue
+        if operation["kind"] == "message.update":
+            prior_message = _confirmed_message_entry(
+                store,
+                account_uuid,
+                provider_message_id,
+                mapping,
+            )
+            prior_components = (
+                prior_message.get("components")
+                if isinstance(prior_message, dict)
+                else None
+            )
+            updated_components = (
+                copy.deepcopy(prior_components)
+                if isinstance(prior_components, dict)
+                else None
+            )
+            updated_fingerprint = None
+            if isinstance(updated_components, dict):
+                if updated_chat_key.startswith("channel:"):
+                    updated_components.update(
+                        chat_type="channel",
+                        chat_id=updated_chat_key,
+                        stream_id=int(
+                            updated_chat_key.removeprefix("channel:")
+                        ),
+                    )
+                    if destination_topic_name is not None:
+                        updated_components["topic"] = channel_topic_name(
+                            destination_topic_name
+                        )
+                    elif event.get("subject") is not None:
+                        updated_components["topic"] = channel_topic_name(
+                            str(event["subject"])
+                        )
+                edit_timestamp = event.get("edit_timestamp")
+                if edit_timestamp is not None:
+                    updated_components["edit_timestamp"] = str(edit_timestamp)
+                if event.get("content") is not None:
+                    updated_state = {
+                        **updated_components,
+                        "content": str(event["content"]),
+                    }
+                    updated_fingerprint = hashlib.sha256(
+                        canonical.canonical_json(updated_state)
+                    ).hexdigest()
+            operation["_confirmed_state"] = {
+                "kind": "message",
+                "provider_message_id": provider_message_id,
+                "fingerprint": updated_fingerprint,
+                "components": updated_components,
+                "prior_token": (
+                    prior_message.get("token")
+                    if isinstance(prior_message, dict)
+                    and isinstance(prior_message.get("token"), str)
+                    else None
+                ),
+            }
         records.append(
             _record(
                 store,

@@ -53,3 +53,13 @@ def unicode_emoji_from_code(value: str) -> str:
 
 def canonical_unicode_emoji_code(value: str) -> str:
     return unicode_emoji_code(unicode_emoji_from_code(value))
+
+
+def normalized_reaction_code(reaction_type: str, emoji_code: str) -> str:
+    """Return the collision-safe code used by confirmed reaction state keys."""
+
+    normalized_type = unicodedata.normalize("NFC", str(reaction_type))
+    normalized_code = unicodedata.normalize("NFC", str(emoji_code))
+    if normalized_type == "unicode_emoji":
+        normalized_code = canonical_unicode_emoji_code(normalized_code)
+    return f"{normalized_type}:{normalized_code}"
