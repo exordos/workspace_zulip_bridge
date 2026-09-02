@@ -554,6 +554,38 @@ def test_message_author_mismatch_is_rejected_before_attachment_export():
     assert client.sent == []
 
 
+@pytest.mark.parametrize("entrypoint", ["prepare", "apply"])
+@pytest.mark.parametrize(
+    "kind",
+    ["reaction.create", "reaction.update", "reaction.delete"],
+)
+def test_reaction_write_rejects_actor_different_from_account_owner(entrypoint, kind):
+    client = FakeClient()
+    adapter = _adapter(client)
+    operation = {
+        "kind": kind,
+        "provider": {"kind": "zulip", "chat_id": "channel:42"},
+        "payload": {
+            "message_uuid": MESSAGE_UUID,
+            "user_uuid": USER_2_UUID,
+            "emoji_name": "heart",
+            "previous_message_uuid": MESSAGE_UUID,
+            "previous_emoji_name": "thumbs_up",
+        },
+    }
+
+    with pytest.raises(zulip_adapter.ZulipOperationError) as error:
+        if entrypoint == "prepare":
+            adapter.prepare(operation, "operation-1")
+        else:
+            adapter.apply(operation)
+
+    assert error.value.code == "permission_denied"
+    assert not error.value.retryable
+    assert client.added_reactions == []
+    assert client.removed_reactions == []
+
+
 def test_outbound_mentions_and_attachments_use_provider_formats_without_raw_urns():
     class FileClient:
         def __init__(self):
