@@ -124,6 +124,19 @@ def test_provider_lease_adapts_to_existing_durable_zulip_scheduler():
     assert record["transport"]["lease_uuid"] == leased["lease_uuid"]
 
 
+@pytest.mark.parametrize("kind", ["message.update", "message.delete"])
+def test_provider_message_mutation_exposes_canonical_actor(kind):
+    leased = _lease(kind)
+
+    record = provider_protocol.leased_operation_record(Store(), leased)
+
+    operation = record["operation"]
+    assert operation["kind"] == kind
+    assert operation["actor_uuid"] == ACCOUNT_UUID
+    assert operation["payload"]["user_uuid"] == ACCOUNT_UUID
+    assert "author_uuid" not in operation["payload"]
+
+
 @pytest.mark.parametrize(
     ("kind", "required_capability", "payload", "expected_bridge_kind"),
     [

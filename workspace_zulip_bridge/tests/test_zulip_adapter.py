@@ -357,6 +357,7 @@ def _operation(chat_kind="channel"):
     }[chat_kind]
     return {
         "kind": "message.create",
+        "actor_uuid": AUTHOR_UUID,
         "provider": {
             "kind": "zulip",
             "chat_id": chat_key,
@@ -501,7 +502,7 @@ def test_message_create_rejects_author_different_from_account_owner(entrypoint):
     client = FakeClient()
     adapter = _adapter(client)
     operation = _operation()
-    operation["payload"]["author_uuid"] = USER_2_UUID
+    operation["actor_uuid"] = USER_2_UUID
 
     with pytest.raises(zulip_adapter.ZulipOperationError) as error:
         if entrypoint == "prepare":
@@ -518,6 +519,30 @@ def test_message_create_rejects_author_different_from_account_owner(entrypoint):
     assert not error.value.retryable
     assert client.sent == []
     assert not hasattr(client, "last_get_messages")
+
+
+@pytest.mark.parametrize("entrypoint", ["prepare", "apply"])
+@pytest.mark.parametrize("kind", ["message.update", "message.delete"])
+def test_message_mutation_rejects_author_different_from_account_owner(
+    entrypoint,
+    kind,
+):
+    client = FakeClient()
+    adapter = _adapter(client)
+    operation = _operation()
+    operation["kind"] = kind
+    operation["actor_uuid"] = USER_2_UUID
+
+    with pytest.raises(zulip_adapter.ZulipOperationError) as error:
+        if entrypoint == "prepare":
+            adapter.prepare(operation, "operation-1")
+        else:
+            adapter.apply(operation)
+
+    assert error.value.code == "permission_denied"
+    assert not error.value.retryable
+    assert client.updated == []
+    assert client.deleted == []
 
 
 def test_message_author_mismatch_is_rejected_before_attachment_export():
@@ -541,7 +566,7 @@ def test_message_author_mismatch_is_rejected_before_attachment_export():
     )
     adapter.restore_queue("queue-1", 7)
     operation = _operation()
-    operation["payload"]["author_uuid"] = USER_2_UUID
+    operation["actor_uuid"] = USER_2_UUID
     operation["payload"]["payload"]["content"] = (
         "[report.pdf](urn:file:10000000-0000-4000-8000-000000000008)"
     )
@@ -565,6 +590,7 @@ def test_reaction_write_rejects_actor_different_from_account_owner(entrypoint, k
     adapter = _adapter(client)
     operation = {
         "kind": kind,
+        "actor_uuid": USER_2_UUID,
         "provider": {"kind": "zulip", "chat_id": "channel:42"},
         "payload": {
             "message_uuid": MESSAGE_UUID,
@@ -585,6 +611,73 @@ def test_reaction_write_rejects_actor_different_from_account_owner(entrypoint, k
     assert not error.value.retryable
     assert client.added_reactions == []
     assert client.removed_reactions == []
+
+
+@pytest.mark.parametrize("entrypoint", ["prepare", "apply"])
+@pytest.mark.parametrize(
+    "operation",
+    [
+        {
+            "kind": "read_state.set",
+            "actor_uuid": USER_2_UUID,
+            "provider": {"kind": "zulip", "chat_id": "channel:42"},
+            "payload": {
+                "stream_uuid": STREAM_UUID,
+                "topic_uuid": TOPIC_UUID,
+                "reader_uuid": USER_2_UUID,
+                "through_message_uuid": MESSAGE_UUID,
+                "read": True,
+            },
+        },
+        {
+            "kind": "stream.notification.update",
+            "actor_uuid": USER_2_UUID,
+            "entity_uuid": STREAM_UUID,
+            "provider": {"kind": "zulip", "chat_id": "channel:42"},
+            "payload": {
+                "uuid": STREAM_UUID,
+                "stream_uuid": STREAM_UUID,
+                "user_uuid": USER_2_UUID,
+                "notification_mode": "all_messages",
+                "notification_updated_at": "2026-08-23T12:30:00Z",
+            },
+        },
+        {
+            "kind": "topic.notification.update",
+            "actor_uuid": USER_2_UUID,
+            "entity_uuid": TOPIC_UUID,
+            "provider": {"kind": "zulip", "chat_id": "channel:42"},
+            "payload": {
+                "uuid": TOPIC_UUID,
+                "stream_uuid": STREAM_UUID,
+                "user_uuid": USER_2_UUID,
+                "notification_mode": "follow",
+                "notification_updated_at": "2026-08-23T12:31:00Z",
+            },
+        },
+    ],
+    ids=["read-state", "stream-notification", "topic-notification"],
+)
+def test_user_state_write_rejects_actor_different_from_account_owner(
+    entrypoint,
+    operation,
+):
+    client = FakeClient()
+    adapter = _adapter(client)
+
+    with pytest.raises(zulip_adapter.ZulipOperationError) as error:
+        if entrypoint == "prepare":
+            adapter.prepare(operation, "operation-1")
+        else:
+            adapter.apply(operation)
+
+    assert error.value.code == "permission_denied"
+    assert not error.value.retryable
+    assert client.flags == []
+    assert client.read_streams == []
+    assert client.read_topics == []
+    assert client.subscription_settings == []
+    assert client.endpoint_requests == []
 
 
 def test_outbound_mentions_and_attachments_use_provider_formats_without_raw_urns():
@@ -1032,13 +1125,24 @@ def test_outbound_update_attachment_uses_real_external_chat_uuid():
     assert client.updated[0]["content"] == "[report.pdf](/user_uploads/file)"
 
 
+@pytest.mark.parametrize("entrypoint", ["prepare", "apply"])
 @pytest.mark.parametrize("kind", ["message.update", "message.delete"])
-def test_message_mutation_resolves_provider_id_after_create(kind):
+def test_message_mutation_uses_canonical_actor_with_existing_payload_shape(
+    entrypoint,
+    kind,
+):
     client = FakeClient()
     adapter = _adapter(client)
     operation = _operation()
     operation["kind"] = kind
     operation["entity_uuid"] = MESSAGE_UUID
+    operation["payload"]["user_uuid"] = operation["payload"].pop("author_uuid")
+
+    if entrypoint == "prepare":
+        assert adapter.prepare(operation, "operation-1") is None
+        assert client.updated == []
+        assert client.deleted == []
+        return
 
     assert adapter.apply(operation) == ("99", None)
     if kind == "message.update":
@@ -1096,6 +1200,7 @@ def test_read_state_resolves_canonical_workspace_message_uuid():
     adapter = _adapter(client)
     operation = {
         "kind": "read_state.set",
+        "actor_uuid": OWNER_UUID,
         "provider": {
             "kind": "zulip",
             "chat_id": "channel:42",
@@ -1131,6 +1236,7 @@ def test_read_state_boundary_expands_all_mapped_messages_in_scope():
     adapter = _adapter(client, routing=Routing())
     operation = {
         "kind": "read_state.set",
+        "actor_uuid": OWNER_UUID,
         "provider": {"kind": "zulip", "chat_id": "channel:42"},
         "payload": {
             "stream_uuid": STREAM_UUID,
@@ -1149,6 +1255,7 @@ def test_exact_read_state_updates_only_listed_messages():
     adapter = _adapter(client)
     operation = {
         "kind": "read_state.set",
+        "actor_uuid": OWNER_UUID,
         "provider": {"kind": "zulip", "chat_id": "channel:42"},
         "payload": {
             "stream_uuid": STREAM_UUID,
@@ -1187,6 +1294,7 @@ def test_exact_read_state_resolves_the_page_with_one_bulk_mapping_call():
     adapter = _adapter(client, routing=routing)
     operation = {
         "kind": "read_state.set",
+        "actor_uuid": OWNER_UUID,
         "provider": {"kind": "zulip", "chat_id": "channel:42"},
         "payload": {
             "stream_uuid": STREAM_UUID,
@@ -1207,6 +1315,7 @@ def test_reaction_create_update_and_delete_use_official_client_semantics():
     adapter = _adapter(client)
     create = {
         "kind": "reaction.create",
+        "actor_uuid": OWNER_UUID,
         "provider": {"kind": "zulip", "chat_id": "channel:42"},
         "payload": {
             "message_uuid": MESSAGE_UUID,
@@ -1220,6 +1329,7 @@ def test_reaction_create_update_and_delete_use_official_client_semantics():
 
     update = {
         "kind": "reaction.update",
+        "actor_uuid": OWNER_UUID,
         "provider": {"kind": "zulip", "chat_id": "channel:42"},
         "payload": {
             "message_uuid": MESSAGE_UUID,
@@ -1247,6 +1357,7 @@ def test_reaction_create_update_and_delete_use_official_client_semantics():
 
     delete = {
         "kind": "reaction.delete",
+        "actor_uuid": OWNER_UUID,
         "provider": {"kind": "zulip", "chat_id": "channel:42"},
         "payload": {
             "message_uuid": MESSAGE_UUID,
@@ -1292,6 +1403,7 @@ def test_workspace_unicode_reaction_uses_zulip_server_emoji_identity(monkeypatch
 
     create = {
         "kind": "reaction.create",
+        "actor_uuid": OWNER_UUID,
         "provider": {"kind": "zulip", "chat_id": "channel:42"},
         "payload": {
             "message_uuid": MESSAGE_UUID,
@@ -1301,6 +1413,7 @@ def test_workspace_unicode_reaction_uses_zulip_server_emoji_identity(monkeypatch
     }
     delete = {
         "kind": "reaction.delete",
+        "actor_uuid": OWNER_UUID,
         "provider": {"kind": "zulip", "chat_id": "channel:42"},
         "payload": {
             "message_uuid": MESSAGE_UUID,
@@ -1342,6 +1455,7 @@ def test_reaction_retries_converge_after_ambiguous_provider_commit():
     assert adapter.apply(
         {
             "kind": "reaction.create",
+            "actor_uuid": OWNER_UUID,
             "provider": {"kind": "zulip", "chat_id": "channel:42"},
             "payload": {
                 "message_uuid": MESSAGE_UUID,
@@ -1353,6 +1467,7 @@ def test_reaction_retries_converge_after_ambiguous_provider_commit():
     assert adapter.apply(
         {
             "kind": "reaction.delete",
+            "actor_uuid": OWNER_UUID,
             "provider": {"kind": "zulip", "chat_id": "channel:42"},
             "payload": {
                 "message_uuid": MESSAGE_UUID,
@@ -1384,6 +1499,7 @@ def test_exact_read_state_does_not_reinterpret_workspace_order_as_provider_bound
     adapter = _adapter(client, routing=Routing())
     operation = {
         "kind": "read_state.set",
+        "actor_uuid": OWNER_UUID,
         "provider": {"kind": "zulip", "chat_id": "channel:42"},
         "payload": {
             "stream_uuid": STREAM_UUID,
@@ -1415,6 +1531,7 @@ def test_exact_read_state_updates_mapped_messages_when_one_message_is_unmapped()
     adapter = _adapter(client, routing=Routing())
     operation = {
         "kind": "read_state.set",
+        "actor_uuid": OWNER_UUID,
         "provider": {"kind": "zulip", "chat_id": "channel:42"},
         "payload": {
             "stream_uuid": STREAM_UUID,
@@ -1441,6 +1558,7 @@ def test_exact_read_state_succeeds_as_noop_when_all_messages_are_unmapped():
     adapter = _adapter(client, routing=Routing())
     operation = {
         "kind": "read_state.set",
+        "actor_uuid": OWNER_UUID,
         "provider": {"kind": "zulip", "chat_id": "channel:42"},
         "payload": {
             "stream_uuid": STREAM_UUID,
@@ -1462,6 +1580,7 @@ def test_exact_read_state_uses_server_bound_provider_message_ids():
     adapter = _adapter(client, routing=FakeRouting())
     operation = {
         "kind": "read_state.set",
+        "actor_uuid": OWNER_UUID,
         "provider": {"kind": "zulip", "chat_id": "channel:42"},
         "payload": {
             "stream_uuid": STREAM_UUID,
@@ -1494,6 +1613,7 @@ def test_topic_read_state_without_boundary_uses_canonical_topic_mapping():
     adapter = _adapter(client)
     operation = {
         "kind": "read_state.set",
+        "actor_uuid": OWNER_UUID,
         "provider": {
             "kind": "zulip",
             "chat_id": "channel:42",
@@ -1576,6 +1696,7 @@ def test_stream_notification_modes_use_official_subscription_api(mode, expected)
     adapter = _adapter(client)
     operation = {
         "kind": "stream.notification.update",
+        "actor_uuid": OWNER_UUID,
         "entity_uuid": STREAM_UUID,
         "provider": {"kind": "zulip", "chat_id": "channel:42"},
         "payload": {
@@ -1596,6 +1717,7 @@ def test_topic_notification_mode_uses_user_topic_endpoint():
     adapter = _adapter(client)
     operation = {
         "kind": "topic.notification.update",
+        "actor_uuid": OWNER_UUID,
         "entity_uuid": TOPIC_UUID,
         "provider": {"kind": "zulip", "chat_id": "channel:42"},
         "payload": {
@@ -1640,6 +1762,7 @@ def test_newer_provider_notification_observation_skips_stale_workspace_write():
     adapter = _adapter(client, routing=Routing())
     operation = {
         "kind": "stream.notification.update",
+        "actor_uuid": OWNER_UUID,
         "entity_uuid": STREAM_UUID,
         "provider": {"kind": "zulip", "chat_id": "channel:42"},
         "payload": {
