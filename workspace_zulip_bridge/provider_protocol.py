@@ -27,6 +27,7 @@ _OUTBOUND_KIND = {
 
 _INBOUND_KIND = {
     "identity.upsert": "identity.upsert",
+    "history.finalize": "history.finalize",
     "stream.upsert": "stream.upsert",
     "stream.delete": "stream.delete",
     "topic.upsert": "topic.upsert",
@@ -70,6 +71,7 @@ def _chat_key(store, account_uuid: str, kind: str, payload: dict[str, object]):
     elif (
         kind.startswith(("topic.", "message.", "membership."))
         or kind == "read_state.set"
+        or kind == "history.finalize"
     ):
         stream_uuid = payload["stream_uuid"]
     elif kind.startswith("reaction."):
@@ -505,6 +507,7 @@ def command_payload(store, record: dict[str, object]) -> dict[str, object] | Non
         "message": "message",
         "reaction": "reaction",
         "read_state": "read-state",
+        "history": "history",
     }[kind.split(".", 1)[0]]
     object_id = str(resource["provider_external_id"])
     references: dict[str, object] = {}
@@ -558,6 +561,17 @@ def command_payload(store, record: dict[str, object]) -> dict[str, object] | Non
             resource["uuid"],
         )
     provider_metadata = resource.get("provider_metadata")
+    delivery_class = (
+        provider_metadata.get("delivery_class")
+        if isinstance(provider_metadata, dict)
+        else "live"
+    )
+    if delivery_class is None:
+        delivery_class = "live"
+    if delivery_class == "history":
+        delivery_class = "backfill"
+    if delivery_class not in {"live", "backfill"}:
+        raise ValueError("Provider command delivery class is invalid")
     if isinstance(provider_metadata, dict):
         resource["provider_metadata"] = {
             key: value
@@ -590,6 +604,7 @@ def command_payload(store, record: dict[str, object]) -> dict[str, object] | Non
         "external_account_uuid": account_uuid,
         "provider_chat_key": command_chat_key,
         "provider_sequence": provider.get("revision"),
+        "delivery_class": delivery_class,
         "kind": kind,
         "provider_object": provider_object,
         "provider_references": references,

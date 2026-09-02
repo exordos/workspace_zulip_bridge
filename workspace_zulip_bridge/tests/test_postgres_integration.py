@@ -3057,9 +3057,10 @@ def test_confirmed_history_state_persists_only_after_ack_and_survives_restart(
     retry = converter.event_records(
         before_ack, account_uuid, queue_id, event, "backfill"
     )
-    assert {
-        record["operation"]["kind"] for record in retry
-    }.issuperset({"message.create", "read_state.set", "reaction.upsert"})
+    assert {record["operation"]["kind"] for record in retry}.issuperset(
+        {"message.create", "reaction.upsert"}
+    )
+    assert not any(record["operation"]["kind"] == "read_state.set" for record in retry)
 
     for record in records:
         assert postgres_store.enqueue_workspace_delivery(record, 2)
@@ -3116,14 +3117,13 @@ def test_confirmed_history_state_persists_only_after_ack_and_survives_restart(
         "backfill",
     )
     assert [record["operation"]["kind"] for record in rebound] == [
-        "read_state.set",
+        "message.update",
         "reaction.upsert",
     ]
-    read_record = rebound[0]
+    message_record = rebound[0]
     reaction_record = rebound[1]
-    assert read_record["operation"]["payload"]["message_uuids"] == [
-        canonical_message_uuid
-    ]
+    assert message_record["operation"]["entity_uuid"] == canonical_message_uuid
+    assert message_record["operation"]["payload"]["read"] is True
     assert (
         reaction_record["operation"]["payload"]["message_uuid"]
         == canonical_message_uuid
@@ -3144,6 +3144,148 @@ def test_confirmed_history_state_persists_only_after_ack_and_survives_restart(
         )
         == []
     )
+
+
+def test_history_finalizer_delivery_waits_for_earlier_chat_records(postgres_store):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    _enable_zulip_provider(postgres_store)
+    _materialize_channel_projection(postgres_store, account_uuid, project_uuid)
+    assignment = postgres_store.assignment_for_provider_chat(account_uuid, "channel:42")
+    assert assignment is not None
+    queue_id = (
+        f"backfill:channel:42:{assignment['uuid']}:"
+        f"{assignment['generation']}:snapshot:7"
+    )
+    records = converter.event_records(
+        postgres_store,
+        account_uuid,
+        queue_id,
+        {
+            "id": 601,
+            "type": "message",
+            "message": {**_provider_history_message(601), "flags": ["read"]},
+        },
+        "backfill",
+    )
+    finalizer = converter.history_finalize_record(
+        postgres_store,
+        account_uuid,
+        queue_id,
+        "channel:42",
+        assignment,
+    )
+    for record in [*records, finalizer]:
+        assert postgres_store.enqueue_workspace_delivery(record, 2)
+
+    message = next(
+        record
+        for record in records
+        if record["operation"]["kind"] in {"message.create", "message.update"}
+    )
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE workspace_delivery_outbox
+            SET record = jsonb_set(
+                    record,
+                    '{causal_lane}',
+                    to_jsonb('chat:moved-message-history'::text)
+                )
+            WHERE operation_uuid = %s
+            """,
+            (message["operation_uuid"],),
+        )
+        session.execute(
+            """
+            UPDATE workspace_delivery_outbox
+            SET sent_at = NOW(), submission_state = 'sent'
+            WHERE record->'operation'->>'kind' <> 'history.finalize'
+              AND operation_uuid <> %s
+            """,
+            (message["operation_uuid"],),
+        )
+
+    pending = postgres_store.pending_workspace_deliveries(2, 2)
+    assert finalizer not in pending
+
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE workspace_delivery_outbox
+            SET sent_at = NOW(), submission_state = 'sent'
+            WHERE record->'operation'->>'kind' <> 'history.finalize'
+            """
+        )
+    assert postgres_store.pending_workspace_deliveries(2, 2) == [finalizer]
+
+
+def test_history_finalizer_is_rejected_after_incomplete_history(postgres_store):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    _enable_zulip_provider(postgres_store)
+    _materialize_channel_projection(postgres_store, account_uuid, project_uuid)
+    assignment = postgres_store.assignment_for_provider_chat(account_uuid, "channel:42")
+    assert assignment is not None
+    queue_id = (
+        f"backfill:channel:42:{assignment['uuid']}:"
+        f"{assignment['generation']}:snapshot:7"
+    )
+    records = converter.event_records(
+        postgres_store,
+        account_uuid,
+        queue_id,
+        {
+            "id": 601,
+            "type": "message",
+            "message": {**_provider_history_message(601), "flags": ["read"]},
+        },
+        "backfill",
+    )
+    finalizer = converter.history_finalize_record(
+        postgres_store,
+        account_uuid,
+        queue_id,
+        "channel:42",
+        assignment,
+    )
+    for record in [*records, finalizer]:
+        assert postgres_store.enqueue_workspace_delivery(record, 2)
+
+    message = next(
+        record
+        for record in records
+        if record["operation"]["kind"] in {"message.create", "message.update"}
+    )
+    with postgres_store.session() as session:
+        session.execute(
+            """
+            UPDATE workspace_delivery_outbox
+            SET record = jsonb_set(
+                    record,
+                    '{causal_lane}',
+                    to_jsonb('chat:moved-message-history'::text)
+                ),
+                submission_state = 'rejected',
+                submission_error_code = 'provider_api_http_422'
+            WHERE operation_uuid = %s
+            """,
+            (message["operation_uuid"],),
+        )
+
+    assert finalizer not in postgres_store.pending_workspace_deliveries(2, 2)
+    assert postgres_store.finalize_ready_provider_events() == 0
+    with postgres_store.session() as session:
+        state = session.execute(
+            """
+            SELECT submission_state, submission_error_code
+            FROM workspace_delivery_outbox
+            WHERE operation_uuid = %s
+            """,
+            (finalizer["operation_uuid"],),
+        ).fetchone()
+    assert state == {
+        "submission_state": "rejected",
+        "submission_error_code": "workspace_delivery_dependency_rejected",
+    }
 
 
 def test_workspace_delivery_probe_ignores_inactive_accounts_and_provider(
@@ -7410,8 +7552,7 @@ def test_live_message_replay_reuses_accepted_link_after_topic_recanonicalization
         for record in assignment_replay
     ]
     assert assignment_enqueue_results == [
-        record["operation"]["kind"] == "message.create"
-        for record in assignment_replay
+        record["operation"]["kind"] == "message.create" for record in assignment_replay
     ]
     with postgres_store.session() as session:
         restored = session.execute(
@@ -7910,9 +8051,7 @@ def test_committed_message_fast_path_keeps_flagged_snapshots_pending(
             (account_uuid,),
         )
     unresolved_event = {"id": 4, "type": "message", "message": message}
-    assert postgres_store.record_provider_event(
-        account_uuid, "queue", unresolved_event
-    )
+    assert postgres_store.record_provider_event(account_uuid, "queue", unresolved_event)
     assert not postgres_store.finalize_redundant_provider_message_event(
         account_uuid, "queue", 4, fingerprint
     )
