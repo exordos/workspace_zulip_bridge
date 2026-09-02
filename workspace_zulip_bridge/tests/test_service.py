@@ -1265,9 +1265,7 @@ def test_committed_message_event_skips_replay_and_provider_access():
         def finalize_redundant_provider_message_event(
             self, requested, queue_id, event_id, message_fingerprint
         ):
-            self.finalized.append(
-                (requested, queue_id, event_id, message_fingerprint)
-            )
+            self.finalized.append((requested, queue_id, event_id, message_fingerprint))
             return True
 
     store = Store()
@@ -4901,6 +4899,105 @@ def test_backfill_is_discovered_newest_first_and_queued_at_priority_two(
         "backfill:channel:42:00000000-0000-4000-8000-000000000090:1:"
         f"snapshot:{service.BACKFILL_SNAPSHOT_PROJECTION_VERSION}"
     }
+
+
+def test_completed_backfill_queues_one_causal_history_finalizer():
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+    project_uuid = "00000000-0000-4000-8000-000000000002"
+    stream_uuid = "00000000-0000-4000-8000-000000000003"
+    assignment = {
+        "uuid": "00000000-0000-4000-8000-000000000004",
+        "generation": 5,
+        "project_id": project_uuid,
+        "workspace_projection": {"stream": {"uuid": stream_uuid}},
+    }
+
+    class Store:
+        def __init__(self):
+            self.enqueued = []
+            self.positions = []
+
+        def account_resource(self, requested):
+            assert requested == account_uuid
+            return {"owner_user_uuid": "00000000-0000-4000-8000-000000000005"}
+
+        def assignment_for_provider_chat(self, requested, chat_key):
+            assert (requested, chat_key) == (account_uuid, "channel:42")
+            return assignment
+
+        def provider_mapping(self, requested, kind, provider_id):
+            assert (requested, kind, provider_id) == (
+                account_uuid,
+                "stream",
+                "channel:42",
+            )
+            return {"workspace_uuid": stream_uuid}
+
+        def producer_lane_position(self, operation_uuid, origin, causal_lane):
+            self.positions.append((operation_uuid, origin, causal_lane))
+            return 11, "00000000-0000-4000-8000-000000000006"
+
+        def enqueue_workspace_delivery(self, record, priority):
+            self.enqueued.append((record, priority))
+            return True
+
+    store = Store()
+    instance = object.__new__(service.BridgeService)
+    instance.store = store
+
+    assert instance.enqueue_backfill_finalizer(account_uuid, "channel:42")
+
+    record, priority = store.enqueued[0]
+    assert priority == 2
+    assert record["sequence"] == 11
+    assert record["operation"]["kind"] == "history.finalize"
+    assert record["operation"]["payload"] == {
+        "stream_uuid": stream_uuid,
+        "generation": 5,
+    }
+    assert record["operation"]["extensions"]["delivery_class"] == "backfill"
+
+
+def test_backfill_job_completes_only_after_finalizer_is_durable():
+    account_uuid = "00000000-0000-4000-8000-000000000001"
+    calls = []
+
+    class Store:
+        def claim_backfill_job(self):
+            return {
+                "account_uuid": account_uuid,
+                "provider_chat_key": "channel:42",
+                "next_anchor": None,
+                "cutoff_at": None,
+                "retry_count": 0,
+            }
+
+        def account_is_active(self, requested):
+            return requested == account_uuid
+
+        def advance_backfill_job(self, *args):
+            calls.append(("advance", args))
+
+    class Adapter:
+        generation = 1
+
+        def message_history(self, provider_chat_key, anchor):
+            assert (provider_chat_key, anchor) == ("channel:42", "newest")
+            return []
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance.provider_adapters = lambda _account_uuid: Adapter()
+    instance.enqueue_backfill = lambda *args: calls.append(("messages", args)) or 0
+    instance.enqueue_backfill_finalizer = lambda *args: (
+        calls.append(("finalizer", args)) or True
+    )
+    instance._record_interval_stat = lambda *args: None
+    instance._record_provider_account_success = lambda *args: None
+
+    assert instance.run_backfill_once()
+    assert [name for name, _args in calls] == ["messages", "finalizer", "advance"]
+    assert calls[-1][1][-1] is True
 
 
 def test_backfill_conversion_store_caches_reads_and_identical_writes():

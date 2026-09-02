@@ -468,12 +468,8 @@ class RestAlchemyStore:
         self._transaction_state = threading.local()
         self._confirmed_delivery_state_lock = threading.RLock()
         self._confirmed_delivery_state_loaded = False
-        self._confirmed_messages: dict[
-            tuple[str, str], dict[str, object]
-        ] = {}
-        self._confirmed_reads: dict[
-            tuple[str, str, str], dict[str, object]
-        ] = {}
+        self._confirmed_messages: dict[tuple[str, str], dict[str, object]] = {}
+        self._confirmed_reads: dict[tuple[str, str, str], dict[str, object]] = {}
         self._confirmed_reactions: dict[
             tuple[str, str, str, str], dict[str, object]
         ] = {}
@@ -519,15 +515,9 @@ class RestAlchemyStore:
                              updated_at, workspace_uuid
                     """
                 ).fetchall()
-            confirmed_messages: dict[
-                tuple[str, str], dict[str, object]
-            ] = {}
-            confirmed_reads: dict[
-                tuple[str, str, str], dict[str, object]
-            ] = {}
-            confirmed_reactions: dict[
-                tuple[str, str, str, str], dict[str, object]
-            ] = {}
+            confirmed_messages: dict[tuple[str, str], dict[str, object]] = {}
+            confirmed_reads: dict[tuple[str, str, str], dict[str, object]] = {}
+            confirmed_reactions: dict[tuple[str, str, str, str], dict[str, object]] = {}
             for row in rows:
                 account_uuid = str(row["account_uuid"])
                 provider_id = str(row["provider_id"])
@@ -535,9 +525,10 @@ class RestAlchemyStore:
                 if not isinstance(metadata, dict):
                     continue
                 if row["entity_kind"] == "message":
-                    if bool(row["deleted"]) or metadata.get(
-                        "workspace_delivery_state"
-                    ) != "committed":
+                    if (
+                        bool(row["deleted"])
+                        or metadata.get("workspace_delivery_state") != "committed"
+                    ):
                         continue
                     fingerprint = metadata.get("confirmed_message_fingerprint")
                     token = metadata.get("confirmed_message_token")
@@ -552,16 +543,20 @@ class RestAlchemyStore:
                         "confirmed_message_projection_pending"
                     )
                     if (
-                        fingerprint is None or isinstance(fingerprint, str)
-                    ) and isinstance(token, str) and (
-                        unresolved_reply is None
-                        or isinstance(unresolved_reply, str)
-                    ) and (
-                        projection_fingerprint is None
-                        or isinstance(projection_fingerprint, str)
-                    ) and (
-                        projection_pending is None
-                        or isinstance(projection_pending, bool)
+                        (fingerprint is None or isinstance(fingerprint, str))
+                        and isinstance(token, str)
+                        and (
+                            unresolved_reply is None
+                            or isinstance(unresolved_reply, str)
+                        )
+                        and (
+                            projection_fingerprint is None
+                            or isinstance(projection_fingerprint, str)
+                        )
+                        and (
+                            projection_pending is None
+                            or isinstance(projection_pending, bool)
+                        )
                     ):
                         confirmed_messages[(account_uuid, provider_id)] = {
                             "fingerprint": fingerprint,
@@ -577,9 +572,7 @@ class RestAlchemyStore:
                         }
                     read_states = metadata.get("confirmed_read_states")
                     read_tokens = metadata.get("confirmed_read_tokens")
-                    read_message_uuids = metadata.get(
-                        "confirmed_read_message_uuids"
-                    )
+                    read_message_uuids = metadata.get("confirmed_read_message_uuids")
                     if not isinstance(read_states, dict):
                         continue
                     for reader_uuid, read in read_states.items():
@@ -639,9 +632,7 @@ class RestAlchemyStore:
                 )
                 state = metadata.get("confirmed_reaction_state")
                 token = metadata.get("confirmed_reaction_token")
-                persisted_state = (
-                    "absent" if bool(row["deleted"]) else "present"
-                )
+                persisted_state = "absent" if bool(row["deleted"]) else "present"
                 if (
                     state not in {"present", "absent"}
                     or not isinstance(token, str)
@@ -707,9 +698,7 @@ class RestAlchemyStore:
     ) -> dict[str, object] | None:
         self._ensure_confirmed_delivery_state()
         with self._confirmed_delivery_state_lock:
-            value = self._confirmed_messages.get(
-                (account_uuid, provider_message_id)
-            )
+            value = self._confirmed_messages.get((account_uuid, provider_message_id))
             self._confirmed_delivery_counters["message_lookups"] += 1
             self._confirmed_delivery_counters[
                 "message_hits" if value is not None else "message_misses"
@@ -789,9 +778,7 @@ class RestAlchemyStore:
         message_uuid: str,
     ) -> None:
         with self._confirmed_delivery_state_lock:
-            self._confirmed_reads[
-                (account_uuid, provider_message_id, reader_uuid)
-            ] = {
+            self._confirmed_reads[(account_uuid, provider_message_id, reader_uuid)] = {
                 "read": read,
                 "token": token,
                 "message_uuid": message_uuid,
@@ -5801,6 +5788,38 @@ class RestAlchemyStore:
                                     'committed'
                           )
                       )
+                      AND (
+                          delivery.record->'operation'->>'kind' <>
+                              'history.finalize'
+                          OR NOT EXISTS (
+                              SELECT 1
+                              FROM workspace_delivery_outbox AS predecessor
+                              WHERE predecessor.sent_at IS NULL
+                                AND predecessor.submission_state IN (
+                                    'pending', 'submitting', 'ambiguous',
+                                    'awaiting_result', 'rejected'
+                                )
+                                AND predecessor.account_uuid =
+                                    delivery.account_uuid
+                                AND predecessor.assignment_uuid
+                                    IS NOT DISTINCT FROM
+                                    delivery.assignment_uuid
+                                AND predecessor.assignment_generation
+                                    IS NOT DISTINCT FROM
+                                    delivery.assignment_generation
+                                AND predecessor.assignment_project_uuid
+                                    IS NOT DISTINCT FROM
+                                    delivery.assignment_project_uuid
+                                AND predecessor.record->>'origin' =
+                                    delivery.record->>'origin'
+                                AND predecessor.record->'operation'
+                                        ->'extensions'->>'delivery_class' =
+                                    'backfill'
+                                AND predecessor.record->'operation'->>'kind' <>
+                                    'history.finalize'
+                                AND predecessor.created_at <= delivery.created_at
+                          )
+                      )
                     ORDER BY priority, created_at LIMIT %s
                     """,
                 (minimum_priority, maximum_priority, limit),
@@ -6923,8 +6942,12 @@ class RestAlchemyStore:
                             -- became terminal can depend on that failed
                             -- materialization.  Retained evidence must not
                             -- poison records created by later provider events.
-                            AND dependent.created_at <=
-                                dependency_operation.updated_at
+                            AND (
+                                dependent.record->'operation'->>'kind' =
+                                    'history.finalize'
+                                OR dependent.created_at <=
+                                    dependency_operation.updated_at
+                            )
                             AND dependency.account_uuid = dependent.account_uuid
                             AND dependency.assignment_uuid IS NOT DISTINCT FROM
                                 dependent.assignment_uuid
@@ -6936,23 +6959,44 @@ class RestAlchemyStore:
                                 dependent.assignment_project_uuid
                             AND (
                                 (
-                                    dependency.record->>'origin' =
-                                        dependent.record->>'origin'
-                                    AND dependency.record->>'causal_lane' =
-                                        dependent.record->>'causal_lane'
-                                    AND (dependency.record
-                                            ->>'sequence')::bigint <
-                                        (dependent.record
-                                            ->>'sequence')::bigint
+                                    dependent.record->'operation'->>'kind' =
+                                        'history.finalize'
+                                    AND dependency.record->'operation'
+                                            ->'extensions'->>'delivery_class' =
+                                        'backfill'
+                                    AND dependency.record->'operation'->>'kind' <>
+                                        'history.finalize'
+                                    AND dependency.created_at <=
+                                        dependent.created_at
                                 ) OR (
-                                    dependency.provider_queue_id =
-                                        dependent.provider_queue_id
-                                    AND dependency.provider_event_id =
-                                        dependent.provider_event_id
+                                    dependent.record->'operation'->>'kind' <>
+                                        'history.finalize'
+                                    AND (
+                                        (
+                                            dependency.record->>'origin' =
+                                                dependent.record->>'origin'
+                                            AND dependency.record
+                                                    ->>'causal_lane' =
+                                                dependent.record->>'causal_lane'
+                                            AND (dependency.record
+                                                    ->>'sequence')::bigint <
+                                                (dependent.record
+                                                    ->>'sequence')::bigint
+                                        ) OR (
+                                            dependency.provider_queue_id =
+                                                dependent.provider_queue_id
+                                            AND dependency.provider_event_id =
+                                                dependent.provider_event_id
+                                        )
+                                    )
                                 )
                             )
                             AND (
                                 (
+                                    dependent.record->'operation'->>'kind' =
+                                        'history.finalize'
+                                )
+                                OR (
                                     dependency.record->'operation'->>'kind' =
                                         'topic.upsert'
                                     AND dependent.record->'operation'->>'kind' IN (
@@ -10885,6 +10929,24 @@ class RestAlchemyStore:
         if not isinstance(operation, dict):
             raise ValueError("invalid_confirmed_delivery_state")
         state_kind = confirmed.get("kind")
+        if state_kind == "message_snapshot":
+            updates: list[dict[str, object]] = []
+            for name in ("message", "read_state"):
+                nested = confirmed.get(name)
+                if not isinstance(nested, dict):
+                    raise ValueError("invalid_confirmed_message_snapshot_state")
+                nested_record = copy.deepcopy(record)
+                nested_transport = typing.cast(
+                    dict[str, object], nested_record["transport"]
+                )
+                nested_transport["confirmed_delivery_state"] = nested
+                updates.extend(
+                    RestAlchemyStore._persist_confirmed_delivery_state(
+                        session,
+                        nested_record,
+                    )
+                )
+            return updates
         if state_kind == "message":
             provider_message_id = confirmed.get("provider_message_id")
             fingerprint = confirmed.get("fingerprint")
@@ -10898,9 +10960,7 @@ class RestAlchemyStore:
                 raise ValueError("invalid_confirmed_message_state")
             if components is not None and not isinstance(components, dict):
                 raise ValueError("invalid_confirmed_message_state")
-            if unresolved_reply is not None and not isinstance(
-                unresolved_reply, str
-            ):
+            if unresolved_reply is not None and not isinstance(unresolved_reply, str):
                 raise ValueError("invalid_confirmed_message_state")
             if projection_fingerprint is not None and not isinstance(
                 projection_fingerprint, str
@@ -11071,9 +11131,7 @@ class RestAlchemyStore:
                     "reader_uuid": str(reader_uuid),
                     "read": read,
                     "token": operation_uuid,
-                    "message_uuid": message_uuids_by_provider_id[
-                        provider_message_id
-                    ],
+                    "message_uuid": message_uuids_by_provider_id[provider_message_id],
                 }
                 for provider_message_id in provider_message_ids
             ]
@@ -11120,13 +11178,9 @@ class RestAlchemyStore:
                 {
                     "kind": "reaction",
                     "account_uuid": account_uuid,
-                    "provider_message_id": str(
-                        confirmed["provider_message_id"]
-                    ),
+                    "provider_message_id": str(confirmed["provider_message_id"]),
                     "provider_user_id": str(confirmed["provider_user_id"]),
-                    "normalized_emoji_code": str(
-                        confirmed["normalized_emoji_code"]
-                    ),
+                    "normalized_emoji_code": str(confirmed["normalized_emoji_code"]),
                     "state": str(confirmed["state"]),
                     "token": operation_uuid,
                 }

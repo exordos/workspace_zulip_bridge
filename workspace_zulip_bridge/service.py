@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 # A backfill message is a current provider snapshot, not an immutable copy of
 # the first history scan. Bump this only when the snapshot projection contract
 # changes and pair it with a migration that restarts selected history jobs.
-BACKFILL_SNAPSHOT_PROJECTION_VERSION = 7
+BACKFILL_SNAPSHOT_PROJECTION_VERSION = 8
 
 
 class AdapterRegistry:
@@ -534,9 +534,7 @@ class BridgeService:
             self._stats_counters.clear()
             self._stats_last_log = now
         cache_metrics = getattr(self.store, "confirmed_delivery_metrics", None)
-        cache_stats = (
-            cache_metrics(reset=True) if callable(cache_metrics) else {}
-        )
+        cache_stats = cache_metrics(reset=True) if callable(cache_metrics) else {}
         backfill_messages = import_stats.get("backfill_messages", 0.0)
         backfill_operations = import_stats.get("backfill_operations_enqueued", 0.0)
         import_stats["backfill_messages_per_second"] = round(
@@ -980,6 +978,7 @@ class BridgeService:
                 queue_id = str(cursor["queue_id"])
                 last_event_id = int(cursor["last_event_id"])
                 adapter.restore_queue(queue_id, last_event_id)
+
             def scan_and_queue_private_catalog() -> dict[str, object]:
                 if not callable(scanner) or provider_account_generation is None:
                     raise ValueError("Zulip provider generation is unavailable")
@@ -3759,6 +3758,32 @@ class BridgeService:
         )
         return enqueued
 
+    def enqueue_backfill_finalizer(
+        self,
+        account_uuid: str,
+        provider_chat_key: str,
+    ) -> bool:
+        """Queue one durable unread recomputation fence for a completed chat."""
+
+        assignment = self.store.assignment_for_provider_chat(
+            account_uuid, provider_chat_key
+        )
+        if assignment is None:
+            raise ValueError("provider_chat_assignment_pending")
+        queue_id = (
+            f"backfill:{provider_chat_key}:"
+            f"{assignment['uuid']}:{assignment['generation']}:"
+            f"snapshot:{BACKFILL_SNAPSHOT_PROJECTION_VERSION}"
+        )
+        record = converter.history_finalize_record(
+            self.store,
+            account_uuid,
+            queue_id,
+            provider_chat_key,
+            assignment,
+        )
+        return self.store.enqueue_workspace_delivery(record, 2)
+
     def run_backfill_once(self) -> bool:
         job = self.store.claim_backfill_job()
         if job is None:
@@ -3887,6 +3912,19 @@ class BridgeService:
             if not messages
             else min(int(message["id"]) for message in messages) - 1
         )
+        if complete:
+            try:
+                self.enqueue_backfill_finalizer(account_uuid, provider_chat_key)
+            except ValueError as exc:
+                if str(exc) != "provider_chat_assignment_pending":
+                    raise
+                self.store.release_backfill_job(account_uuid, provider_chat_key)
+                return False
+            except Exception as exc:
+                if not self._is_retryable_database_conflict(exc):
+                    raise
+                self.store.release_backfill_job(account_uuid, provider_chat_key)
+                return True
         self.store.advance_backfill_job(
             account_uuid,
             provider_chat_key,

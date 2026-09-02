@@ -480,6 +480,7 @@ def test_zb_msg_001_message_mapping_uses_official_client_semantics(chat_kind):
     request = client.sent[0]
     assert request["queue_id"] == "queue-1"
     assert request["local_id"] == "operation-1"
+    assert request["read_by_sender"] is True
     assert request["type"] == ("stream" if chat_kind == "channel" else "private")
     if chat_kind == "channel":
         assert request["to"] == "engineering"
@@ -2115,9 +2116,7 @@ def test_private_conversation_catalog_pages_all_historical_dm_sets(monkeypatch):
         client=client
     ).private_conversation_catalog(
         keep_queue_alive=lambda: keepalive_anchors.append(
-            client.message_requests[-1]["anchor"]
-            if client.message_requests
-            else None
+            client.message_requests[-1]["anchor"] if client.message_requests else None
         )
     )
 

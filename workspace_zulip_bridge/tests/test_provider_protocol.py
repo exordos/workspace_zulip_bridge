@@ -162,7 +162,9 @@ def test_provider_lease_accepts_channel_lifecycle_operations(
     assert record["operation"]["provider"]["entity_id"] == (
         None
         if kind == "topic.create"
-        else "channel:42" if kind == "stream.delete" else "42:dev"
+        else "channel:42"
+        if kind == "stream.delete"
+        else "42:dev"
     )
 
 
@@ -170,9 +172,7 @@ def test_provider_lease_accepts_channel_lifecycle_operations(
 def test_topic_mutation_can_be_leased_behind_pending_create(kind):
     leased = _lease(kind)
     leased["required_capability"] = (
-        "messenger.topic.rename"
-        if kind == "topic.update"
-        else "messenger.topic.delete"
+        "messenger.topic.rename" if kind == "topic.update" else "messenger.topic.delete"
     )
     leased["payload"] = {
         "uuid": TOPIC_UUID,
@@ -396,6 +396,7 @@ def test_zulip_record_adapts_to_provider_native_v2_command():
         "external_account_uuid": ACCOUNT_UUID,
         "provider_chat_key": "channel:42",
         "provider_sequence": None,
+        "delivery_class": "live",
         "kind": "message.upsert",
         "provider_object": {"kind": "message", "id": "101"},
         "provider_references": {"topic": "42:dev", "user": "42"},
@@ -416,6 +417,45 @@ def test_zulip_record_adapts_to_provider_native_v2_command():
             "provider_metadata": {"provider_revision": None},
         },
     }
+
+
+def test_history_finalizer_command_preserves_transport_classification():
+    record = {
+        "operation_uuid": str(uuid.uuid4()),
+        "account_uuid": ACCOUNT_UUID,
+        "project_uuid": PROJECT_UUID,
+        "sequence": 9,
+        "created_at": "1970-01-01T00:00:00Z",
+        "operation": {
+            "kind": "history.finalize",
+            "entity_uuid": STREAM_UUID,
+            "actor_uuid": ACCOUNT_UUID,
+            "occurred_at": "1970-01-01T00:00:00Z",
+            "provider": {
+                "kind": "zulip",
+                "chat_id": "channel:42",
+                "entity_id": "channel:42",
+                "revision": None,
+            },
+            "payload": {"stream_uuid": STREAM_UUID, "generation": 3},
+            "extensions": {
+                "provider_badge": "zulip",
+                "delivery_class": "backfill",
+            },
+        },
+    }
+
+    command = provider_protocol.command_payload(Store(), record)
+
+    assert command["kind"] == "history.finalize"
+    assert command["delivery_class"] == "backfill"
+    assert command["provider_object"] == {
+        "kind": "history",
+        "id": "channel:42",
+    }
+    assert command["provider_references"] == {}
+    assert command["payload"]["generation"] == 3
+    assert "delivery_class" not in command["payload"]["provider_metadata"]
 
 
 def test_provider_event_key_is_state_based_across_delivery_paths():

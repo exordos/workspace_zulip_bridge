@@ -154,15 +154,22 @@ so the backend freshness fence can order them against live edits.
 
 Owner read state is stored per account, provider message ID, and Workspace
 reader UUID, together with the Workspace message UUID that accepted the state.
-Message snapshots and `update_message_flags` events discard already-confirmed
-values only while that target UUID still matches, omit empty batches, and group
-remaining messages by current stream and topic. Both read-to-unread and
+History carries this exact boolean in the same `message.upsert` command and
+persists both confirmation records in its ACK transaction. Live
+`update_message_flags` events remain separate so a newer realtime flag cannot
+be hidden by an older message freshness fence. Both read-to-unread and
 unread-to-read transitions remain deliverable. Reactions are stored per
 account, provider message ID, provider user ID, and collision-safe normalized
 `reaction_type:emoji_code`. A confirmed-present add is omitted only while its
 stored Workspace projection still matches the current message, stream, topic,
 user, and emoji. This makes both read state and active reactions replay once if
 Workspace replaces a provisional message UUID with the canonical target.
+
+The final history page appends one `history.finalize` operation to the same
+chat causal lane. Delivery selection holds that operation behind every earlier
+uncommitted lane record. Its successful Workspace application schedules the
+single exact stream unread snapshot and per-topic snapshots that publish the
+completed import state.
 Repeated removals of confirmed-absent reactions are still omitted; the opposite
 transition is independent and remains deliverable.
 

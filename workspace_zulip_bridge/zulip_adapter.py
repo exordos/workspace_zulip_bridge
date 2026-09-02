@@ -844,6 +844,7 @@ class OfficialZulipAdapter:
         keep_queue_alive: typing.Callable[[], None] | None = None,
     ) -> dict[str, object]:
         """Return every historical DM participant set without message bodies."""
+
         def keep_alive() -> None:
             if keep_queue_alive is not None:
                 keep_queue_alive()
@@ -1642,6 +1643,7 @@ class OfficialZulipAdapter:
                 "content": correlation.provider_rendered_content,
                 "queue_id": correlation.queue_id,
                 "local_id": correlation.local_id,
+                "read_by_sender": True,
                 **target,
             }
             try:

@@ -261,18 +261,15 @@ class FakeStore:
         candidates = [
             mapping
             for (entity_kind, provider_id), mapping in self.mappings.items()
-            if entity_kind == "reaction" and provider_id.startswith(prefix)
+            if entity_kind == "reaction"
+            and provider_id.startswith(prefix)
             and mapping.get("metadata", {}).get("normalized_emoji_code")
             == normalized_emoji_code
         ]
         if not candidates:
             return None
         active = next(
-            (
-                mapping
-                for mapping in candidates
-                if not mapping.get("deleted", False)
-            ),
+            (mapping for mapping in candidates if not mapping.get("deleted", False)),
             None,
         )
         mapping = active or candidates[-1]
@@ -356,10 +353,14 @@ def _confirm_records(store, records):
         confirmed = transport.get("confirmed_delivery_state")
         if not isinstance(confirmed, dict):
             continue
+        if confirmed["kind"] == "message_snapshot":
+            for nested in (confirmed["message"], confirmed["read_state"]):
+                nested_record = copy.deepcopy(record)
+                nested_record["transport"]["confirmed_delivery_state"] = nested
+                _confirm_records(store, [nested_record])
+            continue
         if confirmed["kind"] == "message":
-            mapping = store.mappings[
-                ("message", str(confirmed["provider_message_id"]))
-            ]
+            mapping = store.mappings[("message", str(confirmed["provider_message_id"]))]
             metadata = mapping["metadata"]
             metadata["workspace_delivery_state"] = "committed"
             fingerprint = confirmed.get("fingerprint")
@@ -372,33 +373,27 @@ def _confirm_records(store, records):
             )
             unresolved_reply = confirmed.get("unresolved_reply_provider_id")
             if unresolved_reply is None:
-                metadata.pop(
-                    "confirmed_message_unresolved_reply_provider_id", None
-                )
+                metadata.pop("confirmed_message_unresolved_reply_provider_id", None)
             else:
-                metadata[
-                    "confirmed_message_unresolved_reply_provider_id"
-                ] = unresolved_reply
+                metadata["confirmed_message_unresolved_reply_provider_id"] = (
+                    unresolved_reply
+                )
             projection_fingerprint = confirmed.get("projection_fingerprint")
             if projection_fingerprint is None:
                 metadata.pop("confirmed_message_projection_fingerprint", None)
             else:
-                metadata[
-                    "confirmed_message_projection_fingerprint"
-                ] = projection_fingerprint
+                metadata["confirmed_message_projection_fingerprint"] = (
+                    projection_fingerprint
+                )
             projection_pending = confirmed.get("projection_pending")
             if projection_pending is None:
                 metadata.pop("confirmed_message_projection_pending", None)
             else:
-                metadata[
-                    "confirmed_message_projection_pending"
-                ] = projection_pending
+                metadata["confirmed_message_projection_pending"] = projection_pending
             metadata["confirmed_message_token"] = record["operation_uuid"]
         elif confirmed["kind"] == "read_state":
             for item in confirmed["items"]:
-                mapping = store.mappings[
-                    ("message", str(item["provider_message_id"]))
-                ]
+                mapping = store.mappings[("message", str(item["provider_message_id"]))]
                 metadata = mapping["metadata"]
                 metadata.setdefault("confirmed_read_states", {})[
                     str(confirmed["reader_uuid"])
@@ -446,12 +441,16 @@ def test_message_fingerprint_uses_only_significant_canonical_state():
     }
 
     assert converter.provider_message_fingerprint(incidental) == baseline
-    assert converter.provider_message_fingerprint(
-        {**message, "content": "changed"}
-    ) != baseline
-    assert converter.provider_message_fingerprint(
-        {**message, "last_edit_timestamp": 1_700_000_010}
-    ) != baseline
+    assert (
+        converter.provider_message_fingerprint({**message, "content": "changed"})
+        != baseline
+    )
+    assert (
+        converter.provider_message_fingerprint(
+            {**message, "last_edit_timestamp": 1_700_000_010}
+        )
+        != baseline
+    )
     empty_topic = {**message, "subject": ""}
     fallback_topic = {
         **message,
@@ -2483,9 +2482,16 @@ def test_confirmed_backfill_snapshot_emits_no_repeated_state_operations():
         event,
         "backfill",
     )
-    assert {
-        record["operation"]["kind"] for record in records
-    }.issuperset({"message.create", "read_state.set", "reaction.upsert"})
+    assert {record["operation"]["kind"] for record in records}.issuperset(
+        {"message.create", "reaction.upsert"}
+    )
+    assert not any(
+        record["operation"]["kind"] == "read_state.set" for record in records
+    )
+    message_record = next(
+        record for record in records if record["operation"]["kind"] == "message.create"
+    )
+    assert message_record["operation"]["payload"]["read"] is True
 
     _confirm_records(store, records)
 
@@ -2522,9 +2528,7 @@ def test_changed_message_state_emits_one_update_then_converges():
         "backfill",
     )
 
-    assert [
-        record["operation"]["kind"] for record in changed
-    ] == ["message.update"]
+    assert [record["operation"]["kind"] for record in changed] == ["message.update"]
     assert changed[0]["operation"]["provider"]["revision"] == "1700000010"
     _confirm_records(store, changed)
     assert (
@@ -2539,7 +2543,7 @@ def test_changed_message_state_emits_one_update_then_converges():
     )
 
 
-def test_read_only_snapshot_change_does_not_update_message():
+def test_read_only_backfill_change_uses_message_snapshot():
     store = FakeStore()
     unread = _stream_message()
     unread["flags"] = []
@@ -2562,9 +2566,8 @@ def test_read_only_snapshot_change_does_not_update_message():
         "backfill",
     )
 
-    assert [record["operation"]["kind"] for record in changed] == [
-        "read_state.set"
-    ]
+    assert [record["operation"]["kind"] for record in changed] == ["message.update"]
+    assert changed[0]["operation"]["payload"]["read"] is True
     _confirm_records(store, changed)
     assert (
         converter.event_records(
@@ -2687,9 +2690,7 @@ def test_reaction_add_remove_replays_only_until_each_ack():
     added = converter.event_records(
         store, ACCOUNT_UUID, "queue", {**reaction, "id": 10, "op": "add"}
     )
-    assert any(
-        record["operation"]["kind"] == "reaction.upsert" for record in added
-    )
+    assert any(record["operation"]["kind"] == "reaction.upsert" for record in added)
     _confirm_records(store, added)
     assert (
         converter.event_records(
@@ -2701,9 +2702,7 @@ def test_reaction_add_remove_replays_only_until_each_ack():
     removed = converter.event_records(
         store, ACCOUNT_UUID, "queue-3", {**reaction, "id": 12, "op": "remove"}
     )
-    assert [record["operation"]["kind"] for record in removed] == [
-        "reaction.delete"
-    ]
+    assert [record["operation"]["kind"] for record in removed] == ["reaction.delete"]
     _confirm_records(store, removed)
     assert (
         converter.event_records(
@@ -2749,9 +2748,7 @@ def test_confirmed_read_and_reaction_follow_recanonicalized_message_target():
     )
 
     canonical_message_uuid = str(uuid.uuid4())
-    store.mappings[("message", "601")]["workspace_uuid"] = (
-        canonical_message_uuid
-    )
+    store.mappings[("message", "601")]["workspace_uuid"] = canonical_message_uuid
     replay = converter.event_records(
         store,
         ACCOUNT_UUID,
@@ -2761,21 +2758,21 @@ def test_confirmed_read_and_reaction_follow_recanonicalized_message_target():
     )
 
     assert [record["operation"]["kind"] for record in replay] == [
-        "read_state.set",
+        "message.update",
         "reaction.upsert",
     ]
     assert all(
-        record["operation"]["payload"]["message_uuid"]
-        == canonical_message_uuid
+        record["operation"]["payload"]["message_uuid"] == canonical_message_uuid
         for record in replay
         if record["operation"]["kind"] == "reaction.upsert"
     )
-    read = next(
+    snapshot = next(
         record["operation"]
         for record in replay
-        if record["operation"]["kind"] == "read_state.set"
+        if record["operation"]["kind"] == "message.update"
     )
-    assert read["payload"]["message_uuids"] == [canonical_message_uuid]
+    assert snapshot["entity_uuid"] == canonical_message_uuid
+    assert snapshot["payload"]["read"] is True
 
     _confirm_records(store, replay)
     assert (
@@ -3332,19 +3329,10 @@ def test_convergent_workspace_alias_replays_idempotent_backfill_upsert():
         if operation["kind"] == "message.update"
     )
     assert message["entity_uuid"] == workspace_uuid
-    assert "read" not in message["payload"]
-    read_state = next(
-        operation
-        for operation in _operations(records)
-        if operation["kind"] == "read_state.set"
+    assert message["payload"]["read"] is True
+    assert not any(
+        operation["kind"] == "read_state.set" for operation in _operations(records)
     )
-    assert read_state["payload"] == {
-        "stream_uuid": message["payload"]["stream_uuid"],
-        "topic_uuid": message["payload"]["topic_uuid"],
-        "reader_uuid": OWNER_UUID,
-        "message_uuids": [workspace_uuid],
-        "read": True,
-    }
     assert (
         store.provider_mapping(ACCOUNT_UUID, "message", "601")["workspace_uuid"]
         == workspace_uuid
@@ -3642,9 +3630,7 @@ def test_backfill_repairs_reply_after_quoted_message_becomes_resolvable():
         reply_event,
         "backfill",
     )
-    assert [record["operation"]["kind"] for record in repaired] == [
-        "message.update"
-    ]
+    assert [record["operation"]["kind"] for record in repaired] == ["message.update"]
     repaired_message = repaired[0]["operation"]
     assert (
         repaired_message["payload"]["reply_to_message_uuid"]
@@ -3687,9 +3673,9 @@ def test_backfill_repairs_native_link_after_target_becomes_resolvable():
         for operation in _operations(initial)
         if operation["kind"] == "message.create"
     )
-    assert "#**Engineering>Topic@601**" in initial_message["payload"][
-        "payload"
-    ]["content"]
+    assert (
+        "#**Engineering>Topic@601**" in initial_message["payload"]["payload"]["content"]
+    )
     assert initial_message["extensions"]["lossy_conversion"] is True
     _confirm_records(store, initial)
 
@@ -3724,9 +3710,7 @@ def test_backfill_repairs_native_link_after_target_becomes_resolvable():
         "backfill",
         original_url,
     )
-    assert [record["operation"]["kind"] for record in repaired] == [
-        "message.update"
-    ]
+    assert [record["operation"]["kind"] for record in repaired] == ["message.update"]
     repaired_message = repaired[0]["operation"]
     assert (
         f"urn:message:{target['workspace_uuid']}"

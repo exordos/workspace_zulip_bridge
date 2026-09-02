@@ -164,19 +164,24 @@ def test_confirmed_delivery_index_survives_restart_and_isolates_accounts():
         )
         assert store.confirmed_read_state(account_a, "42", reader_uuid)["read"] is True
         assert store.confirmed_read_state(account_b, "42", reader_uuid)["read"] is False
-        assert store.confirmed_read_state(account_a, "42", reader_uuid)[
-            "message_uuid"
-        ] == "11111111-1111-1111-1111-111111111111"
-        assert store.confirmed_reaction_state(
-            account_a, "42", "3", "unicode_emoji:270d"
-        )["state"] == "present"
-        assert store.confirmed_reaction_state(
-            account_b, "42", "3", "unicode_emoji:270d"
-        )["state"] == "absent"
         assert (
-            store.confirmed_reaction_state(
-                account_a, "43", "3", "unicode_emoji:270d"
-            )
+            store.confirmed_read_state(account_a, "42", reader_uuid)["message_uuid"]
+            == "11111111-1111-1111-1111-111111111111"
+        )
+        assert (
+            store.confirmed_reaction_state(account_a, "42", "3", "unicode_emoji:270d")[
+                "state"
+            ]
+            == "present"
+        )
+        assert (
+            store.confirmed_reaction_state(account_b, "42", "3", "unicode_emoji:270d")[
+                "state"
+            ]
+            == "absent"
+        )
+        assert (
+            store.confirmed_reaction_state(account_a, "43", "3", "unicode_emoji:270d")
             is None
         )
         store.record_confirmed_delivery_skip("message")
@@ -262,6 +267,38 @@ def test_pending_provider_event_lane_batch_stops_at_global_barrier():
         "channel:42",
         20,
     )
+
+
+def test_history_finalizer_waits_for_every_earlier_chat_delivery():
+    session = Session()
+    store = _store_with_session(session)
+
+    store.pending_workspace_deliveries()
+
+    statement = " ".join(session.statements[-1][0].split())
+    assert "'history.finalize'" in statement
+    assert "FROM workspace_delivery_outbox AS predecessor" in statement
+    assert "predecessor.created_at <= delivery.created_at" in statement
+    assert "->>'delivery_class' = 'backfill'" in statement
+
+
+def test_history_finalizer_rejection_fence_covers_every_backfill_lane():
+    class RejectionSession(Session):
+        def execute(self, statement, parameters=None):
+            self.statements.append((statement, parameters))
+            if "SELECT count(*) AS total FROM rejected" in statement:
+                return Result(({"total": 0},))
+            return Result()
+
+    session = RejectionSession()
+    store = _store_with_session(session)
+
+    store._quarantine_rejected_workspace_delivery_dependents(session)
+
+    statement = " ".join(session.statements[-1][0].split())
+    assert "dependency.created_at <= dependent.created_at" in statement
+    assert "->>'delivery_class' = 'backfill'" in statement
+    assert "dependent.record->'operation'->>'kind' <> 'history.finalize'" in statement
 
 
 def test_redundant_provider_message_event_requires_committed_mapping():
