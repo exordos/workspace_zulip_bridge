@@ -53,6 +53,11 @@ PROVIDER_NETWORK_ERRORS = (
     zulip.UnrecoverableNetworkError,
     zulip.ZulipError,
 )
+REACTION_WRITE_KINDS = {
+    "reaction.create",
+    "reaction.update",
+    "reaction.delete",
+}
 
 
 class ZulipClient(typing.Protocol):
@@ -639,6 +644,8 @@ class OfficialZulipAdapter:
         operation_uuid: str,
         provider_rendered_content: str | None = None,
     ) -> SendCorrelation | None:
+        if operation["kind"] in REACTION_WRITE_KINDS:
+            self._require_reaction_author(operation)
         if operation["kind"] != "message.create":
             self._prepared_operation_uuid = operation_uuid
             return None
@@ -660,6 +667,14 @@ class OfficialZulipAdapter:
             # Zulip assigns authorship from the API key and exposes no sender
             # override on message creation. Fail closed instead of publishing a
             # Workspace participant's content as the linked account owner.
+            raise ZulipOperationError("permission_denied", False)
+
+    def _require_reaction_author(self, operation: dict[str, object]) -> None:
+        payload = typing.cast(dict[str, object], operation["payload"])
+        if str(payload["user_uuid"]) != self.owner_user_uuid:
+            # Zulip assigns reaction authorship from the API key and exposes no
+            # actor override. Never publish a participant's reaction as the
+            # linked account owner.
             raise ZulipOperationError("permission_denied", False)
 
     def register_queue(self) -> tuple[str, int, dict[str, object]]:
@@ -1616,6 +1631,8 @@ class OfficialZulipAdapter:
         kind = str(operation["kind"])
         payload = typing.cast(dict[str, object], operation["payload"])
         provider = typing.cast(dict[str, object], operation["provider"])
+        if kind in REACTION_WRITE_KINDS:
+            self._require_reaction_author(operation)
         if kind == "message.create":
             self._require_message_author(operation)
             if correlation is None:
