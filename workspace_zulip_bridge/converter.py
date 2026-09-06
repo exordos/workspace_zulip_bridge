@@ -639,48 +639,6 @@ def _record(
     return record
 
 
-def history_finalize_record(
-    store: ConversionStore,
-    account_uuid: str,
-    queue_id: str,
-    provider_chat_key: str,
-    assignment: dict[str, object],
-) -> dict[str, object]:
-    """Build the causal fence that publishes exact unread state after history."""
-
-    account = store.account_resource(account_uuid)
-    if account is None:
-        raise ValueError("unknown_external_account")
-    stream = store.provider_mapping(account_uuid, "stream", provider_chat_key)
-    if stream is None:
-        raise ValueError("provider_chat_assignment_pending")
-    stream_uuid = str(stream["workspace_uuid"])
-    operation = {
-        "kind": "history.finalize",
-        "entity_uuid": stream_uuid,
-        "actor_uuid": str(account["owner_user_uuid"]),
-        "occurred_at": "1970-01-01T00:00:00Z",
-        "provider": _provider(provider_chat_key, provider_chat_key),
-        "payload": {
-            "stream_uuid": stream_uuid,
-            "generation": int(assignment["generation"]),
-        },
-        "extensions": {"provider_badge": "zulip"},
-    }
-    return _record(
-        store,
-        account_uuid,
-        str(assignment["project_id"]),
-        f"{queue_id}:history-finalize",
-        0,
-        0,
-        operation,
-        f"chat:{account_uuid}:{stream_uuid}",
-        datetime.datetime(1970, 1, 1, tzinfo=datetime.UTC),
-        "backfill",
-    )
-
-
 def convert_markdown(
     content: str,
     mention_uuids: dict[str, str],

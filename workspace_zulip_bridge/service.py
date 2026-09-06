@@ -25,6 +25,9 @@ from workspace_zulip_bridge import (
     converter,
     credentials,
     file_api,
+    history,
+    history_configuration,
+    history_delivery,
     provider_api,
     provider_protocol,
     scheduler,
@@ -55,6 +58,10 @@ class AdapterRegistry:
         self.file_client = file_client
         self.custom_ca_dir = custom_ca_dir
         self.validated_ca_digest: str | None = None
+        self.history_user_cache = zulip_adapter.HistoryUserCache()
+
+    def invalidate_history_users(self, account_uuid: str) -> None:
+        self.history_user_cache.invalidate(account_uuid)
 
     def _cert_bundle(self) -> str | None:
         resource = self.store.custom_ca_bundle("zulip")
@@ -149,6 +156,7 @@ class AdapterRegistry:
                 file_limit=lambda: self.store.effective_file_limit(
                     file_api.MAX_FILE_BYTES
                 ),
+                history_user_cache=self.history_user_cache,
             )
         except zulip_adapter.ZulipOperationError as exc:
             if exc.account_generation is None:
@@ -448,6 +456,16 @@ class BridgeService:
         self.provider_adapters = provider_adapters
         self.health_file = health_file
         self.file_client = file_client
+        self.history_publisher = (
+            history_delivery.HistoryPublisher(
+                store,
+                file_client,
+                provider_adapters,
+                self._queue_history_failure_report,
+            )
+            if file_client is not None
+            else None
+        )
         self.provider_api = provider_client
         self.certificate_renewer = certificate_renewer
         self.control_poll_interval_seconds = control_poll_interval_seconds
@@ -469,6 +487,7 @@ class BridgeService:
         self.last_history_quantum = time.monotonic()
         self.history_quantum_lock = threading.Lock()
         self.history_delivery_lock = threading.Lock()
+        self.history_directory_refresh_lock = threading.Lock()
         self.last_terminal_state_prune = time.monotonic()
         self.last_history_lease_reap = time.monotonic()
         self.provider_poll_threads: dict[str, threading.Thread] = {}
@@ -1038,7 +1057,8 @@ class BridgeService:
                 if queue_error.code != "bad_event_queue_id":
                     raise
                 self.store.begin_provider_queue_catchup(account_uuid)
-                self.store.invalidate_provider_event_cursor(account_uuid)
+                # Keep the verified account realm while registration is in
+                # flight so concurrent history reconciliation retains captures.
                 getattr(self, "initial_sync_ready_accounts", set()).discard(
                     account_uuid
                 )
@@ -1076,7 +1096,6 @@ class BridgeService:
         except zulip_adapter.ZulipOperationError as exc:
             if exc.code == "bad_event_queue_id":
                 self.store.begin_provider_queue_catchup(account_uuid)
-                self.store.invalidate_provider_event_cursor(account_uuid)
                 getattr(self, "initial_sync_ready_accounts", set()).discard(
                     account_uuid
                 )
@@ -1495,6 +1514,27 @@ class BridgeService:
                 report_state,
                 now + self.OBSERVED_REPORT_RECHECK_INTERVAL_SECONDS,
             )
+
+    def _queue_history_failure_report(
+        self,
+        account_uuid: str,
+        status: str,
+        safe_error_code: str,
+        expected_generation: int,
+    ) -> bool:
+        """Acknowledge durable history reporting without an in-memory cache."""
+        account = self.store.account_resource(account_uuid)
+        if account is None or int(account["generation"]) != expected_generation:
+            return False
+        return self._queue_observed_report(
+            "external_account",
+            account_uuid,
+            expected_generation,
+            status,
+            "retry",
+            safe_error_code=safe_error_code,
+            ensure_durable=True,
+        )
 
     def _queue_ready_assignment_reports(self, account_uuid: str) -> None:
         for assignment in self.store.assignments_needing_live_report(account_uuid):
@@ -2559,7 +2599,7 @@ class BridgeService:
 
         if messages:
             try:
-                self.enqueue_backfill(
+                self.enqueue_catchup_messages(
                     account_uuid,
                     chat_key,
                     converter.newest_first(messages),
@@ -2645,9 +2685,12 @@ class BridgeService:
         return False
 
     def _run_history_quantum_once(self) -> bool:
-        if self.run_provider_catchup_once():
-            return True
-        return self.run_backfill_once()
+        progressed = False
+        if self._provider_delivery_delay() <= 0:
+            progressed = self.run_provider_catchup_once()
+        # Local capture has no Workspace dependency. A catch-up waiting for
+        # catalog materialization must not starve it either.
+        return self.run_backfill_once() or progressed
 
     def _file_resolver(
         self,
@@ -2658,9 +2701,16 @@ class BridgeService:
         if self.file_client is None:
             return None
 
-        def resolve(provider_url: str, display_name: str) -> str:
+        def resolve(provider_url: str, display_name: str) -> str | None:
             max_bytes = self.store.effective_file_limit(file_api.MAX_FILE_BYTES)
-            downloaded = adapter.download_file(provider_url, max_bytes=max_bytes)
+            try:
+                downloaded = adapter.download_file(provider_url, max_bytes=max_bytes)
+            except zulip_adapter.ZulipOperationError as exc:
+                # A malformed user-authored attachment must not discard the
+                # surrounding message. The adapter rejects it before HTTP.
+                if exc.code == "invalid_provider_file_url" and not exc.retryable:
+                    return None
+                raise
             incoming_uuid = uuid.uuid5(
                 converter.ENTITY_NAMESPACE,
                 f"zulip-file:{account_uuid}:{external_chat_uuid}:{provider_url}",
@@ -3630,13 +3680,13 @@ class BridgeService:
             yield chunk
             offset += len(chunk)
 
-    def enqueue_backfill(
+    def enqueue_catchup_messages(
         self,
         account_uuid: str,
         provider_chat_key: str,
         messages: list[dict[str, object]],
     ) -> int:
-        """Discover historical messages newest-first without outranking live work."""
+        """Reconcile queue-loss messages through the unchanged Provider path."""
         started_at = time.monotonic()
         adapter = self.provider_adapters(account_uuid)
         enqueued = 0
@@ -3758,185 +3808,161 @@ class BridgeService:
         )
         return enqueued
 
-    def enqueue_backfill_finalizer(
-        self,
-        account_uuid: str,
-        provider_chat_key: str,
-    ) -> bool:
-        """Queue one durable unread recomputation fence for a completed chat."""
-
-        assignment = self.store.assignment_for_provider_chat(
-            account_uuid, provider_chat_key
-        )
-        if assignment is None:
-            raise ValueError("provider_chat_assignment_pending")
-        queue_id = (
-            f"backfill:{provider_chat_key}:"
-            f"{assignment['uuid']}:{assignment['generation']}:"
-            f"snapshot:{BACKFILL_SNAPSHOT_PROJECTION_VERSION}"
-        )
-        record = converter.history_finalize_record(
-            self.store,
-            account_uuid,
-            queue_id,
-            provider_chat_key,
-            assignment,
-        )
-        return self.store.enqueue_workspace_delivery(record, 2)
-
     def run_backfill_once(self) -> bool:
+        """Capture one source-ID range in bridge PostgreSQL; never enqueue it."""
         job = self.store.claim_backfill_job()
         if job is None:
             return False
         account_uuid = str(job["account_uuid"])
-        provider_chat_key = str(job["provider_chat_key"])
+        chat_key = str(job["provider_chat_key"])
         if not self.store.account_is_active(account_uuid):
-            self.store.release_backfill_job(account_uuid, provider_chat_key)
+            self.store.release_backfill_job(account_uuid, chat_key)
             return False
         adapter: zulip_adapter.OfficialZulipAdapter | None = None
         try:
             adapter = self.provider_adapters(account_uuid)
-            anchor = "newest" if job["next_anchor"] is None else int(job["next_anchor"])
-            fetch_started_at = time.monotonic()
-            messages = adapter.message_history(provider_chat_key, anchor=anchor)
-            self._record_interval_stat("history_pages")
-            self._record_interval_stat("history_messages", len(messages))
-            self._record_interval_stat(
-                "history_provider_fetch_ms",
-                (time.monotonic() - fetch_started_at) * 1000.0,
-            )
-        except zulip_adapter.ZulipOperationError as exc:
-            authentication = self._handle_provider_account_error(
-                account_uuid, exc, self._adapter_generation(adapter)
-            )
-            if authentication:
-                self.store.release_backfill_job(account_uuid, provider_chat_key)
-                return True
-            if not exc.retryable:
-                self.store.fail_backfill_job(
-                    account_uuid,
-                    provider_chat_key,
-                    exc.code,
-                )
-                self.store.mark_health(
-                    storage.backfill_health_component(account_uuid, provider_chat_key),
-                    "degraded",
-                    exc.code,
-                )
-                self._queue_account_report(account_uuid, "degraded", exc.code)
-                return True
-            attempts = int(job.get("retry_count", 0)) + 1
-            ceiling = min(300.0, float(2 ** min(attempts - 1, 8)))
-            random_source = getattr(self, "provider_random", random)
-            delay = random_source.uniform(0.0, ceiling)
-            self.store.defer_backfill_job(
-                account_uuid,
-                provider_chat_key,
-                datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=delay),
-                exc.code,
-            )
-            return True
-        cutoff = job["cutoff_at"]
-        eligible = messages
-        reached_cutoff = False
-        if isinstance(cutoff, datetime.datetime):
-            eligible = [
-                message
-                for message in messages
-                if datetime.datetime.fromtimestamp(
-                    float(message["timestamp"]), datetime.UTC
-                )
-                >= cutoff
-            ]
-            reached_cutoff = len(eligible) != len(messages)
-        try:
-            self.enqueue_backfill(account_uuid, provider_chat_key, eligible)
-        except zulip_adapter.ZulipOperationError as exc:
-            authentication = self._handle_provider_account_error(
-                account_uuid, exc, self._adapter_generation(adapter)
-            )
-            if authentication:
-                self.store.release_backfill_job(account_uuid, provider_chat_key)
-                return True
-            if not exc.retryable:
-                self.store.fail_backfill_job(
-                    account_uuid,
-                    provider_chat_key,
-                    exc.code,
-                )
-                self.store.mark_health(
-                    storage.backfill_health_component(account_uuid, provider_chat_key),
-                    "degraded",
-                    exc.code,
-                )
-                self._queue_account_report(account_uuid, "degraded", exc.code)
-                return True
-            attempts = int(job.get("retry_count", 0)) + 1
-            ceiling = min(300.0, float(2 ** min(attempts - 1, 8)))
-            random_source = getattr(self, "provider_random", random)
-            delay = random_source.uniform(0.0, ceiling)
-            self.store.defer_backfill_job(
-                account_uuid,
-                provider_chat_key,
-                datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=delay),
-                exc.code,
-            )
-            return True
-        except ValueError as exc:
-            if str(exc) not in {
-                "provider_chat_assignment_pending",
-                "provider_chat_participants_pending",
-            }:
-                raise
-            # Selecting a chat and receiving the resulting Workspace stream/topic
-            # mappings are separate control-plane steps. Keep the history job
-            # pending until those mappings arrive instead of crashing the worker.
-            self.store.release_backfill_job(account_uuid, provider_chat_key)
-            return False
-        except Exception as exc:
-            if not self._is_retryable_database_conflict(exc):
-                raise
-            # Concurrent live and history projections can update the same
-            # provider mapping in opposite order. PostgreSQL rolls one whole
-            # transaction back; release the durable job so another lane can
-            # retry it instead of restarting the bridge process.
-            self.store.release_backfill_job(account_uuid, provider_chat_key)
-            return True
-        complete = (
-            reached_cutoff
-            or len(messages) < zulip_adapter.HISTORY_PAGE_SIZE
-            or not messages
-        )
-        next_anchor = (
-            None
-            if not messages
-            else min(int(message["id"]) for message in messages) - 1
-        )
-        if complete:
-            try:
-                self.enqueue_backfill_finalizer(account_uuid, provider_chat_key)
-            except ValueError as exc:
-                if str(exc) != "provider_chat_assignment_pending":
-                    raise
-                self.store.release_backfill_job(account_uuid, provider_chat_key)
+            started_at = time.monotonic()
+            with history.keep_capture_lease_alive(self.store, job) as lease:
+                page = adapter.history_range(chat_key, anchor=job["next_anchor"])
+                users = adapter.history_users(page.messages)
+            if not lease["current"]:
                 return False
-            except Exception as exc:
-                if not self._is_retryable_database_conflict(exc):
+            cursor = self.store.provider_event_cursor(account_uuid)
+            if cursor is None or cursor.get("provider_owner_user_id") is None:
+                self.store.release_backfill_job(account_uuid, chat_key)
+                return False
+            # Validate source fields before using timestamps for the depth filter.
+            batch = history.make_batch(
+                page, users, int(cursor["provider_owner_user_id"])
+            )
+            cutoff = job["cutoff_at"]
+            reached_cutoff = False
+            if isinstance(cutoff, datetime.datetime):
+                eligible = [
+                    message
+                    for message in page.messages
+                    if datetime.datetime.fromtimestamp(
+                        message["timestamp"], datetime.UTC
+                    )
+                    >= cutoff
+                ]
+                reached_cutoff = len(eligible) != len(page.messages)
+                batch = history.make_batch(
+                    history.HistoryRange(page.from_id, page.to_id, eligible),
+                    users,
+                    int(cursor["provider_owner_user_id"]),
+                )
+            complete = page.next_anchor is None or reached_cutoff
+            saved = self.store.save_history_batch(
+                job,
+                batch,
+                None if complete else page.next_anchor,
+                complete,
+            )
+            if not saved:
+                return False
+            self._record_interval_stat("history_ranges")
+            self._record_interval_stat("history_messages", len(batch["messages"]))
+            self._record_interval_stat(
+                "history_provider_fetch_ms", (time.monotonic() - started_at) * 1000.0
+            )
+            if complete:
+                self._record_interval_stat("history_completed")
+        except history.CaptureWriteTimeout as timeout:
+            try:
+                self.store.defer_history_capture_write(job, timeout)
+            except Exception as error:
+                if not history_delivery.retryable_database_error(error):
                     raise
-                self.store.release_backfill_job(account_uuid, provider_chat_key)
-                return True
-        self.store.advance_backfill_job(
-            account_uuid,
-            provider_chat_key,
-            next_anchor,
-            complete,
-        )
-        if complete:
-            self._record_interval_stat("history_completed")
+                # Failed bookkeeping leaves the lease intact for expiry;
+                # do not turn a body-write timeout into a one-second retry.
+            return True
+        except (ValueError, UnicodeError):
+            # Report only a safe code; never log provider payloads or message text.
+            error = zulip_adapter.ZulipOperationError("invalid_history_snapshot", False)
+            self._fail_history_capture(job, adapter, error)
+            return True
+        except zulip_adapter.ZulipOperationError as exc:
+            self._fail_history_capture(job, adapter, exc)
+            return True
+        except Exception as exc:
+            if not history_delivery.retryable_database_error(exc):
+                raise
+            try:
+                self.store.release_history_capture(job)
+            except Exception as release_error:
+                if not history_delivery.retryable_database_error(release_error):
+                    raise
+                # A contended cleanup can wait for lease expiry/reclaim.
+            return True
         self._record_provider_account_success(
             account_uuid, self._adapter_generation(adapter)
         )
         return True
+
+    def _fail_history_capture(
+        self,
+        job: dict[str, object],
+        adapter: zulip_adapter.OfficialZulipAdapter | None,
+        error: zulip_adapter.ZulipOperationError,
+    ) -> None:
+        account_uuid = str(job["account_uuid"])
+        chat_key = str(job["provider_chat_key"])
+        authentication = self._provider_auth_error(error.code)
+        transition_records_health = False
+        if authentication:
+            transition = getattr(self.store, "release_history_capture", None)
+            changed = (
+                transition(job)
+                if callable(transition)
+                else self.store.release_backfill_job(account_uuid, chat_key)
+            )
+        elif error.retryable:
+            attempts = int(job.get("retry_count", 0)) + 1
+            ceiling = min(300.0, float(2 ** min(attempts - 1, 8)))
+            delay = getattr(self, "provider_random", random).uniform(0.0, ceiling)
+            available_at = datetime.datetime.now(
+                datetime.UTC
+            ) + datetime.timedelta(seconds=delay)
+            transition = getattr(self.store, "defer_history_capture", None)
+            changed = (
+                transition(job, available_at, error.code)
+                if callable(transition)
+                else self.store.defer_backfill_job(
+                    account_uuid, chat_key, available_at, error.code
+                )
+            )
+        else:
+            transition = getattr(self.store, "fail_history_capture", None)
+            transition_records_health = callable(transition)
+            changed = (
+                transition(job, error.code)
+                if transition_records_health
+                else self.store.fail_backfill_job(account_uuid, chat_key, error.code)
+            )
+        # Exact-lease and source-generation fencing happens before any account
+        # health or report is changed. A stale provider result belongs to the
+        # old capture attempt and must not affect its replacement.
+        if changed is False:
+            return
+        self._handle_provider_account_error(
+            account_uuid, error, self._adapter_generation(adapter)
+        )
+        if not authentication and not error.retryable:
+            if not transition_records_health:
+                self.store.mark_health(
+                    storage.backfill_health_component(account_uuid, chat_key),
+                    "degraded",
+                    error.code,
+                )
+            self._queue_account_report(
+                account_uuid,
+                "degraded",
+                error.code,
+                int(job["account_generation"])
+                if "account_generation" in job
+                else None,
+            )
 
     def _provider_delivery_delay(self, now: float | None = None) -> float:
         if now is None:
@@ -4013,7 +4039,9 @@ class BridgeService:
             if live_pending and not self._claim_history_quantum():
                 return 0, history_batch_size, False
             if self._provider_delivery_delay() > 0:
-                return 0, history_batch_size, False
+                # Keep the live-work throttle, but permit local history capture
+                # while outbound Provider delivery is deferred.
+                return 0, history_batch_size, True
             return (
                 self._flush_provider_events_locked(
                     minimum_priority=2,
@@ -4307,7 +4335,7 @@ class BridgeService:
         return progressed
 
     def _run_history_lane_once(self) -> bool:
-        """Drain one durable history batch, then discover at most one page."""
+        """Drain legacy/catch-up events, then capture at most one source range."""
         history_delivered = 0
         history_batch_size = 1
         history_permitted = False
@@ -4330,8 +4358,37 @@ class BridgeService:
                 )
         progressed = history_delivered > 0
         if history_delivered < history_batch_size:
+            try:
+                progressed |= self._refresh_history_directory_once()
+            except zulip_adapter.ZulipOperationError:
+                # A temporary directory fetch failure must not stop live capture.
+                pass
             progressed |= self._run_history_quantum_once()
+            publisher = getattr(self, "history_publisher", None)
+            if publisher is not None:
+                progressed |= publisher.run_once()
         return progressed
+
+    def _refresh_history_directory_once(self) -> bool:
+        lock = getattr(self, "history_directory_refresh_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self.history_directory_refresh_lock = lock
+        if not lock.acquire(blocking=False):
+            return False
+        try:
+            try:
+                return history_configuration.refresh_once(
+                    self.store, self.provider_adapters, self._queue_account_report
+                )
+            except Exception as error:
+                if not history_delivery.retryable_database_error(error):
+                    raise
+                # The durable cursor is unchanged; retry this quantum later while
+                # live lanes and message capture continue to make progress.
+                return False
+        finally:
+            lock.release()
 
     def _claim_history_quantum(self) -> bool:
         """Let exactly one history worker progress during sustained live load."""

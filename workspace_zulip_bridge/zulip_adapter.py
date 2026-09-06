@@ -1,3 +1,5 @@
+import collections
+import copy
 import dataclasses
 import datetime
 import functools
@@ -5,6 +7,8 @@ import hashlib
 import io
 import pathlib
 import re
+import threading
+import time
 import typing
 import urllib.parse
 import uuid
@@ -12,7 +16,13 @@ import uuid
 import requests
 import zulip
 
-from workspace_zulip_bridge import converter, emoji, file_api, markdown_conversion
+from workspace_zulip_bridge import (
+    converter,
+    emoji,
+    file_api,
+    history,
+    markdown_conversion,
+)
 
 MAX_PROVIDER_FILE_BYTES = 52_428_800
 PROVIDER_QUEUE_IDLE_TIMEOUT_SECONDS = 43_200
@@ -180,6 +190,44 @@ class ZulipAmbiguousOutcome(RuntimeError):
     """The provider may have committed a message but the response was lost."""
 
 
+def validated_upload_path(value: object) -> str:
+    """Keep authenticated downloads inside uploads after URL normalization."""
+    invalid = ZulipOperationError("invalid_provider_file_url", False)
+    if not isinstance(value, str) or any(
+        ord(char) < 32 or ord(char) == 127 for char in value
+    ):
+        raise invalid
+    try:
+        parsed = urllib.parse.urlsplit(value)
+    except ValueError as error:
+        raise invalid from error
+    if (
+        parsed.scheme
+        or parsed.netloc
+        or not parsed.path.startswith("/user_uploads/")
+        or not urllib.parse.urljoin("/", parsed.path).startswith("/user_uploads/")
+    ):
+        raise invalid
+    for segment in parsed.path.split("/"):
+        # Clients and proxies can decode escapes at different stages. Check
+        # each interpretation, with a fixed bound for nested escape sequences.
+        for _ in range(8):
+            if segment in {".", ".."} or any(
+                char in "/\\" or ord(char) < 32 or ord(char) == 127 for char in segment
+            ):
+                raise invalid
+            try:
+                decoded = urllib.parse.unquote(segment, errors="strict")
+            except UnicodeError as error:
+                raise invalid from error
+            if decoded == segment:
+                break
+            segment = decoded
+        else:
+            raise invalid
+    return value
+
+
 @dataclasses.dataclass(frozen=True)
 class SendCorrelation:
     queue_id: str
@@ -266,6 +314,102 @@ def _zulip_unicode_emoji_names(
     return names_by_code
 
 
+@dataclasses.dataclass
+class _HistoryUserCacheEntry:
+    expires_at: float
+    users: dict[int, dict[str, object]] | None = None
+    historical_users: collections.OrderedDict[int, dict[str, object]] = (
+        dataclasses.field(default_factory=collections.OrderedDict)
+    )
+    lock: typing.Any = dataclasses.field(default_factory=threading.Lock)
+
+
+class HistoryUserCache:
+    """Share bounded account directories across short-lived capture adapters.
+
+    Account generations isolate changed credentials. Queue/directory events
+    invalidate the account explicitly, while the TTL bounds missed events.
+    Provider I/O holds only an entry lock; invalidation never waits for it.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_accounts: int = 128,
+        max_historical_users: int = 1024,
+        max_cached_users: int = 64_000,
+        ttl_seconds: float = 300,
+        clock: typing.Callable[[], float] = time.monotonic,
+    ):
+        if min(max_accounts, max_historical_users, max_cached_users, ttl_seconds) <= 0:
+            raise ValueError("invalid_history_user_cache_limits")
+        self.max_accounts = max_accounts
+        self.max_historical_users = max_historical_users
+        self.max_cached_users = max_cached_users
+        self.ttl_seconds = ttl_seconds
+        self.clock = clock
+        self._entries: collections.OrderedDict[
+            tuple[str | None, int | None, str], _HistoryUserCacheEntry
+        ] = collections.OrderedDict()
+        self._lock = threading.Lock()
+
+    def invalidate(self, account_uuid: str | None) -> None:
+        with self._lock:
+            for key in list(self._entries):
+                if key[0] == account_uuid:
+                    del self._entries[key]
+
+    def users(
+        self,
+        key: tuple[str | None, int | None, str],
+        referenced: set[int],
+        load_directory: typing.Callable[[], dict[int, dict[str, object]]],
+        load_historical: typing.Callable[[set[int]], dict[int, dict[str, object]]],
+    ) -> list[dict[str, object]]:
+        with self._lock:
+            now = self.clock()
+            for expired_key, cached in list(self._entries.items()):
+                if cached.expires_at <= now:
+                    del self._entries[expired_key]
+            entry = self._entries.get(key)
+            if entry is None:
+                entry = _HistoryUserCacheEntry(now + self.ttl_seconds)
+                self._entries[key] = entry
+            self._entries.move_to_end(key)
+            while len(self._entries) > self.max_accounts:
+                self._entries.popitem(last=False)
+        with entry.lock:
+            if entry.users is None:
+                entry.users = load_directory()
+            historical_ids = referenced - entry.users.keys()
+            missing = historical_ids - entry.historical_users.keys()
+            fetched = load_historical(missing) if missing else {}
+            # Keep this batch's profiles even when it references more users than
+            # the hydration cache can retain for later ranges.
+            historical = {
+                user_id: fetched.get(user_id) or entry.historical_users[user_id]
+                for user_id in sorted(historical_ids)
+            }
+            for user_id, user in historical.items():
+                entry.historical_users[user_id] = user
+                entry.historical_users.move_to_end(user_id)
+            while len(entry.historical_users) > self.max_historical_users:
+                entry.historical_users.popitem(last=False)
+            with self._lock:
+                if self._entries.get(key) is not entry:
+                    # An event may have invalidated this entry during a slow
+                    # provider request. Never publish that stale directory.
+                    raise ZulipOperationError("history_directory_changed", True)
+                while sum(
+                    len(cached.users or {}) + len(cached.historical_users)
+                    for cached in self._entries.values()
+                ) > self.max_cached_users:
+                    self._entries.popitem(last=False)
+                # An individually oversized directory remains available to this
+                # batch, but is not retained beyond the current provider quantum.
+            return copy.deepcopy([*entry.users.values(), *historical.values()])
+
+
 class OfficialZulipAdapter:
     """Boundary for the official Python client used by Zulip 12.1.1."""
 
@@ -279,6 +423,7 @@ class OfficialZulipAdapter:
         account_generation: int | None = None,
         file_client: file_api.FileApiClient | None = None,
         file_limit: typing.Callable[[], int] | None = None,
+        history_user_cache: HistoryUserCache | None = None,
     ):
         if client is None:
             if credentials is None:
@@ -312,6 +457,7 @@ class OfficialZulipAdapter:
         self.account_generation = account_generation
         self.file_client = file_client
         self.file_limit = file_limit
+        self._history_user_cache = history_user_cache or HistoryUserCache()
         self._queue_id: str | None = None
         self._last_event_id: int | None = None
         self._user_id: int | None = None
@@ -499,8 +645,7 @@ class OfficialZulipAdapter:
     def download_file(
         self, provider_url: str, max_bytes: int = MAX_PROVIDER_FILE_BYTES
     ) -> ProviderFile:
-        if not provider_url.startswith("/user_uploads/"):
-            raise ZulipOperationError("invalid_provider_file_url", False)
+        provider_url = validated_upload_path(provider_url)
         if max_bytes <= 0 or max_bytes > MAX_PROVIDER_FILE_BYTES:
             raise ZulipOperationError("provider_file_transfer_disabled", False)
         email = getattr(self.client, "email", None)
@@ -593,6 +738,184 @@ class OfficialZulipAdapter:
             typing.cast(list[dict[str, object]], result["messages"]),
             key=lambda message: (float(message["timestamp"]), int(message["id"])),
             reverse=True,
+        )
+
+    def invalidate_history_users(self) -> None:
+        self._history_user_cache.invalidate(self.account_uuid)
+
+    def history_users(
+        self,
+        messages: list[dict[str, object]] | None = None,
+        *,
+        force_refresh: bool = False,
+    ) -> list[dict[str, object]]:
+        """Read the full realm directory and hydrate this range's missing IDs."""
+        if force_refresh:
+            self.invalidate_history_users()
+
+        def directory() -> dict[int, dict[str, object]]:
+            try:
+                result = _successful(
+                    self.client.get_users({"include_deactivated": True})
+                )
+            except PROVIDER_NETWORK_ERRORS as exc:
+                raise ZulipOperationError("provider_unavailable", True) from exc
+            users = result.get("members")
+            if not isinstance(users, list) or not all(
+                isinstance(user, dict) for user in users
+            ):
+                raise ZulipOperationError("invalid_record", False)
+            history.user_catalog(users)
+            return {history.validated_id(user.get("user_id")): user for user in users}
+
+        try:
+            referenced = set()
+            for message in messages or []:
+                referenced.add(history.validated_id(message.get("sender_id")))
+                reactions = message.get("reactions")
+                if not isinstance(reactions, list) or not all(
+                    isinstance(reaction, dict) for reaction in reactions
+                ):
+                    raise ZulipOperationError("invalid_record", False)
+                for reaction in reactions:
+                    referenced.add(history.validated_id(reaction.get("user_id")))
+                if message.get("type") == "private":
+                    recipients = message.get("display_recipient")
+                    if not isinstance(recipients, list) or not all(
+                        isinstance(person, dict) for person in recipients
+                    ):
+                        raise ZulipOperationError("invalid_record", False)
+                    for person in recipients:
+                        referenced.add(history.validated_id(person.get("id")))
+            users = self._history_user_cache.users(
+                (self.account_uuid, self.account_generation, self.server_url),
+                referenced,
+                directory,
+                lambda missing: self._hydrate_referenced_users({}, missing),
+            )
+            history.user_catalog(users)
+        except (ValueError, UnicodeError) as exc:
+            raise ZulipOperationError("invalid_record", False) from exc
+        return users
+
+    def history_range(
+        self, provider_chat_key: str, anchor: int | None = None
+    ) -> history.HistoryRange:
+        """Read one aligned 5000-ID range without modifying the live queue.
+
+        Numeric ID ranges are not counts of visible messages. API pages use
+        inclusive anchors and advance by ID, never by the number returned.
+        """
+        chat_type, _, identifiers = provider_chat_key.partition(":")
+        try:
+            if chat_type == "channel":
+                narrow = [{"operator": "channel", "operand": int(identifiers)}]
+            elif chat_type in {"direct", "group_direct"}:
+                narrow = [
+                    {
+                        "operator": "dm",
+                        "operand": [int(value) for value in identifiers.split(",")],
+                    }
+                ]
+            else:
+                raise ValueError("invalid_provider_chat_key")
+        except ValueError as exc:
+            raise ZulipOperationError("invalid_provider_chat_key", False) from exc
+
+        def fetch(
+            request: dict[str, object],
+        ) -> tuple[list[dict[str, object]], bool, bool]:
+            try:
+                result = _successful(
+                    self.client.get_messages(
+                        {
+                            **request,
+                            "narrow": narrow,
+                            "apply_markdown": False,
+                        }
+                    )
+                )
+            except PROVIDER_NETWORK_ERRORS as exc:
+                raise ZulipOperationError("provider_unavailable", True) from exc
+            messages = result.get("messages")
+            if not isinstance(messages, list) or not all(
+                isinstance(message, dict)
+                and type(message.get("id")) is int
+                and 0 < message["id"] <= 2**53 - 1
+                for message in messages
+            ):
+                raise ZulipOperationError("invalid_record", False)
+            return (
+                messages,
+                result.get("found_newest") is True,
+                result.get("found_oldest") is True,
+            )
+
+        if anchor is None:
+            newest, found_newest, found_oldest = fetch(
+                {"anchor": "newest", "num_before": 1, "num_after": 0}
+            )
+            if not found_newest:
+                raise ZulipOperationError("history_pagination_stalled", True)
+            if not newest:
+                if found_oldest:
+                    return history.HistoryRange(1, history.BATCH_SIZE, [])
+                raise ZulipOperationError("history_pagination_stalled", True)
+            anchor = max(message["id"] for message in newest)
+        try:
+            anchor = history.validated_id(anchor)
+        except ValueError as exc:
+            raise ZulipOperationError("invalid_record", False) from exc
+        lower = ((anchor - 1) // history.BATCH_SIZE) * history.BATCH_SIZE + 1
+        upper = lower + history.BATCH_SIZE - 1
+        cursor = lower
+        collected: dict[int, dict[str, object]] = {}
+        while cursor <= upper:
+            messages, found_newest, _ = fetch(
+                {
+                    "anchor": cursor,
+                    "include_anchor": True,
+                    "num_before": 0,
+                    "num_after": min(999, upper - cursor),
+                }
+            )
+            if not messages:
+                # An empty forward page does not prove exhaustion unless the
+                # server confirms it. At the last ID, however, we requested
+                # only that anchor and its absence completes this range.
+                if not found_newest and cursor < upper:
+                    raise ZulipOperationError("history_pagination_stalled", True)
+                break
+            for message in messages:
+                message_id = message["id"]
+                if cursor <= message_id <= upper:
+                    collected[message_id] = message
+            last_id = max(message["id"] for message in messages)
+            if found_newest or last_id >= upper:
+                break
+            if last_id < cursor:
+                raise ZulipOperationError("history_pagination_stalled", True)
+            cursor = last_id + 1
+        next_anchor = None
+        if lower > 1:
+            older, _, found_oldest = fetch(
+                {
+                    "anchor": lower,
+                    "include_anchor": False,
+                    "num_before": 1,
+                    "num_after": 0,
+                }
+            )
+            if any(message["id"] >= lower for message in older):
+                raise ZulipOperationError("invalid_record", False)
+            next_anchor = max((message["id"] for message in older), default=None)
+            if next_anchor is None and not found_oldest:
+                raise ZulipOperationError("history_pagination_stalled", True)
+        return history.HistoryRange(
+            lower,
+            upper,
+            [collected[message_id] for message_id in sorted(collected)],
+            next_anchor,
         )
 
     def message_by_id(self, provider_message_id: int) -> dict[str, object] | None:

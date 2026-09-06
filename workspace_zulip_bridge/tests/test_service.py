@@ -1,4 +1,5 @@
 import collections
+import concurrent.futures
 import contextlib
 import datetime
 import hashlib
@@ -3609,7 +3610,7 @@ def test_backfill_waits_for_selected_channel_participant_projection():
     instance = _delivery_service(Store())
 
     with pytest.raises(ValueError, match="provider_chat_participants_pending"):
-        instance.enqueue_backfill(
+        instance.enqueue_catchup_messages(
             "00000000-0000-4000-8000-000000000001",
             "channel:42",
             [{"id": 7, "timestamp": 7}],
@@ -4082,9 +4083,6 @@ def test_first_provider_poll_processes_registration_and_reports_live_ready():
         def catalog_assignments_ready(self, requested, generation):
             return self.ready
 
-        def initial_backfill_ready(self, requested):
-            return self.ready
-
         def assignments_needing_live_report(self, requested):
             if not self.ready:
                 return []
@@ -4216,9 +4214,6 @@ def test_live_ready_requires_catalog_assignment_but_not_initial_backfill():
         def catalog_assignments_ready(self, requested, generation):
             return self.ready["assignment"]
 
-        def initial_backfill_ready(self, requested):
-            return self.ready["backfill"]
-
     instance = object.__new__(service.BridgeService)
     instance.store = Store()
     instance.account_state_recheck_interval_seconds = 0
@@ -4315,9 +4310,6 @@ def test_tick_reconciles_global_backfill_state_once_not_once_per_account(
         def catalog_assignments_ready(self, requested, generation):
             return True
 
-        def initial_backfill_ready(self, requested):
-            return True
-
     class Scheduler:
         def reconcile_once(self):
             return False
@@ -4326,6 +4318,7 @@ def test_tick_reconciles_global_backfill_state_once_not_once_per_account(
             return False
 
     instance = object.__new__(service.BridgeService)
+    instance._refresh_history_directory_once = lambda: False
     instance.store = Store()
     instance.last_heartbeat = now
     instance.last_control = now
@@ -4882,7 +4875,7 @@ def test_backfill_is_discovered_newest_first_and_queued_at_priority_two(
         {"id": 2, "timestamp": 11},
     ]
     assert (
-        _delivery_service(store).enqueue_backfill(
+        _delivery_service(store).enqueue_catchup_messages(
             "00000000-0000-0000-0000-000000000001",
             "channel:42",
             messages,
@@ -4899,105 +4892,6 @@ def test_backfill_is_discovered_newest_first_and_queued_at_priority_two(
         "backfill:channel:42:00000000-0000-4000-8000-000000000090:1:"
         f"snapshot:{service.BACKFILL_SNAPSHOT_PROJECTION_VERSION}"
     }
-
-
-def test_completed_backfill_queues_one_causal_history_finalizer():
-    account_uuid = "00000000-0000-4000-8000-000000000001"
-    project_uuid = "00000000-0000-4000-8000-000000000002"
-    stream_uuid = "00000000-0000-4000-8000-000000000003"
-    assignment = {
-        "uuid": "00000000-0000-4000-8000-000000000004",
-        "generation": 5,
-        "project_id": project_uuid,
-        "workspace_projection": {"stream": {"uuid": stream_uuid}},
-    }
-
-    class Store:
-        def __init__(self):
-            self.enqueued = []
-            self.positions = []
-
-        def account_resource(self, requested):
-            assert requested == account_uuid
-            return {"owner_user_uuid": "00000000-0000-4000-8000-000000000005"}
-
-        def assignment_for_provider_chat(self, requested, chat_key):
-            assert (requested, chat_key) == (account_uuid, "channel:42")
-            return assignment
-
-        def provider_mapping(self, requested, kind, provider_id):
-            assert (requested, kind, provider_id) == (
-                account_uuid,
-                "stream",
-                "channel:42",
-            )
-            return {"workspace_uuid": stream_uuid}
-
-        def producer_lane_position(self, operation_uuid, origin, causal_lane):
-            self.positions.append((operation_uuid, origin, causal_lane))
-            return 11, "00000000-0000-4000-8000-000000000006"
-
-        def enqueue_workspace_delivery(self, record, priority):
-            self.enqueued.append((record, priority))
-            return True
-
-    store = Store()
-    instance = object.__new__(service.BridgeService)
-    instance.store = store
-
-    assert instance.enqueue_backfill_finalizer(account_uuid, "channel:42")
-
-    record, priority = store.enqueued[0]
-    assert priority == 2
-    assert record["sequence"] == 11
-    assert record["operation"]["kind"] == "history.finalize"
-    assert record["operation"]["payload"] == {
-        "stream_uuid": stream_uuid,
-        "generation": 5,
-    }
-    assert record["operation"]["extensions"]["delivery_class"] == "backfill"
-
-
-def test_backfill_job_completes_only_after_finalizer_is_durable():
-    account_uuid = "00000000-0000-4000-8000-000000000001"
-    calls = []
-
-    class Store:
-        def claim_backfill_job(self):
-            return {
-                "account_uuid": account_uuid,
-                "provider_chat_key": "channel:42",
-                "next_anchor": None,
-                "cutoff_at": None,
-                "retry_count": 0,
-            }
-
-        def account_is_active(self, requested):
-            return requested == account_uuid
-
-        def advance_backfill_job(self, *args):
-            calls.append(("advance", args))
-
-    class Adapter:
-        generation = 1
-
-        def message_history(self, provider_chat_key, anchor):
-            assert (provider_chat_key, anchor) == ("channel:42", "newest")
-            return []
-
-    instance = object.__new__(service.BridgeService)
-    instance.store = Store()
-    instance.provider_adapters = lambda _account_uuid: Adapter()
-    instance.enqueue_backfill = lambda *args: calls.append(("messages", args)) or 0
-    instance.enqueue_backfill_finalizer = lambda *args: (
-        calls.append(("finalizer", args)) or True
-    )
-    instance._record_interval_stat = lambda *args: None
-    instance._record_provider_account_success = lambda *args: None
-
-    assert instance.run_backfill_once()
-    assert [name for name, _args in calls] == ["messages", "finalizer", "advance"]
-    assert calls[-1][1][-1] is True
 
 
 def test_backfill_conversion_store_caches_reads_and_identical_writes():
@@ -5142,7 +5036,7 @@ def test_backfill_bounds_catalog_and_message_transactions(monkeypatch):
     )
 
     assert (
-        _delivery_service(store).enqueue_backfill(
+        _delivery_service(store).enqueue_catchup_messages(
             "00000000-0000-0000-0000-000000000001",
             "channel:42",
             [{"id": value, "timestamp": value} for value in range(1, 13)],
@@ -5190,7 +5084,7 @@ def test_backfill_uses_single_message_transactions_while_live_work_is_pending(
     instance._live_workspace_delivery_pending = lambda: True
 
     assert (
-        instance.enqueue_backfill(
+        instance.enqueue_catchup_messages(
             "00000000-0000-0000-0000-000000000001",
             "channel:42",
             [{"id": value, "timestamp": value} for value in range(1, 13)],
@@ -5250,7 +5144,7 @@ def test_backfill_isolates_attachment_transfers_from_batched_transactions(
     ]
 
     assert (
-        instance.enqueue_backfill(
+        instance.enqueue_catchup_messages(
             "00000000-0000-0000-0000-000000000001",
             "channel:42",
             messages,
@@ -5293,7 +5187,7 @@ def test_backfill_keeps_first_accepted_digest_for_repeated_history(monkeypatch):
     )
 
     assert (
-        _delivery_service(store).enqueue_backfill(
+        _delivery_service(store).enqueue_catchup_messages(
             "00000000-0000-0000-0000-000000000001",
             "channel:42",
             [
@@ -5340,7 +5234,7 @@ def test_backfill_caches_durable_topic_upsert_per_assignment_generation(monkeypa
     )
 
     assert (
-        instance.enqueue_backfill(
+        instance.enqueue_catchup_messages(
             "00000000-0000-0000-0000-000000000001",
             "channel:42",
             [{"id": 2, "timestamp": 2}, {"id": 1, "timestamp": 1}],
@@ -5348,7 +5242,7 @@ def test_backfill_caches_durable_topic_upsert_per_assignment_generation(monkeypa
         == 3
     )
     assert (
-        instance.enqueue_backfill(
+        instance.enqueue_catchup_messages(
             "00000000-0000-0000-0000-000000000001",
             "channel:42",
             [{"id": 0, "timestamp": 0}],
@@ -5386,7 +5280,7 @@ def test_backfill_marks_permanently_unavailable_attachment_and_enqueues_message(
     )
 
     assert (
-        instance.enqueue_backfill(
+        instance.enqueue_catchup_messages(
             "00000000-0000-0000-0000-000000000001",
             "channel:42",
             [{"id": 7, "timestamp": 7}],
@@ -5414,7 +5308,7 @@ def test_backfill_discovers_all_topics_before_waiting_for_workspace_mappings(
     )
 
     with pytest.raises(ValueError, match="provider_chat_assignment_pending"):
-        instance.enqueue_backfill(
+        instance.enqueue_catchup_messages(
             "00000000-0000-0000-0000-000000000001",
             "channel:42",
             [
@@ -5452,13 +5346,13 @@ def test_queue_loss_catchup_recovers_create_edit_delete_before_live_ready(
     instance = _delivery_service(store)
     created_batches = []
 
-    def enqueue_backfill(account_uuid, chat_key, messages):
+    def enqueue_catchup_messages(account_uuid, chat_key, messages):
         message_ids = [message["id"] for message in messages]
         created_batches.append(message_ids)
         store.created.extend(message_ids)
         return len(messages)
 
-    instance.enqueue_backfill = enqueue_backfill
+    instance.enqueue_catchup_messages = enqueue_catchup_messages
     converted_events = []
 
     def records(*args, **kwargs):
@@ -5490,7 +5384,7 @@ def test_queue_loss_catchup_recovers_create_edit_delete_before_live_ready(
 def test_queue_loss_catchup_keeps_first_accepted_recovery_operations(monkeypatch):
     store = CatchupStore()
     instance = _delivery_service(store)
-    instance.enqueue_backfill = lambda *args: 2
+    instance.enqueue_catchup_messages = lambda *args: 2
     attempted = []
 
     def reject_replayed_digest(record, priority):
@@ -5529,7 +5423,7 @@ def test_queue_loss_catchup_waits_for_workspace_chat_gates(pending_gate):
     store = CatchupStore()
     store.mappings = {}
     instance = _delivery_service(store)
-    instance.enqueue_backfill = lambda *args: (_ for _ in ()).throw(
+    instance.enqueue_catchup_messages = lambda *args: (_ for _ in ()).throw(
         ValueError(pending_gate)
     )
 
@@ -5739,22 +5633,34 @@ def test_idle_history_uses_full_large_profile_delivery_batch():
     ]
 
 
-def test_provider_delivery_backoff_pauses_history_discovery(monkeypatch):
+def test_provider_delivery_backoff_allows_local_history_capture(monkeypatch):
     now = [10.0]
     calls = []
     monkeypatch.setattr(time, "monotonic", lambda: now[0])
 
     instance = object.__new__(service.BridgeService)
+    instance._refresh_history_directory_once = lambda: False
     instance.provider_batch_size = 100
     instance.provider_delivery_retry_after = now[0] + 30.0
     instance._live_workspace_delivery_pending = lambda: False
     instance._flush_provider_events_locked = lambda **kwargs: (_ for _ in ()).throw(
         AssertionError("history delivery must remain paused during Provider backoff")
     )
-    instance._run_history_quantum_once = lambda: calls.append("discovery") or True
+    instance.run_provider_catchup_once = lambda: calls.append("catchup") or True
+    instance.run_backfill_once = lambda: calls.append("capture") or True
 
-    assert not instance._run_history_lane_once()
-    assert calls == []
+    assert instance._run_history_lane_once()
+    assert calls == ["capture"]
+
+
+def test_pending_queue_catchup_does_not_starve_local_history_capture():
+    calls = []
+    instance = object.__new__(service.BridgeService)
+    instance.run_provider_catchup_once = lambda: calls.append("catchup") or True
+    instance.run_backfill_once = lambda: calls.append("capture") or True
+
+    assert instance._run_history_quantum_once()
+    assert calls == ["catchup", "capture"]
 
 
 def test_background_live_worker_does_not_race_dedicated_delivery_worker():
@@ -5908,6 +5814,7 @@ def test_continuous_live_work_still_runs_bounded_history_quantum(tmp_path, monke
             return True
 
     instance = object.__new__(service.BridgeService)
+    instance._refresh_history_directory_once = lambda: False
     instance.last_heartbeat = now[0]
     instance.last_control = now[0]
     instance.last_certificate_check = now[0]
@@ -5965,6 +5872,7 @@ def test_history_quantum_runs_in_the_main_service_thread(tmp_path, monkeypatch):
             return False
 
     instance = object.__new__(service.BridgeService)
+    instance._refresh_history_directory_once = lambda: False
     instance.last_heartbeat = now[0]
     instance.last_control = now[0]
     instance.last_certificate_check = now[0]
@@ -6050,6 +5958,7 @@ def test_longpoll_persists_live_event_while_main_thread_runs_history(
             return False
 
     instance = object.__new__(service.BridgeService)
+    instance._refresh_history_directory_once = lambda: False
     instance.store = Store()
     instance.provider_adapters = lambda requested: Adapter()
     instance.provider_retry_attempts = {}
@@ -6172,7 +6081,7 @@ def test_retryable_backfill_error_is_durably_deferred_with_full_jitter():
             health.append(args)
 
     class Adapter:
-        def message_history(self, provider_chat_key, anchor):
+        def history_range(self, provider_chat_key, anchor):
             raise zulip_adapter.ZulipOperationError("provider_unavailable", True)
 
     class FixedRandom:
@@ -6193,124 +6102,6 @@ def test_retryable_backfill_error_is_durably_deferred_with_full_jitter():
     assert deferred[0][2].timestamp() - after <= 4.1
     assert deferred[0][3] == "provider_unavailable"
     assert health == [("provider", "degraded", "provider_unavailable")]
-
-
-def test_retryable_file_import_during_backfill_is_durably_deferred():
-    account_uuid = "00000000-0000-4000-8000-000000000001"
-    deferred = []
-
-    class Store:
-        def claim_backfill_job(self):
-            return {
-                "account_uuid": account_uuid,
-                "provider_chat_key": "channel:42",
-                "next_anchor": None,
-                "cutoff_at": None,
-                "retry_count": 0,
-            }
-
-        def account_is_active(self, requested):
-            return True
-
-        def defer_backfill_job(self, *args):
-            deferred.append(args)
-
-        def mark_health(self, *args):
-            return None
-
-    class Adapter:
-        def message_history(self, provider_chat_key, anchor):
-            return [{"id": 7, "timestamp": 7}]
-
-    instance = object.__new__(service.BridgeService)
-    instance.store = Store()
-    instance.provider_adapters = lambda requested: Adapter()
-    instance.provider_random = type(
-        "Random", (), {"uniform": lambda self, lower, upper: upper}
-    )()
-    instance.enqueue_backfill = lambda *args: (_ for _ in ()).throw(
-        zulip_adapter.ZulipOperationError("workspace_file_import_unavailable", True)
-    )
-
-    assert instance.run_backfill_once()
-    assert deferred[0][0:2] == (account_uuid, "channel:42")
-    assert deferred[0][3] == "workspace_file_import_unavailable"
-
-
-def test_backfill_waits_for_workspace_chat_mappings_without_crashing():
-    account_uuid = "00000000-0000-4000-8000-000000000001"
-    released = []
-    advanced = []
-
-    class Store:
-        def claim_backfill_job(self):
-            return {
-                "account_uuid": account_uuid,
-                "provider_chat_key": "channel:42",
-                "next_anchor": None,
-                "cutoff_at": None,
-                "retry_count": 0,
-            }
-
-        def account_is_active(self, requested):
-            return True
-
-        def release_backfill_job(self, *args):
-            released.append(args)
-
-        def advance_backfill_job(self, *args):
-            advanced.append(args)
-
-    class Adapter:
-        def message_history(self, provider_chat_key, anchor):
-            return [{"id": 7, "timestamp": 7}]
-
-    instance = object.__new__(service.BridgeService)
-    instance.store = Store()
-    instance.provider_adapters = lambda requested: Adapter()
-    instance.enqueue_backfill = lambda *args: (_ for _ in ()).throw(
-        ValueError("provider_chat_assignment_pending")
-    )
-
-    assert not instance.run_backfill_once()
-    assert released == [(account_uuid, "channel:42")]
-    assert advanced == []
-
-
-def test_backfill_releases_job_after_retryable_database_conflict():
-    account_uuid = "00000000-0000-4000-8000-000000000001"
-    released = []
-
-    class DeadlockDetected(Exception):
-        sqlstate = "40P01"
-
-    class Store:
-        def claim_backfill_job(self):
-            return {
-                "account_uuid": account_uuid,
-                "provider_chat_key": "channel:42",
-                "next_anchor": None,
-                "cutoff_at": None,
-                "retry_count": 0,
-            }
-
-        def account_is_active(self, requested):
-            return True
-
-        def release_backfill_job(self, *args):
-            released.append(args)
-
-    class Adapter:
-        def message_history(self, provider_chat_key, anchor):
-            return [{"id": 7, "timestamp": 7}]
-
-    instance = object.__new__(service.BridgeService)
-    instance.store = Store()
-    instance.provider_adapters = lambda requested: Adapter()
-    instance.enqueue_backfill = lambda *args: (_ for _ in ()).throw(DeadlockDetected())
-
-    assert instance.run_backfill_once()
-    assert released == [(account_uuid, "channel:42")]
 
 
 def test_background_history_lane_retries_database_conflict(monkeypatch):
@@ -6413,7 +6204,7 @@ def test_non_retryable_backfill_error_fails_only_affected_job_and_reports_it():
             return True
 
     class Adapter:
-        def message_history(self, provider_chat_key, anchor):
+        def history_range(self, provider_chat_key, anchor):
             raise zulip_adapter.ZulipOperationError("provider_forbidden", False)
 
     instance = object.__new__(service.BridgeService)
@@ -6448,6 +6239,7 @@ def test_provider_events_use_a_monotonic_two_second_schedule(tmp_path, monkeypat
     now = [1.99]
     monkeypatch.setattr(time, "monotonic", lambda: now[0])
     instance = object.__new__(service.BridgeService)
+    instance._refresh_history_directory_once = lambda: False
     instance.last_heartbeat = 100.0
     instance.last_control = 100.0
     instance.last_certificate_check = 100.0
@@ -6523,6 +6315,7 @@ def test_control_transport_outage_retries_with_full_jitter_and_recovers(
             return False
 
     instance = object.__new__(service.BridgeService)
+    instance._refresh_history_directory_once = lambda: False
     instance.store = Store()
     instance.control = Control()
     instance.last_heartbeat = 0.0
@@ -6806,6 +6599,7 @@ def test_report_success_cannot_clear_blocked_desired_feed_in_same_tick(
 
     reports = iter((1, 0))
     instance = object.__new__(service.BridgeService)
+    instance._refresh_history_directory_once = lambda: False
     instance.store = Store()
     instance.control = Control()
     instance.last_heartbeat = 0.0
@@ -7498,3 +7292,65 @@ def test_certificate_renewal_failure_is_degraded_without_stopping_message_work()
 
     assert not instance._renew_certificate(False)
     assert health == [("certificate", "degraded", "certificate_renewal_failed")]
+
+
+@pytest.mark.parametrize('code', ['55P03', '57014', '40001', '40P01'])
+def test_directory_refresh_contention_keeps_the_history_lane_running(monkeypatch, code):
+    class DatabaseError(Exception):
+        sqlstate = code
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = object()
+    instance.provider_adapters = object()
+    instance._queue_account_report = lambda *_, **__: None
+    instance._flush_history_events = lambda: (0, 1, True)
+    captures = []
+    instance._run_history_quantum_once = lambda: captures.append(True) or True
+
+    def contend(*_):
+        raise DatabaseError()
+
+    monkeypatch.setattr(service.history_configuration, 'refresh_once', contend)
+    assert instance._run_history_lane_once()
+    assert captures == [True]
+
+
+def test_directory_refresh_does_not_hide_unexpected_errors(monkeypatch):
+    instance = object.__new__(service.BridgeService)
+    instance.store = object()
+    instance.provider_adapters = object()
+    instance._queue_account_report = lambda *_, **__: None
+
+    def invalid(*_):
+        raise ValueError('unexpected_directory_failure')
+
+    monkeypatch.setattr(service.history_configuration, 'refresh_once', invalid)
+    with pytest.raises(ValueError, match='unexpected_directory_failure'):
+        instance._refresh_history_directory_once()
+
+
+def test_concurrent_directory_refreshes_share_one_provider_request(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+    instance = object.__new__(service.BridgeService)
+    instance.store = object()
+    instance.provider_adapters = object()
+    instance._queue_account_report = lambda *_, **__: None
+    instance.history_directory_refresh_lock = threading.Lock()
+
+    def refresh(*_):
+        calls.append(True)
+        entered.set()
+        assert release.wait(10)
+        return True
+
+    monkeypatch.setattr(service.history_configuration, "refresh_once", refresh)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(instance._refresh_history_directory_once)
+        assert entered.wait(10)
+        second = pool.submit(instance._refresh_history_directory_once)
+        assert not second.result(timeout=10)
+        release.set()
+        assert first.result(timeout=10)
+    assert calls == [True]

@@ -1,0 +1,101 @@
+{
+  "provider_messages": [
+    {
+      "id": 13,
+      "sender_id": 7,
+      "type": "stream",
+      "stream_id": 42,
+      "display_recipient": "Café",
+      "subject": "Import",
+      "timestamp": 1788000000,
+      "content": "Hello @**Zoë|8** — é!",
+      "flags": [
+        "read",
+        "starred"
+      ],
+      "reactions": [
+        {
+          "user_id": 8,
+          "reaction_type": "unicode_emoji",
+          "emoji_code": "1f44d",
+          "emoji_name": "+1"
+        }
+      ]
+    }
+  ],
+  "provider_users": [
+    {
+      "user_id": 9,
+      "full_name": "Directory only"
+    },
+    {
+      "user_id": 8,
+      "full_name": "Zoë"
+    },
+    {
+      "user_id": 7,
+      "full_name": "Owner"
+    }
+  ],
+  "observer_user_id": 7,
+  "envelope": {
+    "schema_version": 1,
+    "project_uuid": "11111111-1111-4111-8111-111111111111",
+    "provider_realm_uuid": "22222222-2222-4222-8222-222222222222",
+    "generation": 1,
+    "sources": [
+      {
+        "account_uuid": "33333333-3333-4333-8333-333333333333",
+        "account_generation": 1,
+        "chat_uuid": "44444444-4444-4444-8444-444444444444",
+        "assignment_generation": 1
+      }
+    ],
+    "batch": {
+      "from_id": 1,
+      "to_id": 5000,
+      "users": [
+        {
+          "id": 7,
+          "name": "Owner"
+        },
+        {
+          "id": 8,
+          "name": "Zoë"
+        },
+        {
+          "id": 9,
+          "name": "Directory only"
+        }
+      ],
+      "messages": [
+        {
+          "id": 13,
+          "sender_id": 7,
+          "channel_id": 42,
+          "channel_name": "Café",
+          "topic": "Import",
+          "sent_at": 1788000000,
+          "content": "Hello @**Zoë|8** — é!",
+          "reactions": [
+            {
+              "user_id": 8,
+              "reaction_type": "unicode_emoji",
+              "emoji_code": "1f44d",
+              "emoji_name": "+1"
+            }
+          ],
+          "access": [
+            {
+              "user_id": 7,
+              "read": true,
+              "starred": true
+            }
+          ],
+          "hash": "f37a8e0ba2131d384d5a2506250db566582b2fd23fc7ee0a49a572211be00518"
+        }
+      ],
+      "hash": "0b78d29dee91c960b8b37481997b5a7b0064007b86c9a31ac344919d48eca000"
+    }
+  }
+}

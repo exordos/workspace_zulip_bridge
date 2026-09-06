@@ -11,7 +11,14 @@ import uuid
 
 from restalchemy.storage.sql import engines, sessions
 
-from workspace_zulip_bridge import canonical, control, emoji
+from workspace_zulip_bridge import (
+    canonical,
+    control,
+    emoji,
+    history,
+    history_configuration,
+    history_failure_reports,
+)
 
 PARTICIPANT_RECHECK_INTERVAL_SECONDS = 3600
 
@@ -5788,38 +5795,6 @@ class RestAlchemyStore:
                                     'committed'
                           )
                       )
-                      AND (
-                          delivery.record->'operation'->>'kind' <>
-                              'history.finalize'
-                          OR NOT EXISTS (
-                              SELECT 1
-                              FROM workspace_delivery_outbox AS predecessor
-                              WHERE predecessor.sent_at IS NULL
-                                AND predecessor.submission_state IN (
-                                    'pending', 'submitting', 'ambiguous',
-                                    'awaiting_result', 'rejected'
-                                )
-                                AND predecessor.account_uuid =
-                                    delivery.account_uuid
-                                AND predecessor.assignment_uuid
-                                    IS NOT DISTINCT FROM
-                                    delivery.assignment_uuid
-                                AND predecessor.assignment_generation
-                                    IS NOT DISTINCT FROM
-                                    delivery.assignment_generation
-                                AND predecessor.assignment_project_uuid
-                                    IS NOT DISTINCT FROM
-                                    delivery.assignment_project_uuid
-                                AND predecessor.record->>'origin' =
-                                    delivery.record->>'origin'
-                                AND predecessor.record->'operation'
-                                        ->'extensions'->>'delivery_class' =
-                                    'backfill'
-                                AND predecessor.record->'operation'->>'kind' <>
-                                    'history.finalize'
-                                AND predecessor.created_at <= delivery.created_at
-                          )
-                      )
                     ORDER BY priority, created_at LIMIT %s
                     """,
                 (minimum_priority, maximum_priority, limit),
@@ -6369,22 +6344,6 @@ class RestAlchemyStore:
                     """,
                     (locked["record_uuid"],),
                 )
-                if int(locked["priority"]) == 2 and operation is not None:
-                    session.execute(
-                        """
-                        UPDATE zulip_backfill_jobs
-                        SET state = 'failed', lease_until = NULL,
-                            last_error_code =
-                                'workspace_delivery_assignment_ambiguous',
-                            updated_at = now()
-                        WHERE account_uuid = %s AND provider_chat_key = %s
-                          AND state != 'cancelled'
-                        """,
-                        (
-                            locked["account_uuid"],
-                            str(provider.get("chat_id", "")),
-                        ),
-                    )
             stale = session.execute(
                 f"""
                 DELETE FROM workspace_delivery_outbox AS delivery
@@ -6449,32 +6408,6 @@ class RestAlchemyStore:
                 )
 
             for row in stale:
-                if row["priority"] == 2:
-                    record = typing.cast(dict[str, object], row["record"])
-                    operation = typing.cast(
-                        dict[str, object] | None,
-                        record.get("operation"),
-                    )
-                    if operation is not None:
-                        provider = typing.cast(
-                            dict[str, object],
-                            operation["provider"],
-                        )
-                        session.execute(
-                            """
-                            UPDATE zulip_backfill_jobs
-                            SET state = 'pending', next_anchor = NULL,
-                                lease_until = NULL, available_at = now(),
-                                retry_count = 0, last_error_code = NULL,
-                                updated_at = now()
-                            WHERE account_uuid = %s AND provider_chat_key = %s
-                              AND state != 'cancelled'
-                            """,
-                            (
-                                row["account_uuid"],
-                                str(provider["chat_id"]),
-                            ),
-                        )
                 if row["provider_queue_id"] is None:
                     continue
                 provider_event_key = (
@@ -6942,12 +6875,8 @@ class RestAlchemyStore:
                             -- became terminal can depend on that failed
                             -- materialization.  Retained evidence must not
                             -- poison records created by later provider events.
-                            AND (
-                                dependent.record->'operation'->>'kind' =
-                                    'history.finalize'
-                                OR dependent.created_at <=
-                                    dependency_operation.updated_at
-                            )
+                            AND dependent.created_at <=
+                                dependency_operation.updated_at
                             AND dependency.account_uuid = dependent.account_uuid
                             AND dependency.assignment_uuid IS NOT DISTINCT FROM
                                 dependent.assignment_uuid
@@ -6959,44 +6888,21 @@ class RestAlchemyStore:
                                 dependent.assignment_project_uuid
                             AND (
                                 (
-                                    dependent.record->'operation'->>'kind' =
-                                        'history.finalize'
-                                    AND dependency.record->'operation'
-                                            ->'extensions'->>'delivery_class' =
-                                        'backfill'
-                                    AND dependency.record->'operation'->>'kind' <>
-                                        'history.finalize'
-                                    AND dependency.created_at <=
-                                        dependent.created_at
+                                    dependency.record->>'origin' =
+                                        dependent.record->>'origin'
+                                    AND dependency.record->>'causal_lane' =
+                                        dependent.record->>'causal_lane'
+                                    AND (dependency.record->>'sequence')::bigint <
+                                        (dependent.record->>'sequence')::bigint
                                 ) OR (
-                                    dependent.record->'operation'->>'kind' <>
-                                        'history.finalize'
-                                    AND (
-                                        (
-                                            dependency.record->>'origin' =
-                                                dependent.record->>'origin'
-                                            AND dependency.record
-                                                    ->>'causal_lane' =
-                                                dependent.record->>'causal_lane'
-                                            AND (dependency.record
-                                                    ->>'sequence')::bigint <
-                                                (dependent.record
-                                                    ->>'sequence')::bigint
-                                        ) OR (
-                                            dependency.provider_queue_id =
-                                                dependent.provider_queue_id
-                                            AND dependency.provider_event_id =
-                                                dependent.provider_event_id
-                                        )
-                                    )
+                                    dependency.provider_queue_id =
+                                        dependent.provider_queue_id
+                                    AND dependency.provider_event_id =
+                                        dependent.provider_event_id
                                 )
                             )
                             AND (
                                 (
-                                    dependent.record->'operation'->>'kind' =
-                                        'history.finalize'
-                                )
-                                OR (
                                     dependency.record->'operation'->>'kind' =
                                         'topic.upsert'
                                     AND dependent.record->'operation'->>'kind' IN (
@@ -8099,8 +8005,41 @@ class RestAlchemyStore:
             ).fetchone()
             return row is not None and bool(row["ready"])
 
+    @staticmethod
+    def history_configuration_fingerprint(session, project_uuid=None, provider_realm_uuid=None):
+        if project_uuid is not None:
+            return history_configuration.fingerprint(history_configuration.sources(session, project_uuid, provider_realm_uuid))
+        sources = session.execute(
+            """
+            SELECT resource_type, resource_uuid::text AS uuid,
+                   CASE resource_type
+                     WHEN 'external_account' THEN jsonb_build_object(
+                         'generation', generation
+                     )
+                     ELSE jsonb_build_object(
+                         'account_uuid', body->>'external_account_uuid',
+                         'project_id', body->>'project_id',
+                         'provider_chat', body->'provider_chat',
+                         'selected', body->'selected',
+                         'history_depth', body->>'history_depth'
+                     )
+                   END AS configuration
+            FROM desired_resources
+            WHERE NOT deleted AND resource_type IN (
+                'external_account', 'external_chat_assignment'
+            )
+            ORDER BY resource_type, resource_uuid
+            """
+        ).fetchall()
+        return history.digest({"capture_version": 2, "sources": [dict(row) for row in sources]})
+
+    @staticmethod
+    def _reconcile_history_configuration(session: sessions.PgSQLSession) -> None:
+        history_configuration.reconcile(RestAlchemyStore, session)
+
     def reconcile_backfill_jobs(self) -> None:
         with self.session() as session:
+            self._reconcile_history_configuration(session)
             session.execute(
                 """
                 INSERT INTO zulip_backfill_jobs (
@@ -8127,6 +8066,7 @@ class RestAlchemyStore:
                  AND account.resource_uuid::text =
                      assignment.body->>'external_account_uuid'
                  AND NOT account.deleted
+                 AND COALESCE((account.body->>'synchronization_enabled')::boolean, false)
                 WHERE assignment.resource_type = 'external_chat_assignment'
                   AND NOT assignment.deleted
                   AND COALESCE((assignment.body->>'selected')::boolean, true)
@@ -8172,7 +8112,7 @@ class RestAlchemyStore:
             session.execute(
                 """
                 UPDATE zulip_backfill_jobs AS job
-                SET state = 'cancelled', updated_at = now()
+                SET state = 'cancelled', capture_timeout_pending=false, updated_at = now()
                 WHERE job.state <> 'cancelled'
                   AND NOT EXISTS (
                     SELECT 1 FROM desired_resources AS assignment
@@ -8181,6 +8121,7 @@ class RestAlchemyStore:
                      AND account.resource_uuid::text =
                          assignment.body->>'external_account_uuid'
                      AND NOT account.deleted
+                     AND COALESCE((account.body->>'synchronization_enabled')::boolean, false)
                     WHERE assignment.resource_type = 'external_chat_assignment'
                       AND NOT assignment.deleted
                       AND assignment.body->>'external_account_uuid' =
@@ -8315,76 +8256,6 @@ class RestAlchemyStore:
             ).fetchone()["count"]
         return int(assignment_count) >= min(int(catalog_count), maximum)
 
-    def initial_backfill_ready(self, account_uuid: str) -> bool:
-        with self.session() as session:
-            row = session.execute(
-                """
-                SELECT
-                    NOT EXISTS (
-                        SELECT 1 FROM desired_resources AS assignment
-                        WHERE assignment.resource_type = 'external_chat_assignment'
-                          AND NOT assignment.deleted
-                          AND (
-                              assignment.body->>'external_account_uuid'
-                          )::uuid = %s
-                          AND COALESCE(
-                              (assignment.body->>'selected')::boolean, true
-                          )
-                          AND NOT EXISTS (
-                              SELECT 1 FROM zulip_participant_sync
-                                  AS participant_sync
-                              WHERE participant_sync.account_uuid = %s
-                                AND participant_sync.provider_chat_key =
-                                    assignment.body->'provider_chat'
-                                        ->>'provider_chat_key'
-                                AND participant_sync.assignment_generation =
-                                    assignment.generation
-                                AND participant_sync.state = 'ready'
-                          )
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1 FROM desired_resources AS assignment
-                        WHERE assignment.resource_type =
-                              'external_chat_assignment'
-                          AND NOT assignment.deleted
-                          AND (
-                              assignment.body->>'external_account_uuid'
-                          )::uuid = %s
-                          AND COALESCE(
-                              (assignment.body->>'selected')::boolean, true
-                          )
-                          AND NOT EXISTS (
-                              SELECT 1 FROM zulip_backfill_jobs AS job
-                              WHERE job.account_uuid = %s
-                                AND job.provider_chat_key =
-                                    assignment.body->'provider_chat'->>'provider_chat_key'
-                                AND job.state = 'complete'
-                          )
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1 FROM workspace_delivery_outbox AS delivery
-                        JOIN desired_resources AS account
-                          ON account.resource_type = 'external_account'
-                         AND account.resource_uuid = delivery.account_uuid
-                         AND NOT account.deleted
-                        LEFT JOIN operation_idempotency AS operation
-                          ON operation.operation_uuid = delivery.operation_uuid
-                        WHERE delivery.account_uuid = %s
-                          AND delivery.priority = 2
-                          AND delivery.account_generation = account.generation
-                          AND operation.terminal_outcome IS DISTINCT FROM 'committed'
-                    ) AS ready
-                """,
-                (
-                    account_uuid,
-                    account_uuid,
-                    account_uuid,
-                    account_uuid,
-                    account_uuid,
-                ),
-            ).fetchone()
-            return bool(row["ready"])
-
     def claim_backfill_job(self) -> dict[str, object] | None:
         with self.session() as session:
             return session.execute(
@@ -8410,18 +8281,12 @@ class RestAlchemyStore:
                           ON assignment.resource_type =
                              'external_chat_assignment'
                          AND NOT assignment.deleted
+                         AND COALESCE((assignment.body->>'selected')::boolean, true)
                          AND assignment.body->>'external_account_uuid' =
                              job.account_uuid::text
                          AND assignment.body->'provider_chat'
                                  ->>'provider_chat_key' =
                              job.provider_chat_key
-                        JOIN zulip_participant_sync AS participant_sync
-                          ON participant_sync.account_uuid = job.account_uuid
-                         AND participant_sync.provider_chat_key =
-                             job.provider_chat_key
-                         AND participant_sync.assignment_generation =
-                             assignment.generation
-                         AND participant_sync.state = 'ready'
                         WHERE job.account_uuid = scheduler.account_uuid
                           AND (
                               (
@@ -8454,18 +8319,12 @@ class RestAlchemyStore:
                       ON assignment.resource_type =
                          'external_chat_assignment'
                      AND NOT assignment.deleted
+                     AND COALESCE((assignment.body->>'selected')::boolean, true)
                      AND assignment.body->>'external_account_uuid' =
                          job.account_uuid::text
                      AND assignment.body->'provider_chat'
                              ->>'provider_chat_key' =
                          job.provider_chat_key
-                    JOIN zulip_participant_sync AS participant_sync
-                      ON participant_sync.account_uuid = job.account_uuid
-                     AND participant_sync.provider_chat_key =
-                         job.provider_chat_key
-                     AND participant_sync.assignment_generation =
-                         assignment.generation
-                     AND participant_sync.state = 'ready'
                     WHERE (
                         job.state = 'pending' AND job.available_at <= now()
                     ) OR (
@@ -8475,14 +8334,14 @@ class RestAlchemyStore:
                     FOR UPDATE OF job SKIP LOCKED LIMIT 1
                 ), claimed AS (
                 UPDATE zulip_backfill_jobs AS job
-                SET state = 'running', lease_until = now() + interval '60 seconds',
+                SET state = 'running', lease_until = now() + interval '10 minutes',
                     updated_at = now()
                 FROM candidate
                 WHERE job.account_uuid = candidate.account_uuid
                   AND job.provider_chat_key = candidate.provider_chat_key
                 RETURNING job.account_uuid, job.provider_chat_key,
                           job.history_depth, job.next_anchor, job.cutoff_at,
-                          job.retry_count
+                          job.retry_count, job.lease_until
                 ), dispatched AS (
                     UPDATE scheduler_accounts AS scheduler
                     SET last_backfill_at = now()
@@ -8492,11 +8351,371 @@ class RestAlchemyStore:
                 )
                 SELECT claimed.account_uuid, claimed.provider_chat_key,
                        claimed.history_depth, claimed.next_anchor,
-                       claimed.cutoff_at, claimed.retry_count
+                       claimed.cutoff_at, claimed.retry_count, claimed.lease_until,
+                       account.generation AS account_generation,
+                       assignment.generation AS assignment_generation
                 FROM claimed
                 JOIN dispatched USING (account_uuid)
+                JOIN desired_resources AS account
+                  ON account.resource_type = 'external_account'
+                 AND account.resource_uuid = claimed.account_uuid
+                JOIN desired_resources AS assignment
+                  ON assignment.resource_type = 'external_chat_assignment'
+                 AND NOT assignment.deleted
+                 AND COALESCE((assignment.body->>'selected')::boolean, true)
+                 AND assignment.body->>'external_account_uuid' =
+                     claimed.account_uuid::text
+                 AND assignment.body->'provider_chat'->>'provider_chat_key' =
+                     claimed.provider_chat_key
                 """
             ).fetchone()
+
+    def renew_history_capture_lease(self, job: dict[str, object]) -> bool:
+        with self.session() as session:
+            session.execute("SET LOCAL lock_timeout = '50ms'")
+            session.execute("SET LOCAL statement_timeout = '500ms'")
+            row = session.execute(
+                """UPDATE zulip_backfill_jobs SET lease_until=now()+interval '10 minutes'
+                   WHERE account_uuid=%s AND provider_chat_key=%s AND state='running'
+                     AND lease_until=%s AND lease_until>now()
+                   RETURNING lease_until""",
+                (job["account_uuid"], job["provider_chat_key"], job["lease_until"]),
+            ).fetchone()
+        if row is None:
+            return False
+        job["lease_until"] = row["lease_until"]
+        return True
+
+    def _history_capture_context(self, session, job, *, locked=False):
+        locking = "FOR SHARE OF account, assignment" if locked else ""
+        return session.execute(
+            f"""
+                SELECT assignment.body->>'project_id' AS project_uuid,
+                       cursor.provider_realm_uuid, cursor.provider_owner_user_id
+                FROM desired_resources AS account
+                JOIN desired_resources AS assignment
+                  ON assignment.resource_type = 'external_chat_assignment'
+                 AND assignment.body->>'external_account_uuid' =
+                     account.resource_uuid::text
+                 AND assignment.body->'provider_chat'->>'provider_chat_key' = %s
+                 AND assignment.generation = %s AND NOT assignment.deleted
+                 AND COALESCE((assignment.body->>'selected')::boolean, true)
+                JOIN zulip_event_cursors AS cursor
+                  ON cursor.account_uuid = account.resource_uuid
+                 AND cursor.provider_account_generation = account.generation
+                WHERE account.resource_type = 'external_account'
+                  AND account.resource_uuid = %s AND NOT account.deleted
+                  AND account.generation = %s
+                  AND COALESCE(
+                      (account.body->>'synchronization_enabled')::boolean, false
+                  )
+                {locking}
+                """,
+            (
+                job["provider_chat_key"],
+                job["assignment_generation"],
+                job["account_uuid"],
+                job["account_generation"],
+            ),
+        ).fetchone()
+
+    def _transition_history_capture(
+        self,
+        job: dict[str, object],
+        state: str,
+        code: str | None = None,
+        available_at: datetime.datetime | None = None,
+    ) -> bool:
+        """Change an erroring capture only while its exact source claim is current."""
+        with self.transaction() as session:
+            session.execute("SET LOCAL lock_timeout = '50ms'")
+            session.execute("SET LOCAL statement_timeout = '500ms'")
+            session.execute("LOCK TABLE desired_resources IN SHARE MODE")
+            if self._history_capture_context(session, job, locked=True) is None:
+                return False
+            if state == "pending" and available_at is not None:
+                row = session.execute(
+                    """UPDATE zulip_backfill_jobs SET state='pending',lease_until=NULL,
+                         available_at=%s,retry_count=retry_count+1,
+                         last_error_code=%s,updated_at=now()
+                       WHERE account_uuid=%s AND provider_chat_key=%s
+                         AND state='running' AND lease_until=%s AND lease_until>now()
+                       RETURNING 1""",
+                    (
+                        available_at,
+                        code,
+                        job["account_uuid"],
+                        job["provider_chat_key"],
+                        job["lease_until"],
+                    ),
+                ).fetchone()
+            elif state == "pending":
+                row = session.execute(
+                    """UPDATE zulip_backfill_jobs SET state='pending',lease_until=NULL,
+                         available_at=now()+interval '1 second',updated_at=now()
+                       WHERE account_uuid=%s AND provider_chat_key=%s
+                         AND state='running' AND lease_until=%s AND lease_until>now()
+                       RETURNING 1""",
+                    (
+                        job["account_uuid"],
+                        job["provider_chat_key"],
+                        job["lease_until"],
+                    ),
+                ).fetchone()
+            elif state == "failed":
+                row = session.execute(
+                    """UPDATE zulip_backfill_jobs SET state='failed',lease_until=NULL,
+                         last_error_code=%s,updated_at=now()
+                       WHERE account_uuid=%s AND provider_chat_key=%s
+                         AND state='running' AND lease_until=%s AND lease_until>now()
+                       RETURNING 1""",
+                    (
+                        code,
+                        job["account_uuid"],
+                        job["provider_chat_key"],
+                        job["lease_until"],
+                    ),
+                ).fetchone()
+            else:
+                raise ValueError("invalid_history_capture_transition")
+            if row is not None and state == "failed":
+                self.mark_health(
+                    backfill_health_component(
+                        str(job["account_uuid"]), str(job["provider_chat_key"])
+                    ),
+                    "degraded",
+                    code,
+                )
+            return row is not None
+
+    def release_history_capture(self, job: dict[str, object]) -> bool:
+        """Yield only the current lease and source generation for this attempt."""
+        return self._transition_history_capture(job, "pending")
+
+    def defer_history_capture(
+        self,
+        job: dict[str, object],
+        available_at: datetime.datetime,
+        code: str,
+    ) -> bool:
+        return self._transition_history_capture(job, "pending", code, available_at)
+
+    def fail_history_capture(self, job: dict[str, object], code: str) -> bool:
+        return self._transition_history_capture(job, "failed", code)
+
+    @staticmethod
+    def _release_history_capture(session, job):
+        session.execute(
+            """UPDATE zulip_backfill_jobs SET state='pending',lease_until=NULL,
+                 available_at=now()+interval '1 second',updated_at=now()
+               WHERE account_uuid=%s AND provider_chat_key=%s
+                 AND state='running' AND lease_until=%s""",
+            (job["account_uuid"], job["provider_chat_key"], job["lease_until"]),
+        )
+
+    def defer_history_capture_write(self, job, timeout):
+        """Persist one failed body-write attempt and its report atomically."""
+        code = "history_capture_write_timeout"
+        with self.transaction() as session:
+            session.execute("SET LOCAL lock_timeout = '50ms'")
+            session.execute("SET LOCAL statement_timeout = '500ms'")
+            session.execute("LOCK TABLE desired_resources IN SHARE MODE")
+            context = self._history_capture_context(session, job, locked=True)
+            if context is None or tuple(
+                map(str, (context["project_uuid"], context["provider_realm_uuid"]))
+            ) != tuple(map(str, timeout.scope[:2])):
+                self._release_history_capture(session, job)
+                return False
+            scope = session.execute(
+                "SELECT generation FROM zulip_history_scopes WHERE project_uuid=%s AND provider_realm_uuid=%s FOR SHARE",
+                timeout.scope[:2],
+            ).fetchone()
+            if (
+                scope is None
+                or scope["generation"] != timeout.generation
+                or not self.provider_is_enabled("zulip")
+            ):
+                self._release_history_capture(session, job)
+                return False
+            current = session.execute(
+                """SELECT retry_count,last_error_code FROM zulip_backfill_jobs
+                   WHERE account_uuid=%s AND provider_chat_key=%s AND state='running'
+                     AND lease_until=%s AND lease_until>now() FOR UPDATE""",
+                (job["account_uuid"], job["provider_chat_key"], job["lease_until"]),
+            ).fetchone()
+            if current is None:
+                return False
+            attempts = (
+                current["retry_count"] + 1 if current["last_error_code"] == code else 1
+            )
+            delay = min(300, 5 * 2 ** min(attempts - 1, 6))
+            session.execute(
+                """UPDATE zulip_backfill_jobs SET state=%s,lease_until=NULL,
+                     available_at=now()+(%s*interval '1 second'),retry_count=%s,
+                     last_error_code=%s,capture_timeout_pending=true,updated_at=now()
+                   WHERE account_uuid=%s AND provider_chat_key=%s""",
+                (
+                    "failed"
+                    if attempts >= history.CAPTURE_WRITE_MAX_ATTEMPTS
+                    else "pending",
+                    delay,
+                    attempts,
+                    code,
+                    job["account_uuid"],
+                    job["provider_chat_key"],
+                ),
+            )
+            self.mark_health(
+                backfill_health_component(
+                    str(job["account_uuid"]), str(job["provider_chat_key"])
+                ),
+                "degraded",
+                code,
+            )
+            history_failure_reports.record(
+                session,
+                {"scope": timeout.scope, "generation": timeout.generation},
+                code,
+                restart_completed=True,
+            )
+            return True
+
+    @staticmethod
+    def _write_history_body(session, query, parameters, budget, scope, generation):
+        session.execute("SELECT set_config('statement_timeout',%s,true)", (budget,))
+        try:
+            row = session.execute(query, parameters).fetchone()
+        except Exception as error:
+            if history.is_statement_timeout(error):
+                raise history.CaptureWriteTimeout(scope, generation) from error
+            raise
+        session.execute("SET LOCAL statement_timeout = '500ms'")
+        return row
+
+    def save_history_batch(
+        self,
+        job: dict[str, object],
+        batch: dict[str, object],
+        next_anchor: int | None,
+        complete: bool,
+    ) -> bool:
+        """Prepare outside SQL, then atomically CAS the range and checkpoint."""
+        # The capture lane calls this directly. Reusing an outer transaction
+        # would accidentally keep its locks across hashing and serialization.
+        if getattr(self._transaction_state, "session", None) is not None:
+            raise RuntimeError("history_capture_requires_transaction_boundary")
+        with self.session() as session:
+            context = self._history_capture_context(session, job)
+            if (
+                context is None
+                or context["provider_realm_uuid"] is None
+                or context["provider_owner_user_id"] is None
+            ):
+                self._release_history_capture(session, job)
+                return False
+            scope = (
+                str(uuid.UUID(str(context["project_uuid"]))),
+                str(uuid.UUID(str(context["provider_realm_uuid"]))),
+                batch["from_id"],
+            )
+            scope_row = session.execute(
+                "SELECT * FROM zulip_history_scopes WHERE project_uuid=%s AND provider_realm_uuid=%s",
+                scope[:2],
+            ).fetchone()
+            if scope_row is None:
+                self._release_history_capture(session, job)
+                return False
+            prior = session.execute(
+                "SELECT body FROM zulip_history_batches WHERE project_uuid=%s AND provider_realm_uuid=%s AND from_id=%s",
+                scope,
+            ).fetchone()
+        observer_id = int(context["provider_owner_user_id"])
+        if any(
+            len(message["access"]) != 1
+            or message["access"][0]["user_id"] != observer_id
+            for message in batch["messages"]
+        ):
+            raise ValueError("history_observer_mismatch")
+        merged = history.merge_batch(prior["body"] if prior else None, batch)
+        if scope_row["directory_account_cursor"] and scope_row[
+            "directory_account_cursor"
+        ] >= len({source["account_uuid"] for source in scope_row["sources"]}):
+            merged = history_configuration.with_directory(
+                merged, scope_row["directory_users"]
+            )
+        # ensure_ascii guarantees that len(encoded) is its wire byte length.
+        encoded = json.dumps(merged, ensure_ascii=True)
+        budget = f"{history.capture_write_budget_ms(len(encoded))}ms"
+        prior_hash = prior["body"]["hash"] if prior else None
+        with self.transaction() as session:
+            session.execute("SET LOCAL lock_timeout = '50ms'")
+            session.execute("SET LOCAL statement_timeout = '500ms'")
+            session.execute("LOCK TABLE desired_resources IN SHARE MODE")
+            if self._history_capture_context(session, job, locked=True) != context:
+                self._release_history_capture(session, job)
+                return False
+            current_scope = session.execute(
+                "SELECT generation,directory_account_cursor FROM zulip_history_scopes WHERE project_uuid=%s AND provider_realm_uuid=%s FOR SHARE",
+                scope[:2],
+            ).fetchone()
+            if (
+                current_scope is None
+                or current_scope["generation"] != scope_row["generation"]
+                or current_scope["directory_account_cursor"]
+                != scope_row["directory_account_cursor"]
+            ):
+                self._release_history_capture(session, job)
+                return False
+            current_job = session.execute(
+                """SELECT lease_until FROM zulip_backfill_jobs
+                   WHERE account_uuid=%s AND provider_chat_key=%s
+                     AND state='running' AND lease_until>now() FOR UPDATE""",
+                (job["account_uuid"], job["provider_chat_key"]),
+            ).fetchone()
+            if current_job is None or current_job["lease_until"] != job["lease_until"]:
+                return False
+            if not self.provider_is_enabled("zulip"):
+                self._release_history_capture(session, job)
+                return False
+            if prior is None:
+                written = self._write_history_body(
+                    session,
+                    """INSERT INTO zulip_history_batches
+                         (project_uuid,provider_realm_uuid,from_id,to_id,body)
+                       VALUES (%s,%s,%s,%s,%s::jsonb)
+                       ON CONFLICT DO NOTHING RETURNING 1""",
+                    (*scope, batch["to_id"], encoded),
+                    budget,
+                    scope,
+                    scope_row["generation"],
+                )
+            else:
+                current_batch = session.execute(
+                    "SELECT body->>'hash' AS hash FROM zulip_history_batches WHERE project_uuid=%s AND provider_realm_uuid=%s AND from_id=%s FOR UPDATE",
+                    scope,
+                ).fetchone()
+                written = (
+                    current_batch is not None and current_batch["hash"] == prior_hash
+                )
+                if written and merged["hash"] != prior_hash:
+                    self._write_history_body(
+                        session,
+                        "UPDATE zulip_history_batches SET body=%s::jsonb,updated_at=now() WHERE project_uuid=%s AND provider_realm_uuid=%s AND from_id=%s RETURNING 1",
+                        (encoded, *scope),
+                        budget,
+                        scope,
+                        scope_row["generation"],
+                    )
+            if not written:
+                self._release_history_capture(session, job)
+                return False
+            self.advance_backfill_job(
+                str(job["account_uuid"]),
+                str(job["provider_chat_key"]),
+                next_anchor,
+                complete,
+            )
+            return True
 
     def advance_backfill_job(
         self,
@@ -8511,7 +8730,7 @@ class RestAlchemyStore:
                 UPDATE zulip_backfill_jobs
                 SET next_anchor = %s, state = %s, lease_until = NULL,
                     available_at = now(), retry_count = 0,
-                    last_error_code = NULL, updated_at = now()
+                    last_error_code = NULL, capture_timeout_pending=false, updated_at = now()
                 WHERE account_uuid = %s AND provider_chat_key = %s
                 """,
                 (
@@ -9963,6 +10182,10 @@ class RestAlchemyStore:
         provider_account_generation: int | None = None,
     ) -> None:
         with self.session() as session:
+            prior = session.execute(
+                "SELECT queue_id FROM zulip_event_cursors WHERE account_uuid=%s FOR UPDATE",
+                (account_uuid,),
+            ).fetchone()
             session.execute(
                 """
                 INSERT INTO zulip_event_cursors (
@@ -10003,6 +10226,11 @@ class RestAlchemyStore:
                     provider_account_generation,
                 ),
             )
+
+            if prior is not None and prior["queue_id"] != queue_id:
+                # A new registration covers a queue gap, including directory
+                # changes whose realm_user events are no longer available.
+                history_configuration.invalidate_directory(session, account_uuid)
 
     def mark_private_catalog_scanned(
         self, account_uuid: str, provider_account_generation: int
@@ -10126,18 +10354,33 @@ class RestAlchemyStore:
                     causal_lane,
                 ),
             ).fetchone()
+            if result is not None and event.get("type") == "realm_user" and (
+                event.get("op") in {"add", "remove"} or "full_name" in event.get("person", {})
+            ):
+                history_configuration.invalidate_directory(session, account_uuid)
             return result is not None
 
     def invalidate_provider_event_cursor(self, account_uuid: str) -> None:
         with self.session() as session:
+            prior = session.execute(
+                "SELECT provider_realm_uuid FROM zulip_event_cursors WHERE account_uuid=%s FOR UPDATE",
+                (account_uuid,),
+            ).fetchone()
+            if prior is not None and prior["provider_realm_uuid"] is not None:
+                # Preserve the directory invalidation before deleting the
+                # verified realm metadata from an unusable cursor.
+                history_configuration.invalidate_directory(session, account_uuid)
             session.execute(
                 "DELETE FROM zulip_event_cursors WHERE account_uuid = %s",
                 (account_uuid,),
             )
 
     def begin_provider_queue_catchup(self, account_uuid: str) -> None:
-        """Persist the recovery boundary before discarding a dead queue."""
+        """Persist recovery while retaining the verified dead queue's realm."""
         with self.session() as session:
+            # Fence publication before the replacement's provider request.
+            # The old cursor survives until a new queue is durably registered.
+            history_configuration.invalidate_directory(session, account_uuid)
             session.execute(
                 """
                 WITH selected_chats AS (
@@ -10219,35 +10462,9 @@ class RestAlchemyStore:
                 """,
                 (account_uuid,),
             )
-            session.execute(
-                """
-                UPDATE zulip_backfill_jobs AS job
-                SET next_anchor = NULL,
-                    state = CASE
-                        WHEN job.history_depth = 'new' THEN 'complete'
-                        ELSE 'pending'
-                    END,
-                    available_at = now(), retry_count = 0,
-                    last_error_code = NULL, lease_until = NULL,
-                    updated_at = now()
-                WHERE job.account_uuid = %s
-                  AND EXISTS (
-                      SELECT 1 FROM desired_resources AS assignment
-                      WHERE assignment.resource_type =
-                            'external_chat_assignment'
-                        AND NOT assignment.deleted
-                        AND assignment.body->>'external_account_uuid' =
-                            job.account_uuid::text
-                        AND assignment.body->'provider_chat'
-                                ->>'provider_chat_key' =
-                            job.provider_chat_key
-                        AND COALESCE(
-                            (assignment.body->>'selected')::boolean, true
-                        )
-                  )
-                """,
-                (account_uuid,),
-            )
+            # Frozen history captures retain their checkpoints. Queue loss is
+            # recovered by the dedicated catch-up jobs above; cursor replacement
+            # separately refreshes directories without re-fetching old messages.
 
     def pending_provider_catchup(self, account_uuid: str) -> dict[str, object] | None:
         with self.session() as session:

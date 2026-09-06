@@ -76,8 +76,9 @@ Workspace assignment changes.
 The first provider queue is registered and its cursor is persisted before any
 catalog or history work. Initial channel catalog reports contain channel names
 only. Once Workspace selects a channel, the bridge fetches the authoritative
-Zulip subscriber list and reports it before admitting live messages or
-starting the configured history backfill. The participant gate opens only when
+Zulip subscriber list and reports it before admitting live or queue-catch-up
+message delivery. Local history capture does not require Workspace participant
+materialization. The participant gate opens only when
 the current Workspace assignment projection contains the same provider user
 IDs. Zulip `subscription` peer add/remove events immediately invalidate only
 the affected selected channels, so administrator changes return through the
@@ -113,10 +114,9 @@ verified Zulip realm, provider chat, and Workspace project. The provisional UUID
 is retained as an alias, while replayed message updates, reactions, and reads use
 the canonical target. A bounded selected-chat replay repairs provisional
 reaction dependencies created before this convergence rule.
-Backfill queue identities include a snapshot projection version. When the
-message snapshot contract changes, its migration restarts every selected
-history window under fresh operation identities so terminal deliveries from a
-previous scan cannot suppress the new read/unread state.
+Queue-catch-up operation identities retain their snapshot projection version.
+Local history batches use source IDs and content hashes instead of Provider
+operation identities.
 If an assignment exists but its local stream or topic mapping was lost, the
 bridge rematerializes that mapping from the durable assignment and immediately
 wakes assignment-blocked journal events. Read-state events whose historical
@@ -124,11 +124,22 @@ message mappings point at a retired stream are omitted. A later full message
 snapshot rematerializes the current projection and emits its read state as a
 separate dependent command.
 
-### ACK-confirmed history convergence
+### Local history capture
 
-History and queue-recovery snapshots are compared with state stored in the
-existing `provider_mappings.metadata` JSONB. No sidecar file, table, or second
-source of truth is introduced. At startup the bridge builds account-scoped
+Configured history is stored in bridge PostgreSQL as
+[local JSON batches](history_batches.md).
+A separate history publisher sends completed frozen batches to the private
+history API; the backend owns S3 preparation and canonical insertion. Capture
+does not use the realtime Provider data plane. The
+following ACK rules apply to live delivery, queue recovery, and retained legacy
+outbox operations, not to the new local batch hashes.
+
+### ACK-confirmed queue-recovery convergence
+
+Queue-recovery snapshots are compared with state stored in the
+existing `provider_mappings.metadata` JSONB. Those mappings remain the delivery
+confirmation state; local history batches do not change them. At startup the
+bridge builds account-scoped
 in-memory indexes from those durable mappings; lookups include the Zulip
 account UUID and are constant-time after the normal message-mapping lookup.
 Control snapshot/reset changes rebuild the indexes.
@@ -148,13 +159,13 @@ initially applies a reply or native Zulip link before its target is mapped, the
 ACK records both the applied projection and that it still has a resolution
 dependency. A later snapshot emits one update when the rendered target becomes
 resolvable, then converges normally. Pending projections bypass the journal's
-raw-fingerprint shortcut so they are always reconsidered. History-derived
+raw-fingerprint shortcut so they are always reconsidered. Queue-recovery
 message updates also forward the Zulip edit timestamp as the provider revision
 so the backend freshness fence can order them against live edits.
 
 Owner read state is stored per account, provider message ID, and Workspace
 reader UUID, together with the Workspace message UUID that accepted the state.
-History carries this exact boolean in the same `message.upsert` command and
+Queue recovery carries this exact boolean in the same `message.upsert` command and
 persists both confirmation records in its ACK transaction. Live
 `update_message_flags` events remain separate so a newer realtime flag cannot
 be hidden by an older message freshness fence. Both read-to-unread and
@@ -165,11 +176,9 @@ stored Workspace projection still matches the current message, stream, topic,
 user, and emoji. This makes both read state and active reactions replay once if
 Workspace replaces a provisional message UUID with the canonical target.
 
-The final history page appends one `history.finalize` operation to the same
-chat causal lane. Delivery selection holds that operation behind every earlier
-uncommitted lane record. Its successful Workspace application schedules the
-single exact stream unread snapshot and per-topic snapshots that publish the
-completed import state.
+Initial history capture stores local batches without publishing Workspace
+unread snapshots. The retired history finalizer and its delivery fences have
+been removed; migration `0041` cancels unsent finalizers in upgraded outboxes.
 Repeated removals of confirmed-absent reactions are still omitted; the opposite
 transition is independent and remains deliverable.
 
@@ -224,17 +233,19 @@ replacement snapshot outlives a channel omitted by the latest registration,
 the bridge finalizes the stale event instead of letting it occupy the channel
 lane forever.
 
-Control-derived backfill jobs are reconciled by a profile-sized history pool.
-Large profiles use eight workers so independent account/chat pages can be
-fetched and converted concurrently. Idle history delivery fills the configured
-Provider batch, up to 100 events, and yields for 10 milliseconds between
-successful quanta instead of applying a fixed throughput delay. History catalog
-and outbox writes use ten-message transactions while idle. Messages that invoke
-the remote file-transfer path retain a dedicated single-message transaction.
+Control-derived history jobs use the existing profile-sized worker pool. Each
+job fetches one aligned 5000-ID source range and the provider user directory,
+then atomically merges the local batch and advances its checkpoint. Large
+profiles use up to eight workers. Jobs for different accounts share a range
+row only within the same verified realm and Workspace project.
+
+The pool also retains queue-loss catch-up and drains already queued legacy
+history events. Those deliveries retain the existing bounded Provider batches,
+file-transfer behavior, live priority, and causal dependencies.
 
 Ready chat-catalog upserts are a strict per-chat dependency lane. The bridge
 orders chat materialization ahead of ordinary observed status reports and
-withholds live or historical message events only when their assignment UUID
+withholds live or queue-catch-up message events only when their assignment UUID
 matches an incomplete catalog upsert. Independent chats and account-global
 events continue through the data plane. A retryable catalog result keeps that
 chat's message gate closed during its control-plane backoff; `available_at`
@@ -247,18 +258,17 @@ Provider submission.
 For deliveries whose chat-materialization dependency is clear, live operations
 and priority-0 Provider events take precedence over history. The history lane
 rechecks durable live work after acquiring the shared Provider HTTP mutex; when
-live work is waiting, history delivery and local conversion both fall back to
-one message per transaction, while Provider submission uses at most one
+live work is waiting, catch-up conversion falls back to one message per
+transaction, while Provider submission uses at most one
 priority-2 batch of up to ten events per second. A live event that becomes
 durable after the check waits for no more than the already-started bounded
-Provider request. If Provider rejects a history batch permanently, the bridge
+Provider request. If Provider rejects a catch-up delivery batch permanently, the bridge
 rechecks and submits ready live events between the smaller isolation requests.
 
-The 100-event batch removes the bridge-side ceiling for a 100 messages/second
-history target on large profiles. The sustained end-to-end rate still depends on
-Zulip history fetch latency and the Provider/backend/database round-trip.
-Retryable Provider delivery backoff pauses both history submission and new page
-discovery until the retry deadline, bounding the local outbox during an outage.
+Retryable Provider delivery backoff pauses outbound submission and new
+queue-catch-up conversion. Local history capture remains eligible during this
+backoff and while catch-up waits for Workspace catalog materialization. The
+existing live-work quantum throttle still bounds its scheduling frequency.
 Retryable history-fetch failures return the job to `pending` with a durable
 `available_at`, incremented retry count, safe error code, and exponential full
 jitter capped at 300 seconds. A worker restart therefore does not erase retry
@@ -272,8 +282,8 @@ account observed report. Other accounts continue polling and synchronizing.
 The worker emits one INFO-level `bridge_interval_stats` JSON record every 60
 seconds. It contains only aggregate, low-cardinality counters: confirmed-state
 index sizes and rebuild duration; message/read/reaction cache lookups, hits,
-misses, skips, and ACK updates; history and queue-catch-up pages, messages, and
-provider fetch time; and backfill generated, enqueued, no-op, and suppressed
+misses, skips, and ACK updates; local history ranges and queue-catch-up pages,
+messages, and provider fetch time; and backfill generated, enqueued, no-op, and suppressed
 operations with per-second rates. Counters reset after each record while index
 sizes remain gauges. The record contains no message text, account UUID, chat
 identifier, or other per-entity label, so it is useful for capacity analysis
