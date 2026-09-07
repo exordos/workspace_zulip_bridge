@@ -54,9 +54,14 @@ class ProviderApiConfig:
     private_key_file: pathlib.Path
     poll_interval_seconds: float = 2.0
     event_long_polling: bool = False
+    operation_wait_seconds: float = 20.0
     lease_seconds: int = 300
     batch_size: int = 20
     timeout_seconds: float = 30.0
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.operation_wait_seconds <= 25.0:
+            raise ValueError("Provider operation wait must be between 0 and 25 seconds")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -118,6 +123,9 @@ def load(path: str | pathlib.Path) -> RuntimeConfig:
             private_key_file=_path(provider_api, "private_key_file"),
             poll_interval_seconds=provider_api.getfloat("poll_interval_seconds", 2.0),
             event_long_polling=provider_api.getboolean("event_long_polling", False),
+            operation_wait_seconds=provider_api.getfloat(
+                "operation_wait_seconds", 20.0
+            ),
             lease_seconds=provider_api.getint("lease_seconds", 300),
             batch_size=provider_api.getint("batch_size", 20),
             timeout_seconds=provider_api.getfloat("timeout_seconds", 30.0),

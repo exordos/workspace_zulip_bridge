@@ -25,6 +25,12 @@ The request uses a client-generated request UUID, a maximum batch size, and a
 transport failure. Each returned operation is durably bound to its
 `provider_operation_uuid` and `lease_uuid` before execution.
 
+The operation lease request asks a current backend to wait for up to 20 seconds
+when no operation is ready. The wait is bounded to 25 seconds and may finish
+early when work becomes available. The response advertises wait support through
+`X-Workspace-Provider-Lease-Wait-Supported`. Older backends ignore the optional
+wait field, so the bridge falls back to polling twice per second.
+
 Terminal outcomes are reported to:
 
 ```text

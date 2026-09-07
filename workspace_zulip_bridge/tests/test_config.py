@@ -79,6 +79,7 @@ def test_provider_event_long_polling_is_explicit_and_defaults_off(
     path.write_text(text, encoding="utf-8")
 
     assert config.load(path).provider_api.event_long_polling is False
+    assert config.load(path).provider_api.operation_wait_seconds == 20.0
 
     path.write_text(
         text.replace("event_long_polling = false", "event_long_polling = true"),
@@ -86,3 +87,22 @@ def test_provider_event_long_polling_is_explicit_and_defaults_off(
     )
 
     assert config.load(path).provider_api.event_long_polling is True
+
+
+@pytest.mark.parametrize("wait_seconds", ["-0.1", "25.1"])
+def test_provider_operation_wait_must_match_backend_contract(
+    tmp_path: pathlib.Path,
+    wait_seconds: str,
+):
+    source = pathlib.Path(__file__).parents[2] / "etc/bridge.conf.example"
+    path = tmp_path / "bridge.conf"
+    path.write_text(
+        source.read_text(encoding="utf-8").replace(
+            "operation_wait_seconds = 20",
+            f"operation_wait_seconds = {wait_seconds}",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="between 0 and 25"):
+        config.load(path)

@@ -278,6 +278,7 @@ def test_provider_api_reuses_enrolled_control_mtls_identity():
     assert "control-ca.crt" in provider
     assert "bridge.crt" in provider
     assert "bridge.key" in provider
+    assert "operation_wait_seconds = 20" in provider
     assert "workspace-mail" not in install
     assert "workspace-mail" not in bootstrap
 
