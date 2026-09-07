@@ -211,11 +211,12 @@ UUID spellings are normalized before authorization and adapter lookup. Empty,
 invalid, or foreign account lists stop publication with a durable
 `history_file_account_not_assigned` health and account report.
 
-An import scope may contain at most 128 selected account/chat sources. The
+An import scope may contain at most 512 selected account/chat sources. The
 bridge detects an oversized scope before posting its batch, stores a terminal
 `history_source_limit_exceeded` failure, and reports degraded publication health
-and account status. This bounds the source list; it is not a limit on total
-messages. Other scopes remain eligible for publication.
+and account status. The maximum source envelope remains below 100 KiB while the
+private import endpoint allows a 50 MiB request. This bounds the source list; it
+is not a limit on total messages. Other scopes remain eligible for publication.
 
 A dedicated history lane publishes one bounded request/file operation at a
 time and persists the server job UUID/status. It polls missing attachment

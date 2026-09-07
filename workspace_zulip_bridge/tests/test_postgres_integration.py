@@ -14784,10 +14784,14 @@ def test_directory_finish_rechecks_batch_inserted_after_read(
         ).fetchone()["directory_pending"]
 
 
-def test_oversized_history_scope_is_rejected_locally_and_reported(postgres_store):
+def test_oversized_history_scope_is_rejected_locally_and_reported(
+    postgres_store, monkeypatch
+):
     import types
 
     from workspace_zulip_bridge import history_delivery
+
+    monkeypatch.setattr(history_delivery, "MAX_SOURCES", 128)
 
     project, realm = str(uuid.uuid4()), str(uuid.uuid4())
     account = _history_source(postgres_store, 17, realm, project)
@@ -15052,6 +15056,8 @@ def test_oversized_history_reports_all_scope_accounts_after_authority_check(
     import types
 
     from workspace_zulip_bridge import history_configuration, history_delivery
+
+    monkeypatch.setattr(history_delivery, "MAX_SOURCES", 128)
 
     project, realm = str(uuid.uuid4()), str(uuid.uuid4())
     first = _history_source(postgres_store, 17, realm, project)
