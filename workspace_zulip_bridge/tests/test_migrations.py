@@ -118,6 +118,76 @@ def test_0044_adopts_existing_failed_scopes_without_rewriting_batches(tmp_path):
             session.execute(f'DROP SCHEMA "{schema}" CASCADE')
 
 
+def test_0048_retries_scopes_that_fit_the_increased_source_limit(tmp_path):
+    connection_url = os.environ.get("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN")
+    if not connection_url:
+        pytest.skip("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN is not configured")
+    schema = f"cassi_history_source_limit_{uuid.uuid4().hex}"
+    scoped_url = _schema_connection_url(connection_url, schema)
+    previous = tmp_path / "previous-migrations"
+    previous.mkdir()
+    for path in MIGRATIONS.glob("*.py"):
+        if path.name < "0048-":
+            shutil.copy2(path, previous / path.name)
+    admin = storage.RestAlchemyStore(connection_url)
+    store = storage.RestAlchemyStore(scoped_url)
+    config_path = tmp_path / "bridge.conf"
+    with admin.session() as session:
+        session.execute(f'CREATE SCHEMA "{schema}"')
+    try:
+        _apply_migrations(scoped_url, config_path, previous)
+        scopes = []
+        with store.session() as session:
+            for source_count, error in (
+                (147, "history_source_limit_exceeded"),
+                (513, "history_source_limit_exceeded"),
+                (147, "history_batch_rejected"),
+            ):
+                scope = (uuid.uuid4(), uuid.uuid4())
+                scopes.append(scope)
+                sources = json.dumps([{}] * source_count)
+                session.execute(
+                    "INSERT INTO zulip_history_scopes(project_uuid,provider_realm_uuid,generation,fingerprint,sources) VALUES (%s,%s,7,%s,%s::jsonb)",
+                    (*scope, "a" * 64, sources),
+                )
+                session.execute(
+                    "INSERT INTO zulip_history_batches(project_uuid,provider_realm_uuid,from_id,to_id,body,import_status,import_error) VALUES (%s,%s,1,5000,'{}'::jsonb,'failed',%s)",
+                    (*scope, error),
+                )
+                session.execute(
+                    "INSERT INTO zulip_history_failure_reports(project_uuid,provider_realm_uuid,generation,safe_error_code) VALUES (%s,%s,7,%s)",
+                    (*scope, error),
+                )
+                session.execute(
+                    "INSERT INTO bridge_health(component,status,progressed_at,safe_error_code) VALUES (%s,'degraded',now(),%s)",
+                    (f"history_publication:{scope[0]}:{scope[1]}", error),
+                )
+        _apply_migrations(scoped_url, config_path)
+        with store.session() as session:
+            batches = session.execute(
+                "SELECT project_uuid,import_status,import_error FROM zulip_history_batches ORDER BY project_uuid"
+            ).fetchall()
+            reports = session.execute(
+                "SELECT project_uuid,safe_error_code FROM zulip_history_failure_reports ORDER BY project_uuid"
+            ).fetchall()
+            health = session.execute(
+                "SELECT component,safe_error_code FROM bridge_health ORDER BY component"
+            ).fetchall()
+        batch_by_scope = {row["project_uuid"]: row for row in batches}
+        assert batch_by_scope[scopes[0][0]]["import_status"] == "pending"
+        assert batch_by_scope[scopes[0][0]]["import_error"] is None
+        assert batch_by_scope[scopes[1][0]]["import_status"] == "failed"
+        assert batch_by_scope[scopes[2][0]]["import_status"] == "failed"
+        assert {row["project_uuid"] for row in reports} == {
+            scopes[1][0],
+            scopes[2][0],
+        }
+        assert len(health) == 2
+    finally:
+        with admin.session() as session:
+            session.execute(f'DROP SCHEMA "{schema}" CASCADE')
+
+
 def test_retired_history_finalizers_do_not_cancel_realtime_or_catchup(tmp_path):
     connection_url = os.environ.get("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN")
     if not connection_url:
@@ -351,7 +421,8 @@ def test_semantic_report_indexes_upgrade_an_applied_archive_chain(tmp_path):
             "0044-Persist-history-failure-reporting-work-90da9f.py",
             "0045-Acknowledge-history-directory-revisions-0a44f0.py",
             "0046-Persist-outstanding-capture-timeout-markers-97e00d.py",
-        "0047-Bound-directory-write-retries-436b12.py",
+            "0047-Bound-directory-write-retries-436b12.py",
+            "0048-Retry-history-batches-after-source-limit-increase-21b5ff.py",
         }:
             shutil.copy2(migration_path, archive_migrations / migration_path.name)
     admin_store = storage.RestAlchemyStore(connection_url)
@@ -413,7 +484,7 @@ def test_semantic_report_indexes_upgrade_an_applied_archive_chain(tmp_path):
                   AND column_name = 'result_record_uuid'
                 """
             ).fetchone()
-        assert applied["count"] == 48
+        assert applied["count"] == 49
         assert [row["indexname"] for row in indexes] == [
             "bridge_operations_pending_result_idx",
             "bridge_operations_result_record_uuid_idx",
@@ -467,7 +538,8 @@ def test_projection_reset_upgrade_forces_snapshot_after_old_bridge_consumed_chan
             "0044-Persist-history-failure-reporting-work-90da9f.py",
             "0045-Acknowledge-history-directory-revisions-0a44f0.py",
             "0046-Persist-outstanding-capture-timeout-markers-97e00d.py",
-        "0047-Bound-directory-write-retries-436b12.py",
+            "0047-Bound-directory-write-retries-436b12.py",
+            "0048-Retry-history-batches-after-source-limit-increase-21b5ff.py",
         }:
             shutil.copy2(migration_path, old_bridge_migrations / migration_path.name)
     admin_store = storage.RestAlchemyStore(connection_url)
@@ -639,11 +711,15 @@ def test_migrations_have_one_versioned_dependency_chain():
         "0045-Acknowledge-history-directory-revisions-0a44f0.py",
         "0046-Persist-outstanding-capture-timeout-markers-97e00d.py",
         "0047-Bound-directory-write-retries-436b12.py",
+        "0048-Retry-history-batches-after-source-limit-increase-21b5ff.py",
     ]
     assert engine.get_latest_migration() == (
-        "0047-Bound-directory-write-retries-436b12.py"
+        "0048-Retry-history-batches-after-source-limit-increase-21b5ff.py"
     )
-    assert len({step["uuid"] for step in all_migrations.values()}) == 48
+    assert len({step["uuid"] for step in all_migrations.values()}) == 49
+    assert all_migrations[
+        "0048-Retry-history-batches-after-source-limit-increase-21b5ff.py"
+    ]["depends"] == ["0047-Bound-directory-write-retries-436b12.py"]
     assert all_migrations["0047-Bound-directory-write-retries-436b12.py"]["depends"] == [
         "0046-Persist-outstanding-capture-timeout-markers-97e00d.py"
     ]
@@ -1858,7 +1934,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                   AND column_name = 'private_catalog_scanned_generation'
                 """
             ).fetchone()
-            assert applied["count"] == 48
+            assert applied["count"] == 49
             assert private_catalog_marker == {"data_type": "bigint"}
             assert [row["indexname"] for row in indexes] == [
                 "bridge_operations_active_local_echo_idx",
@@ -1917,7 +1993,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
             provider_cursor_count = session.execute(
                 "SELECT count(*) AS count FROM zulip_event_cursors"
             ).fetchone()
-            assert applied["count"] == 48
+            assert applied["count"] == 49
             assert cursor["control_cursor"] == "preserved"
             assert provider_cursor_count["count"] == 0
     finally:

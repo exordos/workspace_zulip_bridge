@@ -19,7 +19,7 @@ from workspace_zulip_bridge import (
 )
 
 PATH = "/v1/history-imports"
-MAX_SOURCES = 128
+MAX_SOURCES = 512
 # These failures describe the request/bytes/path, not observer credentials.
 PERMANENT_FILE_ERRORS = frozenset({
     "invalid_provider_file_url", "invalid_provider_file_length",
@@ -58,8 +58,8 @@ def sources_for(session, project_uuid, provider_realm_uuid):
            WHERE account.resource_type = 'external_account' AND NOT account.deleted
              AND COALESCE((account.body->>'synchronization_enabled')::boolean, false)
              AND assignment.body->>'project_id' = %s AND cursor.provider_realm_uuid = %s
-           ORDER BY assignment.resource_uuid LIMIT 129""",
-        (str(project_uuid), provider_realm_uuid),
+           ORDER BY assignment.resource_uuid LIMIT %s""",
+        (str(project_uuid), provider_realm_uuid, MAX_SOURCES + 1),
     ).fetchall()
 
 
