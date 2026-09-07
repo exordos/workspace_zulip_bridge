@@ -27,7 +27,6 @@ _OUTBOUND_KIND = {
 
 _INBOUND_KIND = {
     "identity.upsert": "identity.upsert",
-    "history.finalize": "history.finalize",
     "stream.upsert": "stream.upsert",
     "stream.delete": "stream.delete",
     "topic.upsert": "topic.upsert",
@@ -71,7 +70,6 @@ def _chat_key(store, account_uuid: str, kind: str, payload: dict[str, object]):
     elif (
         kind.startswith(("topic.", "message.", "membership."))
         or kind == "read_state.set"
-        or kind == "history.finalize"
     ):
         stream_uuid = payload["stream_uuid"]
     elif kind.startswith("reaction."):
@@ -507,7 +505,6 @@ def command_payload(store, record: dict[str, object]) -> dict[str, object] | Non
         "message": "message",
         "reaction": "reaction",
         "read_state": "read-state",
-        "history": "history",
     }[kind.split(".", 1)[0]]
     object_id = str(resource["provider_external_id"])
     references: dict[str, object] = {}

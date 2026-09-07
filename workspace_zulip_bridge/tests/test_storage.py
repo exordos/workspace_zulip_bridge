@@ -269,38 +269,6 @@ def test_pending_provider_event_lane_batch_stops_at_global_barrier():
     )
 
 
-def test_history_finalizer_waits_for_every_earlier_chat_delivery():
-    session = Session()
-    store = _store_with_session(session)
-
-    store.pending_workspace_deliveries()
-
-    statement = " ".join(session.statements[-1][0].split())
-    assert "'history.finalize'" in statement
-    assert "FROM workspace_delivery_outbox AS predecessor" in statement
-    assert "predecessor.created_at <= delivery.created_at" in statement
-    assert "->>'delivery_class' = 'backfill'" in statement
-
-
-def test_history_finalizer_rejection_fence_covers_every_backfill_lane():
-    class RejectionSession(Session):
-        def execute(self, statement, parameters=None):
-            self.statements.append((statement, parameters))
-            if "SELECT count(*) AS total FROM rejected" in statement:
-                return Result(({"total": 0},))
-            return Result()
-
-    session = RejectionSession()
-    store = _store_with_session(session)
-
-    store._quarantine_rejected_workspace_delivery_dependents(session)
-
-    statement = " ".join(session.statements[-1][0].split())
-    assert "dependency.created_at <= dependent.created_at" in statement
-    assert "->>'delivery_class' = 'backfill'" in statement
-    assert "dependent.record->'operation'->>'kind' <> 'history.finalize'" in statement
-
-
 def test_redundant_provider_message_event_requires_committed_mapping():
     session = Session(({"event_id": 7},))
     store = _store_with_session(session)
@@ -1377,25 +1345,6 @@ def test_committed_inbound_topic_result_marks_projection_durable():
     assert parameters == (account_uuid, "topic", "42:Topic", topic_uuid)
 
 
-def test_initial_backfill_gate_ignores_delivery_outcomes_from_older_generation():
-    session = Session(({"ready": True},))
-    store = _store_with_session(session)
-
-    assert store.initial_backfill_ready("00000000-0000-4000-8000-000000000001")
-    statement = session.statements[0][0]
-    normalized = " ".join(statement.split())
-    assert "zulip_participant_sync" in normalized
-    assert (
-        "participant_sync.assignment_generation = assignment.generation" in normalized
-    )
-    assert "participant_sync.state = 'ready'" in normalized
-    assert "account.resource_uuid = delivery.account_uuid" in normalized
-    assert "delivery.account_generation = account.generation" in normalized
-    assert "participant_sync.account_uuid::text" not in normalized
-    assert "job.account_uuid::text" not in normalized
-    assert "delivery.account_uuid::text" not in normalized
-
-
 def test_catalog_readiness_queries_use_native_uuid_index_expressions():
     session = Session(({"accepted": True, "count": 0},))
     store = _store_with_session(session)
@@ -1482,17 +1431,17 @@ def test_outside_history_reaction_terminalization_is_policy_guarded():
     )
 
 
-def test_backfill_claim_requires_ready_participants_for_current_assignment():
+def test_history_capture_claim_does_not_require_workspace_participant_projection():
     session = Session()
     store = _store_with_session(session)
 
     assert store.claim_backfill_job() is None
 
     statement = session.statements[0][0]
-    assert "JOIN zulip_participant_sync AS participant_sync" in statement
-    assert "participant_sync.assignment_generation =" in statement
-    assert "assignment.generation" in statement
-    assert "participant_sync.state = 'ready'" in statement
+    assert "zulip_participant_sync" not in statement
+    assert "assignment.generation AS assignment_generation" in statement
+    assert "account.generation AS account_generation" in statement
+    assert "claimed.lease_until" in statement
 
 
 def test_participant_claim_only_refreshes_channels():
@@ -1530,22 +1479,23 @@ def test_provider_event_invalidates_only_selected_participant_channels():
     assert parameters == (account_uuid, ["channel:42", "channel:43"])
 
 
-def test_dead_queue_restarts_participants_and_configured_history():
-    session = Session()
+def test_dead_queue_recovers_live_state_without_resetting_history_captures():
+    session = Session(({"generation": 1},))
     store = _store_with_session(session)
 
     store.begin_provider_queue_catchup("00000000-0000-4000-8000-000000000001")
 
-    assert len(session.statements) == 3
-    participant_reset = session.statements[1][0]
-    history_reset = session.statements[2][0]
+    assert "UPDATE zulip_history_configuration" in session.statements[0][0]
+    assert "directory_pending=true" in session.statements[2][0]
+    statements = [sql for sql, _ in session.statements]
+    capture_report = next(sql for sql in statements if "INSERT INTO zulip_history_failure_reports" in sql)
+    assert "job.capture_timeout_pending" in capture_report
+    assert any("INSERT INTO zulip_queue_catchup_jobs" in sql for sql in statements)
+    participant_reset = next(sql for sql in statements if "UPDATE zulip_participant_sync" in sql)
     assert "UPDATE zulip_participant_sync" in participant_reset
     assert "state = 'pending'" in participant_reset
     assert "provider_user_ids = '[]'::jsonb" in participant_reset
-    assert "UPDATE zulip_backfill_jobs" in history_reset
-    assert "next_anchor = NULL" in history_reset
-    assert "WHEN job.history_depth = 'new' THEN 'complete'" in history_reset
-    assert "ELSE 'pending'" in history_reset
+    assert not any("UPDATE zulip_backfill_jobs" in sql for sql, _ in session.statements)
 
 
 def test_live_assignment_report_is_queued_once_per_completed_generation():
@@ -2088,6 +2038,7 @@ def test_projection_tombstone_includes_all_assignment_owned_entities():
 def test_backfill_depth_is_assignment_owned():
     session = Session()
     store = _store_with_session(session)
+    store._reconcile_history_configuration = lambda _session: None
     store.reconcile_backfill_jobs()
     statement = session.statements[0][0]
     assert "assignment.body->>'history_depth'" in statement
@@ -2097,6 +2048,7 @@ def test_backfill_depth_is_assignment_owned():
 def test_backfill_reconcile_cancels_inactive_accounts_and_clears_stale_health():
     session = Session()
     store = _store_with_session(session)
+    store._reconcile_history_configuration = lambda _session: None
 
     store.reconcile_backfill_jobs()
 

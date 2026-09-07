@@ -63,7 +63,7 @@ def postgres_store(migrated_postgres_dsn):
     with store.session() as session:
         session.execute(
             """
-            TRUNCATE desired_resources, provider_mappings,
+            TRUNCATE zulip_history_scopes,zulip_history_directory_revisions,zulip_history_batches, desired_resources, provider_mappings,
                      provider_mapping_aliases, zulip_backfill_jobs,
                      zulip_queue_catchup_jobs, zulip_participant_sync,
                      workspace_delivery_outbox,
@@ -3146,148 +3146,6 @@ def test_confirmed_history_state_persists_only_after_ack_and_survives_restart(
     )
 
 
-def test_history_finalizer_delivery_waits_for_earlier_chat_records(postgres_store):
-    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
-    _enable_zulip_provider(postgres_store)
-    _materialize_channel_projection(postgres_store, account_uuid, project_uuid)
-    assignment = postgres_store.assignment_for_provider_chat(account_uuid, "channel:42")
-    assert assignment is not None
-    queue_id = (
-        f"backfill:channel:42:{assignment['uuid']}:"
-        f"{assignment['generation']}:snapshot:7"
-    )
-    records = converter.event_records(
-        postgres_store,
-        account_uuid,
-        queue_id,
-        {
-            "id": 601,
-            "type": "message",
-            "message": {**_provider_history_message(601), "flags": ["read"]},
-        },
-        "backfill",
-    )
-    finalizer = converter.history_finalize_record(
-        postgres_store,
-        account_uuid,
-        queue_id,
-        "channel:42",
-        assignment,
-    )
-    for record in [*records, finalizer]:
-        assert postgres_store.enqueue_workspace_delivery(record, 2)
-
-    message = next(
-        record
-        for record in records
-        if record["operation"]["kind"] in {"message.create", "message.update"}
-    )
-    with postgres_store.session() as session:
-        session.execute(
-            """
-            UPDATE workspace_delivery_outbox
-            SET record = jsonb_set(
-                    record,
-                    '{causal_lane}',
-                    to_jsonb('chat:moved-message-history'::text)
-                )
-            WHERE operation_uuid = %s
-            """,
-            (message["operation_uuid"],),
-        )
-        session.execute(
-            """
-            UPDATE workspace_delivery_outbox
-            SET sent_at = NOW(), submission_state = 'sent'
-            WHERE record->'operation'->>'kind' <> 'history.finalize'
-              AND operation_uuid <> %s
-            """,
-            (message["operation_uuid"],),
-        )
-
-    pending = postgres_store.pending_workspace_deliveries(2, 2)
-    assert finalizer not in pending
-
-    with postgres_store.session() as session:
-        session.execute(
-            """
-            UPDATE workspace_delivery_outbox
-            SET sent_at = NOW(), submission_state = 'sent'
-            WHERE record->'operation'->>'kind' <> 'history.finalize'
-            """
-        )
-    assert postgres_store.pending_workspace_deliveries(2, 2) == [finalizer]
-
-
-def test_history_finalizer_is_rejected_after_incomplete_history(postgres_store):
-    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
-    _enable_zulip_provider(postgres_store)
-    _materialize_channel_projection(postgres_store, account_uuid, project_uuid)
-    assignment = postgres_store.assignment_for_provider_chat(account_uuid, "channel:42")
-    assert assignment is not None
-    queue_id = (
-        f"backfill:channel:42:{assignment['uuid']}:"
-        f"{assignment['generation']}:snapshot:7"
-    )
-    records = converter.event_records(
-        postgres_store,
-        account_uuid,
-        queue_id,
-        {
-            "id": 601,
-            "type": "message",
-            "message": {**_provider_history_message(601), "flags": ["read"]},
-        },
-        "backfill",
-    )
-    finalizer = converter.history_finalize_record(
-        postgres_store,
-        account_uuid,
-        queue_id,
-        "channel:42",
-        assignment,
-    )
-    for record in [*records, finalizer]:
-        assert postgres_store.enqueue_workspace_delivery(record, 2)
-
-    message = next(
-        record
-        for record in records
-        if record["operation"]["kind"] in {"message.create", "message.update"}
-    )
-    with postgres_store.session() as session:
-        session.execute(
-            """
-            UPDATE workspace_delivery_outbox
-            SET record = jsonb_set(
-                    record,
-                    '{causal_lane}',
-                    to_jsonb('chat:moved-message-history'::text)
-                ),
-                submission_state = 'rejected',
-                submission_error_code = 'provider_api_http_422'
-            WHERE operation_uuid = %s
-            """,
-            (message["operation_uuid"],),
-        )
-
-    assert finalizer not in postgres_store.pending_workspace_deliveries(2, 2)
-    assert postgres_store.finalize_ready_provider_events() == 0
-    with postgres_store.session() as session:
-        state = session.execute(
-            """
-            SELECT submission_state, submission_error_code
-            FROM workspace_delivery_outbox
-            WHERE operation_uuid = %s
-            """,
-            (finalizer["operation_uuid"],),
-        ).fetchone()
-    assert state == {
-        "submission_state": "rejected",
-        "submission_error_code": "workspace_delivery_dependency_rejected",
-    }
-
-
 def test_workspace_delivery_probe_ignores_inactive_accounts_and_provider(
     postgres_store,
 ):
@@ -5100,7 +4958,7 @@ def test_outbound_commit_suppresses_queue_loss_history_duplicate(postgres_store)
     with postgres_store.session() as session:
         postgres_store._persist_committed_mapping(session, outbound, "601", None)
 
-    _backfill_service(postgres_store).enqueue_backfill(
+    _backfill_service(postgres_store).enqueue_catchup_messages(
         account_uuid, "channel:42", [_provider_history_message(601)]
     )
 
@@ -5344,7 +5202,7 @@ def test_shared_realm_backfill_rekeys_pending_message_before_reactions(
             "reaction_type": "unicode_emoji",
         }
     ]
-    _backfill_service(postgres_store).enqueue_backfill(
+    _backfill_service(postgres_store).enqueue_catchup_messages(
         target_account_uuid,
         "channel:42",
         [message],
@@ -7365,7 +7223,7 @@ def test_provider_mapping_written_before_event_delivery_recovers_same_message(
     )
     pending_workspace_uuid = first_create["operation"]["entity_uuid"]
 
-    _backfill_service(postgres_store).enqueue_backfill(
+    _backfill_service(postgres_store).enqueue_catchup_messages(
         account_uuid, "channel:42", [message]
     )
 
@@ -10430,7 +10288,7 @@ def test_exact_provider_read_lease_is_idempotent_and_ordered_in_postgres_schedul
     assert claimed.record["operation"]["entity_uuid"] == last_message_uuid
 
 
-def test_stale_backfill_delivery_restarts_chat_history(postgres_store):
+def test_stale_catchup_delivery_does_not_restart_local_history(postgres_store):
     account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
     postgres_store.reconcile_backfill_jobs()
     with postgres_store.session() as session:
@@ -10464,7 +10322,7 @@ def test_stale_backfill_delivery_restarts_chat_history(postgres_store):
             """,
             (account_uuid,),
         ).fetchone()
-    assert job == {"state": "pending", "next_anchor": None}
+    assert job == {"state": "complete", "next_anchor": 42}
 
 
 def test_submitted_delivery_survives_assignment_change_as_ambiguous(postgres_store):
@@ -11132,7 +10990,7 @@ def test_assignment_reset_quarantines_changed_setup_projection(
     }
 
 
-def test_assignment_reset_quarantines_unsafe_backfill_without_target(postgres_store):
+def test_assignment_reset_quarantines_unsafe_catchup_without_target(postgres_store):
     account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
     postgres_store.reconcile_backfill_jobs()
     record = _provider_record(account_uuid, project_uuid)
@@ -11171,12 +11029,12 @@ def test_assignment_reset_quarantines_unsafe_backfill_without_target(postgres_st
         "submission_error_code": "workspace_delivery_assignment_ambiguous",
     }
     assert job == {
-        "state": "failed",
-        "last_error_code": "workspace_delivery_assignment_ambiguous",
+        "state": "pending",
+        "last_error_code": None,
     }
 
 
-def test_assignment_reset_keeps_inflight_backfill_rejectable(postgres_store):
+def test_assignment_reset_keeps_inflight_catchup_rejectable(postgres_store):
     account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
     postgres_store.reconcile_backfill_jobs()
     record = _provider_record(account_uuid, project_uuid)
@@ -11220,8 +11078,8 @@ def test_assignment_reset_keeps_inflight_backfill_rejectable(postgres_store):
         "submission_error_code": "workspace_delivery_assignment_ambiguous",
     }
     assert job == {
-        "state": "failed",
-        "last_error_code": "workspace_delivery_assignment_ambiguous",
+        "state": "pending",
+        "last_error_code": None,
     }
     assert postgres_store.reject_provider_event_submission(
         record["record_uuid"],
@@ -13953,3 +13811,1762 @@ def test_explicit_manual_retry_remains_claimable_after_lane_advanced(postgres_st
     assert claimed is not None
     assert claimed.record["operation_uuid"] == record["operation_uuid"]
     assert claimed.record["attempt"] == 2
+
+
+def _history_source(store, provider_user_id, realm_uuid, project_uuid):
+    account_uuid = str(uuid.uuid4())
+    assignment_uuid = str(uuid.uuid4())
+    policy_uuid = "00000000-0000-4000-8000-000000000099"
+    account = {
+        "uuid": account_uuid,
+        "generation": 1,
+        "synchronization_enabled": True,
+        "owner_user_uuid": str(uuid.uuid4()),
+        "settings": {"default_project_id": project_uuid, "selection_mode": "all"},
+    }
+    assignment = {
+        "uuid": assignment_uuid,
+        "generation": 1,
+        "project_id": project_uuid,
+        "external_account_uuid": account_uuid,
+        "selected": True,
+        "history_depth": "all",
+        "provider_chat": {"provider_chat_key": "channel:42", "chat_type": "channel"},
+    }
+    policy = {
+        "uuid": policy_uuid,
+        "generation": 1,
+        "provider_kind": "zulip",
+        "enabled": True,
+        "emergency_suspended": False,
+    }
+    with store.session() as session:
+        for resource_type, body in (
+            ("external_provider_policy", policy),
+            ("external_account", account),
+            ("external_chat_assignment", assignment),
+        ):
+            session.execute(
+                """INSERT INTO desired_resources
+                   (resource_type, resource_uuid, generation, body, deleted)
+                   VALUES (%s, %s, 1, %s::jsonb, false)
+                   ON CONFLICT (resource_type, resource_uuid) DO NOTHING""",
+                (resource_type, body["uuid"], json.dumps(body)),
+            )
+        session.execute(
+            """INSERT INTO scheduler_accounts (account_uuid, provider_generation,
+                                              provider_state)
+               VALUES (%s, 1, 'ready')""",
+            (account_uuid,),
+        )
+    store.update_provider_event_cursor(
+        account_uuid, "synthetic-queue", 1, realm_uuid, str(provider_user_id), 1
+    )
+    store.reconcile_backfill_jobs()
+    return account_uuid
+
+
+def _history_job_batch(job, observer_id, *, read=True, starred=False):
+    from workspace_zulip_bridge import history
+
+    flags = (["read"] if read else []) + (["starred"] if starred else [])
+    raw = {
+        "id": 205,
+        "type": "stream",
+        "sender_id": 17,
+        "stream_id": 42,
+        "display_recipient": "Example channel",
+        "subject": "Topic",
+        "timestamp": 1788638060,
+        "content": "Synthetic persisted history",
+        "flags": flags,
+        "reactions": [],
+    }
+    users = [
+        {"user_id": uid, "full_name": f"Example user {uid}"} for uid in (17, 28, 39)
+    ]
+    return history.make_batch(history.HistoryRange(1, 5000, [raw]), users, observer_id)
+
+
+def test_history_batches_merge_accounts_and_survive_restart(
+    postgres_store, migrated_postgres_dsn
+):
+    project, realm = str(uuid.uuid4()), str(uuid.uuid4())
+    accounts = {
+        _history_source(postgres_store, uid, realm, project): uid for uid in (17, 28)
+    }
+    for _ in accounts:
+        job = postgres_store.claim_backfill_job()
+        observer = accounts[str(job["account_uuid"])]
+        assert postgres_store.save_history_batch(
+            job,
+            _history_job_batch(
+                job, observer, read=observer == 17, starred=observer == 28
+            ),
+            None,
+            True,
+        )
+    restarted = storage.RestAlchemyStore(migrated_postgres_dsn)
+    with restarted.session() as session:
+        rows = session.execute("SELECT body FROM zulip_history_batches").fetchall()
+        jobs = session.execute("SELECT state FROM zulip_backfill_jobs").fetchall()
+        outgoing = session.execute(
+            "SELECT count(*) AS count FROM workspace_delivery_outbox"
+        ).fetchone()
+        participants = session.execute(
+            "SELECT count(*) AS count FROM zulip_participant_sync"
+        ).fetchone()
+    assert len(rows) == 1
+    body = rows[0]["body"]
+    assert [user["id"] for user in body["users"]] == [17, 28, 39]
+    assert len(body["messages"]) == 1
+    assert body["messages"][0]["access"] == [
+        {"user_id": 17, "read": True, "starred": False},
+        {"user_id": 28, "read": False, "starred": True},
+    ]
+    assert all(job["state"] == "complete" for job in jobs)
+    assert outgoing["count"] == participants["count"] == 0
+    from workspace_zulip_bridge import history
+
+    assert body["hash"] == history.digest(
+        {k: v for k, v in body.items() if k != "hash"}
+    )
+
+
+def test_history_batch_and_checkpoint_roll_back_together(postgres_store, monkeypatch):
+    project, realm = str(uuid.uuid4()), str(uuid.uuid4())
+    _history_source(postgres_store, 17, realm, project)
+    job = postgres_store.claim_backfill_job()
+    value = _history_job_batch(job, 17)
+    advance = postgres_store.advance_backfill_job
+
+    def fail_checkpoint(*args):
+        advance(*args)
+        raise RuntimeError("synthetic failure after checkpoint")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(postgres_store, "advance_backfill_job", fail_checkpoint)
+        with pytest.raises(RuntimeError, match="synthetic failure"):
+            postgres_store.save_history_batch(job, value, None, True)
+    with postgres_store.session() as session:
+        assert (
+            session.execute(
+                "SELECT count(*) AS count FROM zulip_history_batches"
+            ).fetchone()["count"]
+            == 0
+        )
+        stored_job = session.execute(
+            "SELECT state, next_anchor FROM zulip_backfill_jobs"
+        ).fetchone()
+    assert stored_job["state"] == "running" and stored_job["next_anchor"] is None
+    assert postgres_store.save_history_batch(job, value, None, True)
+    assert not postgres_store.save_history_batch(job, value, None, True)
+
+
+def test_concurrent_history_observers_do_not_overwrite_each_other(postgres_store):
+    import concurrent.futures
+
+    project, realm = str(uuid.uuid4()), str(uuid.uuid4())
+    accounts = {
+        _history_source(postgres_store, uid, realm, project): uid for uid in (17, 28)
+    }
+    jobs = [postgres_store.claim_backfill_job() for _ in accounts]
+    barrier = threading.Barrier(2)
+
+    def persist(job):
+        observer = accounts[str(job["account_uuid"])]
+        barrier.wait(timeout=10)
+        return postgres_store.save_history_batch(
+            job, _history_job_batch(job, observer), None, True
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(persist, jobs))
+    assert any(results)
+    # A competing merge yields without checkpointing; reclaim and prepare
+    # against the newly committed body on the next capture quantum.
+    with postgres_store.session() as session:
+        session.execute("UPDATE zulip_backfill_jobs SET available_at=now() WHERE state='pending'")
+    while (job := postgres_store.claim_backfill_job()) is not None:
+        observer = accounts[str(job["account_uuid"])]
+        assert postgres_store.save_history_batch(job, _history_job_batch(job, observer), None, True)
+    with postgres_store.session() as session:
+        row = session.execute("SELECT body FROM zulip_history_batches").fetchone()
+    assert [item["user_id"] for item in row["body"]["messages"][0]["access"]] == [
+        17,
+        28,
+    ]
+
+
+def test_history_scope_isolates_realms_and_projects(postgres_store):
+    project, realm = str(uuid.uuid4()), str(uuid.uuid4())
+    scopes = [
+        (project, realm),
+        (str(uuid.uuid4()), realm),
+        (project, str(uuid.uuid4())),
+    ]
+    for target_project, target_realm in scopes:
+        _history_source(postgres_store, 17, target_realm, target_project)
+    for _ in scopes:
+        job = postgres_store.claim_backfill_job()
+        assert postgres_store.save_history_batch(
+            job, _history_job_batch(job, 17), None, True
+        )
+    with postgres_store.session() as session:
+        rows = session.execute(
+            "SELECT project_uuid, provider_realm_uuid FROM zulip_history_batches"
+        ).fetchall()
+    assert {
+        (str(row["project_uuid"]), str(row["provider_realm_uuid"])) for row in rows
+    } == set(scopes)
+
+
+@pytest.mark.parametrize("change", ["delete", "disable", "deselect", "new_only"])
+def test_history_rebuild_removes_observer_and_exclusive_messages(
+    postgres_store, change
+):
+    project, realm = str(uuid.uuid4()), str(uuid.uuid4())
+    accounts = {
+        uid: _history_source(postgres_store, uid, realm, project) for uid in (17, 28)
+    }
+    for _ in accounts:
+        job = postgres_store.claim_backfill_job()
+        uid = next(
+            uid
+            for uid, account in accounts.items()
+            if account == str(job["account_uuid"])
+        )
+        batch = _history_job_batch(job, uid)
+        if uid == 28:
+            from workspace_zulip_bridge import history
+
+            exclusive = copy.deepcopy(batch["messages"][0])
+            exclusive["id"] = 206
+            exclusive["hash"] = history.digest(
+                {k: v for k, v in exclusive.items() if k != "hash"}
+            )
+            batch["messages"].append(exclusive)
+            batch["hash"] = history.digest(
+                {k: v for k, v in batch.items() if k != "hash"}
+            )
+        assert postgres_store.save_history_batch(job, batch, None, True)
+    with postgres_store.session() as session:
+        if change == "delete":
+            session.execute(
+                "UPDATE desired_resources SET deleted = true, generation = 2 WHERE resource_uuid = %s",
+                (accounts[28],),
+            )
+        elif change == "disable":
+            session.execute(
+                "UPDATE desired_resources SET generation = 2, body = jsonb_set(body, '{synchronization_enabled}', 'false') WHERE resource_uuid = %s",
+                (accounts[28],),
+            )
+        else:
+            field, value = (
+                ("selected", "false")
+                if change == "deselect"
+                else ("history_depth", '"new"')
+            )
+            session.execute(
+                "UPDATE desired_resources SET generation = 2, body = jsonb_set(body, %s, %s::jsonb) WHERE resource_type = 'external_chat_assignment' AND body->>'external_account_uuid' = %s",
+                ([field], value, accounts[28]),
+            )
+    postgres_store.reconcile_backfill_jobs()
+    with postgres_store.session() as session:
+        assert session.execute("SELECT * FROM zulip_history_batches").fetchall() == []
+    job = postgres_store.claim_backfill_job()
+    assert str(job["account_uuid"]) == accounts[17]
+    assert postgres_store.save_history_batch(
+        job, _history_job_batch(job, 17), None, True
+    )
+    assert postgres_store.claim_backfill_job() is None
+    with postgres_store.session() as session:
+        batch = session.execute("SELECT body FROM zulip_history_batches").fetchone()[
+            "body"
+        ]
+    assert [message["id"] for message in batch["messages"]] == [205]
+    assert batch["messages"][0]["access"] == [
+        {"user_id": 17, "read": True, "starred": False}
+    ]
+    # Disconnecting an observer does not remove their server directory profile.
+    assert [user["id"] for user in batch["users"]] == [17, 28, 39]
+
+
+def test_adding_account_rebuilds_and_fences_an_older_fetch(postgres_store):
+    project, realm = str(uuid.uuid4()), str(uuid.uuid4())
+    accounts = {17: _history_source(postgres_store, 17, realm, project)}
+    old_job = postgres_store.claim_backfill_job()
+    old_batch = _history_job_batch(old_job, 17)
+    accounts[28] = _history_source(postgres_store, 28, realm, project)
+    assert not postgres_store.save_history_batch(old_job, old_batch, None, True)
+    for _ in accounts:
+        job = postgres_store.claim_backfill_job()
+        uid = next(
+            uid
+            for uid, account in accounts.items()
+            if account == str(job["account_uuid"])
+        )
+        assert postgres_store.save_history_batch(
+            job, _history_job_batch(job, uid), None, True
+        )
+    with postgres_store.session() as session:
+        before = session.execute(
+            "SELECT body, updated_at FROM zulip_history_batches"
+        ).fetchone()
+    postgres_store.reconcile_backfill_jobs()
+    assert postgres_store.claim_backfill_job() is None
+    with postgres_store.session() as session:
+        after = session.execute(
+            "SELECT body, updated_at FROM zulip_history_batches"
+        ).fetchone()
+    assert before == after
+    assert [item["user_id"] for item in after["body"]["messages"][0]["access"]] == [
+        17,
+        28,
+    ]
+
+
+@pytest.mark.parametrize("operation", ["add", "update", "remove"])
+def test_directory_changes_rebuild_completed_history(postgres_store, operation):
+    from workspace_zulip_bridge import history, history_delivery
+
+    account = _history_source(postgres_store, 17, str(uuid.uuid4()), str(uuid.uuid4()))
+    job = postgres_store.claim_backfill_job()
+    original = _history_job_batch(job, 17)
+    assert postgres_store.save_history_batch(job, original, None, True)
+    publishing = history_delivery.claim(postgres_store)
+    assert publishing is not None
+    assert history_delivery.current(postgres_store, publishing)
+    event = {
+        "id": 90,
+        "type": "realm_user",
+        "op": operation,
+        "person": {"user_id": 39, "full_name": "New directory name"},
+    }
+    assert postgres_store.record_provider_event(account, "synthetic-queue", event)
+    assert not history_delivery.current(postgres_store, publishing)
+    # The old lease cannot install routing rows even before reconciliation runs.
+    history_delivery.save_references(postgres_store, publishing, account, [], {"after": "stale"}, True)
+    with postgres_store.session() as session:
+        assert session.execute("SELECT import_mapping_cursor FROM zulip_history_batches").fetchone()["import_mapping_cursor"] == {}
+    postgres_store.reconcile_backfill_jobs()
+    assert postgres_store.claim_backfill_job() is None
+    fresh = _history_job_batch(job, 17)
+    if operation == "add":
+        fresh["users"].append({"id": 40, "name": "New user"})
+    elif operation == "update":
+        fresh["users"][-1]["name"] = "New directory name"
+    else:
+        fresh["users"].pop()
+    fresh["hash"] = history.digest({k: v for k, v in fresh.items() if k != "hash"})
+    _refresh_directory(postgres_store, fresh["users"])
+    assert not postgres_store.record_provider_event(account, "synthetic-queue", event)
+    postgres_store.reconcile_backfill_jobs()
+    assert postgres_store.claim_backfill_job() is None
+    with postgres_store.session() as session:
+        rebuilt = session.execute("SELECT body FROM zulip_history_batches").fetchone()[
+            "body"
+        ]
+    assert rebuilt == fresh and rebuilt["hash"] != original["hash"]
+
+
+@pytest.mark.parametrize(
+    "depth,days",
+    [("new", 0), ("7_days", 7), ("30_days", 30), ("90_days", 90), ("all", None)],
+)
+def test_history_depth_narrows_and_expands_each_observer_independently(
+    postgres_store, depth, days
+):
+    from workspace_zulip_bridge import history
+
+    project, realm = str(uuid.uuid4()), str(uuid.uuid4())
+    accounts = {
+        uid: _history_source(postgres_store, uid, realm, project) for uid in (17, 28)
+    }
+    ages = {1: 100, 2: 40, 3: 10, 4: 1}
+    now = datetime.datetime.now(datetime.UTC)
+
+    class Adapter:
+        def __init__(self, observer):
+            self.observer = observer
+
+        def history_range(self, chat_key, anchor=None):
+            return history.HistoryRange(
+                1,
+                5000,
+                [
+                    {
+                        "id": mid,
+                        "type": "stream",
+                        "sender_id": 17,
+                        "stream_id": 42,
+                        "display_recipient": "Example channel",
+                        "subject": "Depth",
+                        "timestamp": int(
+                            (now - datetime.timedelta(days=age)).timestamp()
+                        ),
+                        "content": "Synthetic depth example",
+                        "reactions": [],
+                        "flags": ["read"] if self.observer == 17 else ["starred"],
+                    }
+                    for mid, age in ages.items()
+                ],
+            )
+
+        def history_users(self, messages=None):
+            return [
+                {"user_id": uid, "full_name": f"Example {uid}"} for uid in (17, 28, 39)
+            ]
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = postgres_store
+    instance.provider_adapters = lambda account: Adapter(
+        next(uid for uid, value in accounts.items() if value == account)
+    )
+
+    def capture():
+        for _ in range(5):
+            if not instance.run_backfill_once():
+                break
+        else:
+            pytest.fail("history jobs did not complete")
+        with postgres_store.session() as session:
+            return session.execute("SELECT body FROM zulip_history_batches").fetchone()[
+                "body"
+            ]
+
+    original = capture()
+    assert all(len(message["access"]) == 2 for message in original["messages"])
+    with postgres_store.session() as session:
+        session.execute(
+            "UPDATE desired_resources SET generation = 2, body = jsonb_set(body, '{history_depth}', %s::jsonb) WHERE resource_type = 'external_chat_assignment' AND body->>'external_account_uuid' = %s",
+            (json.dumps(depth), accounts[28]),
+        )
+    postgres_store.reconcile_backfill_jobs()
+    narrowed = capture()
+    for message in narrowed["messages"]:
+        expected = [17, 28] if days is None or ages[message["id"]] <= days else [17]
+        assert [item["user_id"] for item in message["access"]] == expected
+        assert message["access"][0] == {"user_id": 17, "read": True, "starred": False}
+    with postgres_store.session() as session:
+        session.execute(
+            "UPDATE desired_resources SET generation = 3, body = jsonb_set(body, '{history_depth}', '\"all\"'::jsonb) WHERE resource_type = 'external_chat_assignment' AND body->>'external_account_uuid' = %s",
+            (accounts[28],),
+        )
+    postgres_store.reconcile_backfill_jobs()
+    assert capture() == original
+
+
+@pytest.mark.parametrize(
+    "change", ["lease", "account", "assignment", "disabled", "observer"]
+)
+def test_stale_history_capture_cannot_commit(postgres_store, change):
+    project, realm = str(uuid.uuid4()), str(uuid.uuid4())
+    account = _history_source(postgres_store, 17, realm, project)
+    job = postgres_store.claim_backfill_job()
+    value = _history_job_batch(job, 17)
+    with postgres_store.session() as session:
+        if change == "lease":
+            session.execute(
+                "UPDATE zulip_backfill_jobs SET lease_until = lease_until + interval '1 second'"
+            )
+        elif change == "account":
+            session.execute(
+                "UPDATE desired_resources SET generation = 2 WHERE resource_type = 'external_account'"
+            )
+        elif change == "assignment":
+            session.execute(
+                "UPDATE desired_resources SET generation = 2 WHERE resource_type = 'external_chat_assignment'"
+            )
+        elif change == "disabled":
+            session.execute(
+                "UPDATE desired_resources SET body = jsonb_set(body, '{enabled}', 'false'::jsonb) WHERE resource_type = 'external_provider_policy'"
+            )
+        elif change == "observer":
+            value = _history_job_batch(job, 28)
+    if change == "observer":
+        with pytest.raises(ValueError, match="history_observer_mismatch"):
+            postgres_store.save_history_batch(job, value, None, True)
+    else:
+        assert not postgres_store.save_history_batch(job, value, None, True)
+    with postgres_store.session() as session:
+        assert (
+            session.execute(
+                "SELECT count(*) AS count FROM zulip_history_batches"
+            ).fetchone()["count"]
+            == 0
+        )
+        assert (
+            session.execute(
+                "SELECT state FROM zulip_backfill_jobs WHERE account_uuid = %s",
+                (account,),
+            ).fetchone()["state"]
+            != "complete"
+        )
+
+
+def test_publisher_waits_for_complete_scope_and_fences_configuration(postgres_store):
+    from workspace_zulip_bridge import history_delivery
+
+    project, realm = str(uuid.uuid4()), str(uuid.uuid4())
+    accounts = {_history_source(postgres_store, user_id, realm, project): user_id for user_id in (17, 28)}
+    job = postgres_store.claim_backfill_job()
+    assert postgres_store.save_history_batch(job, _history_job_batch(job, accounts[str(job['account_uuid'])]), None, True)
+    assert history_delivery.claim(postgres_store) is None
+    job = postgres_store.claim_backfill_job()
+    assert postgres_store.save_history_batch(job, _history_job_batch(job, accounts[str(job['account_uuid'])]), None, True)
+    with postgres_store.session() as session:
+        session.execute('UPDATE zulip_history_batches SET import_retry_at = now()')
+    claimed = history_delivery.claim(postgres_store)
+    assert claimed is not None
+    assert len(claimed['envelope']['sources']) == 2
+    assert len(claimed['envelope']['batch']['messages'][0]['access']) == 2
+    assert history_delivery.current(postgres_store, claimed)
+    with postgres_store.session() as session:
+        session.execute("UPDATE desired_resources SET generation = generation + 1 WHERE resource_type = 'external_account'")
+    postgres_store.reconcile_backfill_jobs()
+    assert not history_delivery.current(postgres_store, claimed)
+    history_delivery.release(postgres_store, claimed, status='complete', job_uuid=uuid.uuid4())
+    with postgres_store.session() as session:
+        assert session.execute('SELECT count(*) AS n FROM zulip_history_batches').fetchone()['n'] == 0
+        assert session.execute('SELECT generation FROM zulip_history_configuration').fetchone()['generation'] > claimed['generation']
+
+
+def test_publisher_keeps_completed_receipt_after_restart(postgres_store, migrated_postgres_dsn):
+    from workspace_zulip_bridge import history_delivery
+
+    project, realm = str(uuid.uuid4()), str(uuid.uuid4())
+    _history_source(postgres_store, 17, realm, project)
+    job = postgres_store.claim_backfill_job()
+    assert postgres_store.save_history_batch(job, _history_job_batch(job, 17), None, True)
+    claimed = history_delivery.claim(postgres_store)
+    job_uuid = uuid.uuid4()
+    history_delivery.release(postgres_store, claimed, status='complete', job_uuid=job_uuid)
+    restarted = storage.RestAlchemyStore(migrated_postgres_dsn)
+    assert history_delivery.claim(restarted) is None
+    with restarted.session() as session:
+        assert session.execute('SELECT import_uuid FROM zulip_history_batches').fetchone()['import_uuid'] == job_uuid
+
+
+def test_history_routing_receipt_enables_existing_outbound_message_actions(postgres_store):
+    from workspace_zulip_bridge import history_delivery
+
+    project, realm = str(uuid.uuid4()), str(uuid.uuid4())
+    account = _history_source(postgres_store, 17, realm, project)
+    job = postgres_store.claim_backfill_job()
+    assert postgres_store.save_history_batch(job, _history_job_batch(job, 17), None, True)
+    item = history_delivery.claim(postgres_store)
+    item['import_uuid'] = uuid.uuid4()
+    canonical_uuid = str(uuid.uuid4())
+    mappings = [{'kind': 'message', 'provider_id': '41', 'workspace_uuid': canonical_uuid,
+                 'metadata': {'workspace_delivery_state': 'committed', 'chat_key': 'channel:42'}}]
+    history_delivery.save_references(postgres_store, item, account, mappings, {'account': 0, 'kind': 'messages', 'after': '500'}, False)
+    assert postgres_store.workspace_mapping(account, 'message', canonical_uuid)['provider_id'] == '41'
+    assert postgres_store.provider_message_mapping(account, '41')['workspace_uuid'] == uuid.UUID(canonical_uuid)
+    with postgres_store.session() as session:
+        row = session.execute('SELECT import_mapping_cursor, import_status FROM zulip_history_batches').fetchone()
+        assert row['import_mapping_cursor']['after'] == '500'
+        assert row['import_status'] == 'pending'
+
+
+def test_publisher_rejects_control_change_before_reconciliation(postgres_store):
+    from workspace_zulip_bridge import history_delivery
+    project, realm = str(uuid.uuid4()), str(uuid.uuid4())
+    _history_source(postgres_store, 17, realm, project)
+    job = postgres_store.claim_backfill_job()
+    assert postgres_store.save_history_batch(job, _history_job_batch(job, 17), None, True)
+    claimed = history_delivery.claim(postgres_store)
+    assert history_delivery.current(postgres_store, claimed)
+    with postgres_store.session() as session:
+        session.execute("UPDATE desired_resources SET generation=generation+1 WHERE resource_type='external_account'")
+        # Reproduce a READ COMMITTED claim that observed the fresh source rows
+        # after it checked the old fingerprint.
+        sources = history_delivery.sources_for(session, project, realm)
+        claimed['envelope']['sources'] = [{k:v for k,v in dict(x).items() if k != 'state'} for x in sources]
+    assert not history_delivery.current(postgres_store, claimed)
+
+
+@pytest.mark.parametrize('suspended', [False, True])
+def test_history_publication_and_mappings_recheck_provider_policy(postgres_store, suspended):
+    from workspace_zulip_bridge import history_delivery
+    project, realm = str(uuid.uuid4()), str(uuid.uuid4())
+    account = _history_source(postgres_store, 17, realm, project)
+    job = postgres_store.claim_backfill_job()
+    assert postgres_store.save_history_batch(job, _history_job_batch(job, 17), None, True)
+    item = history_delivery.claim(postgres_store)
+    assert history_delivery.current(postgres_store, item)
+    with postgres_store.session() as session:
+        session.execute("UPDATE desired_resources SET body=body || %s::jsonb WHERE resource_type='external_provider_policy'",
+                        (json.dumps({'enabled': suspended, 'emergency_suspended': suspended}),))
+    assert not history_delivery.current(postgres_store, item)
+    canonical_uuid = str(uuid.uuid4())
+    mappings = [{'kind': 'message', 'provider_id': '41', 'workspace_uuid': canonical_uuid, 'metadata': {}}]
+    history_delivery.save_references(postgres_store, item, account, mappings, {'after': '41'}, True)
+    assert postgres_store.workspace_mapping(account, 'message', canonical_uuid) is None
+
+
+def test_mapping_write_rejects_changed_source_before_reconciliation(postgres_store):
+    from workspace_zulip_bridge import history_delivery
+    project, realm = str(uuid.uuid4()), str(uuid.uuid4())
+    account = _history_source(postgres_store, 17, realm, project)
+    job = postgres_store.claim_backfill_job()
+    assert postgres_store.save_history_batch(job, _history_job_batch(job, 17), None, True)
+    item = history_delivery.claim(postgres_store)
+    assert history_delivery.current(postgres_store, item)
+    with postgres_store.session() as session:
+        session.execute("UPDATE desired_resources SET generation=generation+1, body=jsonb_set(body,'{project_id}',%s::jsonb) WHERE resource_type='external_chat_assignment'", (json.dumps(str(uuid.uuid4())),))
+    canonical_uuid = str(uuid.uuid4())
+    history_delivery.save_references(postgres_store, item, account, [{'kind':'message','provider_id':'41','workspace_uuid':canonical_uuid,'metadata':{}}], {'after':'41'}, True)
+    assert postgres_store.workspace_mapping(account, 'message', canonical_uuid) is None
+
+
+def test_slow_history_file_lease_can_be_renewed_and_revoked(postgres_store):
+    from workspace_zulip_bridge import history_delivery
+    project, realm = str(uuid.uuid4()), str(uuid.uuid4())
+    _history_source(postgres_store, 17, realm, project)
+    job = postgres_store.claim_backfill_job()
+    assert postgres_store.save_history_batch(job, _history_job_batch(job, 17), None, True)
+    item = history_delivery.claim(postgres_store)
+    with postgres_store.session() as session:
+        session.execute("UPDATE zulip_history_batches SET import_lease_until=now()+interval '1 second'")
+    assert history_delivery.renew_lease(postgres_store, item)
+    with postgres_store.session() as session:
+        assert session.execute("SELECT import_lease_until > now()+interval '100 seconds' AS renewed FROM zulip_history_batches").fetchone()['renewed']
+        session.execute("UPDATE desired_resources SET generation=generation+1 WHERE resource_type='external_account'")
+    assert not history_delivery.renew_lease(postgres_store, item)
+
+
+def test_history_capture_renewal_keeps_only_the_current_owner(postgres_store):
+    project, realm = str(uuid.uuid4()), str(uuid.uuid4())
+    _history_source(postgres_store, 17, realm, project)
+    job = postgres_store.claim_backfill_job()
+    with postgres_store.session() as session:
+        job['lease_until'] = session.execute(
+            "UPDATE zulip_backfill_jobs SET lease_until=now()+interval '1 second' RETURNING lease_until"
+        ).fetchone()['lease_until']
+    stale = dict(job)
+    assert postgres_store.renew_history_capture_lease(job)
+    assert job['lease_until'] > stale['lease_until'] + datetime.timedelta(minutes=9)
+    assert not postgres_store.renew_history_capture_lease(stale)
+    assert not postgres_store.save_history_batch(stale, _history_job_batch(stale, 17), None, True)
+    assert postgres_store.save_history_batch(job, _history_job_batch(job, 17), None, True)
+
+
+def test_new_queue_registration_invalidates_history_without_realm_user_events(postgres_store):
+    project, realm = str(uuid.uuid4()), str(uuid.uuid4())
+    account = _history_source(postgres_store, 17, realm, project)
+    job = postgres_store.claim_backfill_job()
+    assert postgres_store.save_history_batch(job, _history_job_batch(job, 17), None, True)
+    with postgres_store.session() as session:
+        before = dict(session.execute("SELECT generation,fingerprint FROM zulip_history_configuration").fetchone())
+    postgres_store.update_provider_event_cursor(account, 'synthetic-queue', 2)
+    with postgres_store.session() as session:
+        assert dict(session.execute("SELECT generation,fingerprint FROM zulip_history_configuration").fetchone()) == before
+    postgres_store.update_provider_event_cursor(account, 'replacement-queue', 0)
+    with postgres_store.session() as session:
+        changed = session.execute("SELECT generation,fingerprint FROM zulip_history_configuration").fetchone()
+    assert changed['generation'] == before['generation'] + 1
+    assert changed['fingerprint'] == before['fingerprint']
+    postgres_store.reconcile_backfill_jobs()
+    assert postgres_store.claim_backfill_job() is None
+    with postgres_store.session() as session:
+        assert session.execute("SELECT directory_pending FROM zulip_history_scopes").fetchone()['directory_pending']
+
+
+def test_failed_history_receipt_is_not_claimed_until_capture_rebuild(postgres_store):
+    from workspace_zulip_bridge import history_delivery
+    project, realm = str(uuid.uuid4()), str(uuid.uuid4())
+    account = _history_source(postgres_store, 17, realm, project)
+    job = postgres_store.claim_backfill_job()
+    assert postgres_store.save_history_batch(job, _history_job_batch(job, 17), None, True)
+    item = history_delivery.claim(postgres_store)
+    history_delivery.release(postgres_store,item,status='failed',error='history_invalid_domain_value')
+    with postgres_store.session() as session:
+        session.execute("UPDATE zulip_history_batches SET import_retry_at=now()-interval '1 hour'")
+    assert history_delivery.claim(postgres_store) is None
+    assert postgres_store.record_provider_event(account,'synthetic-queue',{'id':2,'type':'realm_user','op':'update','person':{'user_id':17,'full_name':'Updated'}})
+    postgres_store.reconcile_backfill_jobs()
+    assert postgres_store.claim_backfill_job() is None
+    _refresh_directory(postgres_store, _history_job_batch(job, 17)["users"])
+    assert history_delivery.claim(postgres_store) is not None
+
+
+def _refresh_directory(store, users):
+    import types
+
+    from workspace_zulip_bridge import history_configuration
+
+    adapter = types.SimpleNamespace(
+        history_users=lambda **_: [
+            {"user_id": user["id"], "full_name": user["name"]} for user in users
+        ]
+    )
+    for _ in range(100):
+        if not history_configuration.refresh_once(store, lambda _: adapter):
+            return
+    raise AssertionError("directory refresh did not finish")
+
+
+def test_history_scope_change_preserves_other_project_and_claim(postgres_store):
+    from workspace_zulip_bridge import history_delivery
+
+    scopes = [(str(uuid.uuid4()), str(uuid.uuid4())) for _ in range(2)]
+    accounts = []
+    for project, realm in scopes:
+        account = _history_source(postgres_store, 17, realm, project)
+        accounts.append(account)
+        job = postgres_store.claim_backfill_job()
+        assert str(job["account_uuid"]) == account
+        assert postgres_store.save_history_batch(
+            job, _history_job_batch(job, 17), None, True
+        )
+    item = history_delivery.claim(postgres_store)
+    assert str(item["scope"][0]) == scopes[0][0]
+    assert history_delivery.current(postgres_store, item)
+    assert postgres_store.record_provider_event(
+        accounts[1],
+        "synthetic-queue",
+        {
+            "id": 90,
+            "type": "realm_user",
+            "op": "update",
+            "person": {"user_id": 39, "full_name": "Changed"},
+        },
+    )
+    postgres_store.reconcile_backfill_jobs()
+    assert history_delivery.current(postgres_store, item)
+    assert postgres_store.claim_backfill_job() is None
+    with postgres_store.session() as session:
+        session.execute(
+            "UPDATE desired_resources SET body=jsonb_set(body,'{history_depth}','\"7_days\"'::jsonb) WHERE resource_type='external_chat_assignment' AND body->>'external_account_uuid'=%s",
+            (accounts[1],),
+        )
+    postgres_store.reconcile_backfill_jobs()
+    assert history_delivery.current(postgres_store, item)
+    with postgres_store.session() as session:
+        rows = session.execute(
+            "SELECT project_uuid FROM zulip_history_batches"
+        ).fetchall()
+        assert [str(row["project_uuid"]) for row in rows] == [scopes[0][0]]
+        assert (
+            session.execute(
+                "SELECT state FROM zulip_backfill_jobs WHERE account_uuid=%s",
+                (accounts[0],),
+            ).fetchone()["state"]
+            == "complete"
+        )
+
+
+def test_directory_refresh_preserves_capture_checkpoint_and_late_batch(postgres_store):
+    from workspace_zulip_bridge import history
+
+    project, realm = str(uuid.uuid4()), str(uuid.uuid4())
+    account = _history_source(postgres_store, 17, realm, project)
+    job = postgres_store.claim_backfill_job()
+    first = _history_job_batch(job, 17)
+    first.update(from_id=5001, to_id=10000)
+    first["messages"][0]["id"] = 5205
+    first["messages"][0]["hash"] = history.digest(
+        {k: v for k, v in first["messages"][0].items() if k != "hash"}
+    )
+    first["hash"] = history.digest({k: v for k, v in first.items() if k != "hash"})
+    assert postgres_store.save_history_batch(job, first, 5000, False)
+    inflight = postgres_store.claim_backfill_job()
+    assert inflight["next_anchor"] == 5000
+    assert postgres_store.record_provider_event(
+        account,
+        "synthetic-queue",
+        {
+            "id": 90,
+            "type": "realm_user",
+            "op": "update",
+            "person": {"user_id": 17, "full_name": "New name"},
+        },
+    )
+    postgres_store.reconcile_backfill_jobs()
+    with postgres_store.session() as session:
+        current = session.execute(
+            "SELECT state,next_anchor,lease_until FROM zulip_backfill_jobs"
+        ).fetchone()
+        assert (
+            current["state"] == "running"
+            and current["next_anchor"] == 5000
+            and current["lease_until"] == inflight["lease_until"]
+        )
+    users = [{"id": 17, "name": "New name"}, {"id": 40, "name": "New user"}]
+    _refresh_directory(postgres_store, users)
+    # The old fetch completes after the directory sweep passed its lower range.
+    assert postgres_store.save_history_batch(
+        inflight, _history_job_batch(inflight, 17), None, True
+    )
+    with postgres_store.session() as session:
+        rows = session.execute(
+            "SELECT body FROM zulip_history_batches ORDER BY from_id"
+        ).fetchall()
+    assert len(rows) == 2
+    assert all(row["body"]["users"] == users for row in rows)
+    assert rows[1]["body"]["messages"] == first["messages"]
+
+
+def test_directory_event_before_scope_bootstrap_is_not_lost(postgres_store):
+    account = _history_source(postgres_store, 17, str(uuid.uuid4()), str(uuid.uuid4()))
+    job = postgres_store.claim_backfill_job()
+    original = _history_job_batch(job, 17)
+    assert postgres_store.save_history_batch(job, original, None, True)
+    with postgres_store.session() as session:
+        session.execute("DELETE FROM zulip_history_scopes")
+    assert postgres_store.record_provider_event(
+        account,
+        "synthetic-queue",
+        {
+            "id": 90,
+            "type": "realm_user",
+            "op": "update",
+            "person": {"user_id": 39, "full_name": "Renamed"},
+        },
+    )
+    postgres_store.reconcile_backfill_jobs()
+    assert postgres_store.claim_backfill_job() is None
+    with postgres_store.session() as session:
+        assert session.execute(
+            "SELECT directory_pending FROM zulip_history_scopes"
+        ).fetchone()["directory_pending"]
+        assert (
+            session.execute("SELECT body FROM zulip_history_batches").fetchone()["body"]
+            == original
+        )
+    fresh = copy.deepcopy(original["users"])
+    fresh[-1]["name"] = "Renamed"
+    _refresh_directory(postgres_store, fresh)
+    with postgres_store.session() as session:
+        assert (
+            session.execute("SELECT body FROM zulip_history_batches").fetchone()[
+                "body"
+            ]["users"]
+            == fresh
+        )
+
+
+def test_irrelevant_directory_updates_do_not_rebuild_history(postgres_store):
+    account = _history_source(postgres_store, 17, str(uuid.uuid4()), str(uuid.uuid4()))
+    job = postgres_store.claim_backfill_job()
+    assert postgres_store.save_history_batch(
+        job, _history_job_batch(job, 17), None, True
+    )
+    with postgres_store.session() as session:
+        before = dict(session.execute("SELECT * FROM zulip_history_scopes").fetchone())
+    assert postgres_store.record_provider_event(
+        account,
+        "synthetic-queue",
+        {
+            "id": 90,
+            "type": "realm_user",
+            "op": "update",
+            "person": {"user_id": 17, "timezone": "UTC"},
+        },
+    )
+    with postgres_store.session() as session:
+        assert (
+            dict(session.execute("SELECT * FROM zulip_history_scopes").fetchone())
+            == before
+        )
+
+
+def test_unavailable_directory_does_not_starve_other_scopes(postgres_store):
+    import types
+
+    from workspace_zulip_bridge import history_configuration
+
+    accounts = []
+    for _ in range(2):
+        account = _history_source(
+            postgres_store, 17, str(uuid.uuid4()), str(uuid.uuid4())
+        )
+        accounts.append(account)
+        job = postgres_store.claim_backfill_job()
+        assert postgres_store.save_history_batch(
+            job, _history_job_batch(job, 17), None, True
+        )
+        assert postgres_store.record_provider_event(
+            account,
+            "synthetic-queue",
+            {
+                "id": 90,
+                "type": "realm_user",
+                "op": "update",
+                "person": {"user_id": 39, "full_name": "Changed"},
+            },
+        )
+    with postgres_store.session() as session:
+        session.execute(
+            "UPDATE zulip_history_scopes SET directory_retry_at=now()-interval '1 hour' WHERE sources->0->>'account_uuid'=%s",
+            (accounts[0],),
+        )
+
+    def unavailable(**_):
+        raise zulip_adapter.ZulipOperationError("provider_unavailable", True)
+
+    def adapter(account):
+        return types.SimpleNamespace(
+            history_users=unavailable
+            if account == accounts[0]
+            else lambda **_: [{"user_id": 17, "full_name": "Updated"}]
+        )
+
+    reports = []
+    assert not history_configuration.refresh_once(
+        postgres_store, adapter, lambda *a, **kw: reports.append((a, kw))
+    )
+    for _ in range(4):
+        history_configuration.refresh_once(postgres_store, adapter)
+    with postgres_store.session() as session:
+        states = {
+            row["sources"][0]["account_uuid"]: row["directory_pending"]
+            for row in session.execute(
+                "SELECT sources,directory_pending FROM zulip_history_scopes"
+            ).fetchall()
+        }
+    assert states == {accounts[0]: True, accounts[1]: False}
+    assert reports == [
+        (
+            (accounts[0], "degraded", "history_directory_unavailable"),
+            {"expected_generation": 1},
+        )
+    ]
+    assert any(
+        row["safe_error_code"] == "history_directory_unavailable"
+        for row in postgres_store.health()
+    )
+
+
+def test_directory_finish_rechecks_batch_inserted_after_read(
+    postgres_store, monkeypatch
+):
+    import contextlib
+
+    from workspace_zulip_bridge import history_configuration
+
+    _history_source(postgres_store, 17, str(uuid.uuid4()), str(uuid.uuid4()))
+    job = postgres_store.claim_backfill_job()
+    original = _history_job_batch(job, 17)
+    assert postgres_store.save_history_batch(job, original, None, True)
+    with postgres_store.session() as session:
+        row = session.execute(
+            "SELECT project_uuid,provider_realm_uuid FROM zulip_history_scopes"
+        ).fetchone()
+        scope = (row["project_uuid"], row["provider_realm_uuid"])
+        session.execute("DELETE FROM zulip_history_batches")
+        session.execute(
+            "UPDATE zulip_history_scopes SET directory_pending=true,directory_account_cursor=1,directory_users=%s::jsonb",
+            (json.dumps(original["users"]),),
+        )
+    factory = postgres_store.session
+    calls = 0
+
+    @contextlib.contextmanager
+    def raced_session():
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            with factory() as session:
+                session.execute(
+                    "INSERT INTO zulip_history_batches(project_uuid,provider_realm_uuid,from_id,to_id,body) VALUES (%s,%s,1,5000,%s::jsonb)",
+                    (*scope, json.dumps(original)),
+                )
+        with factory() as session:
+            yield session
+
+    monkeypatch.setattr(postgres_store, "session", raced_session)
+    assert history_configuration.refresh_once(postgres_store, None)
+    with factory() as session:
+        assert session.execute(
+            "SELECT directory_pending FROM zulip_history_scopes"
+        ).fetchone()["directory_pending"]
+
+
+def test_oversized_history_scope_is_rejected_locally_and_reported(postgres_store):
+    import types
+
+    from workspace_zulip_bridge import history_delivery
+
+    project, realm = str(uuid.uuid4()), str(uuid.uuid4())
+    account = _history_source(postgres_store, 17, realm, project)
+    job = postgres_store.claim_backfill_job()
+    original = _history_job_batch(job, 17)
+    assert postgres_store.save_history_batch(job, original, None, True)
+    with postgres_store.session() as session:
+        assignment = session.execute(
+            "SELECT body FROM desired_resources WHERE resource_type='external_chat_assignment'"
+        ).fetchone()["body"]
+        for i in range(128):
+            body = {
+                **assignment,
+                "uuid": str(uuid.uuid4()),
+                "provider_chat": {
+                    "provider_chat_key": f"channel:{1000 + i}",
+                    "chat_type": "channel",
+                },
+            }
+            session.execute(
+                "INSERT INTO desired_resources(resource_type,resource_uuid,generation,body,deleted) VALUES ('external_chat_assignment',%s,1,%s::jsonb,false)",
+                (body["uuid"], json.dumps(body)),
+            )
+    postgres_store.reconcile_backfill_jobs()
+    with postgres_store.session() as session:
+        session.execute(
+            "INSERT INTO zulip_history_batches(project_uuid,provider_realm_uuid,from_id,to_id,body) VALUES (%s,%s,1,5000,%s::jsonb)",
+            (project, realm, json.dumps(original)),
+        )
+    reports = []
+    publisher = history_delivery.HistoryPublisher(
+        postgres_store,
+        types.SimpleNamespace(client=object()),
+        None,
+        lambda *a, **kw: reports.append((a, kw)) or True,
+    )
+    publisher.supported = True
+    assert not publisher.run_once()  # No HTTP method exists on the client.
+    assert reports == []
+    _drain_history_failure_reports(postgres_store, publisher.account_report)
+    with postgres_store.session() as session:
+        row = session.execute(
+            "SELECT import_status,import_error FROM zulip_history_batches"
+        ).fetchone()
+        assert (
+            row["import_status"] == "failed"
+            and row["import_error"] == "history_source_limit_exceeded"
+        )
+    assert reports == [
+        (
+            (account, "degraded", "history_source_limit_exceeded"),
+            {"expected_generation": 1},
+        )
+    ]
+    assert any(
+        row["safe_error_code"] == "history_source_limit_exceeded"
+        for row in postgres_store.health()
+    )
+
+
+@pytest.mark.parametrize("changed", ["directory", "account", "lease", "expired"])
+def test_stale_http_failure_does_not_report_new_history_scope(postgres_store, monkeypatch, changed):
+    import types
+
+    import httpx
+
+    from workspace_zulip_bridge import history_configuration, history_delivery
+
+    account = _history_source(postgres_store, 17, str(uuid.uuid4()), str(uuid.uuid4()))
+    job = postgres_store.claim_backfill_job()
+    assert postgres_store.save_history_batch(job, _history_job_batch(job, 17), None, True)
+    item = history_delivery.claim(postgres_store)
+    assert item is not None
+    reports = []
+    replacement_lease = uuid.uuid4()
+
+    def respond(request):
+        if changed == "directory":
+            assert postgres_store.record_provider_event(account, "synthetic-queue", {
+                "id": 90, "type": "realm_user", "op": "update",
+                "person": {"user_id": 17, "full_name": "Current name"},
+            })
+        else:
+            with postgres_store.session() as session:
+                if changed == "account":
+                    session.execute("UPDATE desired_resources SET generation=generation+1 WHERE resource_type='external_account'")
+                elif changed == "lease":
+                    session.execute("UPDATE zulip_history_batches SET import_lease=%s", (replacement_lease,))
+                else:
+                    session.execute("UPDATE zulip_history_batches SET import_lease_until=now()-interval '1 second'")
+        return httpx.Response(200, json={
+            "uuid": str(uuid.uuid4()), "status": "failed",
+            "safe_error": {"code": "history_invalid_domain_value"},
+        })
+
+    client = httpx.Client(transport=httpx.MockTransport(respond), base_url="https://workspace.example.test")
+    publisher = history_delivery.HistoryPublisher(
+        postgres_store, types.SimpleNamespace(client=client), None,
+        lambda *args, **kwargs: reports.append((args, kwargs)),
+    )
+    publisher.supported = True
+    monkeypatch.setattr(history_delivery, "claim", lambda _: item)
+    assert publisher.run_once() is False
+    with postgres_store.session() as session:
+        batch = session.execute("SELECT import_status,import_lease,import_error FROM zulip_history_batches").fetchone()
+    assert batch["import_status"] == "pending" and batch["import_error"] is None
+    assert batch["import_lease"] == (replacement_lease if changed == "lease" else None)
+    assert not reports
+    component = history_configuration.health_component(item["scope"])
+    assert not any(row["component"] == component for row in postgres_store.health())
+
+
+def test_terminal_history_health_failure_rolls_back_batch_failure(postgres_store, monkeypatch):
+    from workspace_zulip_bridge import history_delivery
+
+    _history_source(postgres_store, 17, str(uuid.uuid4()), str(uuid.uuid4()))
+    job = postgres_store.claim_backfill_job()
+    assert postgres_store.save_history_batch(job, _history_job_batch(job, 17), None, True)
+    item = history_delivery.claim(postgres_store)
+    reports = []
+
+    def failed_health(*_):
+        with postgres_store.session() as session:
+            assert session.execute("SELECT import_status FROM zulip_history_batches").fetchone()["import_status"] == "failed"
+        raise RuntimeError("health_write_failed")
+
+    monkeypatch.setattr(postgres_store, "mark_health", failed_health)
+    publisher = history_delivery.HistoryPublisher(postgres_store, None, None, lambda *args, **kwargs: reports.append((args, kwargs)))
+    with pytest.raises(RuntimeError, match="health_write_failed"):
+        publisher.fail(item, "history_invalid_domain_value")
+    with postgres_store.session() as session:
+        batch = session.execute("SELECT import_status,import_lease,import_error FROM zulip_history_batches").fetchone()
+    assert batch["import_status"] == "pending"
+    assert batch["import_lease"] == item["lease"] and batch["import_error"] is None
+    assert reports == []
+
+
+@pytest.mark.parametrize('prior_status', ['complete', 'failed', 'pending'])
+def test_catalog_assignment_revision_republishes_without_recapturing(postgres_store, prior_status):
+    from workspace_zulip_bridge import history_configuration, history_delivery
+
+    account = _history_source(postgres_store, 17, str(uuid.uuid4()), str(uuid.uuid4()))
+    job = postgres_store.claim_backfill_job()
+    original = _history_job_batch(job, 17)
+    assert postgres_store.save_history_batch(job, original, None, True)
+    item = history_delivery.claim(postgres_store)
+    assert item is not None
+    with postgres_store.session() as session:
+        checkpoint = dict(session.execute('SELECT * FROM zulip_backfill_jobs').fetchone())
+        session.execute(
+            "UPDATE zulip_history_batches SET import_status=%s,import_uuid=%s,import_mapping_cursor=%s::jsonb,import_error='history_batch_rejected'",
+            (prior_status, uuid.uuid4(), json.dumps({'account': 1, 'kind': 'messages', 'after': '205'})),
+        )
+        session.execute(
+            "UPDATE desired_resources SET generation=generation+1,body=jsonb_set(body,'{generation}','2'::jsonb) WHERE resource_type='external_chat_assignment' AND body->>'external_account_uuid'=%s",
+            (account,),
+        )
+    component = history_configuration.health_component(item['scope'])
+    postgres_store.mark_health(component, 'degraded', 'history_batch_rejected')
+    postgres_store.reconcile_backfill_jobs()
+    with postgres_store.session() as session:
+        assert dict(session.execute('SELECT * FROM zulip_backfill_jobs').fetchone()) == checkpoint
+        current = session.execute('SELECT * FROM zulip_history_batches').fetchone()
+        assert current['body'] == original
+        assert current['import_status'] == 'pending'
+        assert current['import_uuid'] is current['import_lease'] is current['import_lease_until'] is current['import_error'] is None
+        assert current['import_mapping_cursor'] == {}
+    assert not any(row['component'] == component for row in postgres_store.health())
+    assert not history_delivery.current(postgres_store, item)
+    fresh = history_delivery.claim(postgres_store)
+    assert fresh is not None and fresh['import_uuid'] is None
+    assert fresh['envelope']['batch'] == original
+    assert fresh['envelope']['sources'][0]['assignment_generation'] == 2
+    assert fresh['generation'] > item['generation']
+    assert postgres_store.claim_backfill_job() is None
+
+
+def test_expired_queue_service_replacement_refreshes_completed_directory(postgres_store):
+    from workspace_zulip_bridge import history_delivery, service
+
+    realm = str(uuid.uuid4())
+    account = _history_source(postgres_store, 17, realm, str(uuid.uuid4()))
+    job = postgres_store.claim_backfill_job()
+    original = _history_job_batch(job, 17)
+    assert postgres_store.save_history_batch(job, original, None, True)
+    item = history_delivery.claim(postgres_store)
+    assert item is not None
+    assert history_delivery.release(postgres_store, item, status='complete', job_uuid=uuid.uuid4())
+    with postgres_store.session() as session:
+        checkpoint = dict(session.execute('SELECT * FROM zulip_backfill_jobs').fetchone())
+        generation = session.execute('SELECT generation FROM zulip_history_scopes').fetchone()['generation']
+
+    class Adapter:
+        server_url = 'https://zulip.example.invalid'
+
+        def __init__(self):
+            self.polled = []
+
+        def restore_queue(self, queue_id, last_event_id):
+            assert queue_id == 'synthetic-queue'
+
+        def events(self, queue_id, last_event_id):
+            self.polled.append(queue_id)
+            if queue_id == 'synthetic-queue':
+                raise zulip_adapter.ZulipOperationError('bad_event_queue_id', True)
+            assert queue_id == 'replacement-queue'
+            return []
+
+        def invalidate_queue(self):
+            pass
+
+        def ensure_queue(self):
+            # Main-loop reconciliation can run while the replacement request
+            # is in flight. The verified source must remain present throughout.
+            assert postgres_store.provider_event_cursor(account)['queue_id'] == 'synthetic-queue'
+            postgres_store.reconcile_backfill_jobs()
+            with postgres_store.session() as session:
+                scope = session.execute('SELECT directory_pending FROM zulip_history_scopes').fetchone()
+                assert scope['directory_pending']
+                assert dict(session.execute('SELECT * FROM zulip_backfill_jobs').fetchone()) == checkpoint
+                assert session.execute('SELECT body FROM zulip_history_batches').fetchone()['body'] == original
+            return 'replacement-queue', 0
+
+        def take_registration_snapshot(self):
+            return {
+                'realm_uuid': realm, 'user_id': 17,
+                'subscriptions': [], 'recent_private_conversations': [],
+                'realm_users': [{'user_id': 17, 'full_name': 'Changed during queue gap'}],
+            }
+
+    instance = object.__new__(service.BridgeService)
+    instance.store = postgres_store
+    instance._queue_registration_reports = lambda *_, **__: None
+    instance._record_registration_notification_snapshots = lambda *_, **__: None
+    instance._initial_sync_ready = lambda _: False
+    instance._queue_account_report = lambda *_, **__: None
+    adapter = Adapter()
+    assert instance._poll_provider_account(account, adapter) == (0, None)
+    assert adapter.polled == ['synthetic-queue', 'replacement-queue']
+    assert postgres_store.provider_event_cursor(account)['queue_id'] == 'replacement-queue'
+    with postgres_store.session() as session:
+        scope = session.execute('SELECT generation,directory_pending FROM zulip_history_scopes').fetchone()
+        assert scope['directory_pending'] and scope['generation'] > generation
+        assert dict(session.execute('SELECT * FROM zulip_backfill_jobs').fetchone()) == checkpoint
+        assert session.execute('SELECT body FROM zulip_history_batches').fetchone()['body'] == original
+    assert postgres_store.claim_backfill_job() is None
+    fresh_users = copy.deepcopy(original['users'])
+    fresh_users[0]['name'] = 'Changed during queue gap'
+    _refresh_directory(postgres_store, fresh_users)
+    with postgres_store.session() as session:
+        body = session.execute('SELECT body FROM zulip_history_batches').fetchone()['body']
+    assert body['users'] == fresh_users
+    assert body['messages'] == original['messages']
+    assert postgres_store.claim_backfill_job() is None
+    assert history_delivery.claim(postgres_store) is not None
+
+
+@pytest.mark.parametrize("changed", [None, "generation", "deleted", "directory"])
+def test_oversized_history_reports_all_scope_accounts_after_authority_check(
+    postgres_store, monkeypatch, changed
+):
+    import types
+
+    from workspace_zulip_bridge import history_configuration, history_delivery
+
+    project, realm = str(uuid.uuid4()), str(uuid.uuid4())
+    first = _history_source(postgres_store, 17, realm, project)
+    job = postgres_store.claim_backfill_job()
+    original = _history_job_batch(job, 17)
+    accounts = {first: 1}
+    with postgres_store.session() as session:
+        template = session.execute(
+            "SELECT body FROM desired_resources WHERE resource_type='external_account'"
+        ).fetchone()["body"]
+        assignment = session.execute(
+            "SELECT body FROM desired_resources WHERE resource_type='external_chat_assignment'"
+        ).fetchone()["body"]
+        for index in range(130):
+            account_uuid = str(uuid.uuid4())
+            generation = 7 if index == 129 else 1
+            accounts[account_uuid] = generation
+            body = {**template, "uuid": account_uuid, "generation": generation}
+            chat = {
+                **assignment,
+                "uuid": str(uuid.UUID(int=(2**128 - 1 if index == 129 else index + 1))),
+                "external_account_uuid": account_uuid,
+            }
+            for kind, resource in (
+                ("external_account", body),
+                ("external_chat_assignment", chat),
+            ):
+                session.execute(
+                    "INSERT INTO desired_resources(resource_type,resource_uuid,generation,body,deleted) VALUES (%s,%s,%s,%s::jsonb,false)",
+                    (
+                        kind,
+                        resource["uuid"],
+                        resource["generation"],
+                        json.dumps(resource),
+                    ),
+                )
+            session.execute(
+                "INSERT INTO zulip_event_cursors(account_uuid,queue_id,last_event_id,provider_realm_uuid,provider_owner_user_id,provider_account_generation) VALUES (%s,'synthetic-queue',1,%s,%s,%s)",
+                (account_uuid, realm, str(index + 100), generation),
+            )
+        # The last account sorts beyond the bounded rejected envelope. Give
+        # another account a second source to exercise DISTINCT reporting.
+        late = account_uuid
+        duplicate = {
+            **assignment,
+            "uuid": str(uuid.UUID(int=500)),
+            "provider_chat": {
+                "provider_chat_key": "channel:43",
+                "chat_type": "channel",
+            },
+        }
+        session.execute(
+            "INSERT INTO desired_resources(resource_type,resource_uuid,generation,body,deleted) VALUES ('external_chat_assignment',%s,1,%s::jsonb,false)",
+            (duplicate["uuid"], json.dumps(duplicate)),
+        )
+    outside = _history_source(postgres_store, 1000, realm, str(uuid.uuid4()))
+    postgres_store.reconcile_backfill_jobs()
+    with postgres_store.session() as session:
+        session.execute(
+            "INSERT INTO zulip_history_batches(project_uuid,provider_realm_uuid,from_id,to_id,body) VALUES (%s,%s,1,5000,%s::jsonb)",
+            (project, realm, json.dumps(original)),
+        )
+    item = history_delivery.claim(postgres_store)
+    assert (
+        item is not None and item["validation_error"] == "history_source_limit_exceeded"
+    )
+    assert len(item["envelope"]["sources"]) == history_delivery.MAX_SOURCES + 1
+    assert late not in {
+        source["account_uuid"] for source in item["envelope"]["sources"]
+    }
+    if changed is not None:
+        with postgres_store.session() as session:
+            if changed == "directory":
+                history_configuration.invalidate_directory(session, late)
+            else:
+                statement = (
+                    "generation=generation+1"
+                    if changed == "generation"
+                    else "deleted=true"
+                )
+                session.execute(
+                    f"UPDATE desired_resources SET {statement} WHERE resource_type='external_account' AND resource_uuid=%s",
+                    (late,),
+                )
+    reports = []
+    publisher = history_delivery.HistoryPublisher(
+        postgres_store,
+        types.SimpleNamespace(client=object()),
+        None,
+        lambda *args, **kwargs: reports.append((args, kwargs)) or True,
+    )
+    publisher.supported = True
+    monkeypatch.setattr(history_delivery, "claim", lambda _: item)
+    assert publisher.run_once() is False  # No HTTP method exists on the client.
+    assert reports == []
+    _drain_history_failure_reports(postgres_store, publisher.account_report)
+    with postgres_store.session() as session:
+        row = session.execute(
+            "SELECT import_status,import_error,import_lease FROM zulip_history_batches"
+        ).fetchone()
+    assert row["import_lease"] is None
+    if changed is not None:
+        assert row["import_status"] == "pending" and row["import_error"] is None
+        assert reports == []
+        assert not postgres_store.health()
+    else:
+        assert row["import_status"] == "failed"
+        assert row["import_error"] == "history_source_limit_exceeded"
+        assert len(reports) == len(accounts) == 131
+        assert {
+            args[0]: kwargs["expected_generation"] for args, kwargs in reports
+        } == accounts
+        assert outside not in {args[0] for args, _ in reports}
+        assert all(
+            args[1:] == ("degraded", "history_source_limit_exceeded")
+            for args, _ in reports
+        )
+        assert any(
+            row["safe_error_code"] == "history_source_limit_exceeded"
+            for row in postgres_store.health()
+        )
+
+
+def _drain_history_failure_reports(store, callback):
+    from workspace_zulip_bridge import history_failure_reports
+
+    for _ in range(200):
+        if not history_failure_reports.flush_once(store, callback):
+            return
+    pytest.fail("History reports did not finish within their account count")
+
+
+def _failed_history_reporting_scope(store, count=3):
+    from workspace_zulip_bridge import history_delivery
+
+    realm, project = str(uuid.uuid4()), str(uuid.uuid4())
+    accounts = [
+        _history_source(store, user, realm, project) for user in (17, 28, 39)[:count]
+    ]
+    job = store.claim_backfill_job()
+    observer = int(
+        store.provider_event_cursor(str(job["account_uuid"]))["provider_owner_user_id"]
+    )
+    assert store.save_history_batch(job, _history_job_batch(job, observer), None, True)
+    with store.session() as session:
+        session.execute("UPDATE zulip_backfill_jobs SET state='complete'")
+    item = history_delivery.claim(store)
+    assert item is not None
+    assert history_delivery.HistoryPublisher(store, None, None).fail(
+        item, "history_batch_rejected"
+    )
+    instance = object.__new__(service.BridgeService)
+    instance.store = store
+    return item, sorted(accounts), instance
+
+
+def test_history_failure_reports_resume_after_first_account_and_restart(postgres_store):
+    from workspace_zulip_bridge import history_failure_reports
+
+    item, accounts, instance = _failed_history_reporting_scope(postgres_store)
+    # Cached ordinary status reports must not suppress this durable queue.
+    instance.provider_account_report_states = {
+        account: (1, "degraded", "history_batch_rejected") for account in accounts
+    }
+    with postgres_store.session() as session:
+        assert (
+            session.execute(
+                "SELECT import_status FROM zulip_history_batches"
+            ).fetchone()["import_status"]
+            == "failed"
+        )
+        assert (
+            session.execute(
+                "SELECT count(*) AS count FROM observed_report_outbox"
+            ).fetchone()["count"]
+            == 0
+        )
+    assert history_failure_reports.flush_once(
+        postgres_store, instance._queue_history_failure_report
+    )
+    with postgres_store.session() as session:
+        assert (
+            session.execute(
+                "SELECT count(*) AS count FROM observed_report_outbox"
+            ).fetchone()["count"]
+            == 1
+        )
+        assert (
+            str(
+                session.execute(
+                    "SELECT after_account FROM zulip_history_failure_reports"
+                ).fetchone()["after_account"]
+            )
+            == accounts[0]
+        )
+    restarted = storage.RestAlchemyStore(postgres_store.connection_url)
+    fresh = object.__new__(service.BridgeService)
+    fresh.store = restarted
+    _drain_history_failure_reports(restarted, fresh._queue_history_failure_report)
+    with restarted.session() as session:
+        rows = session.execute("SELECT body FROM observed_report_outbox").fetchall()
+        assert len(rows) == 3
+        assert sorted(row["body"]["resource_uuid"] for row in rows) == accounts
+        assert all(row["body"]["observed_generation"] == 1 for row in rows)
+        assert session.execute(
+            "SELECT complete FROM zulip_history_failure_reports"
+        ).fetchone()["complete"]
+        history_failure_reports.record(session, item, "history_batch_rejected")
+    assert not history_failure_reports.flush_once(
+        restarted, fresh._queue_history_failure_report
+    )
+
+
+@pytest.mark.parametrize(
+    "changed",
+    ["account_generation", "deleted", "directory", "scope_generation", "scope_removed"],
+)
+def test_history_failure_report_cursor_cannot_degrade_changed_scope(
+    postgres_store, changed
+):
+    from workspace_zulip_bridge import history_configuration, history_failure_reports
+
+    item, accounts, instance = _failed_history_reporting_scope(postgres_store)
+    assert history_failure_reports.flush_once(
+        postgres_store, instance._queue_history_failure_report
+    )
+    with postgres_store.session() as session:
+        if changed == "directory":
+            history_configuration.invalidate_directory(session, accounts[-1])
+        elif changed == "scope_removed":
+            session.execute("DELETE FROM zulip_history_scopes")
+        elif changed == "scope_generation":
+            session.execute("UPDATE zulip_history_scopes SET generation=generation+1")
+        else:
+            statement = (
+                "generation=generation+1"
+                if changed == "account_generation"
+                else "deleted=true"
+            )
+            session.execute(
+                f"UPDATE desired_resources SET {statement} WHERE resource_type='external_account' AND resource_uuid=%s",
+                (accounts[-1],),
+            )
+    _drain_history_failure_reports(
+        postgres_store, instance._queue_history_failure_report
+    )
+    with postgres_store.session() as session:
+        assert (
+            session.execute(
+                "SELECT count(*) AS count FROM observed_report_outbox"
+            ).fetchone()["count"]
+            == 1
+        )
+        assert (
+            session.execute(
+                "SELECT count(*) AS count FROM zulip_history_failure_reports"
+            ).fetchone()["count"]
+            == 0
+        )
+
+
+def test_history_failure_report_callback_rollback_does_not_starve_healthy_publication(
+    postgres_store, monkeypatch
+):
+    import types
+
+    from workspace_zulip_bridge import history_delivery, history_failure_reports
+
+    _, accounts, instance = _failed_history_reporting_scope(postgres_store)
+    healthy = _history_source(postgres_store, 17, str(uuid.uuid4()), str(uuid.uuid4()))
+    job = postgres_store.claim_backfill_job()
+    assert (
+        job["account_uuid"] == uuid.UUID(healthy) or str(job["account_uuid"]) == healthy
+    )
+    assert postgres_store.save_history_batch(
+        job, _history_job_batch(job, 17), None, True
+    )
+
+    def crashing_report(*args, **kwargs):
+        assert instance._queue_history_failure_report(*args, **kwargs)
+        raise RuntimeError("simulated_process_failure_after_enqueue")
+
+    publisher = history_delivery.HistoryPublisher(
+        postgres_store, types.SimpleNamespace(client=object()), None, crashing_report
+    )
+    publisher.supported = True
+    published = []
+
+    def publish(_, item):
+        published.append(item)
+        return history_delivery.release(postgres_store, item, status="complete")
+
+    monkeypatch.setattr(publisher, "_publish", publish)
+    assert publisher.run_once()
+    assert (
+        len(published) == 1
+        and published[0]["envelope"]["sources"][0]["account_uuid"] == healthy
+    )
+    with postgres_store.session() as session:
+        assert (
+            session.execute(
+                "SELECT count(*) AS count FROM observed_report_outbox"
+            ).fetchone()["count"]
+            == 0
+        )
+        work = session.execute(
+            "SELECT after_account,retry_at>now() AS deferred FROM zulip_history_failure_reports"
+        ).fetchone()
+        assert work["after_account"] is None and work["deferred"]
+        session.execute("UPDATE zulip_history_failure_reports SET retry_at=now()")
+    restarted = storage.RestAlchemyStore(postgres_store.connection_url)
+    fresh = object.__new__(service.BridgeService)
+    fresh.store = restarted
+    _drain_history_failure_reports(restarted, fresh._queue_history_failure_report)
+    with restarted.session() as session:
+        assert session.execute(
+            "SELECT count(*) AS count FROM observed_report_outbox"
+        ).fetchone()["count"] == len(accounts)
+    assert not history_failure_reports.flush_once(
+        restarted, fresh._queue_history_failure_report
+    )
+
+
+def test_history_failure_report_without_durable_ack_retains_cursor(postgres_store):
+    from workspace_zulip_bridge import history_failure_reports
+
+    _, _, instance = _failed_history_reporting_scope(postgres_store, count=1)
+    assert not history_failure_reports.flush_once(
+        postgres_store, lambda *_, **__: False
+    )
+    with postgres_store.session() as session:
+        row = session.execute(
+            "SELECT after_account,retry_at>now() AS deferred FROM zulip_history_failure_reports"
+        ).fetchone()
+        assert row["after_account"] is None and row["deferred"]
+        session.execute("UPDATE zulip_history_failure_reports SET retry_at=now()")
+    _drain_history_failure_reports(
+        postgres_store, instance._queue_history_failure_report
+    )
+    with postgres_store.session() as session:
+        assert (
+            session.execute(
+                "SELECT count(*) AS count FROM observed_report_outbox"
+            ).fetchone()["count"]
+            == 1
+        )
+
+
+def test_history_reporting_work_is_atomic_with_terminal_batch_and_health(
+    postgres_store, monkeypatch
+):
+    from workspace_zulip_bridge import history_delivery, history_failure_reports
+
+    _history_source(postgres_store, 17, str(uuid.uuid4()), str(uuid.uuid4()))
+    job = postgres_store.claim_backfill_job()
+    assert postgres_store.save_history_batch(
+        job, _history_job_batch(job, 17), None, True
+    )
+    item = history_delivery.claim(postgres_store)
+
+    def crash(*_):
+        raise RuntimeError("simulated_report_work_write_failure")
+
+    monkeypatch.setattr(history_failure_reports, "record", crash)
+    with pytest.raises(RuntimeError, match="simulated_report_work_write_failure"):
+        history_delivery.HistoryPublisher(postgres_store, None, None).fail(
+            item, "history_batch_rejected"
+        )
+    with postgres_store.session() as session:
+        row = session.execute(
+            "SELECT import_status,import_lease FROM zulip_history_batches"
+        ).fetchone()
+        assert (
+            row["import_status"] == "pending" and row["import_lease"] == item["lease"]
+        )
+        assert (
+            session.execute(
+                "SELECT count(*) AS count FROM zulip_history_failure_reports"
+            ).fetchone()["count"]
+            == 0
+        )
+    assert not postgres_store.health()
+
+
+def _pause_history_provider(store, flag, paused):
+    value = not paused if flag == "enabled" else paused
+    with store.session() as session:
+        session.execute(
+            """UPDATE desired_resources SET generation=generation+1,
+                 body=jsonb_set(jsonb_set(body,ARRAY[%s],%s::jsonb),'{generation}',to_jsonb(generation+1))
+               WHERE resource_type='external_provider_policy'""",
+            (flag, json.dumps(value)),
+        )
+
+
+@pytest.mark.parametrize("flag", ["enabled", "emergency_suspended"])
+@pytest.mark.parametrize("changed", [None, "account_generation", "directory"])
+def test_history_report_pause_restart_and_resume_retains_cursor_and_rechecks_scope(
+    postgres_store, flag, changed
+):
+    from workspace_zulip_bridge import history_configuration, history_failure_reports
+
+    _, accounts, instance = _failed_history_reporting_scope(postgres_store)
+    assert history_failure_reports.flush_once(
+        postgres_store, instance._queue_history_failure_report
+    )
+    _pause_history_provider(postgres_store, flag, True)
+    assert not history_failure_reports.flush_once(
+        postgres_store, instance._queue_history_failure_report
+    )
+    with postgres_store.session() as session:
+        work = session.execute("SELECT * FROM zulip_history_failure_reports").fetchone()
+        assert str(work["after_account"]) == accounts[0] and not work["complete"]
+        assert (
+            session.execute(
+                "SELECT count(*) AS count FROM observed_report_outbox"
+            ).fetchone()["count"]
+            == 1
+        )
+    restarted = storage.RestAlchemyStore(postgres_store.connection_url)
+    fresh = object.__new__(service.BridgeService)
+    fresh.store = restarted
+    with restarted.session() as session:
+        session.execute("UPDATE zulip_history_failure_reports SET retry_at=now()")
+    assert not history_failure_reports.flush_once(
+        restarted, fresh._queue_history_failure_report
+    )
+    with restarted.session() as session:
+        assert (
+            session.execute(
+                "SELECT after_account FROM zulip_history_failure_reports"
+            ).fetchone()["after_account"]
+            == work["after_account"]
+        )
+        if changed == "account_generation":
+            session.execute(
+                "UPDATE desired_resources SET generation=generation+1 WHERE resource_type='external_account' AND resource_uuid=%s",
+                (accounts[-1],),
+            )
+        elif changed == "directory":
+            history_configuration.invalidate_directory(session, accounts[-1])
+        session.execute("UPDATE zulip_history_failure_reports SET retry_at=now()")
+    _pause_history_provider(restarted, flag, False)
+    _drain_history_failure_reports(restarted, fresh._queue_history_failure_report)
+    with restarted.session() as session:
+        reports = session.execute("SELECT body FROM observed_report_outbox").fetchall()
+        if changed is None:
+            assert sorted(row["body"]["resource_uuid"] for row in reports) == accounts
+            assert session.execute(
+                "SELECT complete FROM zulip_history_failure_reports"
+            ).fetchone()["complete"]
+        else:
+            assert len(reports) == 1
+            assert (
+                session.execute(
+                    "SELECT count(*) AS count FROM zulip_history_failure_reports"
+                ).fetchone()["count"]
+                == 0
+            )
+
+
+@pytest.mark.parametrize("flag", ["enabled", "emergency_suspended"])
+def test_history_report_rollback_delay_preserves_work_when_provider_pauses(
+    postgres_store, monkeypatch, flag
+):
+    import contextlib
+
+    from workspace_zulip_bridge import history_failure_reports
+
+    _, accounts, instance = _failed_history_reporting_scope(postgres_store)
+    factory = postgres_store.transaction
+    transactions = 0
+
+    @contextlib.contextmanager
+    def pause_after_rollback():
+        nonlocal transactions
+        transactions += 1
+        if transactions == 2:
+            # The report transaction has rolled back; policy changes before
+            # the separate retry-delay transaction acquires its scope locks.
+            _pause_history_provider(postgres_store, flag, True)
+        with factory() as session:
+            yield session
+
+    def crash_after_outbox_write(*args, **kwargs):
+        assert instance._queue_history_failure_report(*args, **kwargs)
+        raise RuntimeError("simulated_report_enqueue_failure")
+
+    monkeypatch.setattr(postgres_store, "transaction", pause_after_rollback)
+    assert not history_failure_reports.flush_once(
+        postgres_store, crash_after_outbox_write
+    )
+    monkeypatch.setattr(postgres_store, "transaction", factory)
+    with postgres_store.session() as session:
+        work = session.execute(
+            "SELECT after_account,retry_at>now() AS deferred FROM zulip_history_failure_reports"
+        ).fetchone()
+        assert work["after_account"] is None and work["deferred"]
+        assert (
+            session.execute(
+                "SELECT count(*) AS count FROM observed_report_outbox"
+            ).fetchone()["count"]
+            == 0
+        )
+        session.execute("UPDATE zulip_history_failure_reports SET retry_at=now()")
+    assert not history_failure_reports.flush_once(
+        postgres_store, instance._queue_history_failure_report
+    )
+    _pause_history_provider(postgres_store, flag, False)
+    with postgres_store.session() as session:
+        session.execute("UPDATE zulip_history_failure_reports SET retry_at=now()")
+    _drain_history_failure_reports(
+        postgres_store, instance._queue_history_failure_report
+    )
+    with postgres_store.session() as session:
+        assert session.execute(
+            "SELECT count(*) AS count FROM observed_report_outbox"
+        ).fetchone()["count"] == len(accounts)

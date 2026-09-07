@@ -99,17 +99,20 @@ The current implementation provides:
   durable event and cursor capture independent from history synchronization;
 - extended idle queue lifetimes on compatible Zulip servers, preserving durable
   queue cursors across quiet periods without ten-minute recovery churn;
-- live/retry/backfill scheduling with hard live priority and adaptive history
-  throughput: large profiles use up to eight discovery workers and 100-event
-  idle delivery batches, then fall back to one history event per second while
-  durable live traffic is waiting;
-- ten-message history transactions during idle import, with an adaptive
-  one-message fallback while live work is pending or the message transfers a
-  file;
+- local history capture in aligned 5000-ID JSON batches, merged across selected
+  accounts in PostgreSQL, with all directory users, per-user read/starred flags,
+  reactions, and deterministic message/batch hashes;
+- atomic history range persistence and checkpoints, safe concurrent merging,
+  and retryable collection independent of Workspace delivery backoff; see
+  [History batches](docs/history_batches.md) for the stored and publishing contract;
+- resumable publication of frozen history through the private history API, with
+  separate file transfer and durable receipts; realtime delivery stays independent;
+- live-priority scheduling and the existing bounded delivery path for queue-loss
+  catch-up and already queued legacy history operations;
 - exact owner read/unread projection from both Zulip message snapshots and live
   flag events, emitted independently and ordered after the corresponding
   Workspace message projection;
-- ACK-confirmed history convergence for message bodies, owner read state, and
+- ACK-confirmed queue-catch-up convergence for message bodies, owner read state, and
   reactions. The existing PostgreSQL mapping metadata stores the last accepted
   semantic state, while an account-scoped in-memory index gives constant-time
   checks during catch-up. Missing legacy state is replayed safely and only a
@@ -119,11 +122,11 @@ The current implementation provides:
   once if Workspace replaces a provisional message UUID with its canonical
   target;
 - one structured `bridge_interval_stats` log record per minute with cache
-  entries, hit/miss/skip and ACK counts, index-build time, backfill/catch-up
-  page and message counts, generated/enqueued/suppressed operations, fetch
+  entries, hit/miss/skip and ACK counts, index-build time, history range/catch-up
+  message counts, generated/enqueued/suppressed operations, fetch
   duration, and calculated import rates;
 - canonical Workspace quote references for Zulip replies on both create and
-  edit, including history replay before the local account has materialized a
+  edit, including queue catch-up before the local account has materialized a
   realm-shared quote target;
 - automatic removal of queue-recovery jobs when their chats are deselected, so
   stale recovery state cannot keep an account in backfill forever;
@@ -132,7 +135,7 @@ The current implementation provides:
 - explicit `projection_reset_generation` reconciliation: a newer Workspace
   generation atomically discards rebuildable Zulip message/reaction mappings,
   delivery idempotency and completed history checkpoints while retaining
-  account identity/catalog state, then restarts a fresh complete backfill;
+  account identity/catalog state, then restarts local history capture;
 - rolling-upgrade recovery for a backend-first deployment: the schema step
   that first adds reset-generation tracking clears the persisted control cursor
   once, forcing an authoritative startup snapshot. Thus a pre-upgrade Bridge

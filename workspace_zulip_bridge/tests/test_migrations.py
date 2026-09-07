@@ -54,6 +54,269 @@ def _apply_migrations(
     assert result.returncode == 0, result.stderr
 
 
+def test_0044_adopts_existing_failed_scopes_without_rewriting_batches(tmp_path):
+    connection_url = os.environ.get("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN")
+    if not connection_url:
+        pytest.skip("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN is not configured")
+    schema = f"cassi_history_reports_{uuid.uuid4().hex}"
+    scoped_url = _schema_connection_url(connection_url, schema)
+    previous = tmp_path / "previous-migrations"
+    previous.mkdir()
+    for path in MIGRATIONS.glob("*.py"):
+        if path.name < "0044-":
+            shutil.copy2(path, previous / path.name)
+    admin = storage.RestAlchemyStore(connection_url)
+    store = storage.RestAlchemyStore(scoped_url)
+    config_path = tmp_path / "bridge.conf"
+    with admin.session() as session:
+        session.execute(f'CREATE SCHEMA "{schema}"')
+    try:
+        _apply_migrations(scoped_url, config_path, previous)
+        scopes = []
+        with store.session() as session:
+            for status, directory_pending in (
+                ("failed", False),
+                ("failed", True),
+                ("complete", False),
+            ):
+                scope = (uuid.uuid4(), uuid.uuid4())
+                scopes.append(scope)
+                session.execute(
+                    "INSERT INTO zulip_history_scopes(project_uuid,provider_realm_uuid,generation,fingerprint,sources,directory_pending) VALUES (%s,%s,7,%s,'[]'::jsonb,%s)",
+                    (*scope, "a" * 64, directory_pending),
+                )
+                session.execute(
+                    "INSERT INTO zulip_history_batches(project_uuid,provider_realm_uuid,from_id,to_id,body,import_status,import_error) VALUES (%s,%s,1,5000,'{}'::jsonb,%s,'history_batch_rejected')",
+                    (*scope, status),
+                )
+            before = session.execute(
+                "SELECT * FROM zulip_history_batches ORDER BY project_uuid"
+            ).fetchall()
+        _apply_migrations(scoped_url, config_path)
+        _apply_migrations(scoped_url, config_path)
+        with store.session() as session:
+            assert (
+                session.execute(
+                    "SELECT * FROM zulip_history_batches ORDER BY project_uuid"
+                ).fetchall()
+                == before
+            )
+            work = session.execute(
+                "SELECT * FROM zulip_history_failure_reports"
+            ).fetchall()
+            assert len(work) == 1
+            assert (work[0]["project_uuid"], work[0]["provider_realm_uuid"]) == scopes[
+                0
+            ]
+            assert (
+                work[0]["generation"] == 7
+                and work[0]["safe_error_code"] == "history_batch_rejected"
+            )
+            assert work[0]["after_account"] is None and not work[0]["complete"]
+    finally:
+        with admin.session() as session:
+            session.execute(f'DROP SCHEMA "{schema}" CASCADE')
+
+
+def test_retired_history_finalizers_do_not_cancel_realtime_or_catchup(tmp_path):
+    connection_url = os.environ.get("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN")
+    if not connection_url:
+        pytest.skip("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN is not configured")
+    schema = f"cassi_history_retirement_{uuid.uuid4().hex}"
+    scoped_url = _schema_connection_url(connection_url, schema)
+    config_path = tmp_path / "bridge.conf"
+    previous = tmp_path / "previous-migrations"
+    previous.mkdir()
+    for path in MIGRATIONS.glob("*.py"):
+        if path.name < "0041-":
+            shutil.copy2(path, previous / path.name)
+    admin = storage.RestAlchemyStore(connection_url)
+    store = storage.RestAlchemyStore(scoped_url)
+    account = str(uuid.uuid4())
+    with admin.session() as session:
+        session.execute(f'CREATE SCHEMA "{schema}"')
+    try:
+        _apply_migrations(scoped_url, config_path, previous)
+        with store.session() as session:
+            for kind, state, priority in [
+                *(
+                    ("history.finalize", state, 2)
+                    for state in (
+                        "pending",
+                        "submitting",
+                        "ambiguous",
+                        "awaiting_result",
+                        "rejected",
+                        "cancelled",
+                        "sent",
+                    )
+                ),
+                ("message.create", "pending", 0),
+                ("message.create", "pending", 2),
+            ]:
+                operation_uuid = str(uuid.uuid4())
+                session.execute(
+                    """INSERT INTO workspace_delivery_outbox
+                       (record_uuid, operation_uuid, account_uuid, priority,
+                        record, submission_state, sent_at)
+                       VALUES (%s, %s, %s, %s, %s::jsonb, %s,
+                               CASE WHEN %s = 'sent' THEN now() END)""",
+                    (
+                        str(uuid.uuid4()),
+                        operation_uuid,
+                        account,
+                        priority,
+                        json.dumps({"operation": {"kind": kind}}),
+                        state,
+                        state,
+                    ),
+                )
+                session.execute(
+                    """INSERT INTO operation_idempotency
+                       (operation_uuid, operation_sha256, terminal_outcome)
+                       VALUES (%s, %s, %s)""",
+                    (
+                        operation_uuid,
+                        "a" * 64,
+                        "committed" if state == "sent" else None,
+                    ),
+                )
+            session.execute(
+                """INSERT INTO zulip_backfill_jobs
+                   (account_uuid, provider_chat_key, history_depth, state,
+                    next_anchor) VALUES (%s, 'channel:42', 'all', 'pending', 5000)""",
+                (account,),
+            )
+            before = session.execute(
+                "SELECT * FROM workspace_delivery_outbox ORDER BY operation_uuid"
+            ).fetchall()
+            jobs = session.execute("SELECT * FROM zulip_backfill_jobs").fetchall()
+        _apply_migrations(scoped_url, config_path)
+        with store.session() as session:
+            after = session.execute(
+                "SELECT * FROM workspace_delivery_outbox ORDER BY operation_uuid"
+            ).fetchall()
+            outcomes = {
+                str(row["operation_uuid"]): row["terminal_outcome"]
+                for row in session.execute(
+                    "SELECT * FROM operation_idempotency"
+                ).fetchall()
+            }
+            assert (
+                session.execute("SELECT * FROM zulip_backfill_jobs").fetchall()
+                == [dict(job, capture_timeout_pending=False) for job in jobs]
+            )
+        for old, new in zip(before, after, strict=True):
+            retired = old["record"]["operation"]["kind"] == "history.finalize" and old[
+                "submission_state"
+            ] not in {"cancelled", "sent"}
+            expected = dict(old)
+            if retired:
+                expected.update(
+                    submission_state="cancelled",
+                    submission_error_code="legacy_history_retired",
+                )
+            assert dict(new) == expected
+            assert outcomes[str(old["operation_uuid"])] == (
+                "rejected"
+                if retired
+                else "committed"
+                if old["submission_state"] == "sent"
+                else None
+            )
+        _apply_migrations(scoped_url, config_path)
+        with store.session() as session:
+            assert (
+                session.execute(
+                    "SELECT * FROM workspace_delivery_outbox ORDER BY operation_uuid"
+                ).fetchall()
+                == after
+            )
+    finally:
+        with admin.session() as session:
+            session.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+
+def test_history_storage_upgrade_restarts_capture_and_preserves_delivery(tmp_path):
+    connection_url = os.environ.get("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN")
+    if not connection_url:
+        pytest.skip("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN is not configured")
+    schema = f"cassi_history_upgrade_{uuid.uuid4().hex}"
+    scoped_url = _schema_connection_url(connection_url, schema)
+    config_path = tmp_path / "bridge.conf"
+    previous = tmp_path / "previous-migrations"
+    previous.mkdir()
+    for path in MIGRATIONS.glob("*.py"):
+        if path.name < "0039-":
+            shutil.copy2(path, previous / path.name)
+    admin = storage.RestAlchemyStore(connection_url)
+    store = storage.RestAlchemyStore(scoped_url)
+    account = str(uuid.uuid4())
+    with admin.session() as session:
+        session.execute(f'CREATE SCHEMA "{schema}"')
+    try:
+        _apply_migrations(scoped_url, config_path, previous)
+        with store.session() as session:
+            for state in ("pending", "running", "complete", "failed", "cancelled"):
+                session.execute(
+                    """INSERT INTO zulip_backfill_jobs
+                       (account_uuid, provider_chat_key, history_depth, state,
+                        next_anchor, retry_count, last_error_code, lease_until)
+                       VALUES (%s, %s, 'all', %s, 5000, 3, 'old_error', now())""",
+                    (account, state, state),
+                )
+            session.execute(
+                """INSERT INTO zulip_backfill_jobs
+                   (account_uuid, provider_chat_key, history_depth, state)
+                   VALUES (%s, 'new-only', 'new', 'complete')""",
+                (account,),
+            )
+            for priority in (0, 2):
+                session.execute(
+                    """INSERT INTO workspace_delivery_outbox
+                       (record_uuid, operation_uuid, account_uuid, priority, record)
+                       VALUES (%s, %s, %s, %s, '{}'::jsonb)""",
+                    (str(uuid.uuid4()), str(uuid.uuid4()), account, priority),
+                )
+            before = session.execute(
+                "SELECT * FROM workspace_delivery_outbox ORDER BY priority"
+            ).fetchall()
+        _apply_migrations(scoped_url, config_path)
+        with store.session() as session:
+            jobs = session.execute("SELECT * FROM zulip_backfill_jobs").fetchall()
+            after = session.execute(
+                "SELECT * FROM workspace_delivery_outbox ORDER BY priority"
+            ).fetchall()
+            assert after == before
+            assert (
+                session.execute("SELECT * FROM zulip_history_batches").fetchall() == []
+            )
+            for job in jobs:
+                if job["provider_chat_key"] == "cancelled":
+                    assert job["state"] == "cancelled" and job["next_anchor"] == 5000
+                elif job["history_depth"] == "new":
+                    assert job["state"] == "complete"
+                else:
+                    assert job["state"] == "pending"
+                    assert job["next_anchor"] is job["lease_until"] is None
+                    assert job["retry_count"] == 0 and job["last_error_code"] is None
+            session.execute(
+                "UPDATE zulip_backfill_jobs SET state = 'complete' WHERE provider_chat_key = 'complete'"
+            )
+        # The migration ledger must not restart completed capture on every boot.
+        _apply_migrations(scoped_url, config_path)
+        with store.session() as session:
+            assert (
+                session.execute(
+                    "SELECT state FROM zulip_backfill_jobs WHERE provider_chat_key = 'complete'"
+                ).fetchone()["state"]
+                == "complete"
+            )
+    finally:
+        with admin.session() as session:
+            session.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+
 def test_semantic_report_indexes_upgrade_an_applied_archive_chain(tmp_path):
     connection_url = os.environ.get("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN")
     if not connection_url:
@@ -80,6 +343,15 @@ def test_semantic_report_indexes_upgrade_an_applied_archive_chain(tmp_path):
             "0036-replay-canonical-provider-quotes-6ea4c2.py",
             "0037-replay-independent-provider-read-snapshots-ae38ad.py",
             "0038-replay-history-with-final-unread-snapshot-05224a.py",
+            "0039-store-history-batches-in-bridge-database-6681b1.py",
+            "0040-rebuild-history-batches-when-sources-change-c8d0c2.py",
+            "0041-retire-legacy-history-finalizers-6ead92.py",
+            "0042-Publish-frozen-history-batches-2a4b70.py",
+            "0043-Scope-history-invalidation-and-refresh-directories-without-recapture-8ab268.py",
+            "0044-Persist-history-failure-reporting-work-90da9f.py",
+            "0045-Acknowledge-history-directory-revisions-0a44f0.py",
+            "0046-Persist-outstanding-capture-timeout-markers-97e00d.py",
+        "0047-Bound-directory-write-retries-436b12.py",
         }:
             shutil.copy2(migration_path, archive_migrations / migration_path.name)
     admin_store = storage.RestAlchemyStore(connection_url)
@@ -141,7 +413,7 @@ def test_semantic_report_indexes_upgrade_an_applied_archive_chain(tmp_path):
                   AND column_name = 'result_record_uuid'
                 """
             ).fetchone()
-        assert applied["count"] == 39
+        assert applied["count"] == 48
         assert [row["indexname"] for row in indexes] == [
             "bridge_operations_pending_result_idx",
             "bridge_operations_result_record_uuid_idx",
@@ -187,6 +459,15 @@ def test_projection_reset_upgrade_forces_snapshot_after_old_bridge_consumed_chan
             "0036-replay-canonical-provider-quotes-6ea4c2.py",
             "0037-replay-independent-provider-read-snapshots-ae38ad.py",
             "0038-replay-history-with-final-unread-snapshot-05224a.py",
+            "0039-store-history-batches-in-bridge-database-6681b1.py",
+            "0040-rebuild-history-batches-when-sources-change-c8d0c2.py",
+            "0041-retire-legacy-history-finalizers-6ead92.py",
+            "0042-Publish-frozen-history-batches-2a4b70.py",
+            "0043-Scope-history-invalidation-and-refresh-directories-without-recapture-8ab268.py",
+            "0044-Persist-history-failure-reporting-work-90da9f.py",
+            "0045-Acknowledge-history-directory-revisions-0a44f0.py",
+            "0046-Persist-outstanding-capture-timeout-markers-97e00d.py",
+        "0047-Bound-directory-write-retries-436b12.py",
         }:
             shutil.copy2(migration_path, old_bridge_migrations / migration_path.name)
     admin_store = storage.RestAlchemyStore(connection_url)
@@ -349,11 +630,26 @@ def test_migrations_have_one_versioned_dependency_chain():
         "0036-replay-canonical-provider-quotes-6ea4c2.py",
         "0037-replay-independent-provider-read-snapshots-ae38ad.py",
         "0038-replay-history-with-final-unread-snapshot-05224a.py",
+        "0039-store-history-batches-in-bridge-database-6681b1.py",
+        "0040-rebuild-history-batches-when-sources-change-c8d0c2.py",
+        "0041-retire-legacy-history-finalizers-6ead92.py",
+        "0042-Publish-frozen-history-batches-2a4b70.py",
+        "0043-Scope-history-invalidation-and-refresh-directories-without-recapture-8ab268.py",
+        "0044-Persist-history-failure-reporting-work-90da9f.py",
+        "0045-Acknowledge-history-directory-revisions-0a44f0.py",
+        "0046-Persist-outstanding-capture-timeout-markers-97e00d.py",
+        "0047-Bound-directory-write-retries-436b12.py",
     ]
     assert engine.get_latest_migration() == (
-        "0038-replay-history-with-final-unread-snapshot-05224a.py"
+        "0047-Bound-directory-write-retries-436b12.py"
     )
-    assert len({step["uuid"] for step in all_migrations.values()}) == 39
+    assert len({step["uuid"] for step in all_migrations.values()}) == 48
+    assert all_migrations["0047-Bound-directory-write-retries-436b12.py"]["depends"] == [
+        "0046-Persist-outstanding-capture-timeout-markers-97e00d.py"
+    ]
+    assert all_migrations["0046-Persist-outstanding-capture-timeout-markers-97e00d.py"]["depends"] == [
+        "0045-Acknowledge-history-directory-revisions-0a44f0.py"
+    ]
     assert all_migrations["0001-add-Zulip-provider-scheduler-state-143113.py"][
         "depends"
     ] == ["0000-initialize-bridge-operational-state-18f707.py"]
@@ -468,6 +764,15 @@ def test_migrations_have_one_versioned_dependency_chain():
     assert all_migrations["0038-replay-history-with-final-unread-snapshot-05224a.py"][
         "depends"
     ] == ["0037-replay-independent-provider-read-snapshots-ae38ad.py"]
+    assert all_migrations[
+        "0043-Scope-history-invalidation-and-refresh-directories-without-recapture-8ab268.py"
+    ]["depends"] == ["0042-Publish-frozen-history-batches-2a4b70.py"]
+    assert all_migrations["0045-Acknowledge-history-directory-revisions-0a44f0.py"]["depends"] == [
+        "0044-Persist-history-failure-reporting-work-90da9f.py"
+    ]
+    assert all_migrations["0044-Persist-history-failure-reporting-work-90da9f.py"]["depends"] == [
+        "0043-Scope-history-invalidation-and-refresh-directories-without-recapture-8ab268.py"
+    ]
 
 
 def test_pending_authoritative_message_dependency_migration_rekeys_alias(
@@ -1553,7 +1858,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                   AND column_name = 'private_catalog_scanned_generation'
                 """
             ).fetchone()
-            assert applied["count"] == 39
+            assert applied["count"] == 48
             assert private_catalog_marker == {"data_type": "bigint"}
             assert [row["indexname"] for row in indexes] == [
                 "bridge_operations_active_local_echo_idx",
@@ -1612,7 +1917,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
             provider_cursor_count = session.execute(
                 "SELECT count(*) AS count FROM zulip_event_cursors"
             ).fetchone()
-            assert applied["count"] == 39
+            assert applied["count"] == 48
             assert cursor["control_cursor"] == "preserved"
             assert provider_cursor_count["count"] == 0
     finally:
@@ -2058,3 +2363,42 @@ def test_missing_topic_projection_migration_requeues_provider_event(tmp_path):
     finally:
         with admin_store.session() as session:
             session.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+
+def test_0045_acknowledges_completed_scopes_and_preserves_dirty_bootstrap(tmp_path):
+    connection_url = os.environ.get("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN")
+    if not connection_url:
+        pytest.skip("WORKSPACE_BRIDGE_TEST_POSTGRES_DSN is not configured")
+    schema = f"cassi_history_directory_{uuid.uuid4().hex}"
+    scoped_url = _schema_connection_url(connection_url, schema)
+    previous = tmp_path / "previous-migrations"
+    previous.mkdir()
+    for path in MIGRATIONS.glob("*.py"):
+        if path.name < "0045-":
+            shutil.copy2(path, previous / path.name)
+    admin = storage.RestAlchemyStore(connection_url)
+    store = storage.RestAlchemyStore(scoped_url)
+    config = tmp_path / "bridge.conf"
+    pending_realm, finished_realm, bootstrap_realm = [uuid.uuid4() for _ in range(3)]
+    with admin.session() as session:
+        session.execute(f'CREATE SCHEMA "{schema}"')
+    try:
+        _apply_migrations(scoped_url, config, previous)
+        with store.session() as session:
+            for realm in (pending_realm, finished_realm, bootstrap_realm):
+                session.execute("INSERT INTO zulip_history_directory_revisions(provider_realm_uuid,generation) VALUES (%s,23)", (realm,))
+            for realm, pending in ((pending_realm, True), (pending_realm, False), (finished_realm, False)):
+                project = uuid.uuid4()
+                session.execute("INSERT INTO zulip_history_scopes(project_uuid,provider_realm_uuid,generation,fingerprint,sources,directory_pending) VALUES (%s,%s,900,%s,'[]'::jsonb,%s)", (project, realm, "a" * 64, pending))
+                session.execute("INSERT INTO zulip_history_batches(project_uuid,provider_realm_uuid,from_id,to_id,body) VALUES (%s,%s,1,5000,'{}'::jsonb)", (project, realm))
+            batches = session.execute("SELECT * FROM zulip_history_batches ORDER BY project_uuid").fetchall()
+        _apply_migrations(scoped_url, config)
+        _apply_migrations(scoped_url, config)
+        with store.session() as session:
+            assert session.execute("SELECT * FROM zulip_history_batches ORDER BY project_uuid").fetchall() == batches
+            scopes = session.execute("SELECT * FROM zulip_history_scopes").fetchall()
+            assert all(row["directory_revision"] == 23 and row["directory_ack_revision"] == (0 if row["directory_pending"] else 23) and row["generation"] == 900 for row in scopes)
+            assert {str(row["provider_realm_uuid"]) for row in session.execute("SELECT * FROM zulip_history_directory_revisions").fetchall()} == {str(pending_realm), str(bootstrap_realm)}
+    finally:
+        with admin.session() as session:
+            session.execute(f'DROP SCHEMA "{schema}" CASCADE')
