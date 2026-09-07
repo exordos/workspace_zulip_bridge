@@ -302,3 +302,51 @@ ambiguous nested escapes are rejected. Ordinary Unicode names, spaces and
 embedded dots remain supported. Before uploading downloaded bytes, history
 rechecks that the current effective file limit is positive and covers the size;
 zero disables transfer even for an empty file and uses the unavailable path.
+
+## Partial message updates before import
+
+Only the typed Provider API error `provider_message_base_missing` creates a
+missing-base recovery intent after the rejected command is isolated. Generic
+422 responses keep their existing terminal handling. The original outbox
+record and operation digest remain unchanged.
+
+Migration 0049 adds `zulip_missing_message_recovery`, independent of terminal
+outbox/journal cleanup. Its worker runs after history work in the history lane,
+waits for the whole current project/realm capture and publication gate, and
+uses actual post-import references before fetching any current provider
+snapshot. A necessary full snapshot is a separate idempotent outbox operation.
+All intent states are retained in this version. Account/selection changes and
+tombstones fence recovery; unavailable sources and ambiguous equal provider
+revisions leave explicit terminal outcomes.
+
+Inspect aggregate state without selecting provider message content or account
+identifiers:
+
+```sql
+SELECT state, error_code, count(*) AS intents,
+       min(created_at) AS oldest_created_at,
+       min(available_at) AS next_attempt_at
+FROM zulip_missing_message_recovery
+GROUP BY state, error_code
+ORDER BY state, error_code;
+```
+
+`complete` proves completion of the targeted reconciliation, not completion of
+all history or all live delivery. Track those lanes separately. Existing generic
+422 rows are not automatically reclassified or replayed.
+
+The authoritative recovery contract, test commands and backend-first rollout /
+code-only rollback procedure are in the backend repository's
+`docs/provider_partial_move_recovery.md`. Keep the additive bridge table and
+idempotency ledger on rollback, and preserve the backend omitted-link fallback.
+
+Recovery targets the canonical message UUID from the import receipt, including
+when it differs from a retained local mapping. Staged snapshot records leave
+causal sequences unallocated until their atomic enqueue transaction. Recovery
+keeps a separate durable outcome for every child operation, including topic
+upserts that are equivalent to an already pending topic delivery.
+
+Recovery children use the serviced live delivery priority. An intent from an
+older assignment generation is superseded even when its UUID and selected
+project are unchanged; this is checked both before provider I/O and before
+enqueue.

@@ -18,6 +18,7 @@ from workspace_zulip_bridge import (
     history,
     history_configuration,
     history_failure_reports,
+    missing_message_recovery,
 )
 
 PARTICIPANT_RECHECK_INTERVAL_SECONDS = 3600
@@ -5087,6 +5088,8 @@ class RestAlchemyStore:
         priority: int,
         provider_queue_id: str | None = None,
         provider_event_id: int | None = None,
+        *,
+        deduplicate_topics: bool = True,
     ) -> bool:
         with self.session() as session:
             operation_uuid = str(record["operation_uuid"])
@@ -5223,7 +5226,11 @@ class RestAlchemyStore:
                 )
             ):
                 return True
-            if operation.get("kind") == "topic.upsert" and assignment is not None:
+            if (
+                deduplicate_topics
+                and operation.get("kind") == "topic.upsert"
+                and assignment is not None
+            ):
                 payload = typing.cast(dict[str, object], operation["payload"])
                 duplicate_topic = session.execute(
                     """
@@ -5901,6 +5908,14 @@ class RestAlchemyStore:
             SELECT processing_state, processing_reason, prepared_records
             FROM zulip_provider_events
             WHERE account_uuid = %s AND queue_id = %s AND event_id = %s
+              AND NOT EXISTS (
+                  SELECT 1 FROM zulip_missing_message_recovery AS recovery
+                  JOIN workspace_delivery_outbox AS delivery
+                    ON delivery.operation_uuid=recovery.operation_uuid
+                  WHERE delivery.account_uuid=zulip_provider_events.account_uuid
+                    AND delivery.provider_queue_id=zulip_provider_events.queue_id
+                    AND delivery.provider_event_id=zulip_provider_events.event_id
+              )
             FOR UPDATE
             """,
             (account_uuid, queue_id, event_id),
@@ -6059,7 +6074,11 @@ class RestAlchemyStore:
     def reset_stale_workspace_deliveries(self) -> int:
         with self.session() as session:
             stale_predicate = """
-                delivery.sent_at IS NULL AND (
+                delivery.sent_at IS NULL
+                AND NOT EXISTS (
+                    SELECT 1 FROM zulip_missing_message_recovery AS recovery
+                    WHERE recovery.operation_uuid=delivery.operation_uuid
+                ) AND (
                     (
                         delivery.assignment_uuid IS NOT NULL AND NOT EXISTS (
                             SELECT 1 FROM desired_resources AS assignment
@@ -9182,6 +9201,8 @@ class RestAlchemyStore:
                 (error_code[:128], record_uuid),
             ).fetchone()
             if bool(row["rejected"]):
+                if error_code == missing_message_recovery.ERROR:
+                    missing_message_recovery.remember(session, record_uuid)
                 return True
             row = session.execute(
                 """
@@ -9197,6 +9218,16 @@ class RestAlchemyStore:
                 (record_uuid,),
             ).fetchone()
             return bool(row["terminal"])
+
+    def claim_missing_message_recovery(self):
+        return missing_message_recovery.claim(self)
+
+    @staticmethod
+    def lock_missing_message_recovery(session, account_uuid, provider_message_id):
+        session.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (_provider_mapping_lock_key(account_uuid, "message", provider_message_id),),
+        )
 
     @staticmethod
     def _queued_operation(row: dict[str, object]) -> QueuedOperation:

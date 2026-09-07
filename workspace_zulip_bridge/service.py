@@ -28,6 +28,7 @@ from workspace_zulip_bridge import (
     history,
     history_configuration,
     history_delivery,
+    missing_message_recovery,
     provider_api,
     provider_protocol,
     scheduler,
@@ -4153,7 +4154,7 @@ class BridgeService:
                     )
                 return committed
             record, _event = event_records[0]
-            error_code = f"provider_api_http_{exc.status_code}"
+            error_code = exc.error_code or f"provider_api_http_{exc.status_code}"
             rejected = self.store.reject_provider_event_submission(
                 str(record["record_uuid"]),
                 error_code,
@@ -4367,6 +4368,8 @@ class BridgeService:
             publisher = getattr(self, "history_publisher", None)
             if publisher is not None:
                 progressed |= publisher.run_once()
+            if hasattr(getattr(self, "store", None), "claim_missing_message_recovery"):
+                progressed |= missing_message_recovery.run_once(self)
         return progressed
 
     def _refresh_history_directory_once(self) -> bool:

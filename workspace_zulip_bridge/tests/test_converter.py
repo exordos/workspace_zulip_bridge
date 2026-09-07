@@ -1559,6 +1559,56 @@ def test_single_message_topic_move_creates_target_without_renaming_source():
     assert moved[1]["payload"]["topic_uuid"] == target_topic["workspace_uuid"]
 
 
+@pytest.mark.parametrize(
+    "site", ["", "https://zulip.example", "https://zulip.example/"]
+)
+def test_topic_move_and_content_edit_use_the_same_original_link(site):
+    links = []
+    for edit_content in (False, True):
+        store = FakeStore()
+        created = _operations(
+            converter.event_records(
+                store,
+                ACCOUNT_UUID,
+                "queue",
+                {"id": 10, "type": "message", "message": _stream_message()},
+                original_url=site,
+            )
+        )
+        links.append(
+            next(op for op in created if op["kind"] == "message.create")["extensions"][
+                "provider_original_url"
+            ]
+        )
+        store.auto_materialize = False
+        event = {
+            "id": 11,
+            "type": "update_message",
+            "message_id": 601,
+            "message_ids": [601],
+            "stream_id": 42,
+            "orig_subject": "Topic",
+            "subject": "Moved",
+            "propagate_mode": "change_one",
+            "edit_timestamp": 1_700_000_010,
+        }
+        if edit_content:
+            event["content"] = "edited"
+        records = converter.event_records(
+            store, ACCOUNT_UUID, "queue", event, original_url=site
+        )
+        message = next(
+            record
+            for record in records
+            if record["operation"]["kind"] == "message.update"
+        )
+        links.append(message["operation"]["extensions"]["provider_original_url"])
+        assert ("payload" in message["operation"]["payload"]) == edit_content
+        assert message["operation_sha256"] == canonical.operation_digest(message)
+    assert len(set(links)) == 1
+    assert links[0] == (site.rstrip("/") + "/" if site else "") + "#narrow/near/601"
+
+
 def test_combined_topic_move_applies_content_only_to_edited_message():
     store = FakeStore()
     for message_id in (601, 602):
