@@ -63,7 +63,7 @@ def postgres_store(migrated_postgres_dsn):
     with store.session() as session:
         session.execute(
             """
-            TRUNCATE zulip_history_scopes,zulip_history_directory_revisions,zulip_history_batches, desired_resources, provider_mappings,
+            TRUNCATE zulip_missing_message_recovery,zulip_history_scopes,zulip_history_directory_revisions,zulip_history_batches, desired_resources, provider_mappings,
                      provider_mapping_aliases, zulip_backfill_jobs,
                      zulip_queue_catchup_jobs, zulip_participant_sync,
                      workspace_delivery_outbox,

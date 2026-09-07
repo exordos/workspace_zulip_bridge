@@ -1562,6 +1562,15 @@ def _message_context(
     return chat_type, chat_key, project_uuid, stream_uuid, topic_uuid
 
 
+def provider_message_url(original_url: str, provider_message_id: str) -> str:
+    site = original_url.rstrip("/")
+    return (
+        f"{site}/#narrow/near/{provider_message_id}"
+        if site
+        else f"#narrow/near/{provider_message_id}"
+    )
+
+
 def message_event_records(
     store: ConversionStore,
     account_uuid: str,
@@ -1751,12 +1760,7 @@ def message_event_records(
     default_topic_uuid = existing_stream_metadata.get("default_topic_uuid")
     if chat_type != "channel" and default_topic_uuid is None:
         default_topic_uuid = topic_uuid
-    provider_site = original_url.rstrip("/")
-    message_url = (
-        f"{provider_site}/#narrow/near/{provider_message_id}"
-        if provider_site
-        else f"#narrow/near/{provider_message_id}"
-    )
+    message_url = provider_message_url(original_url, provider_message_id)
     provider_content = str(message["content"])
     reply_provider_id = _semantic_reply_provider_id(provider_content)
     canonical_content = _canonicalize_semantic_quotes(
@@ -2654,9 +2658,7 @@ def _mapped_event_records(
                 f"provider-message-update:{provider_message_id}:"
                 f"{provider_content_sha256}"
             )
-            message_url = (
-                f"{original_url.rstrip('/')}/#narrow/near/{provider_message_id}"
-            )
+            message_url = provider_message_url(original_url, provider_message_id)
             occurred_at = event_time.isoformat().replace("+00:00", "Z")
             mention_operations, mention_uuids = _update_mention_operations(
                 store,
@@ -2812,6 +2814,9 @@ def _mapped_event_records(
                 },
                 "extensions": {
                     "provider_badge": "zulip",
+                    "provider_original_url": provider_message_url(
+                        original_url, provider_message_id
+                    ),
                     **(
                         {"subject": destination_topic_name}
                         if destination_topic_name is not None

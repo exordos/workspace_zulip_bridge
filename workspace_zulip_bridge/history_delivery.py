@@ -592,6 +592,9 @@ def save_references(store, item, account_uuid, mappings, cursor, complete):
         ).fetchone()
         if batch is None:
             return
+        from workspace_zulip_bridge import missing_message_recovery
+
+        missing_message_recovery.save_references(session, item, account_uuid, mappings)
         session.execute(
             """INSERT INTO provider_mappings
                (account_uuid, entity_kind, provider_id, workspace_uuid, metadata)
