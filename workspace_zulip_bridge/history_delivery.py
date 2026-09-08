@@ -20,6 +20,8 @@ from workspace_zulip_bridge import (
 
 PATH = "/v1/history-imports"
 MAX_SOURCES = 512
+ADMISSION_COOLDOWN_SECONDS = 5
+ADMISSION_COOLDOWN_MAX_SECONDS = 60
 # These failures describe the request/bytes/path, not observer credentials.
 PERMANENT_FILE_ERRORS = frozenset({
     "invalid_provider_file_url", "invalid_provider_file_length",
@@ -63,7 +65,7 @@ def sources_for(session, project_uuid, provider_realm_uuid):
     ).fetchall()
 
 
-def claim(store):
+def claim(store, *, allow_admission=True, prefer_admission=False):
     if not store.provider_is_enabled("zulip"):
         return None
     with store.session() as session:
@@ -74,7 +76,15 @@ def claim(store):
                WHERE NOT scope.directory_pending AND batch.import_status='pending'
                  AND batch.import_retry_at<=now()
                  AND (batch.import_lease_until IS NULL OR batch.import_lease_until<=now())
-               ORDER BY batch.import_retry_at,batch.project_uuid,batch.provider_realm_uuid,batch.from_id LIMIT 1"""
+                 AND (%s OR batch.import_uuid IS NOT NULL)
+               ORDER BY CASE WHEN batch.import_uuid IS NULL THEN %s ELSE %s END,
+                        batch.import_retry_at,batch.project_uuid,batch.provider_realm_uuid,batch.from_id
+               LIMIT 1""",
+            (
+                allow_admission,
+                0 if prefer_admission else 1,
+                1 if prefer_admission else 0,
+            ),
         ).fetchone()
         if candidate is None:
             return None
@@ -124,6 +134,22 @@ def claim(store):
                WHERE project_uuid = %s AND provider_realm_uuid = %s AND from_id = %s""",
             (lease, sources_hash, sources_hash, sources_hash, *scope),
         )
+        import_uuid = (
+            row["import_uuid"]
+            if row["import_sources_hash"] == sources_hash
+            else None
+        )
+        if not allow_admission and import_uuid is None:
+            # A changed source set invalidates its old receipt. During capacity
+            # backpressure it must not turn this active-only claim into a POST.
+            session.execute(
+                """UPDATE zulip_history_batches SET import_lease=NULL,
+                           import_lease_until=NULL
+                   WHERE project_uuid=%s AND provider_realm_uuid=%s AND from_id=%s
+                     AND import_lease=%s""",
+                (*scope, lease),
+            )
+            return None
         return {
             "validation_error": "history_source_limit_exceeded" if oversized else None,
             "mapping_cursor": row["import_mapping_cursor"]
@@ -132,9 +158,7 @@ def claim(store):
             "scope": scope,
             "lease": lease,
             "generation": configuration["generation"],
-            "import_uuid": row["import_uuid"]
-            if row["import_sources_hash"] == sources_hash
-            else None,
+            "import_uuid": import_uuid,
             "envelope": {
                 "schema_version": 1,
                 "project_uuid": str(scope[0]),
@@ -230,6 +254,24 @@ def safe_error_code(value):
     return "history_import_failed"
 
 
+def response_error_code(response):
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    if not isinstance(body, dict):
+        return None
+    return safe_error_code(body.get("error"))
+
+
+def admission_retry_after(response):
+    try:
+        delay = int(response.headers.get("Retry-After", ""))
+    except (TypeError, ValueError):
+        delay = ADMISSION_COOLDOWN_SECONDS
+    return max(1, min(delay, ADMISSION_COOLDOWN_MAX_SECONDS))
+
+
 def release(
     store, item, *, status="pending", job_uuid=None, error=None, delay=1, reset=False
 ):
@@ -260,14 +302,30 @@ def release(
 
 
 class HistoryPublisher:
-    def __init__(self, store, file_client, adapters, account_report=None):
+    def __init__(
+        self,
+        store,
+        file_client,
+        adapters,
+        account_report=None,
+        record_stat=None,
+        clock=None,
+    ):
         self.store = store
         self.file_client = file_client
         self.adapters = adapters
         self.account_report = account_report
+        self.record_stat = record_stat
+        self.clock = clock or time.monotonic
         self.lock = threading.Lock()
         self.probe_after = 0.0
+        self.admission_probe_after = 0.0
+        self.admission_probe_due = False
         self.supported = False
+
+    def _record_stat(self, name):
+        if self.record_stat is not None:
+            self.record_stat(name)
 
     def fail(self, item, code):
         code = safe_error_code(code) or "history_import_failed"
@@ -326,9 +384,9 @@ class HistoryPublisher:
             reported = False
         client = self.file_client.client
         if not self.supported:
-            if time.monotonic() < self.probe_after:
+            if self.clock() < self.probe_after:
                 return reported
-            self.probe_after = time.monotonic() + 60
+            self.probe_after = self.clock() + 60
             try:
                 response = client.get(PATH, headers={"Content-Length": "0"})
                 self.supported = (
@@ -339,7 +397,17 @@ class HistoryPublisher:
                 return reported
             if not self.supported:
                 return reported
-        item = claim(self.store)
+        if self.clock() < self.admission_probe_after:
+            item = claim(self.store, allow_admission=False)
+        elif self.admission_probe_due:
+            # Default selection always gives active receipts the first turn.
+            # A single bounded probe after an active poll prevents those same
+            # receipts from monopolizing every live-throttled history quantum
+            # when the backend still has a free admission slot.
+            self.admission_probe_due = False
+            item = claim(self.store, prefer_admission=True)
+        else:
+            item = claim(self.store)
         if item is None:
             return reported
         if item.get("validation_error"):
@@ -353,7 +421,9 @@ class HistoryPublisher:
             if not current(self.store, item):
                 release(self.store, item)
                 return False
-            if item["import_uuid"] is None:
+            registered = item["import_uuid"] is not None
+            if not registered:
+                self._record_stat("history_admission_attempts")
                 response = client.post(
                     PATH,
                     content=json.dumps(item["envelope"], ensure_ascii=False).encode(),
@@ -361,27 +431,53 @@ class HistoryPublisher:
                     timeout=60,
                 )
             else:
+                self._record_stat("history_active_polls")
                 response = client.get(
                     f"{PATH}/{item['import_uuid']}", headers={"Content-Length": "0"}
                 )
-            if item["import_uuid"] is not None and response.status_code in {404, 409}:
+            if registered and response.status_code in {404, 409}:
+                self.admission_probe_after = 0.0
+                self.admission_probe_due = True
                 release(self.store, item, error="history_receipt_changed", reset=True)
                 return False
-            if item["import_uuid"] is None and response.status_code in {400, 413, 422}:
+            if (
+                not registered
+                and response.status_code == 429
+                and response_error_code(response) == "history_import_busy"
+            ):
+                delay = admission_retry_after(response)
+                self.admission_probe_after = self.clock() + delay
+                self._record_stat("history_admission_busy")
+                release(
+                    self.store,
+                    item,
+                    error="history_import_busy",
+                    delay=delay,
+                )
+                return False
+            if not registered and response.status_code in {400, 413, 422}:
                 self.fail(item, "history_batch_rejected")
                 return False
             response.raise_for_status()
             state = response.json()
+            if registered:
+                self.admission_probe_due = True
             item["import_uuid"] = uuid.UUID(state["uuid"])
             if state["status"] == "failed":
+                if registered:
+                    self.admission_probe_after = 0.0
                 self.fail(item, state["safe_error"])
                 return False
             if state["status"] == "superseded":
+                if registered:
+                    self.admission_probe_after = 0.0
                 release(
                     self.store, item, error="history_receipt_superseded", reset=True
                 )
                 return False
             if state["status"] == "complete":
+                if registered:
+                    self.admission_probe_after = 0.0
                 if current(self.store, item):
                     self.sync_references(client, item)
                 release(self.store, item, job_uuid=item["import_uuid"])
@@ -543,6 +639,11 @@ class HistoryPublisher:
                 },
             )
         response.raise_for_status()
+        self._record_stat(
+            "history_files_uploaded"
+            if downloaded is not None
+            else "history_files_unavailable"
+        )
 
 
 def save_references(store, item, account_uuid, mappings, cursor, complete):

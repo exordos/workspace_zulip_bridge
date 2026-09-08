@@ -14332,6 +14332,63 @@ def test_publisher_waits_for_complete_scope_and_fences_configuration(postgres_st
         assert session.execute('SELECT generation FROM zulip_history_configuration').fetchone()['generation'] > claimed['generation']
 
 
+def test_history_claim_prioritizes_active_receipt_and_can_pause_admission(
+    postgres_store,
+):
+    from workspace_zulip_bridge import history, history_delivery
+
+    project, realm = str(uuid.uuid4()), str(uuid.uuid4())
+    _history_source(postgres_store, 17, realm, project)
+    job = postgres_store.claim_backfill_job()
+    first = _history_job_batch(job, 17)
+    assert postgres_store.save_history_batch(job, first, None, True)
+
+    initial = history_delivery.claim(postgres_store)
+    receipt = uuid.uuid4()
+    assert history_delivery.release(postgres_store, initial, job_uuid=receipt)
+
+    waiting = copy.deepcopy(first)
+    waiting.update(from_id=5001, to_id=10000)
+    waiting["messages"][0]["id"] = 5205
+    waiting["messages"][0]["hash"] = history.digest(
+        {
+            key: value
+            for key, value in waiting["messages"][0].items()
+            if key != "hash"
+        }
+    )
+    waiting["hash"] = history.digest(
+        {key: value for key, value in waiting.items() if key != "hash"}
+    )
+    with postgres_store.session() as session:
+        session.execute(
+            """INSERT INTO zulip_history_batches
+               (project_uuid,provider_realm_uuid,from_id,to_id,body,import_retry_at)
+               VALUES (%s,%s,5001,10000,%s::jsonb,now()-interval '1 hour')""",
+            (project, realm, json.dumps(waiting)),
+        )
+        session.execute(
+            """UPDATE zulip_history_batches SET import_retry_at=now()
+               WHERE from_id=1"""
+        )
+
+    active = history_delivery.claim(postgres_store)
+    assert active is not None
+    assert active["scope"][2] == 1 and active["import_uuid"] == receipt
+    assert history_delivery.release(postgres_store, active, delay=0)
+
+    admission = history_delivery.claim(postgres_store, prefer_admission=True)
+    assert admission is not None
+    assert admission["scope"][2] == 5001 and admission["import_uuid"] is None
+    assert history_delivery.release(postgres_store, admission, delay=60)
+
+    active = history_delivery.claim(postgres_store, allow_admission=False)
+    assert active is not None
+    assert active["scope"][2] == 1 and active["import_uuid"] == receipt
+    assert history_delivery.release(postgres_store, active, delay=60)
+    assert history_delivery.claim(postgres_store, allow_admission=False) is None
+
+
 def test_publisher_keeps_completed_receipt_after_restart(postgres_store, migrated_postgres_dsn):
     from workspace_zulip_bridge import history_delivery
 
