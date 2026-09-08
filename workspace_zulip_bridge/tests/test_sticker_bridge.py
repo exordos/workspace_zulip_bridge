@@ -7,6 +7,7 @@ import uuid
 
 import httpx
 import pytest
+import requests
 
 from workspace_zulip_bridge import (
     converter,
@@ -449,3 +450,44 @@ def test_export_failure_is_handled_by_scheduler(
         assert not store.retries
         assert store.completed[0][2] == "rejected"
         assert store.completed[0][1]["result"]["safe_error"]["code"] == code
+
+
+@pytest.mark.parametrize("kind", ["sticker", "image"])
+def test_provider_upload_transport_failure_is_retried_by_scheduler(
+    operation_record, kind
+):
+    client = adapters.FakeClient()
+
+    def fail_upload(_stream):
+        raise requests.ConnectionError("synthetic provider transport failure")
+
+    client.upload_file = fail_upload
+    operation = operation_record["operation"]
+    operation["provider"]["chat_id"] = "channel:42"
+    operation["payload"]["stream_uuid"] = adapters.STREAM_UUID
+    operation["payload"]["topic_uuid"] = adapters.TOPIC_UUID
+    operation["payload"]["payload"]["content"] = f"![media](urn:{kind}:{STICKER_UUID})"
+    adapter = zulip_adapter.OfficialZulipAdapter(
+        client=client,
+        routing=adapters.FakeRouting(),
+        account_uuid=operation_record["account_uuid"],
+        owner_user_uuid=operation["actor_uuid"],
+        file_client=types.SimpleNamespace(
+            export_file=lambda *args, **kwargs: (
+                "sticker.webp",
+                "image/webp",
+                CONTENT,
+            )
+        ),
+        file_limit=lambda: 1024,
+    )
+    store = scheduling.FakeStore(operation_record)
+    worker = scheduler.Scheduler(store, lambda _: adapter, "worker")
+
+    assert worker.run_once()
+
+    assert store.retries[0][2] == "provider_unavailable"
+    assert not store.correlations
+    assert not store.completed
+    assert not store.uncertain
+    assert not client.sent

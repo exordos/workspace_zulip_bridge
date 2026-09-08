@@ -1468,7 +1468,10 @@ class OfficialZulipAdapter:
                 raise ZulipOperationError("invalid_record", False) from exc
             stream = io.BytesIO(content_bytes)
             stream.name = name  # type: ignore[attr-defined]
-            uploaded = _successful(self.client.upload_file(stream))
+            try:
+                uploaded = _successful(self.client.upload_file(stream))
+            except PROVIDER_NETWORK_ERRORS as exc:
+                raise ZulipOperationError("provider_unavailable", True) from exc
             provider_uri = uploaded.get("uri")
             if not isinstance(provider_uri, str) or not provider_uri:
                 raise ZulipOperationError("provider_file_unavailable", True)
