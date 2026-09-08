@@ -221,8 +221,9 @@ is not a limit on total messages. Other scopes remain eligible for publication.
 A dedicated history lane publishes one bounded request/file operation at a
 time and persists the server job UUID/status. It polls missing attachment
 requests, downloads bytes through current allowed accounts and uploads them
-without putting base64 content in message JSON. Only definitive 404/410 means
-unavailable; authentication, network and storage failures remain retryable.
+without putting base64 content in message JSON. A definitive 404/410 or a
+rejected redirect means unavailable; authentication, network and other storage
+failures remain retryable.
 For a shared attachment, the publisher tries each distinct authorized observer
 before deferring the transfer. A successful alternate observer supplies the
 bytes; any unresolved transient or authentication error prevents a later
@@ -294,11 +295,19 @@ no observer has a recoverable failure. Credential, authentication and network
 errors retain the receipt for retry and can recover after credentials change;
 a successful alternative observer can supply the file immediately.
 The live and queue-catchup message resolver renders a permanently invalid upload
-URL as an unavailable attachment, preserving the surrounding message text without
-HTTP. Authentication and network failures retain their existing retry behavior.
-Both history and realtime downloads validate relative upload URLs before
-authenticated HTTP: dot segments, encoded separators, control characters and
-ambiguous nested escapes are rejected. Ordinary Unicode names, spaces and
-embedded dots remain supported. Before uploading downloaded bytes, history
-rechecks that the current effective file limit is positive and covers the size;
-zero disables transfer even for an empty file and uses the unavailable path.
+URL as an unavailable attachment, preserving the surrounding message text; only
+live delivery also falls back for a provider-origin 400, 403, 404, 410 or 422
+response. Authentication, network
+and retryable redirected-storage failures retain their existing retry behavior;
+a redirected 404/410 becomes unavailable. Both history and realtime downloads
+validate relative upload URLs before authenticated
+HTTP: dot segments, encoded separators, control characters and ambiguous nested
+escapes are rejected. Ordinary Unicode names, spaces and embedded dots remain
+supported. A download may follow one public HTTP(S) storage redirect without
+forwarding the Zulip credentials; HTTPS downgrades, non-public cross-origin
+targets and a second redirect are rejected. The validated destination address
+is used for direct and proxy connections. A proxy-only target that cannot be
+validated through local DNS becomes unavailable instead of retrying the delivery
+lane indefinitely. Before uploading downloaded bytes, history rechecks that the
+current effective file limit is positive and covers the size; zero disables
+transfer even for an empty file and uses the unavailable path.

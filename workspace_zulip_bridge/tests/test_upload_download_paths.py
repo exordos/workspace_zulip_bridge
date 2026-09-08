@@ -45,13 +45,27 @@ def upload_adapter(monkeypatch):
         def __init__(self):
             self.sent = []
             self.content = b"fixture"
+            self.status_code = 200
+            self.redirect_to = None
+            self.redirect_responses = 1
+            self.redirect_addresses = []
             self.on_send = lambda: None
 
         def send(self, request, **kwargs):
             self.sent.append(request)
             self.on_send()
             response = requests.Response()
-            response.status_code = 200
+            if (
+                self.redirect_to is not None
+                and len(self.sent) <= self.redirect_responses
+            ):
+                response.status_code = 302
+                response.headers = {"Location": self.redirect_to}
+                response.raw = io.BytesIO()
+                response.request = request
+                response.url = request.url
+                return response
+            response.status_code = self.status_code
             response.headers = {
                 "Content-Length": str(len(self.content)),
                 "Content-Type": "text/plain",
@@ -72,6 +86,24 @@ def upload_adapter(monkeypatch):
     session.mount("https://", transport)
     session.mount("http://", transport)
     monkeypatch.setattr(zulip_adapter.requests, "get", session.get)
+
+    def request_file_redirect(redirect, address, *, auth, verify):
+        transport.redirect_addresses.append(str(address))
+        response = session.get(
+            redirect.url,
+            auth=auth,
+            verify=verify,
+            timeout=60.0,
+            allow_redirects=False,
+            stream=True,
+        )
+        return response, types.SimpleNamespace(close=lambda: None)
+
+    monkeypatch.setattr(
+        zulip_adapter,
+        "_request_file_redirect",
+        request_file_redirect,
+    )
     adapter = zulip_adapter.OfficialZulipAdapter(
         client=types.SimpleNamespace(
             base_url="https://zulip.example.test/api/",
@@ -124,6 +156,359 @@ def test_valid_upload_names_keep_real_adapter_download_behavior(upload_adapter, 
         urllib.parse.urlsplit(path).path
     )
     assert "Authorization" in request.headers
+
+
+def test_provider_file_download_follows_public_redirect_without_credentials(
+    upload_adapter, monkeypatch
+):
+    adapter, transport = upload_adapter
+    transport.redirect_to = "https://redirect-target.example.test/private"
+    monkeypatch.setattr(
+        zulip_adapter.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (
+                zulip_adapter.socket.AF_INET,
+                zulip_adapter.socket.SOCK_STREAM,
+                6,
+                "",
+                ("93.184.216.34", 443),
+            )
+        ],
+    )
+
+    assert adapter.download_file("/user_uploads/1/file.txt").content == b"fixture"
+
+    assert len(transport.sent) == 2
+    assert transport.redirect_addresses == ["93.184.216.34"]
+    assert "Authorization" in transport.sent[0].headers
+    assert "Authorization" not in transport.sent[1].headers
+
+
+def test_provider_file_download_keeps_credentials_on_safe_same_origin_redirect(
+    upload_adapter, monkeypatch
+):
+    adapter, transport = upload_adapter
+    transport.redirect_to = (
+        "https://zulip.example.test/user_uploads/1/redirected-file.txt"
+    )
+    monkeypatch.setattr(
+        zulip_adapter.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (
+                zulip_adapter.socket.AF_INET,
+                zulip_adapter.socket.SOCK_STREAM,
+                6,
+                "",
+                ("93.184.216.34", 443),
+            )
+        ],
+    )
+
+    assert adapter.download_file("/user_uploads/1/file.txt").content == b"fixture"
+
+    assert len(transport.sent) == 2
+    assert "Authorization" in transport.sent[0].headers
+    assert "Authorization" in transport.sent[1].headers
+
+
+def test_provider_file_download_rejects_same_origin_redirect_outside_uploads(
+    upload_adapter,
+):
+    adapter, transport = upload_adapter
+    transport.redirect_to = "https://zulip.example.test/api/v1/users"
+
+    with pytest.raises(zulip_adapter.ZulipOperationError) as captured:
+        adapter.download_file("/user_uploads/1/file.txt")
+
+    assert not captured.value.retryable
+    assert len(transport.sent) == 1
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "http://169.254.169.254/latest/meta-data/",
+        "https://127.0.0.1/private",
+        "https://[::1]/private",
+        "http://redirect-target.example.test/private",
+    ],
+)
+def test_provider_file_download_rejects_unsafe_redirect_target(
+    upload_adapter, target
+):
+    adapter, transport = upload_adapter
+    transport.redirect_to = target
+
+    with pytest.raises(zulip_adapter.ZulipOperationError) as captured:
+        adapter.download_file("/user_uploads/1/file.txt")
+
+    assert captured.value.code == "provider_file_unavailable"
+    assert not captured.value.retryable
+    assert captured.value.http_status == 302
+    assert len(transport.sent) == 1
+
+
+def test_provider_file_download_rejects_redirect_hostname_resolving_private(
+    upload_adapter, monkeypatch
+):
+    adapter, transport = upload_adapter
+    transport.redirect_to = "https://redirect-target.example.test/private"
+    monkeypatch.setattr(
+        zulip_adapter.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (
+                zulip_adapter.socket.AF_INET,
+                zulip_adapter.socket.SOCK_STREAM,
+                6,
+                "",
+                ("10.0.0.1", 443),
+            )
+        ],
+    )
+
+    with pytest.raises(zulip_adapter.ZulipOperationError) as captured:
+        adapter.download_file("/user_uploads/1/file.txt")
+
+    assert not captured.value.retryable
+    assert len(transport.sent) == 1
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "https://" + "a" * 64 + ".example.test/private",
+        "https://storage..example.test/private",
+    ],
+)
+def test_provider_file_download_rejects_invalid_redirect_hostname(
+    upload_adapter, target
+):
+    adapter, transport = upload_adapter
+    transport.redirect_to = target
+
+    with pytest.raises(zulip_adapter.ZulipOperationError) as captured:
+        adapter.download_file("/user_uploads/1/file.txt")
+
+    assert captured.value.code == "provider_file_unavailable"
+    assert not captured.value.retryable
+    assert captured.value.http_status == 302
+    assert len(transport.sent) == 1
+
+
+@pytest.mark.parametrize(
+    ("proxies", "retryable"),
+    [
+        ({}, True),
+        ({"http": "http://proxy.example.test:8080"}, True),
+        ({"https": "http://proxy.example.test:8080"}, False),
+    ],
+)
+def test_redirect_dns_failure_does_not_retry_forever_behind_proxy(
+    upload_adapter, monkeypatch, proxies, retryable
+):
+    adapter, transport = upload_adapter
+    transport.redirect_to = "https://storage.example.test/private"
+
+    def fail_dns(*args, **kwargs):
+        raise OSError("synthetic DNS failure")
+
+    monkeypatch.setattr(zulip_adapter.socket, "getaddrinfo", fail_dns)
+    monkeypatch.setattr(
+        zulip_adapter.requests.utils,
+        "get_environ_proxies",
+        lambda url: proxies,
+    )
+
+    with pytest.raises(zulip_adapter.ZulipOperationError) as captured:
+        adapter.download_file("/user_uploads/1/file.txt")
+
+    assert captured.value.code == "provider_file_unavailable"
+    assert captured.value.retryable is retryable
+    assert captured.value.http_status == 302
+    assert len(transport.sent) == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "retryable"),
+    [(403, True), (404, False), (410, False)],
+)
+def test_redirected_storage_http_failure_classification(
+    upload_adapter, monkeypatch, status, retryable
+):
+    adapter, transport = upload_adapter
+    transport.redirect_to = "https://redirect-target.example.test/private"
+    transport.status_code = status
+    monkeypatch.setattr(
+        zulip_adapter.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (
+                zulip_adapter.socket.AF_INET,
+                zulip_adapter.socket.SOCK_STREAM,
+                6,
+                "",
+                ("93.184.216.34", 443),
+            )
+        ],
+    )
+
+    with pytest.raises(zulip_adapter.ZulipOperationError) as captured:
+        adapter.download_file("/user_uploads/1/file.txt")
+
+    assert captured.value.retryable is retryable
+    assert not captured.value.provider_response
+    assert captured.value.http_status == status
+    assert len(transport.sent) == 2
+    assert "Authorization" not in transport.sent[1].headers
+
+
+def test_provider_file_download_rejects_a_second_redirect(
+    upload_adapter, monkeypatch
+):
+    adapter, transport = upload_adapter
+    transport.redirect_to = "https://redirect-target.example.test/private"
+    transport.redirect_responses = 2
+    monkeypatch.setattr(
+        zulip_adapter.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (
+                zulip_adapter.socket.AF_INET,
+                zulip_adapter.socket.SOCK_STREAM,
+                6,
+                "",
+                ("93.184.216.34", 443),
+            )
+        ],
+    )
+
+    with pytest.raises(zulip_adapter.ZulipOperationError) as captured:
+        adapter.download_file("/user_uploads/1/file.txt")
+
+    assert not captured.value.retryable
+    assert captured.value.http_status == 302
+    assert len(transport.sent) == 2
+
+
+def test_pinned_redirect_adapter_connects_to_validated_address(monkeypatch):
+    adapter = zulip_adapter._PinnedAddressAdapter(
+        "storage.example.test",
+        zulip_adapter.ipaddress.ip_address("93.184.216.34"),
+    )
+    captured = {}
+    expected_pool = object()
+
+    def connection_from_host(**kwargs):
+        captured.update(kwargs)
+        return expected_pool
+
+    monkeypatch.setattr(
+        adapter.poolmanager,
+        "connection_from_host",
+        connection_from_host,
+    )
+    request = requests.Request(
+        "GET", "https://storage.example.test/object"
+    ).prepare()
+
+    assert adapter.get_connection_with_tls_context(request, True) is expected_pool
+    adapter.add_headers(request)
+    assert captured["host"] == "93.184.216.34"
+    assert captured["pool_kwargs"]["server_hostname"] == "storage.example.test"
+    assert captured["pool_kwargs"]["assert_hostname"] == "storage.example.test"
+    assert request.headers["Host"] == "storage.example.test"
+
+
+def test_pinned_redirect_adapter_pins_https_tunnel_through_proxy(monkeypatch):
+    adapter = zulip_adapter._PinnedAddressAdapter(
+        "storage.example.test",
+        zulip_adapter.ipaddress.ip_address("93.184.216.34"),
+    )
+    captured = {}
+    expected_pool = object()
+
+    class ProxyManager:
+        def connection_from_host(self, **kwargs):
+            captured.update(kwargs)
+            return expected_pool
+
+    monkeypatch.setattr(
+        adapter,
+        "proxy_manager_for",
+        lambda proxy: ProxyManager(),
+    )
+    request = requests.Request(
+        "GET", "https://storage.example.test/object"
+    ).prepare()
+
+    assert (
+        adapter.get_connection_with_tls_context(
+            request,
+            True,
+            proxies={"https": "http://proxy.example.test:8080"},
+        )
+        is expected_pool
+    )
+    assert captured["host"] == "93.184.216.34"
+    assert captured["pool_kwargs"]["server_hostname"] == "storage.example.test"
+    assert captured["pool_kwargs"]["assert_hostname"] == "storage.example.test"
+
+
+def test_pinned_redirect_adapter_uses_validated_address_for_http_proxy():
+    adapter = zulip_adapter._PinnedAddressAdapter(
+        "storage.example.test",
+        zulip_adapter.ipaddress.ip_address("93.184.216.34"),
+    )
+    request = requests.Request(
+        "GET", "http://storage.example.test:8080/object?download=1"
+    ).prepare()
+
+    assert adapter.request_url(
+        request,
+        {"http": "http://proxy.example.test:3128"},
+    ) == "http://93.184.216.34:8080/object?download=1"
+    adapter.add_headers(request)
+    assert request.headers["Host"] == "storage.example.test:8080"
+
+
+def test_redirect_request_keeps_environment_proxies_without_netrc_auth(monkeypatch):
+    calls = []
+
+    class Session:
+        trust_env = True
+
+        def mount(self, *args):
+            pass
+
+        def get(self, url, **kwargs):
+            calls.append((self.trust_env, url, kwargs))
+            return requests.Response()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(zulip_adapter.requests, "Session", Session)
+    redirect = zulip_adapter._FileRedirect(
+        "https://storage.example.test/object",
+        "storage.example.test",
+        (zulip_adapter.ipaddress.ip_address("93.184.216.34"),),
+        False,
+    )
+
+    response, session = zulip_adapter._request_file_redirect(
+        redirect,
+        redirect.addresses[0],
+        auth=None,
+        verify=True,
+    )
+
+    assert response is not None
+    assert session is not None
+    assert calls[0][0] is True
+    assert calls[0][2]["auth"] is zulip_adapter.NO_REDIRECT_AUTH
 
 
 @pytest.mark.parametrize(
