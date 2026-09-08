@@ -5,8 +5,10 @@ import datetime
 import functools
 import hashlib
 import io
+import ipaddress
 import pathlib
 import re
+import socket
 import threading
 import time
 import typing
@@ -63,6 +65,7 @@ PROVIDER_NETWORK_ERRORS = (
     zulip.UnrecoverableNetworkError,
     zulip.ZulipError,
 )
+PROVIDER_FILE_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 ACCOUNT_SCOPED_OPERATION_KINDS = frozenset(
     {
         "message.create",
@@ -179,11 +182,238 @@ class ZulipOperationError(RuntimeError):
         code: str,
         retryable: bool,
         account_generation: int | None = None,
+        http_status: int | None = None,
+        provider_response: bool = True,
     ):
         super().__init__(code)
         self.code = code
         self.retryable = retryable
         self.account_generation = account_generation
+        self.http_status = http_status
+        self.provider_response = provider_response
+
+
+@dataclasses.dataclass(frozen=True)
+class _FileRedirect:
+    url: str
+    hostname: str
+    addresses: tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, ...]
+    provider_response: bool
+
+
+class _NoRedirectAuth(requests.auth.AuthBase):
+    def __call__(self, request: requests.PreparedRequest) -> requests.PreparedRequest:
+        request.headers.pop("Authorization", None)
+        return request
+
+
+NO_REDIRECT_AUTH = _NoRedirectAuth()
+
+
+class _PinnedAddressAdapter(requests.adapters.HTTPAdapter):
+    def __init__(
+        self,
+        hostname: str,
+        address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    ):
+        self._hostname = hostname
+        self._address = str(address)
+        super().__init__()
+
+    def get_connection_with_tls_context(
+        self,
+        request: requests.PreparedRequest,
+        verify: bool | str,
+        proxies: dict[str, str] | None = None,
+        cert: str | tuple[str, str] | None = None,
+    ):
+        pool_key_builder = getattr(
+            self,
+            "build_connection_pool_key_attributes",
+            None,
+        )
+        if pool_key_builder is None:
+            host_params, pool_kwargs = requests.adapters._urllib3_request_context(
+                request,
+                verify,
+                cert,
+            )
+        else:
+            host_params, pool_kwargs = pool_key_builder(request, verify, cert)
+        host_params["host"] = self._address
+        if host_params["scheme"] == "https":
+            pool_kwargs["assert_hostname"] = self._hostname
+            pool_kwargs["server_hostname"] = self._hostname
+        proxy = requests.utils.select_proxy(request.url, proxies)
+        manager = self.poolmanager
+        if proxy:
+            proxy = requests.utils.prepend_scheme_if_needed(proxy, "http")
+            if urllib.parse.urlsplit(proxy).hostname is None:
+                raise requests.exceptions.InvalidProxyURL(
+                    "Please check the configured proxy URL."
+                )
+            manager = self.proxy_manager_for(proxy)
+        return manager.connection_from_host(
+            **host_params,
+            pool_kwargs=pool_kwargs,
+        )
+
+    def request_url(
+        self,
+        request: requests.PreparedRequest,
+        proxies: dict[str, str] | None,
+    ) -> str:
+        proxy = requests.utils.select_proxy(request.url, proxies)
+        parsed = urllib.parse.urlsplit(request.url)
+        proxy_scheme = urllib.parse.urlsplit(proxy).scheme.lower() if proxy else ""
+        if proxy and parsed.scheme == "http" and not proxy_scheme.startswith("socks"):
+            host = f"[{self._address}]" if ":" in self._address else self._address
+            port = parsed.port
+            if port is not None and port != 80:
+                host = f"{host}:{port}"
+            pinned_url = urllib.parse.urlunsplit(
+                (parsed.scheme, host, parsed.path, parsed.query, "")
+            )
+            return requests.utils.urldefragauth(pinned_url)
+        return super().request_url(request, proxies)
+
+    def add_headers(self, request: requests.PreparedRequest, **kwargs: object) -> None:
+        super().add_headers(request, **kwargs)
+        request.headers["Host"] = urllib.parse.urlsplit(request.url).netloc
+
+
+def _request_file_redirect(
+    redirect: _FileRedirect,
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    *,
+    auth: tuple[str, str] | None,
+    verify: bool | str,
+) -> tuple[requests.Response, requests.Session]:
+    session = requests.Session()
+    adapter = _PinnedAddressAdapter(redirect.hostname, address)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    try:
+        response = session.get(
+            redirect.url,
+            auth=auth if auth is not None else NO_REDIRECT_AUTH,
+            verify=verify,
+            timeout=60.0,
+            allow_redirects=False,
+            stream=True,
+        )
+    except requests.RequestException:
+        session.close()
+        raise
+    return response, session
+
+
+def _http_origin(url: str) -> tuple[str, str, int]:
+    parsed = urllib.parse.urlsplit(url)
+    scheme = parsed.scheme.lower()
+    hostname = (parsed.hostname or "").encode("idna").decode("ascii").lower()
+    return scheme, hostname, parsed.port or (443 if scheme == "https" else 80)
+
+
+def _validated_file_redirect(response: requests.Response) -> _FileRedirect:
+    location = response.headers.get("Location")
+    if not location:
+        raise ZulipOperationError(
+            "provider_file_unavailable",
+            False,
+            http_status=response.status_code,
+        )
+    try:
+        target = urllib.parse.urljoin(response.url, location)
+        prepared_target = requests.Request("GET", target).prepare().url
+        if not isinstance(prepared_target, str):
+            raise ValueError("redirect target has no URL")
+        target = prepared_target
+        parsed = urllib.parse.urlsplit(target)
+        port = parsed.port
+    except (UnicodeError, ValueError, requests.RequestException) as exc:
+        raise ZulipOperationError(
+            "provider_file_unavailable",
+            False,
+            http_status=response.status_code,
+        ) from exc
+    source_scheme = urllib.parse.urlsplit(response.url).scheme.lower()
+    scheme = parsed.scheme.lower()
+    hostname = parsed.hostname
+    if (
+        scheme not in {"http", "https"}
+        or hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or port == 0
+        or (source_scheme == "https" and scheme != "https")
+    ):
+        raise ZulipOperationError(
+            "provider_file_unavailable",
+            False,
+            http_status=response.status_code,
+        )
+
+    try:
+        provider_response = _http_origin(response.url) == _http_origin(target)
+    except UnicodeError as exc:
+        raise ZulipOperationError(
+            "provider_file_unavailable",
+            False,
+            http_status=response.status_code,
+        ) from exc
+    if provider_response:
+        relative_target = urllib.parse.urlunsplit(
+            ("", "", parsed.path, parsed.query, "")
+        )
+        try:
+            validated_upload_path(relative_target)
+        except ZulipOperationError as exc:
+            raise ZulipOperationError(
+                "provider_file_unavailable",
+                False,
+                http_status=response.status_code,
+            ) from exc
+
+    try:
+        addresses = [ipaddress.ip_address(hostname)]
+    except ValueError:
+        try:
+            resolved = socket.getaddrinfo(
+                hostname,
+                port or (443 if scheme == "https" else 80),
+                type=socket.SOCK_STREAM,
+            )
+        except OSError as exc:
+            raise ZulipOperationError(
+                "provider_file_unavailable",
+                not bool(
+                    requests.utils.select_proxy(
+                        target,
+                        requests.utils.get_environ_proxies(target),
+                    )
+                ),
+                http_status=response.status_code,
+            ) from exc
+        addresses = []
+        for item in resolved:
+            address = ipaddress.ip_address(item[4][0])
+            if address not in addresses:
+                addresses.append(address)
+    if not addresses or (
+        not provider_response and any(not address.is_global for address in addresses)
+    ):
+        raise ZulipOperationError(
+            "provider_file_unavailable",
+            False,
+            http_status=response.status_code,
+        )
+    return _FileRedirect(
+        target,
+        hostname.encode("idna").decode("ascii").lower(),
+        tuple(addresses),
+        provider_response,
+    )
 
 
 class ZulipAmbiguousOutcome(RuntimeError):
@@ -653,6 +883,9 @@ class OfficialZulipAdapter:
         if not isinstance(email, str) or not isinstance(api_key, str):
             raise ZulipOperationError("provider_file_credentials_unavailable", False)
         response: requests.Response | None = None
+        redirected = False
+        response_from_provider = True
+        redirect_session: requests.Session | None = None
         try:
             response = requests.get(
                 urllib.parse.urljoin(self.server_url + "/", provider_url.lstrip("/")),
@@ -662,7 +895,40 @@ class OfficialZulipAdapter:
                 allow_redirects=False,
                 stream=True,
             )
+            if response.status_code in PROVIDER_FILE_REDIRECT_STATUSES:
+                redirect = _validated_file_redirect(response)
+                response.close()
+                response = None
+                redirected = True
+                response_from_provider = redirect.provider_response
+                redirect_error: requests.RequestException | None = None
+                for address in redirect.addresses:
+                    try:
+                        response, redirect_session = _request_file_redirect(
+                            redirect,
+                            address,
+                            auth=(email, api_key) if response_from_provider else None,
+                            verify=(
+                                getattr(self.client, "tls_verification", True)
+                                if response_from_provider
+                                else True
+                            ),
+                        )
+                        break
+                    except requests.RequestException as exc:
+                        redirect_error = exc
+                if response is None:
+                    assert redirect_error is not None
+                    raise redirect_error
             response.raise_for_status()
+            if not 200 <= response.status_code < 300:
+                raise ZulipOperationError(
+                    "provider_file_unavailable",
+                    not redirected
+                    or response.status_code not in PROVIDER_FILE_REDIRECT_STATUSES,
+                    http_status=response.status_code,
+                    provider_response=response_from_provider,
+                )
             declared_length = response.headers.get("Content-Length")
             if declared_length is not None:
                 try:
@@ -683,13 +949,18 @@ class OfficialZulipAdapter:
         except requests.HTTPError as exc:
             status = exc.response.status_code if exc.response is not None else None
             raise ZulipOperationError(
-                "provider_file_unavailable", status not in {404, 410}
+                "provider_file_unavailable",
+                status not in {404, 410},
+                http_status=status,
+                provider_response=response_from_provider,
             ) from exc
         except PROVIDER_NETWORK_ERRORS as exc:
             raise ZulipOperationError("provider_file_unavailable", True) from exc
         finally:
             if response is not None:
                 response.close()
+            if redirect_session is not None:
+                redirect_session.close()
         assert response is not None
         name = (
             pathlib.PurePosixPath(urllib.parse.urlparse(provider_url).path).name

@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 # the first history scan. Bump this only when the snapshot projection contract
 # changes and pair it with a migration that restarts selected history jobs.
 BACKFILL_SNAPSHOT_PROJECTION_VERSION = 8
+LIVE_UNAVAILABLE_FILE_HTTP_STATUSES = frozenset({400, 403, 404, 410, 422})
 
 
 class AdapterRegistry:
@@ -2763,20 +2764,32 @@ class BridgeService:
             account_uuid,
             external_chat_uuid,
         )
-        if file_resolver is not None and delivery_class == "backfill":
+        if file_resolver is not None:
             transfer_file = file_resolver
 
-            def resolve_historical_file(
+            def resolve_file(
                 provider_url: str, display_name: str
             ) -> str | None:
                 try:
                     return transfer_file(provider_url, display_name)
                 except zulip_adapter.ZulipOperationError as exc:
-                    if exc.code == "provider_file_unavailable" and not exc.retryable:
+                    unavailable = not exc.retryable or (
+                        delivery_class == "live"
+                        and exc.provider_response
+                        and exc.http_status in LIVE_UNAVAILABLE_FILE_HTTP_STATUSES
+                    )
+                    if exc.code == "provider_file_unavailable" and unavailable:
+                        logger.warning(
+                            "provider_file_fallback account_uuid=%s "
+                            "delivery_class=%s http_status=%s",
+                            account_uuid,
+                            delivery_class,
+                            exc.http_status,
+                        )
                         return None
                     raise
 
-            file_resolver = resolve_historical_file
+            file_resolver = resolve_file
         return converter.event_records(
             self.store if conversion_store is None else conversion_store,
             account_uuid,

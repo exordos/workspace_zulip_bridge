@@ -1,5 +1,6 @@
 """Shared upload validation preserves live and queue-catchup message text."""
 
+import logging
 import types
 import uuid
 
@@ -106,19 +107,81 @@ def test_provider_failures_keep_retry_semantics_through_event_converter(
 
 
 @pytest.mark.parametrize("delivery_class", ["live", "backfill"])
-def test_missing_file_keeps_existing_backfill_only_fallback(
-    upload_adapter, monkeypatch, delivery_class
+def test_forbidden_file_falls_back_only_for_live_message(
+    upload_adapter, monkeypatch, caplog, delivery_class
 ):
     adapter, _ = upload_adapter
 
+    def forbidden(*args, **kwargs):
+        response = requests.Response()
+        response.status_code = 403
+        response.url = "https://zulip.example.test/user_uploads/1/file"
+        response._content = b""
+        response._content_consumed = True
+        return response
+
+    monkeypatch.setattr(zulip_adapter.requests, "get", forbidden)
+    imported = []
+    with caplog.at_level(logging.WARNING):
+        if delivery_class == "live":
+            assert converter.UNAVAILABLE_FILE_MARKER in convert(
+                adapter, delivery_class, "/user_uploads/1/file", imported
+            )
+        else:
+            with pytest.raises(zulip_adapter.ZulipOperationError) as captured:
+                convert(adapter, delivery_class, "/user_uploads/1/file", imported)
+            assert captured.value.retryable
+            assert captured.value.http_status == 403
+    assert not imported
+    assert any(
+        "provider_file_fallback" in message
+        and conversion.ACCOUNT_UUID in message
+        and "http_status=403" in message
+        for message in caplog.messages
+    ) is (delivery_class == "live")
+
+
+def test_redirected_storage_failure_remains_retryable_for_live_message(
+    upload_adapter, monkeypatch
+):
+    adapter, transport = upload_adapter
+
+    def redirected_failure(*args, **kwargs):
+        raise zulip_adapter.ZulipOperationError(
+            "provider_file_unavailable",
+            True,
+            http_status=403,
+            provider_response=False,
+        )
+
+    monkeypatch.setattr(adapter, "download_file", redirected_failure)
+    imported = []
+    with pytest.raises(zulip_adapter.ZulipOperationError) as captured:
+        convert(adapter, "live", "/user_uploads/1/file", imported)
+
+    assert captured.value.retryable
+    assert not transport.sent and not imported
+
+
+@pytest.mark.parametrize("delivery_class", ["live", "backfill"])
+def test_nonretryable_missing_file_falls_back_for_every_delivery_class(
+    upload_adapter, monkeypatch, delivery_class
+):
+    adapter, transport = upload_adapter
+
     def missing(*args, **kwargs):
-        raise zulip_adapter.ZulipOperationError("provider_file_unavailable", False)
+        raise zulip_adapter.ZulipOperationError(
+            "provider_file_unavailable",
+            False,
+            http_status=404,
+        )
 
     monkeypatch.setattr(adapter, "download_file", missing)
-    if delivery_class == "live":
-        with pytest.raises(zulip_adapter.ZulipOperationError):
-            convert(adapter, delivery_class, "/user_uploads/1/file", [])
-    else:
-        assert converter.UNAVAILABLE_FILE_MARKER in convert(
-            adapter, delivery_class, "/user_uploads/1/file", []
-        )
+    imported = []
+    assert converter.UNAVAILABLE_FILE_MARKER in convert(
+        adapter,
+        delivery_class,
+        "/user_uploads/1/file",
+        imported,
+    )
+    assert not transport.sent and not imported

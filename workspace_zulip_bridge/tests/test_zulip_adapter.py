@@ -2373,6 +2373,7 @@ def test_provider_file_download_streams_with_a_strict_effective_limit(monkeypatc
     class Response:
         headers = {"Content-Length": "9", "Content-Type": "application/octet-stream"}
         closed = False
+        status_code = 200
 
         def raise_for_status(self):
             return None
@@ -2401,7 +2402,20 @@ def test_provider_file_download_streams_with_a_strict_effective_limit(monkeypatc
 
 @pytest.mark.parametrize(
     ("status_code", "retryable"),
-    [(404, False), (410, False), (503, True)],
+    [
+        (400, True),
+        (401, True),
+        (403, True),
+        (404, False),
+        (407, True),
+        (408, True),
+        (410, False),
+        (421, True),
+        (422, True),
+        (425, True),
+        (429, True),
+        (503, True),
+    ],
 )
 def test_provider_file_http_error_is_classified_and_closes_response(
     monkeypatch, status_code, retryable
@@ -2431,6 +2445,7 @@ def test_provider_file_http_error_is_classified_and_closes_response(
         adapter.download_file("/user_uploads/missing.bin")
     assert error.value.code == "provider_file_unavailable"
     assert error.value.retryable is retryable
+    assert error.value.http_status == status_code
     assert response.closed
 
 
@@ -2439,6 +2454,7 @@ def test_provider_file_success_and_body_error_close_response(monkeypatch, body_e
     class Response:
         headers = {"Content-Length": "4", "Content-Type": "text/plain"}
         closed = False
+        status_code = 200
 
         def raise_for_status(self):
             return None
