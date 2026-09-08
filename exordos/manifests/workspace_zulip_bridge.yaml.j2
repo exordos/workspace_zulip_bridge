@@ -200,6 +200,7 @@ resources:
           private_key_file = /var/lib/workspace-zulip-bridge/pki/bridge.key
           poll_interval_seconds = 2
           event_long_polling = {$core.vs.variables.$workspace_zulip_bridge_event_long_polling:value}
+          operation_wait_seconds = 20
           lease_seconds = 300
           batch_size = {$core.vs.variables.$workspace_zulip_bridge_batch_size:value}
           timeout_seconds = 30

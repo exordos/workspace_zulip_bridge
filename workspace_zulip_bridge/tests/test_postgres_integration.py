@@ -10211,6 +10211,51 @@ def test_create_then_edit_lease_waits_for_message_mapping(postgres_store):
     assert postgres_store.claim("update-worker") is None
 
 
+def test_active_provider_lease_count_uses_persisted_expiry(postgres_store):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    stream_uuid, topic_uuid, author_uuid = _materialize_channel_projection(
+        postgres_store,
+        account_uuid,
+        project_uuid,
+    )
+    lease_expires_at = (
+        (datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=5))
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    leased = {
+        "provider_operation_uuid": str(uuid.uuid4()),
+        "external_operation_uuid": str(uuid.uuid4()),
+        "lease_uuid": str(uuid.uuid4()),
+        "lease_expires_at": lease_expires_at,
+        "external_account_uuid": account_uuid,
+        "project_id": project_uuid,
+        "operation_kind": "message.create",
+        "required_capability": "messenger.message.send",
+        "attempt": 1,
+        "payload": {
+            "uuid": str(uuid.uuid4()),
+            "stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "author_uuid": author_uuid,
+            "payload": {"kind": "markdown", "content": "queued"},
+        },
+    }
+    record = provider_protocol.leased_operation_record(postgres_store, leased)
+
+    assert "lease_expires_at" not in record["transport"]
+    assert postgres_store.enqueue(record, 0)
+    assert postgres_store.active_provider_lease_count(20) == 1
+
+    with postgres_store.session() as session:
+        session.execute(
+            "UPDATE bridge_operations SET expires_at = now() - interval '1 second' "
+            "WHERE record_uuid = %s",
+            (record["record_uuid"],),
+        )
+    assert postgres_store.active_provider_lease_count(20) == 0
+
+
 def test_exact_provider_read_lease_is_idempotent_and_ordered_in_postgres_scheduler(
     postgres_store,
 ):

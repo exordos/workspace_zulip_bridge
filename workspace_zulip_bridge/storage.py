@@ -353,6 +353,8 @@ class QueuedOperation:
 class QueueStore(typing.Protocol):
     def enqueue(self, record: dict[str, object], priority: int) -> bool: ...
 
+    def active_provider_lease_count(self, limit: int) -> int: ...
+
     def claim(
         self, worker_id: str, lease_seconds: int = 60
     ) -> QueuedOperation | None: ...
@@ -8795,6 +8797,26 @@ class RestAlchemyStore:
                 """,
                 (code, account_uuid, provider_chat_key),
             )
+
+    def active_provider_lease_count(self, limit: int) -> int:
+        if limit < 1:
+            return 0
+        with self.session() as session:
+            row = session.execute(
+                """
+                SELECT count(*) AS operation_count
+                FROM (
+                    SELECT record_uuid
+                    FROM bridge_operations
+                    WHERE result_sent_at IS NULL
+                      AND record #>> '{transport,lease_uuid}' IS NOT NULL
+                      AND expires_at > now()
+                    LIMIT %s
+                ) AS active_provider_leases
+                """,
+                (limit,),
+            ).fetchone()
+            return int(row["operation_count"])
 
     def enqueue(self, record: dict[str, object], priority: int) -> bool:
         if priority not in {0, 1, 2}:

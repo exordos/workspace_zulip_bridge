@@ -636,6 +636,20 @@ def test_pending_results_uses_the_partial_queue_index_shape():
     assert parameters == (25,)
 
 
+def test_active_provider_lease_count_is_bounded_and_ignores_expired_leases():
+    session = Session(({"operation_count": 7},))
+    store = _store_with_session(session)
+
+    assert store.active_provider_lease_count(20) == 7
+    statement, parameters = session.statements[0]
+    assert "result_sent_at IS NULL" in statement
+    assert "{transport,lease_uuid}" in statement
+    assert "expires_at > now()" in statement
+    assert "lease_expires_at" not in statement
+    assert "LIMIT %s" in statement
+    assert parameters == (20,)
+
+
 def test_tombstoned_workspace_mapping_retains_identity_profile_for_delivery():
     row = {
         "workspace_uuid": uuid.uuid4(),

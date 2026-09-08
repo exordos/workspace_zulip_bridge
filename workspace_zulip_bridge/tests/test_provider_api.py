@@ -27,6 +27,9 @@ def test_provider_api_uses_exact_private_v2_routes_and_envelopes():
             return httpx.Response(
                 200,
                 json={"request_uuid": request_uuid, "operations": []},
+                headers={
+                    provider_api.ProviderApiClient.LEASE_WAIT_SUPPORTED_HEADER: "1"
+                },
             )
         if request.url.path.endswith("/operation-results"):
             return httpx.Response(
@@ -58,6 +61,9 @@ def test_provider_api_uses_exact_private_v2_routes_and_envelopes():
     request_uuid = uuid.uuid4()
 
     assert client.lease_operations(request_uuid)["request_uuid"] == str(request_uuid)
+    lease_payload = json.loads(seen[0][2])
+    assert lease_payload["wait_seconds"] == 20.0
+    assert client.last_lease_wait_supported is True
     assert client.report_results([{"result_uuid": "result"}])["results"]
     assert client.apply_commands([{"provider_event_key": "event"}])["results"]
     assert [path for _method, path, _body in seen] == [
@@ -94,6 +100,26 @@ def test_provider_api_keeps_retryable_conflict_separate_from_bad_request():
         client.lease_operations(uuid.uuid4())
     with pytest.raises(httpx.HTTPStatusError):
         client.lease_operations(uuid.uuid4())
+
+
+def test_provider_api_detects_backend_without_lease_wait_support():
+    request_uuid = uuid.uuid4()
+    client = provider_api.ProviderApiClient(
+        _settings(),
+        httpx.Client(
+            base_url="https://provider.invalid",
+            transport=httpx.MockTransport(
+                lambda _request: httpx.Response(
+                    200,
+                    json={"request_uuid": str(request_uuid), "operations": []},
+                )
+            ),
+        ),
+    )
+
+    client.lease_operations(request_uuid)
+
+    assert client.last_lease_wait_supported is False
 
 
 def test_provider_event_validation_rejection_has_a_terminal_error_type():

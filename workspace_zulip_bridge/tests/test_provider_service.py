@@ -55,6 +55,9 @@ class Store:
     def bind_provider_lease(self, record):
         return False
 
+    def active_provider_lease_count(self, limit):
+        return min(self.active_provider_leases, limit)
+
     def enqueue(self, record, priority):
         self.enqueued.append((record, priority))
         return True
@@ -108,10 +111,12 @@ class Store:
 class Provider:
     def __init__(self):
         self.leased = []
+        self.lease_kwargs = []
         self.reported = []
         self.events = []
 
     def lease_operations(self, request_uuid, **kwargs):
+        self.lease_kwargs.append(kwargs)
         return {"request_uuid": str(request_uuid), "operations": self.leased}
 
     def report_results(self, results):
@@ -145,7 +150,9 @@ def _instance():
     instance.provider_api = Provider()
     instance.provider_batch_size = 20
     instance.provider_lease_seconds = 300
+    instance.provider_operation_wait_seconds = 20.0
     instance.provider_lease_request_uuid = None
+    instance.store.active_provider_leases = 0
     return instance
 
 
@@ -195,7 +202,27 @@ def test_poll_provider_operations_durably_enqueues_exact_lease_binding():
         == (leased["provider_operation_uuid"])
     )
     assert instance.provider_lease_request_uuid is None
+    assert instance.provider_api.lease_kwargs == [
+        {"limit": 20, "lease_seconds": 300, "wait_seconds": 20.0}
+    ]
     assert instance.store.health == [("provider_api", "healthy", None)]
+
+
+def test_poll_provider_operations_leases_only_available_local_capacity():
+    instance = _instance()
+    instance.store.active_provider_leases = 19
+    instance.provider_api.leased = [_lease()]
+
+    assert instance.poll_provider_operations() == 1
+    assert instance.provider_api.lease_kwargs == [
+        {"limit": 1, "lease_seconds": 300, "wait_seconds": 20.0}
+    ]
+
+    instance.store.active_provider_leases = 20
+    instance.provider_api.lease_kwargs.clear()
+
+    assert instance.poll_provider_operations() == 0
+    assert instance.provider_api.lease_kwargs == []
 
 
 def test_poll_provider_operations_keeps_create_then_edit_in_durable_lane():

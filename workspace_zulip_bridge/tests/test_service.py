@@ -16,6 +16,7 @@ import pytest
 from workspace_zulip_bridge import (
     control,
     converter,
+    provider_api,
     service,
     zulip_adapter,
 )
@@ -1066,8 +1067,9 @@ def test_run_recovers_interrupted_deliveries_before_starting_workers(monkeypatch
     with pytest.raises(StopRun):
         instance.run()
 
-    assert len(started) == 5
+    assert len(started) == 6
     assert "workspace-zulip-heartbeat" in started
+    assert "workspace-zulip-provider-operations" in started
     assert len([name for name in started if "live-delivery" in name]) == 1
 
 
@@ -5682,34 +5684,124 @@ def test_background_live_worker_does_not_race_dedicated_delivery_worker():
     instance._ready_live_workspace_delivery_pending = lambda: True
     instance.flush_provider_events = lambda **kwargs: calls.append(kwargs) or 1
 
-    assert not instance._run_live_lane_once()
+    assert not instance._run_live_lane_once(before_provider_poll=False)
     assert calls == []
 
 
-def test_live_turn_fills_journal_lanes_before_polling_provider_operations():
+def test_provider_poll_live_lane_returns_without_running_journal_work():
+    instance = object.__new__(service.BridgeService)
+    instance.poll_provider_operations = lambda: 1
+    instance.process_provider_journal = lambda: (_ for _ in ()).throw(
+        AssertionError("provider poll lane must return before journal work")
+    )
+
+    assert instance._run_live_lane_once(before_provider_poll=True)
+
+
+def test_empty_provider_operation_poll_uses_bounded_compatibility_delay(monkeypatch):
+    sleeps = []
+    instance = object.__new__(service.BridgeService)
+    instance.provider_api = type(
+        "ProviderApi",
+        (),
+        {"last_lease_wait_supported": False},
+    )()
+    monkeypatch.setattr(service.time, "sleep", sleeps.append)
+
+    instance._wait_after_empty_provider_operation_poll(0.1)
+
+    assert sleeps == [
+        service.BridgeService.PROVIDER_OPERATION_FALLBACK_POLL_INTERVAL_SECONDS
+    ]
+
+    instance.provider_api.last_lease_wait_supported = True
+    instance._wait_after_empty_provider_operation_poll(20.0)
+
+    assert len(sleeps) == 1
+
+    instance._wait_after_empty_provider_operation_poll(0.1)
+
+    assert sleeps[-1] == pytest.approx(0.4)
+
+
+def test_provider_operation_lane_isolated_from_other_live_work(monkeypatch):
     calls = []
 
-    class Scheduler:
-        def reconcile_once(self):
-            return False
-
-        def run_once(self):
-            return False
+    class TerminalFailure(Exception):
+        pass
 
     instance = object.__new__(service.BridgeService)
-    instance.background_live_delivery_enabled = True
-    instance.scheduler = Scheduler()
-    instance.process_provider_journal = lambda: calls.append("journal") or 1
-    instance.poll_provider_operations = lambda: calls.append("provider-operations") or 0
-    instance.flush_provider_results = lambda: 0
+    instance.background_provider_operation_error = None
+    instance.provider_api = type(
+        "ProviderApi",
+        (),
+        {"last_lease_wait_supported": False},
+    )()
 
-    assert service.BridgeService.PROVIDER_JOURNAL_QUANTA_PER_LIVE_TURN == 1
-    assert instance._run_live_lane_once()
+    def poll():
+        calls.append("lease")
+        if len(calls) == 1:
+            return 0
+        raise TerminalFailure()
+
+    instance.poll_provider_operations = poll
+    monkeypatch.setattr(
+        service.time,
+        "sleep",
+        lambda seconds: calls.append(("sleep", seconds)),
+    )
+
+    instance._run_background_provider_operation_lane()
+
     assert calls == [
-        "journal"
-    ] * service.BridgeService.PROVIDER_JOURNAL_QUANTA_PER_LIVE_TURN + [
-        "provider-operations"
+        "lease",
+        (
+            "sleep",
+            service.BridgeService.PROVIDER_OPERATION_FALLBACK_POLL_INTERVAL_SECONDS,
+        ),
+        "lease",
     ]
+    assert isinstance(instance.background_provider_operation_error, TerminalFailure)
+
+
+def test_provider_operation_lane_honors_retry_after(monkeypatch):
+    calls = []
+
+    class Store:
+        def mark_health(self, component, status, code):
+            calls.append(("health", component, status, code))
+
+    class TerminalFailure(Exception):
+        pass
+
+    outcomes = iter(
+        (
+            provider_api.ProviderApiRetryableError(429, 17.0),
+            TerminalFailure(),
+        )
+    )
+    instance = object.__new__(service.BridgeService)
+    instance.store = Store()
+    instance.background_provider_operation_error = None
+
+    def poll():
+        outcome = next(outcomes)
+        raise outcome
+
+    instance.poll_provider_operations = poll
+    monkeypatch.setattr(
+        service.time,
+        "sleep",
+        lambda seconds: calls.append(("sleep", seconds)),
+    )
+
+    instance._run_background_provider_operation_lane()
+
+    assert calls == [
+        ("health", "provider_api", "degraded", "provider_api_unavailable"),
+        ("sleep", 17.0),
+    ]
+    assert isinstance(instance.background_provider_operation_error, TerminalFailure)
 
 
 def test_history_workers_serialize_delivery_selection_and_submission():

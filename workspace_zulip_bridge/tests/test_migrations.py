@@ -423,6 +423,7 @@ def test_semantic_report_indexes_upgrade_an_applied_archive_chain(tmp_path):
             "0046-Persist-outstanding-capture-timeout-markers-97e00d.py",
             "0047-Bound-directory-write-retries-436b12.py",
             "0048-Retry-history-batches-after-source-limit-increase-21b5ff.py",
+            "0049-index-active-provider-leases-d968ea.py",
         }:
             shutil.copy2(migration_path, archive_migrations / migration_path.name)
     admin_store = storage.RestAlchemyStore(connection_url)
@@ -470,7 +471,8 @@ def test_semantic_report_indexes_upgrade_an_applied_archive_chain(tmp_path):
                       'provider_mappings_reaction_provider_prefix_idx',
                       'bridge_operations_result_record_uuid_idx',
                       'bridge_operations_pending_result_idx',
-                      'bridge_operations_terminal_read_retention_idx'
+                      'bridge_operations_terminal_read_retention_idx',
+                      'bridge_operations_active_provider_lease_idx'
                   )
                 ORDER BY indexname
                 """
@@ -484,8 +486,9 @@ def test_semantic_report_indexes_upgrade_an_applied_archive_chain(tmp_path):
                   AND column_name = 'result_record_uuid'
                 """
             ).fetchone()
-        assert applied["count"] == 49
+        assert applied["count"] == 50
         assert [row["indexname"] for row in indexes] == [
+            "bridge_operations_active_provider_lease_idx",
             "bridge_operations_pending_result_idx",
             "bridge_operations_result_record_uuid_idx",
             "bridge_operations_terminal_read_retention_idx",
@@ -494,7 +497,7 @@ def test_semantic_report_indexes_upgrade_an_applied_archive_chain(tmp_path):
             "observed_report_outbox_terminal_history_idx",
             "provider_mappings_reaction_provider_prefix_idx",
         ]
-        catalog_index = indexes[3]["indexdef"]
+        catalog_index = indexes[4]["indexdef"]
         assert "workspace_bridge_observed_at" in catalog_index
         assert "body ->> 'observed_at'" in catalog_index
         assert "COALESCE" in catalog_index
@@ -540,6 +543,7 @@ def test_projection_reset_upgrade_forces_snapshot_after_old_bridge_consumed_chan
             "0046-Persist-outstanding-capture-timeout-markers-97e00d.py",
             "0047-Bound-directory-write-retries-436b12.py",
             "0048-Retry-history-batches-after-source-limit-increase-21b5ff.py",
+            "0049-index-active-provider-leases-d968ea.py",
         }:
             shutil.copy2(migration_path, old_bridge_migrations / migration_path.name)
     admin_store = storage.RestAlchemyStore(connection_url)
@@ -712,11 +716,17 @@ def test_migrations_have_one_versioned_dependency_chain():
         "0046-Persist-outstanding-capture-timeout-markers-97e00d.py",
         "0047-Bound-directory-write-retries-436b12.py",
         "0048-Retry-history-batches-after-source-limit-increase-21b5ff.py",
+        "0049-index-active-provider-leases-d968ea.py",
     ]
     assert engine.get_latest_migration() == (
-        "0048-Retry-history-batches-after-source-limit-increase-21b5ff.py"
+        "0049-index-active-provider-leases-d968ea.py"
     )
-    assert len({step["uuid"] for step in all_migrations.values()}) == 49
+    assert len({step["uuid"] for step in all_migrations.values()}) == 50
+    assert all_migrations[
+        "0049-index-active-provider-leases-d968ea.py"
+    ]["depends"] == [
+        "0048-Retry-history-batches-after-source-limit-increase-21b5ff.py"
+    ]
     assert all_migrations[
         "0048-Retry-history-batches-after-source-limit-increase-21b5ff.py"
     ]["depends"] == ["0047-Bound-directory-write-retries-436b12.py"]
@@ -1137,6 +1147,38 @@ def test_provider_result_indexes_rebuild_interrupted_concurrent_remnants():
     assert "CREATE INDEX CONCURRENTLY IF NOT EXISTS" not in statement
     assert "NOT manual_reconciliation_required" in statement
     assert "provider_result_stale_lease" in statement
+
+
+def test_active_provider_lease_index_supports_bounded_capacity_probe():
+    migration_path = MIGRATIONS / "0049-index-active-provider-leases-d968ea.py"
+    spec = importlib.util.spec_from_file_location(
+        "active_provider_lease_index", migration_path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class Session:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, statement):
+            self.statements.append(statement)
+
+    session = Session()
+    module.migration_step.upgrade(session)
+
+    statement = "\n".join(session.statements)
+    index_name = "bridge_operations_active_provider_lease_idx"
+    assert statement.index(
+        f"DROP INDEX CONCURRENTLY IF EXISTS {index_name}"
+    ) < statement.index(f"CREATE INDEX CONCURRENTLY {index_name}")
+    assert "ON bridge_operations (expires_at, record_uuid)" in statement
+    assert "result_sent_at IS NULL" in statement
+    assert "{transport,lease_uuid}" in statement
+
+    module.migration_step.downgrade(session)
+    assert session.statements[-1].strip().startswith("DROP INDEX CONCURRENTLY")
 
 
 def test_provider_journal_lane_migration_backfills_and_indexes_scheduler():
@@ -1934,7 +1976,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
                   AND column_name = 'private_catalog_scanned_generation'
                 """
             ).fetchone()
-            assert applied["count"] == 49
+            assert applied["count"] == 50
             assert private_catalog_marker == {"data_type": "bigint"}
             assert [row["indexname"] for row in indexes] == [
                 "bridge_operations_active_local_echo_idx",
@@ -1993,7 +2035,7 @@ def test_restalchemy_migrations_adopt_existing_schema_and_repeat(tmp_path):
             provider_cursor_count = session.execute(
                 "SELECT count(*) AS count FROM zulip_event_cursors"
             ).fetchone()
-            assert applied["count"] == 49
+            assert applied["count"] == 50
             assert cursor["control_cursor"] == "preserved"
             assert provider_cursor_count["count"] == 0
     finally:

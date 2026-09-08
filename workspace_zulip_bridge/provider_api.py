@@ -27,6 +27,7 @@ class ProviderApiClient:
     """mTLS client for the private Workspace Provider Data API v2."""
 
     API_ROOT = "/api/workspace-provider/v2"
+    LEASE_WAIT_SUPPORTED_HEADER = "X-Workspace-Provider-Lease-Wait-Supported"
 
     def __init__(
         self,
@@ -36,6 +37,7 @@ class ProviderApiClient:
         self.settings = settings
         self._owns_client = client is None
         self.client = client or self._new_client()
+        self.last_lease_wait_supported = False
 
     def _new_client(self) -> httpx.Client:
         return httpx.Client(
@@ -93,6 +95,7 @@ class ProviderApiClient:
         *,
         limit: int = 20,
         lease_seconds: int = 300,
+        wait_seconds: float = 20.0,
     ) -> dict[str, object]:
         response = self.client.post(
             f"{self.API_ROOT}/operations/actions/lease",
@@ -100,9 +103,14 @@ class ProviderApiClient:
                 "request_uuid": str(request_uuid),
                 "limit": limit,
                 "lease_seconds": lease_seconds,
+                "wait_seconds": wait_seconds,
             },
+            timeout=max(self.settings.timeout_seconds, wait_seconds + 10.0),
         )
         self._raise_for_status(response)
+        self.last_lease_wait_supported = (
+            response.headers.get(self.LEASE_WAIT_SUPPORTED_HEADER) == "1"
+        )
         value = typing.cast(dict[str, object], response.json())
         if value["request_uuid"] != str(request_uuid):
             raise ValueError("Provider operation lease response UUID mismatch")

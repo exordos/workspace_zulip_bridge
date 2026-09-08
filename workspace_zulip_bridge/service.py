@@ -400,7 +400,6 @@ class BridgeService:
     # Two sequential creates amortize Workspace broadcast setup while keeping
     # the resulting Provider transaction comfortably below its HTTP timeout.
     PROVIDER_JOURNAL_LANE_BATCH_SIZE = 2
-    PROVIDER_JOURNAL_QUANTA_PER_LIVE_TURN = 1
     PROVIDER_JOURNAL_WORKERS = 16
     PROVIDER_EVENT_FAILURE_MAX_ATTEMPTS = 5
     # Give a newly discovered chat five minutes to reach desired state, then
@@ -427,6 +426,7 @@ class BridgeService:
     PROVIDER_DELIVERY_RETRY_BASE_SECONDS = 1.0
     PROVIDER_DELIVERY_RETRY_CAP_SECONDS = 30.0
     PROVIDER_DELIVERY_RETRY_AFTER_CAP_SECONDS = 300.0
+    PROVIDER_OPERATION_FALLBACK_POLL_INTERVAL_SECONDS = 0.5
 
     def __init__(
         self,
@@ -445,6 +445,7 @@ class BridgeService:
         control_retry_after_cap_seconds: float = 300.0,
         provider_poll_interval_seconds: float = 2.0,
         provider_event_long_polling: bool = False,
+        provider_operation_wait_seconds: float = 20.0,
         provider_lease_seconds: int = 300,
         provider_batch_size: int = 20,
     ):
@@ -475,6 +476,7 @@ class BridgeService:
         self.control_retry_after_cap_seconds = control_retry_after_cap_seconds
         self.provider_poll_interval_seconds = provider_poll_interval_seconds
         self.provider_event_long_polling = provider_event_long_polling
+        self.provider_operation_wait_seconds = provider_operation_wait_seconds
         self.provider_lease_seconds = provider_lease_seconds
         self.provider_batch_size = provider_batch_size
         self.provider_lease_request_uuid: uuid.UUID | None = None
@@ -822,12 +824,17 @@ class BridgeService:
 
     def poll_provider_operations(self) -> int:
         """Lease Workspace-to-Zulip operations from the private HTTP data plane."""
+        active_leases = self.store.active_provider_lease_count(self.provider_batch_size)
+        lease_limit = self.provider_batch_size - active_leases
+        if lease_limit <= 0:
+            return 0
         request_uuid = self.provider_lease_request_uuid or uuid.uuid4()
         self.provider_lease_request_uuid = request_uuid
         response = self.provider_api.lease_operations(
             request_uuid,
-            limit=self.provider_batch_size,
+            limit=lease_limit,
             lease_seconds=self.provider_lease_seconds,
+            wait_seconds=self.provider_operation_wait_seconds,
         )
         operations = typing.cast(list[dict[str, object]], response["operations"])
         processed = 0
@@ -4202,6 +4209,15 @@ class BridgeService:
         background_live_error = getattr(self, "background_live_error", None)
         if background_live_error is not None:
             raise RuntimeError("Background live lane failed") from background_live_error
+        background_provider_operation_error = getattr(
+            self,
+            "background_provider_operation_error",
+            None,
+        )
+        if background_provider_operation_error is not None:
+            raise RuntimeError("Background provider operation lane failed") from (
+                background_provider_operation_error
+            )
         background_live_delivery_error = getattr(
             self, "background_live_delivery_error", None
         )
@@ -4282,26 +4298,18 @@ class BridgeService:
         self._log_periodic_stats(now)
         return progressed
 
-    def _run_live_lane_once(self, *, before_provider_poll: bool | None = None) -> bool:
+    def _run_live_lane_once(self, *, before_provider_poll: bool) -> bool:
         """Run live provider traffic independently from catalog and history I/O."""
         progressed = False
-        if before_provider_poll is None:
-            # The dedicated background lane must not let a slow outbound lease
-            # postpone already-journaled Zulip events. Fill several independent
-            # chat lanes, then give Workspace-to-Zulip operations their turn.
-            for _ in range(self.PROVIDER_JOURNAL_QUANTA_PER_LIVE_TURN):
-                progressed |= self.process_provider_journal() > 0
-        if before_provider_poll is not False:
+        if before_provider_poll:
             try:
                 progressed |= self.poll_provider_operations() > 0
             except (httpx.TransportError, provider_api.ProviderApiRetryableError):
                 self.store.mark_health(
                     "provider_api", "degraded", "provider_api_unavailable"
                 )
-        if before_provider_poll is True:
             return progressed
-        if before_provider_poll is not None:
-            progressed |= self.process_provider_journal() > 0
+        progressed |= self.process_provider_journal() > 0
         # Provider operations and their HTTP results always outrank history I/O.
         progressed |= self.scheduler.reconcile_once()
         progressed |= self.scheduler.run_once()
@@ -4451,7 +4459,7 @@ class BridgeService:
     def _run_background_live_lane(self) -> None:
         while True:
             try:
-                if not self._run_live_lane_once():
+                if not self._run_live_lane_once(before_provider_poll=False):
                     time.sleep(0.1)
             except Exception as error:
                 if self._is_retryable_database_conflict(error):
@@ -4459,6 +4467,50 @@ class BridgeService:
                     continue
                 self.background_live_error = error
                 return
+
+    def _run_background_provider_operation_lane(self) -> None:
+        while True:
+            try:
+                poll_started_at = time.monotonic()
+                if not self.poll_provider_operations():
+                    self._wait_after_empty_provider_operation_poll(
+                        time.monotonic() - poll_started_at
+                    )
+            except (
+                httpx.TransportError,
+                provider_api.ProviderApiRetryableError,
+            ) as error:
+                self.store.mark_health(
+                    "provider_api", "degraded", "provider_api_unavailable"
+                )
+                delay = self.PROVIDER_OPERATION_FALLBACK_POLL_INTERVAL_SECONDS
+                if (
+                    isinstance(error, provider_api.ProviderApiRetryableError)
+                    and error.retry_after_seconds is not None
+                ):
+                    delay = max(
+                        delay,
+                        min(
+                            error.retry_after_seconds,
+                            self.PROVIDER_DELIVERY_RETRY_AFTER_CAP_SECONDS,
+                        ),
+                    )
+                time.sleep(delay)
+            except Exception as error:
+                if self._is_retryable_database_conflict(error):
+                    time.sleep(random.uniform(0.05, 0.25))
+                    continue
+                self.background_provider_operation_error = error
+                return
+
+    def _wait_after_empty_provider_operation_poll(
+        self, poll_elapsed_seconds: float
+    ) -> None:
+        delay = self.PROVIDER_OPERATION_FALLBACK_POLL_INTERVAL_SECONDS
+        if getattr(self.provider_api, "last_lease_wait_supported", False):
+            delay = max(0.0, delay - poll_elapsed_seconds)
+        if delay > 0:
+            time.sleep(delay)
 
     def _record_live_delivery_stall(self, now: float | None = None) -> None:
         """Expose a durable dependency stall without hot-looping health writes."""
@@ -4560,6 +4612,12 @@ class BridgeService:
             daemon=True,
         ).start()
         self.background_live_error = None
+        self.background_provider_operation_error = None
+        threading.Thread(
+            target=self._run_background_provider_operation_lane,
+            name="workspace-zulip-provider-operations",
+            daemon=True,
+        ).start()
         for worker_index in range(self.BACKGROUND_LIVE_WORKERS):
             threading.Thread(
                 target=self._run_background_live_lane,
