@@ -106,7 +106,7 @@ def ready_publisher(
         account_report,
     )
     publisher.supported = True
-    monkeypatch.setattr(history_delivery, "claim", lambda _: item)
+    monkeypatch.setattr(history_delivery, "claim", lambda _, **__: item)
     monkeypatch.setattr(history_delivery, "current", lambda *_: True)
     monkeypatch.setattr(history_failure_reports, "flush_once", lambda *_: False)
     monkeypatch.setattr(
@@ -204,6 +204,209 @@ def test_publisher_uploads_one_file_and_keeps_job_receipt(monkeypatch):
     assert [request.method for request in requests] == ["POST", "PUT"]
     assert requests[-1].content == b"fixture"
     assert releases[0]["job_uuid"] == uuid.UUID(job_uuid)
+
+
+def test_busy_admission_sets_bounded_cooldown_without_terminal_failure(monkeypatch):
+    item = publication_item(registered=False)
+    now = [100.0]
+    stats = []
+    publisher, requests, releases = ready_publisher(
+        monkeypatch,
+        item,
+        lambda _: httpx.Response(
+            429,
+            headers={"Retry-After": "12"},
+            json={"error": "history_import_busy"},
+        ),
+    )
+    publisher.clock = lambda: now[0]
+    publisher.record_stat = stats.append
+
+    assert publisher.run_once() is False
+    assert [request.method for request in requests] == ["POST"]
+    assert releases == [{"error": "history_import_busy", "delay": 12}]
+    assert publisher.admission_probe_after == 112.0
+    assert stats == ["history_admission_attempts", "history_admission_busy"]
+
+
+@pytest.mark.parametrize("status", [408, 429, 500, 503])
+def test_retryable_http_failures_keep_generic_delivery_retry(monkeypatch, status):
+    item = publication_item(registered=False)
+    publisher, _, releases = ready_publisher(
+        monkeypatch,
+        item,
+        lambda _: httpx.Response(status, json={"error": "temporary_failure"}),
+    )
+
+    assert publisher.run_once() is False
+    assert releases == [
+        {"job_uuid": None, "error": "history_delivery_unavailable", "delay": 5}
+    ]
+    assert publisher.admission_probe_after == 0.0
+
+
+@pytest.mark.parametrize(
+    "retry_after,expected",
+    [(None, 5), ("0", 1), ("invalid", 5), ("120", 60)],
+)
+def test_admission_retry_after_is_bounded(retry_after, expected):
+    headers = {} if retry_after is None else {"Retry-After": retry_after}
+    response = httpx.Response(429, headers=headers)
+    assert history_delivery.admission_retry_after(response) == expected
+
+
+def test_transport_failure_keeps_generic_delivery_retry(monkeypatch):
+    item = publication_item(registered=False)
+
+    def unavailable(_):
+        raise httpx.ConnectError("synthetic transport failure")
+
+    publisher, _, releases = ready_publisher(monkeypatch, item, unavailable)
+    assert publisher.run_once() is False
+    assert releases == [
+        {"job_uuid": None, "error": "history_delivery_unavailable", "delay": 5}
+    ]
+    assert publisher.admission_probe_after == 0.0
+
+
+def test_cooldown_polls_active_receipt_and_terminal_status_reopens_admission(
+    monkeypatch,
+):
+    active = publication_item()
+    unregistered = publication_item(registered=False)
+    claims = [active, unregistered]
+    claim_options = []
+    requests = []
+    releases = []
+    stats = []
+
+    def claim_next(_, **options):
+        claim_options.append(options)
+        return claims.pop(0)
+
+    def respond(request):
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={"uuid": str(active["import_uuid"]), "status": "complete"},
+            )
+        return httpx.Response(
+            202,
+            json={
+                "uuid": str(uuid.uuid4()),
+                "status": "pending",
+                "safe_error": None,
+                "files": [],
+            },
+        )
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(respond),
+        base_url="https://workspace.example.test",
+    )
+    publisher = history_delivery.HistoryPublisher(
+        object(),
+        types.SimpleNamespace(client=client),
+        None,
+        record_stat=stats.append,
+        clock=lambda: 10.0,
+    )
+    publisher.supported = True
+    publisher.admission_probe_after = 20.0
+    monkeypatch.setattr(history_delivery, "claim", claim_next)
+    monkeypatch.setattr(history_delivery, "current", lambda *_: True)
+    monkeypatch.setattr(history_failure_reports, "flush_once", lambda *_: False)
+    monkeypatch.setattr(
+        history_delivery,
+        "release",
+        lambda *_, **options: releases.append(options) or True,
+    )
+    monkeypatch.setattr(publisher, "sync_references", lambda *_: None)
+
+    assert publisher.run_once()
+    assert publisher.admission_probe_after == 0.0
+    assert publisher.run_once()
+    assert claim_options == [
+        {"allow_admission": False},
+        {"prefer_admission": True},
+    ]
+    assert [request.method for request in requests] == ["GET", "POST"]
+    assert stats == ["history_active_polls", "history_admission_attempts"]
+    assert releases[0] == {"job_uuid": active["import_uuid"]}
+    assert releases[1]["job_uuid"] == unregistered["import_uuid"]
+
+
+@pytest.mark.parametrize("waiting", [1, 1495])
+def test_busy_admission_rate_is_independent_of_waiting_queue_size(
+    monkeypatch, waiting
+):
+    active = [publication_item(), publication_item()]
+    unregistered = [publication_item(registered=False) for _ in range(waiting)]
+    selections = [active[0], unregistered[0], active[1]]
+    now = [0.0]
+    requests = []
+    claim_options = []
+
+    def claim_next(_, **options):
+        claim_options.append(options)
+        if options.get("allow_admission") is False and selections:
+            assert selections[0]["import_uuid"] is not None
+        return selections.pop(0) if selections else None
+
+    def respond(request):
+        requests.append(request)
+        if request.method == "POST":
+            return httpx.Response(429, json={"error": "history_import_busy"})
+        item = active[0] if len(requests) == 1 else active[1]
+        return httpx.Response(
+            200,
+            json={
+                "uuid": str(item["import_uuid"]),
+                "status": "waiting_files",
+                "safe_error": None,
+                "files": [],
+            },
+        )
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(respond),
+        base_url="https://workspace.example.test",
+    )
+    publisher = history_delivery.HistoryPublisher(
+        object(),
+        types.SimpleNamespace(client=client),
+        None,
+        clock=lambda: now[0],
+    )
+    publisher.supported = True
+    monkeypatch.setattr(history_delivery, "claim", claim_next)
+    monkeypatch.setattr(history_delivery, "current", lambda *_: True)
+    monkeypatch.setattr(history_failure_reports, "flush_once", lambda *_: False)
+    monkeypatch.setattr(history_delivery, "release", lambda *_, **__: True)
+
+    assert publisher.run_once()
+    assert publisher.run_once() is False
+    assert publisher.run_once()
+    for _ in range(100):
+        assert publisher.run_once() is False
+    assert [request.method for request in requests] == ["GET", "POST", "GET"]
+    assert claim_options[:3] == [
+        {},
+        {"prefer_admission": True},
+        {"allow_admission": False},
+    ]
+
+    now[0] = history_delivery.ADMISSION_COOLDOWN_SECONDS
+    selections.append(unregistered[-1])
+    assert publisher.run_once() is False
+    assert claim_options[-1] == {"prefer_admission": True}
+    assert [request.method for request in requests] == [
+        "GET",
+        "POST",
+        "GET",
+        "POST",
+    ]
 
 
 @pytest.mark.parametrize("code", ["55P03", "57014", "40001", "40P01"])

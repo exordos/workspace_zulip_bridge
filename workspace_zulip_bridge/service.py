@@ -463,6 +463,7 @@ class BridgeService:
                 file_client,
                 provider_adapters,
                 self._queue_history_failure_report,
+                record_stat=self._record_interval_stat,
             )
             if file_client is not None
             else None
