@@ -1012,14 +1012,14 @@ def test_provider_journal_lane_batch_stops_after_retryable_head():
     assert calls == [1]
 
 
-def test_large_profile_scales_live_conversion_and_delivery_batches():
+def test_large_profile_keeps_capture_contained():
     instance = object.__new__(service.BridgeService)
     instance.provider_batch_size = 100
 
     assert instance._provider_journal_worker_count() == 16
     assert instance._live_delivery_batch_size() == 20
-    assert instance._history_worker_count() == 8
-    assert instance._history_delivery_batch_size(live_pending=False) == 100
+    assert instance._history_worker_count() == 1
+    assert instance._history_delivery_batch_size(live_pending=False) == 20
     assert instance._history_delivery_batch_size(live_pending=True) == 10
 
 
@@ -1066,7 +1066,7 @@ def test_run_recovers_interrupted_deliveries_before_starting_workers(monkeypatch
     with pytest.raises(StopRun):
         instance.run()
 
-    assert len(started) == 5
+    assert len(started) == 4
     assert "workspace-zulip-heartbeat" in started
     assert len([name for name in started if "live-delivery" in name]) == 1
 

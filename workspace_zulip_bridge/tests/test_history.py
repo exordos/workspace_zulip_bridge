@@ -349,6 +349,41 @@ def test_database_conflict_releases_capture_for_retry_without_an_early_checkpoin
     assert instance.store.released == [("account", "channel:42")]
 
 
+@pytest.mark.parametrize("code", ["40001", "40P01", "55P03"])
+def test_provider_error_bookkeeping_conflict_keeps_capture_lane_alive(code):
+    class Conflict(Exception):
+        sqlstate = code
+
+    instance = capture_service(history.HistoryRange(1, 5000, []))
+    instance.provider_adapters = lambda account: (_ for _ in ()).throw(
+        zulip_adapter.ZulipOperationError("rate_limit_hit", True)
+    )
+    instance.store.defer_backfill_job = lambda *args: (_ for _ in ()).throw(
+        Conflict()
+    )
+
+    assert instance.run_backfill_once()
+    assert instance.store.saved == []
+    assert instance.store.released == []
+
+
+def test_provider_error_post_transition_conflict_is_not_silently_swallowed():
+    class Conflict(Exception):
+        sqlstate = "55P03"
+
+    instance = capture_service(history.HistoryRange(1, 5000, []))
+    instance.provider_adapters = lambda account: (_ for _ in ()).throw(
+        zulip_adapter.ZulipOperationError("history_batch_rejected", False)
+    )
+    instance._queue_account_report = lambda *args: (_ for _ in ()).throw(Conflict())
+
+    with pytest.raises(Conflict):
+        instance.run_backfill_once()
+    assert instance.store.failed == [
+        ("account", "channel:42", "history_batch_rejected")
+    ]
+
+
 def test_published_golden_batch_and_markdown():
     import json
     import pathlib

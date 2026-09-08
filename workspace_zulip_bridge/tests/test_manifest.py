@@ -59,8 +59,15 @@ def test_bridge_resources_use_selected_realm_profile_with_fixed_node_size():
         "event_long_polling = "
         "{$core.vs.variables.$workspace_zulip_bridge_event_long_polling:value}" in text
     )
+    batch_size = text.split(
+        "    workspace_zulip_bridge_batch_size:", maxsplit=1
+    )[1].split("    workspace_zulip_bridge_event_long_polling:", maxsplit=1)[0]
     for profile in ("develop", "small", "medium", "large", "legacy"):
         assert f'link: "$core.vs.profiles.${profile}"' in text
+        profile_ref = (
+            f"profile: $workspace_zulip_bridge.imports.$profile_{profile}:uuid\n"
+        )
+        assert f"{profile_ref}            value: 20" in batch_size
 
     cores = text.split("    workspace_zulip_bridge_cores:", maxsplit=1)[1].split(
         "    workspace_zulip_bridge_ram:", maxsplit=1
