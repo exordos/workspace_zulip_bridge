@@ -8428,8 +8428,8 @@ class RestAlchemyStore:
     ) -> bool:
         """Change an erroring capture only while its exact source claim is current."""
         with self.transaction() as session:
-            session.execute("SET LOCAL lock_timeout = '50ms'")
-            session.execute("SET LOCAL statement_timeout = '500ms'")
+            session.execute("SET LOCAL lock_timeout = '2s'")
+            session.execute("SET LOCAL statement_timeout = '2500ms'")
             session.execute("LOCK TABLE desired_resources IN SHARE MODE")
             if self._history_capture_context(session, job, locked=True) is None:
                 return False
@@ -8517,8 +8517,8 @@ class RestAlchemyStore:
         """Persist one failed body-write attempt and its report atomically."""
         code = "history_capture_write_timeout"
         with self.transaction() as session:
-            session.execute("SET LOCAL lock_timeout = '50ms'")
-            session.execute("SET LOCAL statement_timeout = '500ms'")
+            session.execute("SET LOCAL lock_timeout = '2s'")
+            session.execute("SET LOCAL statement_timeout = '2500ms'")
             session.execute("LOCK TABLE desired_resources IN SHARE MODE")
             context = self._history_capture_context(session, job, locked=True)
             if context is None or tuple(
@@ -8648,8 +8648,8 @@ class RestAlchemyStore:
         budget = f"{history.capture_write_budget_ms(len(encoded))}ms"
         prior_hash = prior["body"]["hash"] if prior else None
         with self.transaction() as session:
-            session.execute("SET LOCAL lock_timeout = '50ms'")
-            session.execute("SET LOCAL statement_timeout = '500ms'")
+            session.execute("SET LOCAL lock_timeout = '2s'")
+            session.execute("SET LOCAL statement_timeout = '2500ms'")
             session.execute("LOCK TABLE desired_resources IN SHARE MODE")
             if self._history_capture_context(session, job, locked=True) != context:
                 self._release_history_capture(session, job)

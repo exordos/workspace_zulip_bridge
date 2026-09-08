@@ -243,7 +243,7 @@ def test_large_actual_5000_message_insert_and_update_use_bounded_body_budget(
             session.execute("SHOW statement_timeout").fetchone()["statement_timeout"]
             == "500ms"
         )
-        assert session.execute("SHOW lock_timeout").fetchone()["lock_timeout"] == "50ms"
+        assert session.execute("SHOW lock_timeout").fetchone()["lock_timeout"] == "2s"
         return result
 
     monkeypatch.setattr(postgres_store, "_write_history_body", write)

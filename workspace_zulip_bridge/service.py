@@ -380,9 +380,9 @@ class BridgeService:
     # durable, history drops to one small batch per second so people can keep
     # chatting while the import continues in the background without reducing a
     # large import to one event per HTTP round trip.
-    HISTORY_DELIVERY_BATCH_SIZE = 100
+    HISTORY_DELIVERY_BATCH_SIZE = 20
     HISTORY_LIVE_DELIVERY_BATCH_SIZE = 10
-    BACKGROUND_HISTORY_WORKERS = 8
+    BACKGROUND_HISTORY_WORKERS = 1
     BACKGROUND_LIVE_WORKERS = 1
     # The main live lane owns journal conversion and outbound provider work.
     # Additional workers only submit already-durable Workspace deliveries, so
@@ -3621,7 +3621,7 @@ class BridgeService:
         """Scale history discovery without oversubscribing small deployments."""
         configured_batch = max(1, int(getattr(self, "provider_batch_size", 20)))
         return max(
-            2,
+            1,
             min(self.BACKGROUND_HISTORY_WORKERS, (configured_batch + 9) // 10),
         )
 
@@ -3897,7 +3897,9 @@ class BridgeService:
             self._fail_history_capture(job, adapter, error)
             return True
         except zulip_adapter.ZulipOperationError as exc:
-            self._fail_history_capture(job, adapter, exc)
+            self._fail_history_capture(
+                job, adapter, exc, contain_transition_conflict=True
+            )
             return True
         except Exception as exc:
             if not history_delivery.retryable_database_error(exc):
@@ -3919,41 +3921,53 @@ class BridgeService:
         job: dict[str, object],
         adapter: zulip_adapter.OfficialZulipAdapter | None,
         error: zulip_adapter.ZulipOperationError,
+        *,
+        contain_transition_conflict: bool = False,
     ) -> None:
         account_uuid = str(job["account_uuid"])
         chat_key = str(job["provider_chat_key"])
         authentication = self._provider_auth_error(error.code)
         transition_records_health = False
-        if authentication:
-            transition = getattr(self.store, "release_history_capture", None)
-            changed = (
-                transition(job)
-                if callable(transition)
-                else self.store.release_backfill_job(account_uuid, chat_key)
-            )
-        elif error.retryable:
-            attempts = int(job.get("retry_count", 0)) + 1
-            ceiling = min(300.0, float(2 ** min(attempts - 1, 8)))
-            delay = getattr(self, "provider_random", random).uniform(0.0, ceiling)
-            available_at = datetime.datetime.now(
-                datetime.UTC
-            ) + datetime.timedelta(seconds=delay)
-            transition = getattr(self.store, "defer_history_capture", None)
-            changed = (
-                transition(job, available_at, error.code)
-                if callable(transition)
-                else self.store.defer_backfill_job(
-                    account_uuid, chat_key, available_at, error.code
+        try:
+            if authentication:
+                transition = getattr(self.store, "release_history_capture", None)
+                changed = (
+                    transition(job)
+                    if callable(transition)
+                    else self.store.release_backfill_job(account_uuid, chat_key)
                 )
-            )
-        else:
-            transition = getattr(self.store, "fail_history_capture", None)
-            transition_records_health = callable(transition)
-            changed = (
-                transition(job, error.code)
-                if transition_records_health
-                else self.store.fail_backfill_job(account_uuid, chat_key, error.code)
-            )
+            elif error.retryable:
+                attempts = int(job.get("retry_count", 0)) + 1
+                ceiling = min(300.0, float(2 ** min(attempts - 1, 8)))
+                delay = getattr(self, "provider_random", random).uniform(0.0, ceiling)
+                available_at = datetime.datetime.now(
+                    datetime.UTC
+                ) + datetime.timedelta(seconds=delay)
+                transition = getattr(self.store, "defer_history_capture", None)
+                changed = (
+                    transition(job, available_at, error.code)
+                    if callable(transition)
+                    else self.store.defer_backfill_job(
+                        account_uuid, chat_key, available_at, error.code
+                    )
+                )
+            else:
+                transition = getattr(self.store, "fail_history_capture", None)
+                transition_records_health = callable(transition)
+                changed = (
+                    transition(job, error.code)
+                    if transition_records_health
+                    else self.store.fail_backfill_job(
+                        account_uuid, chat_key, error.code
+                    )
+                )
+        except Exception as transition_error:
+            if not contain_transition_conflict or not (
+                history_delivery.retryable_database_error(transition_error)
+            ):
+                raise
+            # The fenced transition rolled back, so keep its exact lease for expiry.
+            return
         # Exact-lease and source-generation fencing happens before any account
         # health or report is changed. A stale provider result belongs to the
         # old capture attempt and must not affect its replacement.

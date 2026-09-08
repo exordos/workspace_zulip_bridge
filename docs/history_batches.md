@@ -114,8 +114,9 @@ Repeating a range updates one row; it does not append a copy.
 Only the prepared body INSERT/UPDATE receives a size-dependent statement budget:
 `min(5000, 500 + ceil(encoded_bytes / 16384))` milliseconds. ASCII JSON encoding
 makes the prepared string length equal to the transmitted byte length; encoding
-and budget calculation happen before taking locks. Other SQL keeps its 500 ms
-statement budget, and lock acquisition remains limited to 50 ms.
+and budget calculation happen before taking locks. Fenced capture transitions,
+timeout bookkeeping, and batch persistence use a 2500 ms statement budget and
+a 2 second lock-acquisition budget.
 A body-write timeout rolls back the body and checkpoint, then records
 `history_capture_write_timeout`, a persistent retry count, health and durable
 scope reporting work in one short, generation- and lease-checked transaction.
