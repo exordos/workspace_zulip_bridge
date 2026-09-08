@@ -1,0 +1,286 @@
+"""Sticker media reuses file transfer and restores only verified markers."""
+
+import datetime
+import hashlib
+import types
+import uuid
+
+import httpx
+import pytest
+
+from workspace_zulip_bridge import converter, file_api, service, zulip_adapter
+from workspace_zulip_bridge.tests import test_converter as conversion
+from workspace_zulip_bridge.tests import test_file_api as files
+from workspace_zulip_bridge.tests import test_zulip_adapter as adapters
+
+STICKER_UUID = "550e8400-e29b-41d4-a716-446655440000"
+LABEL = f"workspace-sticker:v1:{STICKER_UUID}"
+CONTENT = b"synthetic sticker bytes"
+
+
+@pytest.mark.parametrize("image_marker", ["", "!"])
+def test_outbound_sticker_reuses_upload_and_preserves_image_syntax(image_marker):
+    client = adapters.FakeClient()
+    exports = []
+
+    def export_file(*args, **kwargs):
+        exports.append(args)
+        return "sticker.webp", "image/webp", CONTENT
+
+    adapter = zulip_adapter.OfficialZulipAdapter(
+        client=client,
+        routing=adapters.FakeRouting(),
+        account_uuid=adapters.OWNER_UUID,
+        file_client=types.SimpleNamespace(export_file=export_file),
+        file_limit=lambda: 1024,
+    )
+    original = f"{image_marker}[sticker](urn:sticker:{STICKER_UUID})"
+    content = f"before {original} after ` {original} `"
+    converted = adapter._convert_workspace_markdown(
+        content, str(uuid.uuid4()), "channel:42"
+    )
+    assert converted == (
+        f"before {image_marker}[{LABEL}](/user_uploads/file) after ` {original} `"
+    )
+    assert client.uploads == [("sticker.webp", CONTENT)]
+    assert len(exports) == 1 and exports[0][4] == f"urn:sticker:{STICKER_UUID}"
+
+
+def _resolve(metadata, failure=None):
+    instance = object.__new__(service.BridgeService)
+    instance.store = conversion.FakeStore()
+    instance.store.effective_file_limit = lambda _: 1024
+    calls = []
+
+    def resolve_sticker(*args):
+        calls.append(("resolve", args))
+        if failure is not None:
+            raise failure
+        return metadata
+
+    def import_file(*args, **kwargs):
+        calls.append(("import", args))
+        return "urn:image:00000000-0000-4000-8000-000000000001"
+
+    instance.file_client = types.SimpleNamespace(
+        resolve_sticker=resolve_sticker, import_file=import_file
+    )
+    adapter = types.SimpleNamespace(
+        download_file=lambda *args, **kwargs: types.SimpleNamespace(
+            name="sticker.webp",
+            content_type="application/octet-stream",
+            content=CONTENT,
+        )
+    )
+    resolver = instance._file_resolver(
+        adapter, conversion.ACCOUNT_UUID, str(uuid.uuid4())
+    )
+    return resolver, calls
+
+
+def _metadata():
+    return {
+        "uuid": STICKER_UUID,
+        "sha256": hashlib.sha256(CONTENT).hexdigest(),
+        "size_bytes": len(CONTENT),
+        "content_type": "image/webp",
+    }
+
+
+@pytest.mark.parametrize("delivery_class", ["live", "backfill"])
+def test_verified_marker_restores_sticker_through_event_conversion(delivery_class):
+    resolver, calls = _resolve(_metadata())
+    original = f"[{LABEL}](/user_uploads/file)"
+    records = converter.event_records(
+        conversion.FakeStore(),
+        conversion.ACCOUNT_UUID,
+        "queue",
+        {
+            "id": 10,
+            "type": "message",
+            "message": {
+                **conversion._dm_message(),
+                "content": f"before {original} after `{original}`",
+            },
+        },
+        delivery_class,
+        original_url="https://chat.example.invalid",
+        file_resolver=resolver,
+    )
+    created = next(
+        op for op in conversion._operations(records) if op["kind"] == "message.create"
+    )
+    assert created["payload"]["payload"]["content"] == (
+        f"before ![sticker](urn:sticker:{STICKER_UUID}) after `{original}`"
+    )
+    assert [call[0] for call in calls] == ["resolve"]
+
+
+@pytest.mark.parametrize(
+    "case", ["plain", "version", "invalid", "missing", "hash", "size"]
+)
+def test_unverified_marker_uses_ordinary_import(case):
+    metadata = _metadata()
+    label = LABEL
+    if case == "plain":
+        label = "sticker.webp"
+    elif case == "version":
+        label = LABEL.replace(":v1:", ":v2:")
+    elif case == "invalid":
+        label = "workspace-sticker:v1:invalid"
+    elif case == "missing":
+        metadata = None
+    elif case == "hash":
+        metadata["sha256"] = "0" * 64
+    elif case == "size":
+        metadata["size_bytes"] += 1
+    resolver, calls = _resolve(metadata)
+    assert resolver("/user_uploads/file", label).startswith("urn:image:")
+    assert calls[-1][0] == "import"
+    assert len(calls) == (1 if case in {"plain", "version", "invalid"} else 2)
+
+
+@pytest.mark.parametrize("status,retryable", [(403, False), (429, True), (503, True)])
+def test_lookup_failure_does_not_silently_import(status, retryable):
+    response = httpx.Response(
+        status, request=httpx.Request("GET", "https://test.invalid")
+    )
+    failure = httpx.HTTPStatusError(
+        "synthetic", request=response.request, response=response
+    )
+    resolver, calls = _resolve(None, failure)
+    with pytest.raises(zulip_adapter.ZulipOperationError) as error:
+        resolver("/user_uploads/file", LABEL)
+    assert error.value.retryable is retryable
+    assert [call[0] for call in calls] == ["resolve"]
+
+
+@pytest.mark.parametrize("status", [200, 404, 403, 503])
+def test_metadata_lookup_is_scoped_read_only_request(status):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(status, json=_metadata())
+
+    client = file_api.FileApiClient(
+        files._settings(),
+        httpx.Client(
+            base_url="https://control.invalid", transport=httpx.MockTransport(handler)
+        ),
+    )
+    account, chat = uuid.uuid4(), uuid.uuid4()
+    if status in {403, 503}:
+        with pytest.raises(httpx.HTTPStatusError):
+            client.resolve_sticker(uuid.UUID(STICKER_UUID), account, chat)
+    else:
+        assert client.resolve_sticker(uuid.UUID(STICKER_UUID), account, chat) == (
+            _metadata() if status == 200 else None
+        )
+    request = requests[0]
+    assert request.method == "GET"
+    assert request.headers["Content-Length"] == "0"
+    assert request.url.path == f"/v1/stickers/{STICKER_UUID}"
+    assert dict(request.url.params) == {
+        "external_account_uuid": str(account),
+        "external_chat_uuid": str(chat),
+    }
+    client.close()
+
+
+def test_lookup_transport_failure_retries_without_import():
+    resolver, calls = _resolve(None, httpx.ConnectError("synthetic"))
+    with pytest.raises(zulip_adapter.ZulipOperationError) as error:
+        resolver("/user_uploads/file", LABEL)
+    assert error.value.retryable
+    assert [call[0] for call in calls] == ["resolve"]
+
+
+def test_same_upload_can_be_sticker_and_plain_image_in_one_message():
+    resolver, calls = _resolve(_metadata())
+    assert resolver("/user_uploads/file", LABEL) == f"urn:sticker:{STICKER_UUID}"
+    assert resolver("/user_uploads/file", "ordinary image").startswith("urn:image:")
+    assert [call[0] for call in calls] == ["resolve", "import"]
+
+
+def test_reconcile_sticker_send_uses_persisted_rendering_without_reupload():
+    client = adapters.FakeClient()
+    adapter = zulip_adapter.OfficialZulipAdapter(
+        client=client,
+        routing=adapters.FakeRouting(),
+        owner_user_uuid=adapters.OWNER_UUID,
+        account_uuid=adapters.OWNER_UUID,
+        file_client=types.SimpleNamespace(
+            export_file=lambda *args, **kwargs: ("sticker.webp", "image/webp", CONTENT)
+        ),
+        file_limit=lambda: 1024,
+    )
+    adapter.restore_queue("queue-1", 7)
+    operation = adapters._operation()
+    operation["payload"]["payload"]["content"] = (
+        f"![sticker](urn:sticker:{STICKER_UUID})"
+    )
+    correlation = adapter.prepare(operation, adapters.MESSAGE_UUID)
+    attempted = datetime.datetime.now(datetime.UTC)
+    client.messages = [
+        {
+            "id": 101,
+            "content": correlation.provider_rendered_content,
+            "sender_id": 1,
+            "timestamp": attempted.timestamp(),
+        }
+    ]
+    evidence = adapter.reconcile_message(
+        operation, attempted, correlation.provider_rendered_content
+    )
+    assert evidence.selected_provider_id == "101"
+    assert len(client.uploads) == 1
+    assert correlation.provider_rendered_content == f"![{LABEL}](/user_uploads/file)"
+
+
+@pytest.mark.parametrize("change", ["text", "remove", "unmark", "replace"])
+def test_incoming_edit_keeps_sticker_only_while_matching_attachment_remains(change):
+    store = conversion.FakeStore()
+    resolver, calls = _resolve(_metadata())
+    original = f"[{LABEL}](/user_uploads/file)"
+    converter.event_records(
+        store,
+        conversion.ACCOUNT_UUID,
+        "queue",
+        {
+            "id": 1,
+            "type": "message",
+            "message": {**conversion._dm_message(), "content": original},
+        },
+        file_resolver=resolver,
+    )
+    if change == "text":
+        content = f"edited {original}"
+        expected = f"edited ![sticker](urn:sticker:{STICKER_UUID})"
+    elif change == "remove":
+        content = expected = "removed image"
+    elif change == "unmark":
+        content = "[ordinary](/user_uploads/file)"
+        expected = "[ordinary](urn:image:00000000-0000-4000-8000-000000000001)"
+    else:
+        resolver, calls = _resolve({**_metadata(), "sha256": "0" * 64})
+        content = f"[{LABEL}](/user_uploads/replacement)"
+        expected = f"[{LABEL}](urn:image:00000000-0000-4000-8000-000000000001)"
+    records = converter.event_records(
+        store,
+        conversion.ACCOUNT_UUID,
+        "queue",
+        {
+            "id": 2,
+            "type": "update_message",
+            "message_id": 501,
+            "message_ids": [501],
+            "content": content,
+            "edit_timestamp": 1_700_000_010,
+        },
+        file_resolver=resolver,
+    )
+    updated = next(
+        op for op in conversion._operations(records) if op["kind"] == "message.update"
+    )
+    assert updated["payload"]["payload"]["content"] == expected

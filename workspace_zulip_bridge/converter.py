@@ -8,6 +8,18 @@ import uuid
 
 from workspace_zulip_bridge import canonical, emoji, markdown_conversion
 
+STICKER_LABEL_PREFIX = "workspace-sticker:v1:"
+STICKER_LABEL_RE = re.compile(
+    r"workspace-sticker:v1:([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
+
+
+def sticker_uuid_from_label(label: str) -> uuid.UUID | None:
+    match = STICKER_LABEL_RE.fullmatch(label)
+    return uuid.UUID(match.group(1)) if match is not None else None
+
+
 OPERATION_NAMESPACE = uuid.UUID("9d8b6952-b2de-4c80-a9c7-9619aaf5f35d")
 ENTITY_NAMESPACE = uuid.UUID("9a1d0e75-50a5-413c-b3e8-d070232ef57f")
 MENTION_RE = re.compile(
@@ -1053,6 +1065,8 @@ def _convert_zulip_links(
                 lossy = True
                 label = link.label.strip() or "attachment"
                 return f"**{UNAVAILABLE_FILE_MARKER}:** {label}"
+            if destination.startswith("urn:sticker:"):
+                return f"![sticker]({destination})"
             return link.with_destination(destination)
         if _safe_urlsplit(_source_link_destination(link)) is None:
             return link.raw

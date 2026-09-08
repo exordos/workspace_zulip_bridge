@@ -40,6 +40,10 @@ WORKSPACE_FILE_URN_RE = re.compile(
     r"^urn:(?:file|image|video):[0-9a-f-]+(?:\?.*)?$",
     re.IGNORECASE,
 )
+WORKSPACE_STICKER_URN_RE = re.compile(
+    r"^urn:sticker:(?P<uuid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
+)
 WORKSPACE_MENTION_URN_RE = re.compile(
     r"^urn:user:(?P<uuid>[0-9a-f-]+)$",
     re.IGNORECASE,
@@ -1409,7 +1413,10 @@ class OfficialZulipAdapter:
             if url_match is not None:
                 return link.with_destination(url_match.group("url"))
 
-            if not WORKSPACE_FILE_URN_RE.fullmatch(link.destination):
+            sticker_match = WORKSPACE_STICKER_URN_RE.fullmatch(link.destination)
+            if sticker_match is None and not WORKSPACE_FILE_URN_RE.fullmatch(
+                link.destination
+            ):
                 return link.raw
             if (
                 self.file_client is None
@@ -1418,7 +1425,11 @@ class OfficialZulipAdapter:
                 or operation_uuid is None
             ):
                 raise ZulipOperationError("provider_file_transfer_disabled", False)
-            file_urn = link.destination
+            file_urn = (
+                f"urn:sticker:{uuid.UUID(sticker_match.group('uuid'))}"
+                if sticker_match is not None
+                else link.destination
+            )
             transfer_uuid = uuid.uuid5(
                 TRANSFER_NAMESPACE,
                 f"{operation_uuid}:{file_urn}",
@@ -1437,6 +1448,11 @@ class OfficialZulipAdapter:
             provider_uri = uploaded.get("uri")
             if not isinstance(provider_uri, str) or not provider_uri:
                 raise ZulipOperationError("provider_file_unavailable", True)
+            if sticker_match is not None:
+                sticker_uuid = uuid.UUID(sticker_match.group("uuid"))
+                marker = "!" if link.image else ""
+                label = f"{converter.STICKER_LABEL_PREFIX}{sticker_uuid}"
+                return f"{marker}[{label}]({provider_uri})"
             return link.with_destination(provider_uri)
 
         def transform_quote(

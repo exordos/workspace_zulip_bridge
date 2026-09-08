@@ -2720,6 +2720,21 @@ class BridgeService:
                 f"zulip-file-import:{account_uuid}:{external_chat_uuid}:{provider_url}",
             )
             try:
+                sticker_uuid = converter.sticker_uuid_from_label(display_name)
+                if sticker_uuid is not None:
+                    sticker = self.file_client.resolve_sticker(
+                        sticker_uuid,
+                        uuid.UUID(account_uuid),
+                        uuid.UUID(external_chat_uuid),
+                    )
+                    if (
+                        sticker is not None
+                        and sticker["uuid"] == str(sticker_uuid)
+                        and sticker["size_bytes"] == len(downloaded.content)
+                        and sticker["sha256"]
+                        == hashlib.sha256(downloaded.content).hexdigest()
+                    ):
+                        return f"urn:sticker:{sticker_uuid}"
                 return self.file_client.import_file(
                     transfer_operation_uuid,
                     uuid.UUID(account_uuid),
