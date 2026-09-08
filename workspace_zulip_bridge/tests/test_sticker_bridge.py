@@ -8,9 +8,16 @@ import uuid
 import httpx
 import pytest
 
-from workspace_zulip_bridge import converter, file_api, service, zulip_adapter
+from workspace_zulip_bridge import (
+    converter,
+    file_api,
+    scheduler,
+    service,
+    zulip_adapter,
+)
 from workspace_zulip_bridge.tests import test_converter as conversion
 from workspace_zulip_bridge.tests import test_file_api as files
+from workspace_zulip_bridge.tests import test_scheduler as scheduling
 from workspace_zulip_bridge.tests import test_zulip_adapter as adapters
 
 STICKER_UUID = "550e8400-e29b-41d4-a716-446655440000"
@@ -19,7 +26,10 @@ CONTENT = b"synthetic sticker bytes"
 
 
 @pytest.mark.parametrize("image_marker", ["", "!"])
-def test_outbound_sticker_reuses_upload_and_preserves_image_syntax(image_marker):
+@pytest.mark.parametrize("suffix", ["", "?v=1", "?width=128&height=128"])
+def test_outbound_sticker_reuses_upload_and_preserves_image_syntax(
+    image_marker, suffix
+):
     client = adapters.FakeClient()
     exports = []
 
@@ -34,7 +44,7 @@ def test_outbound_sticker_reuses_upload_and_preserves_image_syntax(image_marker)
         file_client=types.SimpleNamespace(export_file=export_file),
         file_limit=lambda: 1024,
     )
-    original = f"{image_marker}[sticker](urn:sticker:{STICKER_UUID})"
+    original = f"{image_marker}[sticker](urn:sticker:{STICKER_UUID}{suffix})"
     content = f"before {original} after ` {original} `"
     converted = adapter._convert_workspace_markdown(
         content, str(uuid.uuid4()), "channel:42"
@@ -284,3 +294,103 @@ def test_incoming_edit_keeps_sticker_only_while_matching_attachment_remains(chan
         op for op in conversion._operations(records) if op["kind"] == "message.update"
     )
     assert updated["payload"]["payload"]["content"] == expected
+
+
+@pytest.mark.parametrize(
+    "label, expected", [(LABEL, "sticker"), ("photo.png", "photo.png")]
+)
+def test_unavailable_attachment_has_readable_label(label, expected):
+    content, lossy = converter.convert_markdown(
+        f"[{label}](/user_uploads/missing)",
+        {},
+        "https://chat.example.invalid",
+        file_resolver=lambda *_: None,
+    )
+    assert lossy
+    assert content == (
+        f"**File unavailable:** {expected}\n\n"
+        "[Open original](urn:url:https://chat.example.invalid)"
+    )
+
+
+@pytest.mark.parametrize("stage", ["authorization", "download"])
+@pytest.mark.parametrize("kind", ["sticker", "image"])
+@pytest.mark.parametrize(
+    "status, retryable, code",
+    [
+        (400, False, "invalid_record"),
+        (401, False, "permission_denied"),
+        (403, False, "permission_denied"),
+        (404, False, "not_found"),
+        (408, True, "workspace_unavailable"),
+        (425, True, "workspace_unavailable"),
+        (429, True, "rate_limited"),
+        (503, True, "workspace_unavailable"),
+        (None, True, "workspace_unavailable"),
+        ("oversize", False, "invalid_record"),
+        ("length", False, "invalid_record"),
+        ("digest", False, "invalid_record"),
+    ],
+)
+def test_export_failure_is_handled_by_scheduler(
+    operation_record, kind, stage, status, retryable, code
+):
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        if request.method == "PUT" and (stage == "download" or isinstance(status, str)):
+            return httpx.Response(
+                200,
+                json={
+                    "name": "sticker.webp",
+                    "content_type": "image/webp",
+                    "size_bytes": 2048 if status == "oversize" else len(CONTENT),
+                    "sha256": hashlib.sha256(CONTENT).hexdigest(),
+                    "download": {
+                        "method": "GET",
+                        "url": "https://object.invalid/media",
+                    },
+                },
+            )
+        if status == "length":
+            return httpx.Response(200, content=b"short")
+        if status == "digest":
+            return httpx.Response(200, content=b"x" * len(CONTENT))
+        if status is None:
+            raise httpx.ConnectError("Unavailable", request=request)
+        return httpx.Response(status)
+
+    client = adapters.FakeClient()
+    operation = operation_record["operation"]
+    operation["payload"]["payload"]["content"] = f"![media](urn:{kind}:{STICKER_UUID})"
+    with httpx.Client(
+        base_url="https://workspace.example.invalid",
+        transport=httpx.MockTransport(respond),
+    ) as http_client:
+        adapter = zulip_adapter.OfficialZulipAdapter(
+            client=client,
+            routing=adapters.FakeRouting(),
+            account_uuid=operation_record["account_uuid"],
+            owner_user_uuid=operation["actor_uuid"],
+            file_client=file_api.FileApiClient(
+                files._settings(), http_client, http_client
+            ),
+            file_limit=lambda: 1024,
+        )
+        store = scheduling.FakeStore(operation_record)
+        worker = scheduler.Scheduler(store, lambda _: adapter, "worker")
+        assert worker.run_once()
+    assert requests[0].method == "PUT"
+    if stage == "download" and status != "oversize":
+        assert requests[1].method == "GET"
+    assert not client.uploads
+    assert not store.correlations
+    assert not store.uncertain
+    if retryable:
+        assert store.retries[0][2] == code
+        assert not store.completed
+    else:
+        assert not store.retries
+        assert store.completed[0][2] == "rejected"
+        assert store.completed[0][1]["result"]["safe_error"]["code"] == code

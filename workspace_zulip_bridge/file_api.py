@@ -127,6 +127,7 @@ class FileApiClient:
     ) -> dict[str, object] | None:
         response = self.client.get(
             f"/v1/stickers/{sticker_uuid}",
+            # The private bridge HTTP server requires Content-Length even for GET.
             headers={"Content-Length": "0"},
             params={
                 "external_account_uuid": str(account_uuid),

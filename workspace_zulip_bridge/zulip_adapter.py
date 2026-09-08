@@ -13,6 +13,7 @@ import typing
 import urllib.parse
 import uuid
 
+import httpx
 import requests
 import zulip
 
@@ -42,7 +43,7 @@ WORKSPACE_FILE_URN_RE = re.compile(
 )
 WORKSPACE_STICKER_URN_RE = re.compile(
     r"^urn:sticker:(?P<uuid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
-    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:\?.*)?$"
 )
 WORKSPACE_MENTION_URN_RE = re.compile(
     r"^urn:user:(?P<uuid>[0-9a-f-]+)$",
@@ -1434,14 +1435,32 @@ class OfficialZulipAdapter:
                 TRANSFER_NAMESPACE,
                 f"{operation_uuid}:{file_urn}",
             )
-            name, _content_type, content_bytes = self.file_client.export_file(
-                transfer_uuid,
-                uuid.UUID(operation_uuid),
-                uuid.UUID(self.account_uuid),
-                self._external_chat_uuid(provider_chat_key),
-                file_urn,
-                max_bytes=self.file_limit(),
-            )
+            try:
+                name, _content_type, content_bytes = self.file_client.export_file(
+                    transfer_uuid,
+                    uuid.UUID(operation_uuid),
+                    uuid.UUID(self.account_uuid),
+                    self._external_chat_uuid(provider_chat_key),
+                    file_urn,
+                    max_bytes=self.file_limit(),
+                )
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                retryable = status in {408, 425, 429} or status >= 500
+                # Workspace/storage access failures are not Zulip credentials failures.
+                code = {
+                    400: "invalid_record",
+                    401: "permission_denied",
+                    403: "permission_denied",
+                    404: "not_found",
+                    429: "rate_limited",
+                }.get(status, "workspace_unavailable")
+                raise ZulipOperationError(code, retryable) from exc
+            except httpx.TransportError as exc:
+                raise ZulipOperationError("workspace_unavailable", True) from exc
+            except ValueError as exc:
+                # Invalid size or integrity must fail before uploading to Zulip.
+                raise ZulipOperationError("invalid_record", False) from exc
             stream = io.BytesIO(content_bytes)
             stream.name = name  # type: ignore[attr-defined]
             uploaded = _successful(self.client.upload_file(stream))

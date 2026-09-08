@@ -1064,6 +1064,8 @@ def _convert_zulip_links(
             if destination is None:
                 lossy = True
                 label = link.label.strip() or "attachment"
+                if sticker_uuid_from_label(label) is not None:
+                    label = "sticker"
                 return f"**{UNAVAILABLE_FILE_MARKER}:** {label}"
             if destination.startswith("urn:sticker:"):
                 return f"![sticker]({destination})"
