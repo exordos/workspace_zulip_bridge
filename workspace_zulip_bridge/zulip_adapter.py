@@ -43,7 +43,7 @@ WORKSPACE_FILE_URN_RE = re.compile(
 )
 WORKSPACE_STICKER_URN_RE = re.compile(
     r"^urn:sticker:(?P<uuid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-"
-    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:\?.*)?$"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
 )
 WORKSPACE_MENTION_URN_RE = re.compile(
     r"^urn:user:(?P<uuid>[0-9a-f-]+)$",
@@ -1415,6 +1415,8 @@ class OfficialZulipAdapter:
                 return link.with_destination(url_match.group("url"))
 
             sticker_match = WORKSPACE_STICKER_URN_RE.fullmatch(link.destination)
+            if sticker_match is None and link.destination.startswith("urn:sticker:"):
+                return f"**{converter.UNAVAILABLE_STICKER_MARKER}**"
             if sticker_match is None and not WORKSPACE_FILE_URN_RE.fullmatch(
                 link.destination
             ):
@@ -1446,6 +1448,8 @@ class OfficialZulipAdapter:
                 )
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
+                if sticker_match is not None and status == 404:
+                    return f"**{converter.UNAVAILABLE_STICKER_MARKER}**"
                 retryable = status in {408, 425, 429} or status >= 500
                 # Workspace/storage access failures are not Zulip credentials failures.
                 code = {
@@ -1453,6 +1457,7 @@ class OfficialZulipAdapter:
                     401: "permission_denied",
                     403: "permission_denied",
                     404: "not_found",
+                    422: "invalid_record",
                     429: "rate_limited",
                 }.get(status, "workspace_unavailable")
                 raise ZulipOperationError(code, retryable) from exc

@@ -2727,9 +2727,10 @@ class BridgeService:
                         uuid.UUID(account_uuid),
                         uuid.UUID(external_chat_uuid),
                     )
+                    if sticker is None:
+                        return None
                     if (
-                        sticker is not None
-                        and sticker["uuid"] == str(sticker_uuid)
+                        sticker["uuid"] == str(sticker_uuid)
                         and sticker["size_bytes"] == len(downloaded.content)
                         and sticker["sha256"]
                         == hashlib.sha256(downloaded.content).hexdigest()
@@ -2753,8 +2754,13 @@ class BridgeService:
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
                 retryable = status in {408, 425, 429} or status >= 500
+                code = (
+                    "invalid_record"
+                    if status in {400, 422}
+                    else "workspace_file_import_unavailable"
+                )
                 raise zulip_adapter.ZulipOperationError(
-                    "workspace_file_import_unavailable", retryable
+                    code, retryable
                 ) from exc
             except httpx.TransportError as exc:
                 raise zulip_adapter.ZulipOperationError(

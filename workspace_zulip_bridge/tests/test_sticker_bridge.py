@@ -26,10 +26,7 @@ CONTENT = b"synthetic sticker bytes"
 
 
 @pytest.mark.parametrize("image_marker", ["", "!"])
-@pytest.mark.parametrize("suffix", ["", "?v=1", "?width=128&height=128"])
-def test_outbound_sticker_reuses_upload_and_preserves_image_syntax(
-    image_marker, suffix
-):
+def test_outbound_sticker_reuses_upload_and_preserves_image_syntax(image_marker):
     client = adapters.FakeClient()
     exports = []
 
@@ -44,7 +41,7 @@ def test_outbound_sticker_reuses_upload_and_preserves_image_syntax(
         file_client=types.SimpleNamespace(export_file=export_file),
         file_limit=lambda: 1024,
     )
-    original = f"{image_marker}[sticker](urn:sticker:{STICKER_UUID}{suffix})"
+    original = f"{image_marker}[sticker](urn:sticker:{STICKER_UUID})"
     content = f"before {original} after ` {original} `"
     converted = adapter._convert_workspace_markdown(
         content, str(uuid.uuid4()), "channel:42"
@@ -126,9 +123,7 @@ def test_verified_marker_restores_sticker_through_event_conversion(delivery_clas
     assert [call[0] for call in calls] == ["resolve"]
 
 
-@pytest.mark.parametrize(
-    "case", ["plain", "version", "invalid", "missing", "hash", "size"]
-)
+@pytest.mark.parametrize("case", ["plain", "version", "invalid", "hash", "size"])
 def test_unverified_marker_uses_ordinary_import(case):
     metadata = _metadata()
     label = LABEL
@@ -138,8 +133,6 @@ def test_unverified_marker_uses_ordinary_import(case):
         label = LABEL.replace(":v1:", ":v2:")
     elif case == "invalid":
         label = "workspace-sticker:v1:invalid"
-    elif case == "missing":
-        metadata = None
     elif case == "hash":
         metadata["sha256"] = "0" * 64
     elif case == "size":
@@ -150,8 +143,33 @@ def test_unverified_marker_uses_ordinary_import(case):
     assert len(calls) == (1 if case in {"plain", "version", "invalid"} else 2)
 
 
-@pytest.mark.parametrize("status,retryable", [(403, False), (429, True), (503, True)])
-def test_lookup_failure_does_not_silently_import(status, retryable):
+def test_deleted_sticker_marker_uses_placeholder_without_import():
+    resolver, calls = _resolve(None)
+    content, lossy = converter.convert_markdown(
+        f"before [{LABEL}](/user_uploads/file) after",
+        {},
+        "https://chat.example.invalid",
+        file_resolver=resolver,
+    )
+    assert lossy
+    assert content == (
+        f"before **{converter.UNAVAILABLE_STICKER_MARKER}** after\n\n"
+        "[Open original](urn:url:https://chat.example.invalid)"
+    )
+    assert "urn:sticker:" not in content
+    assert [call[0] for call in calls] == ["resolve"]
+
+
+@pytest.mark.parametrize(
+    "status,retryable,code",
+    [
+        (403, False, "workspace_file_import_unavailable"),
+        (422, False, "invalid_record"),
+        (429, True, "workspace_file_import_unavailable"),
+        (503, True, "workspace_file_import_unavailable"),
+    ],
+)
+def test_lookup_failure_does_not_silently_import(status, retryable, code):
     response = httpx.Response(
         status, request=httpx.Request("GET", "https://test.invalid")
     )
@@ -161,6 +179,7 @@ def test_lookup_failure_does_not_silently_import(status, retryable):
     resolver, calls = _resolve(None, failure)
     with pytest.raises(zulip_adapter.ZulipOperationError) as error:
         resolver("/user_uploads/file", LABEL)
+    assert error.value.code == code
     assert error.value.retryable is retryable
     assert [call[0] for call in calls] == ["resolve"]
 
@@ -307,10 +326,33 @@ def test_unavailable_attachment_has_readable_label(label, expected):
         file_resolver=lambda *_: None,
     )
     assert lossy
-    assert content == (
-        f"**File unavailable:** {expected}\n\n"
-        "[Open original](urn:url:https://chat.example.invalid)"
+    marker = (
+        f"**{converter.UNAVAILABLE_STICKER_MARKER}**"
+        if label == LABEL
+        else f"**File unavailable:** {expected}"
     )
+    assert content == (
+        f"{marker}\n\n[Open original](urn:url:https://chat.example.invalid)"
+    )
+
+
+@pytest.mark.parametrize(
+    "sticker_urn",
+    ["urn:sticker:invalid", f"urn:sticker:{STICKER_UUID}?v=1"],
+)
+def test_invalid_outbound_sticker_urn_uses_placeholder_without_export(sticker_urn):
+    client = adapters.FakeClient()
+    adapter = zulip_adapter.OfficialZulipAdapter(
+        client=client,
+        routing=adapters.FakeRouting(),
+    )
+    content = adapter._convert_workspace_markdown(
+        f"before ![sticker]({sticker_urn}) after",
+        str(uuid.uuid4()),
+        "channel:42",
+    )
+    assert content == (f"before **{converter.UNAVAILABLE_STICKER_MARKER}** after")
+    assert "urn:sticker:" not in content
 
 
 @pytest.mark.parametrize("stage", ["authorization", "download"])
@@ -322,6 +364,7 @@ def test_unavailable_attachment_has_readable_label(label, expected):
         (401, False, "permission_denied"),
         (403, False, "permission_denied"),
         (404, False, "not_found"),
+        (422, False, "invalid_record"),
         (408, True, "workspace_unavailable"),
         (425, True, "workspace_unavailable"),
         (429, True, "rate_limited"),
@@ -363,6 +406,9 @@ def test_export_failure_is_handled_by_scheduler(
 
     client = adapters.FakeClient()
     operation = operation_record["operation"]
+    operation["provider"]["chat_id"] = "channel:42"
+    operation["payload"]["stream_uuid"] = adapters.STREAM_UUID
+    operation["payload"]["topic_uuid"] = adapters.TOPIC_UUID
     operation["payload"]["payload"]["content"] = f"![media](urn:{kind}:{STICKER_UUID})"
     with httpx.Client(
         base_url="https://workspace.example.invalid",
@@ -385,8 +431,17 @@ def test_export_failure_is_handled_by_scheduler(
     if stage == "download" and status != "oversize":
         assert requests[1].method == "GET"
     assert not client.uploads
-    assert not store.correlations
     assert not store.uncertain
+    if kind == "sticker" and status == 404:
+        assert not store.retries
+        assert store.correlations
+        assert store.completed[0][2] == "committed"
+        assert client.sent[0]["content"] == (
+            f"**{converter.UNAVAILABLE_STICKER_MARKER}**"
+        )
+        assert "urn:sticker:" not in client.sent[0]["content"]
+        return
+    assert not store.correlations
     if retryable:
         assert store.retries[0][2] == code
         assert not store.completed
