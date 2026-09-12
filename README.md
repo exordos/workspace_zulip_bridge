@@ -1,181 +1,233 @@
 # Workspace Zulip Bridge
 
-Standalone implementation checkout for the independently deployable
-Workspace-Zulip bridge element.
+A minimal, performance-oriented foundation for a bidirectional bridge between
+Workspace and Zulip. The runtime is a regular systemd daemon written in Python
+and backed by PostgreSQL.
 
-The service implements the contracts maintained by the sibling
-`workspace_backend` repository:
+This repository intentionally contains no compatibility layer or code copied
+from earlier bridge implementations. The current Zulip event contract is
+documented in [Zulip events API contract](docs/zulip_events_api.md).
 
-- `docs/zulip_bridge_v1_product_and_api.md`;
-- `docs/zulip_bridge_control_api_v1.yaml`;
-- `docs/workspace_provider_api_v2.yaml`;
-- `docs/zulip_bridge_file_api_v1.yaml`.
+## Design
 
-Workspace messages and operations cross the private Provider HTTP API. The
-bridge has no IMAP, SMTP, Maildir, or Workspace mail-server dependency.
-The bridge VM runs its own PostgreSQL instance on the element's persistent
-disk. Its local `workspace_zulip_bridge` database stores the durable scheduler,
-leases, idempotency records, provider cursors, mappings, and outboxes. The
-Workspace backend remains authoritative for Workspace resources and applies
-Provider events in its own database transactions.
+- One asynchronous daemon process.
+- A small fixed PostgreSQL connection pool using `asyncpg`.
+- One native long-polling thread per Zulip user.
+- Batched, idempotent event persistence with an atomic queue cursor update.
+- One asynchronous database-backed event processor with crash-recoverable claims.
+- Bounded queue-registration concurrency.
+- Concurrent per-user chat discovery with content hashes that suppress unchanged
+  writes.
+- One short-lived endpoint directory cache, so concurrent workers share one
+  human-directory read and PostgreSQL upsert instead of locking the same rows.
+- One canonical chat row plus a user-membership row for each candidate source.
+- One selected source per chat; only that source loads history and applies live
+  entity changes for the chat. Duplicate observations from other users are
+  completed as skipped before mutation work.
+- Stable UUIDv5 identifiers derived from the Zulip endpoint and native entity ID,
+  independent of which source user observed the entity.
+- Canonical topic and message snapshots loaded with binary COPY staging and
+  hash-guarded PostgreSQL upserts.
+- Live message, edit, flag, reaction, move, delete, and channel-update events
+  are applied from the durable event inbox after the polling thread advances
+  its cursor.
+- A daemon restart resumes a still-valid active queue after a lightweight
+  runtime-state refresh; it does not reread message history.
+- Non-retryable account errors park one worker until its database row changes.
+- Bounded SIGINT/SIGTERM shutdown and periodic database liveness probes.
+- No web framework, ORM, scheduler framework, or separate broker.
+
+The Exordos Core image co-locates PostgreSQL with the daemon for the smallest
+deployable unit and lowest database latency. PostgreSQL data lives on the
+node's separate persistent disk. The database connection uses the local Unix
+socket and peer authentication, so the default deployment has no database
+password to distribute.
+
+## Layout
+
+```text
+workspace_zulip_bridge/
+├── config.py       # Environment-only runtime settings
+├── chat_catalog.py # Canonical channel and direct-conversation catalog
+├── database.py     # Pool creation and idempotent schema bootstrap
+├── event_processor.py # Supplier-gated durable event processing
+├── event_store.py  # Batched event and cursor persistence
+├── message_history.py # Canonical message, flag, reaction, and hash builder
+├── monitor.py      # Read-only counters, rates, and storage metrics
+├── models.py       # User, queue, and event value objects
+├── zulip_api.py    # Minimal synchronous Zulip REST client
+├── zulip_worker.py # Per-user threads and their supervisor
+├── service.py      # Daemon lifecycle and supervision
+├── cli.py          # Console entry point and signal handling
+└── schema.sql      # Initial PostgreSQL schema
+etc/                # Environment example and systemd unit
+exordos/            # Exordos Core build, image, and manifest files
+```
 
 ## Development
 
+Python 3.12 or newer and PostgreSQL 15 or newer are required.
+
 ```bash
 tox -e develop
-.tox/develop/bin/pytest
-.tox/develop/bin/ruff check .
+createdb workspace_zulip_bridge
+.tox/develop/bin/workspace-zulip-bridge
 ```
 
-Network-facing tests use fake control, Provider, file, and Zulip endpoints.
+The daemon applies the idempotent initial schema when it opens the database.
+The schema contains `workspace_zulip_bridge.zulip_users`, with the Zulip
+endpoint, API credentials, queue cursor, lifecycle status, and catalog hash;
+canonical `workspace_zulip_bridge.zulip_chats`; candidate memberships in
+`zulip_chat_users`; canonical `zulip_topics` and `zulip_messages`; and durable
+inbox `workspace_zulip_bridge.zulip_events`. Event payloads remain immutable;
+claim, attempt, outcome, and timing columns track processing. Empty `workspace_chats`,
+`workspace_topics`, and `workspace_messages` tables mirror the three canonical
+Zulip entity tables for the future Workspace-side projection. No runtime path
+writes to those destination mirrors yet. The
+`(endpoint, login)` pair is unique. Disabled human identities remain in
+`zulip_users` for foreign-key resolution but do not own a synchronization
+thread. Bots are neither inserted into the user directory nor materialized as
+messages or reactions.
 
-## Continuous integration
+A user moves through `init`, `streaming`, `filling`, `scheduling`,
+`backfilling`, and `active`. Queue registration establishes `streaming`.
+`filling` discovers the human directory, subscribed channels, and the direct
+conversations returned in Zulip's registration state while the queue buffers
+new events. It does not scan message history. Zulip decides how much of the
+direct-conversation list is "recent" (historically it has been based on the
+1,000 most recently received direct messages), so older inactive direct chats
+are intentionally deferred to a later depth-discovery pass.
+`scheduling` selects one source for every canonical chat by Zulip realm role
+(owner, admin, moderator, member, guest), then stable user UUID. Only the
+selected user's `backfilling` phase reads that chat's
+history. A successful per-chat reconciliation establishes `active` when no
+assigned history remains. Existing row hashes suppress identical writes, so
+their backend `updated_at` value does not move.
 
-GitHub Actions runs Ruff and the Python 3.11 test suite through `tox` with the
-`tox-uv` plugin. The test job provides a disposable PostgreSQL service and sets
-`WORKSPACE_BRIDGE_TEST_POSTGRES_DSN`, so the PostgreSQL integration tests run
-instead of being skipped.
+If Zulip reports that a queue was deleted, the worker returns the user to
+`init`, removes its selected-chat snapshots, registers a new queue, rediscovers
+the catalog, and backfills its assignments again. Deleting or disabling a
+selected user clears the affected assignments, removes that source's messages,
+and deterministically selects the next eligible user. A process restart resumes
+a still-valid queue and rebuilds only its in-memory directory and chat-key maps.
 
-The element workflow builds on a runner labelled `self-hosted` and `vm` with
-the pinned Exordos CLI release. Every eligible build, including pull-request
-builds, publishes its immutable output to the configured Exordos repository.
-Repository administrators must configure `PUSH_CFG` as the base64-encoded
-contents of an `exordos.push.yaml` file. The workflow marks tag builds as
-`latest`; non-tag builds are published without changing `latest`.
+Polling threads only persist non-heartbeat, non-bot events. The event processor
+claims a bounded ordered batch with `FOR UPDATE SKIP LOCKED` and recovers claims
+left stale by a crash. It resolves chat ownership for the whole batch before
+applying data. Message, edit/move, flag, reaction, delete, and channel-update
+events are applied only when the event's queue owner is the selected supplier
+for the destination chat; duplicate observations from other users are marked
+`skipped` with `not_chat_supplier`. Unsupported events are also completed as
+skipped so they cannot block the inbox. Consecutive messages, flags, and
+reactions from one supplier are normalized in event order and written as one
+hash-guarded page, which removes per-event PostgreSQL round trips without
+changing the final state. The same processor periodically deletes terminal
+`applied`, `skipped`, and `failed` events more than 24 hours after collection.
+Cleanup uses bounded batches and leaves `pending` and `processing` rows intact,
+so a long outage cannot silently discard unprocessed changes. Stable UUIDs,
+state hashes, set-style flag/reaction changes, and provider event keys make
+retries idempotent.
 
-A manual `production_release` profile provides the immutable bridge artifact
-used by the Workspace PostgreSQL-canonical cutover. It refuses repository
-version collisions and records the exact build and publication evidence in a
-private runner-local archive configured by the
-`WORKSPACE_BRIDGE_RELEASE_EVIDENCE_DIR` repository secret. See
-[Production bridge release](docs/production_release_workflow.md).
-
-## Runtime
+Use a dedicated development database and override the DSN when necessary:
 
 ```bash
-/opt/workspace-zulip-bridge-venv/bin/workspace-zulip-bridge \
-  --config /etc/workspace-zulip-bridge/bridge.conf
-/opt/workspace-zulip-bridge-venv/bin/workspace-zulip-bridge-healthcheck \
-  --config /etc/workspace-zulip-bridge/bridge.conf
+WZB_DATABASE_DSN=postgresql://localhost/workspace_zulip_bridge \
+  .tox/develop/bin/workspace-zulip-bridge
 ```
 
-The image installs the application into the isolated
-`/opt/workspace-zulip-bridge-venv` virtual environment and installs two
-services:
+Run the checks with:
 
-- `workspace-zulip-bridge-bootstrap.service` initializes the persistent data
-  directory and applies versioned RestAlchemy migrations;
-- `workspace-zulip-bridge.service` runs control polling, heartbeat, Provider
-  HTTP operation leasing and event/result delivery, Zulip event ingestion, and
-  the fair live/retry/backfill scheduler.
+```bash
+tox -e py,ruff,mypy
+```
 
-The worker also invokes the serialized bootstrap entrypoint as a `before` hook.
-Repeated bootstrap invocations preserve the persistent PostgreSQL data and wait
-for its local socket before starting the worker. Applied schema revisions are
-tracked in `ra_migrations`; the bootstrap applies only unapplied dependency
-steps through `ra-apply-migration`. Runtime transactions use the RestAlchemy
-PostgreSQL engine and `session_manager()`; the bridge has no direct `psycopg`
-storage layer.
+Optional PostgreSQL integration tests run only when
+`WZB_TEST_DATABASE_DSN` names a disposable database.
 
-## Current implementation boundary
+## Runtime configuration
 
-The current implementation provides:
+All settings are environment variables. Defaults favor a local Exordos Core
+deployment.
 
-- mTLS enrollment, control polling, heartbeat, and certificate renewal;
-- mandatory fail-closed Provider HTTP operation leasing, per-item result
-  reporting, and atomic inbound event batches;
-- durable exact lease binding and idempotent retry state in PostgreSQL;
-- official Zulip client calls, event queues, newest-first backfill, and
-  ambiguous-send reconciliation;
-- durable queue registration before discovery, names-only initial channel
-  discovery, and an authoritative selected-channel participant gate before
-  live or historical messages are projected, followed by bounded ready-state
-  participant rechecks;
-- capability-gated Workspace membership add/remove operations through the
-  official Zulip subscription API;
-- owner-scoped projections and stable identity/chat/topic/message mappings;
-- private file-plane transfers with short-lived URLs;
-- one dedicated persistent Zulip long-poll thread per active account, with
-  durable event and cursor capture independent from history synchronization;
-- extended idle queue lifetimes on compatible Zulip servers, preserving durable
-  queue cursors across quiet periods without ten-minute recovery churn;
-- local history capture in aligned 5000-ID JSON batches, merged across selected
-  accounts in PostgreSQL, with all directory users, per-user read/starred flags,
-  reactions, and deterministic message/batch hashes;
-- atomic history range persistence and checkpoints, safe concurrent merging,
-  and retryable collection independent of Workspace delivery backoff; see
-  [History batches](docs/history_batches.md) for the stored and publishing contract;
-- resumable publication of frozen history through the private history API, with
-  separate file transfer and durable receipts; realtime delivery stays independent;
-- live-priority scheduling and the existing bounded delivery path for queue-loss
-  catch-up and already queued legacy history operations;
-- exact owner read/unread projection from both Zulip message snapshots and live
-  flag events, emitted independently and ordered after the corresponding
-  Workspace message projection;
-- ACK-confirmed queue-catch-up convergence for message bodies, owner read state, and
-  reactions. The existing PostgreSQL mapping metadata stores the last accepted
-  semantic state, while an account-scoped in-memory index gives constant-time
-  checks during catch-up. Missing legacy state is replayed safely and only a
-  successful Workspace result advances the index. Resolution-dependent reply
-  and native-link projections are reconsidered when their target mappings
-  become available. Confirmed read and reaction projections are also rebound
-  once if Workspace replaces a provisional message UUID with its canonical
-  target;
-- one structured `bridge_interval_stats` log record per minute with cache
-  entries, hit/miss/skip and ACK counts, index-build time, history range/catch-up
-  message counts, generated/enqueued/suppressed operations, fetch
-  duration, and calculated import rates;
-- canonical Workspace quote references for Zulip replies on both create and
-  edit, including queue catch-up before the local account has materialized a
-  realm-shared quote target;
-- automatic removal of queue-recovery jobs when their chats are deselected, so
-  stale recovery state cannot keep an account in backfill forever;
-- stable history cutoffs and reconciliation checkpoints across unchanged
-  control-plane polls;
-- explicit `projection_reset_generation` reconciliation: a newer Workspace
-  generation atomically discards rebuildable Zulip message/reaction mappings,
-  delivery idempotency and completed history checkpoints while retaining
-  account identity/catalog state, then restarts local history capture;
-- rolling-upgrade recovery for a backend-first deployment: the schema step
-  that first adds reset-generation tracking clears the persisted control cursor
-  once, forcing an authoritative startup snapshot. Thus a pre-upgrade Bridge
-  that stored the new account resource but ignored its reset field cannot lose
-  the reimport request; idempotent migration-ledger repair does not clear a
-  current cursor again;
-- Provider API v2 channel lifecycle parity: channel deletion archives the
-  mapped Zulip channel, topic deletion repeats the official batched endpoint
-  until complete, and a Workspace-created topic installs its deterministic
-  mapping without a synthetic message before normal message materialization;
-- durable backfill retry state with exponential full-jitter deferral for
-  retryable provider failures; non-retryable failures terminate only the
-  affected account/chat backfill job and produce a degraded observed report.
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `WZB_DATABASE_DSN` | local Unix socket | PostgreSQL connection string |
+| `WZB_DB_POOL_MIN_SIZE` | `2` | Warm connections kept open |
+| `WZB_DB_POOL_MAX_SIZE` | `16` | Maximum database connections |
+| `WZB_DB_COMMAND_TIMEOUT_SECONDS` | `30` | Query timeout |
+| `WZB_DB_PROBE_SECONDS` | `30` | Database liveness interval |
+| `WZB_USER_REFRESH_SECONDS` | `5` | User-table reconciliation interval |
+| `WZB_ZULIP_CA_FILE` | system trust | Optional Zulip CA bundle |
+| `WZB_ZULIP_CONNECT_TIMEOUT_SECONDS` | `10` | Zulip connection timeout |
+| `WZB_ZULIP_DEFAULT_LONGPOLL_TIMEOUT_SECONDS` | `180` | Fallback long-poll timeout |
+| `WZB_ZULIP_DB_ACK_TIMEOUT_SECONDS` | `120` | Database acknowledgement timeout |
+| `WZB_ZULIP_RETRY_BASE_SECONDS` | `1` | Initial retry window |
+| `WZB_ZULIP_RETRY_CAP_SECONDS` | `60` | Maximum retry window |
+| `WZB_ZULIP_IDLE_QUEUE_TIMEOUT_SECONDS` | `3600` | Requested queue lifetime |
+| `WZB_ZULIP_REGISTRATION_CONCURRENCY` | `8` | Concurrent queue registrations |
+| `WZB_ZULIP_MESSAGE_SCAN_CONCURRENCY` | `32` | Concurrent in-memory message pages across all user threads |
+| `WZB_ZULIP_HISTORY_CONCURRENCY` | `12` | Concurrent history sessions; must leave database-pool capacity free |
+| `WZB_ZULIP_DIRECTORY_CACHE_TTL_SECONDS` | `60` | Shared endpoint directory cache lifetime |
+| `WZB_ZULIP_CHAT_FILL_TIMEOUT_SECONDS` | `120` | Read timeout for a catalog API page |
+| `WZB_ZULIP_MESSAGE_PAGE_SIZE` | `5000` | Combined message-history page size |
+| `WZB_EVENT_PROCESSOR_BATCH_SIZE` | `1000` | Maximum events claimed per processor pass |
+| `WZB_EVENT_PROCESSOR_POLL_SECONDS` | `0.05` | Idle inbox polling interval |
+| `WZB_EVENT_PROCESSOR_CLAIM_TIMEOUT_SECONDS` | `60` | Stale processing-claim recovery threshold |
+| `WZB_EVENT_RETENTION_SECONDS` | `86400` | Terminal event retention from collection time |
+| `WZB_EVENT_CLEANUP_INTERVAL_SECONDS` | `300` | Interval between caught-up retention passes |
+| `WZB_EVENT_CLEANUP_BATCH_SIZE` | `10000` | Rows deleted per short retention transaction |
+| `WZB_THREAD_STOP_TIMEOUT_SECONDS` | `5` | Worker shutdown deadline |
+| `WZB_LOG_LEVEL` | `INFO` | Python log level |
 
-The Provider API request UUID is preserved across ambiguous lease transport
-failures. Each leased operation retains the exact Provider operation and lease
-UUID in durable state. Provider result responses are terminally recorded so
-conflict, rejection, not-found, and stale-lease responses cannot create an
-unbounded resend loop. A renewed lease can safely rebind the same immutable
-operation. Provider event batches are released back to the outbox on transport
-or retryable failure and are committed locally only after backend acceptance.
-Permanent record-scoped validation failures are isolated from valid siblings,
-retained as rejected reconciliation evidence, and excluded from automatic
-resubmission.
+The `api_key` column is sensitive. It is used with `login` for Zulip HTTP Basic
+authentication and is never logged. Never use real credentials in tests or
+fixtures.
 
-The 30-day bridge client leaf is renewed with a locally generated replacement
-key during the final seven days of validity. A heartbeat can force immediate
-renewal during a control-CA migration. Control, Provider, and file clients
-reload the enrolled leaf and dual-trust bundle without restarting the worker.
-Zulip TLS uses the system trust store plus administrator-managed custom CAs;
-provider disable and emergency suspension gates are fail-closed.
+## Monitoring
 
-The remaining release gates are explicit realm-policy enablement, live
-Provider/file/Zulip conformance in both directions, live certificate rotation,
-recovery and target-load scenarios, and full visible UI acceptance. Unit and
-fake-endpoint tests do not claim those real-system scenarios.
+Run the read-only monitor with the same database environment as the daemon:
 
-See [Provider HTTP runtime](docs/provider_http_runtime.md) for the exact data
-plane routes and failure semantics.
+```bash
+workspace-zulip-bridge-monitor
+```
 
-## License
+Every five seconds it prints total and sync-enabled user, lifecycle-status,
+ready-queue, canonical-chat, chat-membership, assignment, pending-history,
+topic, message, and event counters;
+event processing states, applied/skipped/failed rates, pending age, average and
+p95 processing latency; recent message-change and ingress rates; and heap,
+index, relation, and database sizes. Rolling queries use small BRIN indexes on
+event timestamps and hash-guarded message `updated_at`.
 
-Licensed under the [Apache License 2.0](LICENSE).
+Use a single exact snapshot when exact event totals and totals by type are
+needed:
+
+```bash
+workspace-zulip-bridge-monitor --once --exact
+```
+
+Exact mode scans both message and event tables and counts reactions, so it
+should not be used at a short interval on a large database. `--window`,
+`--interval`, and `--json` customize the sampling window, cadence, and output
+format.
+
+## Exordos Core build
+
+The element manifest requires the destination Exordos Core project UUID at
+build time:
+
+```bash
+exordos build \
+  --manifest-var project_id=<project-uuid> \
+  --manifest-var repository=https://repo.example.com/exordos-elements \
+  .
+```
+
+Install the rendered local manifest with the `exordos` CLI:
+
+```bash
+exordos elements install output/manifests/workspace_zulip_bridge.yaml
+```
+
+The image bootstrap prepares the persistent disk, starts PostgreSQL, creates a
+peer-authenticated database role, and enables the daemon.

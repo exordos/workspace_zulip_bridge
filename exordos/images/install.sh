@@ -1,44 +1,56 @@
 #!/usr/bin/env bash
 
-set -eu
-set -o pipefail
-set -x
+# Copyright 2026 Genesis Corporation
+# Licensed under the Apache License, Version 2.0 (the "License").
 
-SOURCE=/opt/workspace-zulip-bridge
-VENV=/opt/workspace-zulip-bridge-venv
+set -euo pipefail
+
+APP_DIR="/opt/workspace_zulip_bridge"
+CONFIG_DIR="/etc/workspace_zulip_bridge"
+BOOTSTRAP_DIR="/var/lib/exordos/bootstrap/scripts"
+SYSTEMD_DIR="/etc/systemd/system"
+SERVICE_USER="workspace_zulip_bridge"
+PG_VERSION="18"
 
 sudo apt-get update
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    openssh-server \
-    postgresql \
-    python3 \
-    python3-pip \
-    python3-venv
-sudo systemctl enable ssh.service
+sudo apt-get install -y postgresql-common python3
+sudo YES=1 /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh
+sudo apt-get update
+sudo apt-get install -y "postgresql-${PG_VERSION}"
+sudo systemctl disable --now postgresql
 
-if ! getent group workspace-zulip >/dev/null; then
-    sudo groupadd --system workspace-zulip
-fi
-if ! getent passwd workspace-zulip >/dev/null; then
-    sudo useradd --system --gid workspace-zulip \
-        --home-dir /var/lib/workspace-zulip-bridge \
-        --shell /usr/sbin/nologin workspace-zulip
+if ! getent passwd "$SERVICE_USER" >/dev/null; then
+    sudo useradd \
+        --system \
+        --home-dir "/var/lib/${SERVICE_USER}" \
+        --create-home \
+        --shell /usr/sbin/nologin \
+        "$SERVICE_USER"
 fi
 
-sudo python3 -m venv "$VENV"
-sudo "$VENV/bin/python" -m pip install "$SOURCE"
-sudo install -d -m 0750 -o workspace-zulip -g workspace-zulip \
-    /var/lib/workspace-zulip-bridge
-sudo install -d -m 0755 -o workspace-zulip -g workspace-zulip \
-    /run/workspace-zulip-bridge
-sudo install -d -m 0750 -o root -g workspace-zulip \
-    /etc/workspace-zulip-bridge /etc/workspace-zulip-bridge/secrets
-sudo install -d -m 0755 /usr/local/bin /usr/local/lib/exordos
-sudo install -d -m 0755 /usr/local/lib/workspace-zulip-bridge
-sudo install -m 0755 "$SOURCE/exordos/images/bootstrap.sh" \
-    /usr/local/bin/workspace-zulip-bridge-bootstrap
-sudo install -m 0644 "$SOURCE/exordos/images/bootstrap-persistence.sh" \
-    /usr/local/lib/workspace-zulip-bridge/bootstrap-persistence.sh
-sudo install -m 0755 "$SOURCE/exordos/images/restart.sh" \
-    /usr/local/bin/workspace-zulip-bridge-restart
-sudo systemctl disable --now postgresql.service || true
+cd "$APP_DIR"
+uv sync --locked --no-dev
+
+sudo install -d -o root -g "$SERVICE_USER" -m 0750 "$CONFIG_DIR"
+if [[ ! -f "$CONFIG_DIR/bridge.env" ]]; then
+    sudo install \
+        -o root \
+        -g "$SERVICE_USER" \
+        -m 0640 \
+        "$APP_DIR/etc/workspace-zulip-bridge.env.example" \
+        "$CONFIG_DIR/bridge.env"
+fi
+
+sudo install \
+    -o root \
+    -g root \
+    -m 0644 \
+    "$APP_DIR/etc/systemd/workspace-zulip-bridge.service" \
+    "$SYSTEMD_DIR/workspace-zulip-bridge.service"
+sudo install \
+    -o root \
+    -g root \
+    -m 0755 \
+    "$APP_DIR/exordos/images/bootstrap.sh" \
+    "$BOOTSTRAP_DIR/0100-workspace-zulip-bridge.sh"
+sudo systemctl daemon-reload

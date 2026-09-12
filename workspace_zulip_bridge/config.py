@@ -1,133 +1,215 @@
-import configparser
-import dataclasses
-import pathlib
+# Copyright 2026 Genesis Corporation
+# Licensed under the Apache License, Version 2.0 (the "License").
+
+import os
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
 
 
-@dataclasses.dataclass(frozen=True)
-class DatabaseConfig:
-    connection_url: str
+def _read_int(values: Mapping[str, str], name: str, default: int) -> int:
+    raw = values.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
 
 
-@dataclasses.dataclass(frozen=True)
-class ControlConfig:
-    base_url: str
-    bootstrap_url: str
-    hostname: str
-    ca_file: pathlib.Path
-    certificate_file: pathlib.Path
-    private_key_file: pathlib.Path
-    credential_private_key_file: pathlib.Path
-    timeout_seconds: float = 300.0
-    poll_interval_seconds: float = 2.0
-    heartbeat_interval_seconds: float = 10.0
-    retry_base_seconds: float = 1.0
-    retry_cap_seconds: float = 30.0
-    retry_after_cap_seconds: float = 300.0
+def _read_float(values: Mapping[str, str], name: str, default: float) -> float:
+    raw = values.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number") from exc
 
 
-@dataclasses.dataclass(frozen=True)
-class IdentityConfig:
-    realm_uuid: str
-    bridge_instance_uuid: str
-    identity_generation: int
-    enrollment_secret_file: pathlib.Path
+@dataclass(frozen=True, slots=True)
+class Settings:
+    database_dsn: str
+    db_pool_min_size: int = 2
+    db_pool_max_size: int = 16
+    db_command_timeout_seconds: float = 30.0
+    db_probe_seconds: float = 30.0
+    user_refresh_seconds: float = 5.0
+    zulip_ca_file: Path | None = None
+    zulip_connect_timeout_seconds: float = 10.0
+    zulip_default_longpoll_timeout_seconds: float = 180.0
+    zulip_db_ack_timeout_seconds: float = 120.0
+    zulip_retry_base_seconds: float = 1.0
+    zulip_retry_cap_seconds: float = 60.0
+    zulip_idle_queue_timeout_seconds: int = 3600
+    zulip_registration_concurrency: int = 8
+    zulip_message_scan_concurrency: int = 32
+    zulip_history_concurrency: int = 12
+    zulip_directory_cache_ttl_seconds: float = 60.0
+    zulip_chat_fill_timeout_seconds: float = 120.0
+    zulip_message_page_size: int = 5000
+    event_processor_batch_size: int = 1000
+    event_processor_poll_seconds: float = 0.05
+    event_processor_claim_timeout_seconds: float = 60.0
+    event_retention_seconds: float = 86400.0
+    event_cleanup_interval_seconds: float = 300.0
+    event_cleanup_batch_size: int = 10000
+    thread_stop_timeout_seconds: float = 5.0
+    log_level: str = "INFO"
 
-    def enrollment_secret(self) -> bytes:
-        value = self.enrollment_secret_file.read_bytes()
-        value.decode("utf-8")
-        return value
-
-
-@dataclasses.dataclass(frozen=True)
-class FileApiConfig:
-    base_url: str
-    ca_file: pathlib.Path
-    certificate_file: pathlib.Path
-    private_key_file: pathlib.Path
-
-
-@dataclasses.dataclass(frozen=True)
-class ProviderApiConfig:
-    base_url: str
-    ca_file: pathlib.Path
-    certificate_file: pathlib.Path
-    private_key_file: pathlib.Path
-    poll_interval_seconds: float = 2.0
-    event_long_polling: bool = False
-    lease_seconds: int = 300
-    batch_size: int = 20
-    timeout_seconds: float = 30.0
-
-
-@dataclasses.dataclass(frozen=True)
-class RuntimeConfig:
-    database: DatabaseConfig
-    control: ControlConfig
-    identity: IdentityConfig
-    provider_api: ProviderApiConfig
-    file_api: FileApiConfig
-    health_file: pathlib.Path
-    worker_id: str
-
-
-def _path(section: configparser.SectionProxy, key: str) -> pathlib.Path:
-    return pathlib.Path(section[key])
-
-
-def load(path: str | pathlib.Path) -> RuntimeConfig:
-    parser = configparser.ConfigParser(interpolation=None)
-    read = parser.read(path)
-    if not read:
-        raise FileNotFoundError(path)
-    database = parser["db"] if parser.has_section("db") else parser["database"]
-    connection_url = database.get("connection_url") or database["dsn"]
-    control = parser["control"]
-    identity = parser["identity"]
-    provider_api = parser["provider_api"]
-    file_api = parser["file_api"]
-    service = parser["service"]
-    return RuntimeConfig(
-        database=DatabaseConfig(connection_url=connection_url),
-        control=ControlConfig(
-            base_url=control["base_url"].rstrip("/"),
-            bootstrap_url=control["bootstrap_url"].rstrip("/"),
-            hostname=control["hostname"],
-            ca_file=_path(control, "ca_file"),
-            certificate_file=_path(control, "certificate_file"),
-            private_key_file=_path(control, "private_key_file"),
-            credential_private_key_file=_path(control, "credential_private_key_file"),
-            timeout_seconds=control.getfloat("timeout_seconds", 300.0),
-            poll_interval_seconds=control.getfloat("poll_interval_seconds", 2.0),
-            heartbeat_interval_seconds=control.getfloat(
-                "heartbeat_interval_seconds", 10.0
+    @classmethod
+    def from_env(cls, values: Mapping[str, str] | None = None) -> "Settings":
+        source = os.environ if values is None else values
+        settings = cls(
+            database_dsn=source.get(
+                "WZB_DATABASE_DSN",
+                "postgresql:///workspace_zulip_bridge?host=/var/run/postgresql",
             ),
-            retry_base_seconds=control.getfloat("retry_base_seconds", 1.0),
-            retry_cap_seconds=control.getfloat("retry_cap_seconds", 30.0),
-            retry_after_cap_seconds=control.getfloat("retry_after_cap_seconds", 300.0),
-        ),
-        identity=IdentityConfig(
-            realm_uuid=identity["realm_uuid"],
-            bridge_instance_uuid=identity["bridge_instance_uuid"],
-            identity_generation=identity.getint("identity_generation"),
-            enrollment_secret_file=_path(identity, "enrollment_secret_file"),
-        ),
-        provider_api=ProviderApiConfig(
-            base_url=provider_api["base_url"].rstrip("/"),
-            ca_file=_path(provider_api, "ca_file"),
-            certificate_file=_path(provider_api, "certificate_file"),
-            private_key_file=_path(provider_api, "private_key_file"),
-            poll_interval_seconds=provider_api.getfloat("poll_interval_seconds", 2.0),
-            event_long_polling=provider_api.getboolean("event_long_polling", False),
-            lease_seconds=provider_api.getint("lease_seconds", 300),
-            batch_size=provider_api.getint("batch_size", 20),
-            timeout_seconds=provider_api.getfloat("timeout_seconds", 30.0),
-        ),
-        file_api=FileApiConfig(
-            base_url=file_api["base_url"].rstrip("/"),
-            ca_file=_path(file_api, "ca_file"),
-            certificate_file=_path(file_api, "certificate_file"),
-            private_key_file=_path(file_api, "private_key_file"),
-        ),
-        health_file=_path(service, "health_file"),
-        worker_id=service["worker_id"],
-    )
+            db_pool_min_size=_read_int(source, "WZB_DB_POOL_MIN_SIZE", 2),
+            db_pool_max_size=_read_int(source, "WZB_DB_POOL_MAX_SIZE", 16),
+            db_command_timeout_seconds=_read_float(
+                source, "WZB_DB_COMMAND_TIMEOUT_SECONDS", 30.0
+            ),
+            db_probe_seconds=_read_float(source, "WZB_DB_PROBE_SECONDS", 30.0),
+            user_refresh_seconds=_read_float(source, "WZB_USER_REFRESH_SECONDS", 5.0),
+            zulip_ca_file=(
+                Path(source["WZB_ZULIP_CA_FILE"])
+                if source.get("WZB_ZULIP_CA_FILE")
+                else None
+            ),
+            zulip_connect_timeout_seconds=_read_float(
+                source, "WZB_ZULIP_CONNECT_TIMEOUT_SECONDS", 10.0
+            ),
+            zulip_default_longpoll_timeout_seconds=_read_float(
+                source, "WZB_ZULIP_DEFAULT_LONGPOLL_TIMEOUT_SECONDS", 180.0
+            ),
+            zulip_db_ack_timeout_seconds=_read_float(
+                source, "WZB_ZULIP_DB_ACK_TIMEOUT_SECONDS", 120.0
+            ),
+            zulip_retry_base_seconds=_read_float(
+                source, "WZB_ZULIP_RETRY_BASE_SECONDS", 1.0
+            ),
+            zulip_retry_cap_seconds=_read_float(
+                source, "WZB_ZULIP_RETRY_CAP_SECONDS", 60.0
+            ),
+            zulip_idle_queue_timeout_seconds=_read_int(
+                source, "WZB_ZULIP_IDLE_QUEUE_TIMEOUT_SECONDS", 3600
+            ),
+            zulip_registration_concurrency=_read_int(
+                source, "WZB_ZULIP_REGISTRATION_CONCURRENCY", 8
+            ),
+            zulip_message_scan_concurrency=_read_int(
+                source, "WZB_ZULIP_MESSAGE_SCAN_CONCURRENCY", 32
+            ),
+            zulip_history_concurrency=_read_int(
+                source, "WZB_ZULIP_HISTORY_CONCURRENCY", 12
+            ),
+            zulip_directory_cache_ttl_seconds=_read_float(
+                source, "WZB_ZULIP_DIRECTORY_CACHE_TTL_SECONDS", 60.0
+            ),
+            zulip_chat_fill_timeout_seconds=_read_float(
+                source, "WZB_ZULIP_CHAT_FILL_TIMEOUT_SECONDS", 120.0
+            ),
+            zulip_message_page_size=_read_int(
+                source, "WZB_ZULIP_MESSAGE_PAGE_SIZE", 5000
+            ),
+            event_processor_batch_size=_read_int(
+                source, "WZB_EVENT_PROCESSOR_BATCH_SIZE", 1000
+            ),
+            event_processor_poll_seconds=_read_float(
+                source, "WZB_EVENT_PROCESSOR_POLL_SECONDS", 0.05
+            ),
+            event_processor_claim_timeout_seconds=_read_float(
+                source, "WZB_EVENT_PROCESSOR_CLAIM_TIMEOUT_SECONDS", 60.0
+            ),
+            event_retention_seconds=_read_float(
+                source, "WZB_EVENT_RETENTION_SECONDS", 86400.0
+            ),
+            event_cleanup_interval_seconds=_read_float(
+                source, "WZB_EVENT_CLEANUP_INTERVAL_SECONDS", 300.0
+            ),
+            event_cleanup_batch_size=_read_int(
+                source, "WZB_EVENT_CLEANUP_BATCH_SIZE", 10000
+            ),
+            thread_stop_timeout_seconds=_read_float(
+                source, "WZB_THREAD_STOP_TIMEOUT_SECONDS", 5.0
+            ),
+            log_level=source.get("WZB_LOG_LEVEL", "INFO").upper(),
+        )
+        settings.validate()
+        return settings
+
+    def validate(self) -> None:
+        if not self.database_dsn:
+            raise ValueError("WZB_DATABASE_DSN must not be empty")
+        if self.db_pool_min_size < 1:
+            raise ValueError("WZB_DB_POOL_MIN_SIZE must be positive")
+        if self.db_pool_max_size < self.db_pool_min_size:
+            raise ValueError(
+                "WZB_DB_POOL_MAX_SIZE must be at least WZB_DB_POOL_MIN_SIZE"
+            )
+        if self.db_command_timeout_seconds <= 0:
+            raise ValueError("WZB_DB_COMMAND_TIMEOUT_SECONDS must be positive")
+        if self.db_probe_seconds <= 0:
+            raise ValueError("WZB_DB_PROBE_SECONDS must be positive")
+        positive_float_values = {
+            "WZB_USER_REFRESH_SECONDS": self.user_refresh_seconds,
+            "WZB_ZULIP_CONNECT_TIMEOUT_SECONDS": (self.zulip_connect_timeout_seconds),
+            "WZB_ZULIP_DEFAULT_LONGPOLL_TIMEOUT_SECONDS": (
+                self.zulip_default_longpoll_timeout_seconds
+            ),
+            "WZB_ZULIP_DB_ACK_TIMEOUT_SECONDS": self.zulip_db_ack_timeout_seconds,
+            "WZB_ZULIP_RETRY_BASE_SECONDS": self.zulip_retry_base_seconds,
+            "WZB_ZULIP_RETRY_CAP_SECONDS": self.zulip_retry_cap_seconds,
+            "WZB_ZULIP_DIRECTORY_CACHE_TTL_SECONDS": (
+                self.zulip_directory_cache_ttl_seconds
+            ),
+            "WZB_ZULIP_CHAT_FILL_TIMEOUT_SECONDS": (
+                self.zulip_chat_fill_timeout_seconds
+            ),
+            "WZB_EVENT_PROCESSOR_POLL_SECONDS": self.event_processor_poll_seconds,
+            "WZB_EVENT_PROCESSOR_CLAIM_TIMEOUT_SECONDS": (
+                self.event_processor_claim_timeout_seconds
+            ),
+            "WZB_EVENT_RETENTION_SECONDS": self.event_retention_seconds,
+            "WZB_EVENT_CLEANUP_INTERVAL_SECONDS": (self.event_cleanup_interval_seconds),
+            "WZB_THREAD_STOP_TIMEOUT_SECONDS": self.thread_stop_timeout_seconds,
+        }
+        for name, value in positive_float_values.items():
+            if value <= 0:
+                raise ValueError(f"{name} must be positive")
+        if self.zulip_retry_cap_seconds < self.zulip_retry_base_seconds:
+            raise ValueError(
+                "WZB_ZULIP_RETRY_CAP_SECONDS must be at least "
+                "WZB_ZULIP_RETRY_BASE_SECONDS"
+            )
+        if self.zulip_db_ack_timeout_seconds <= self.db_command_timeout_seconds:
+            raise ValueError(
+                "WZB_ZULIP_DB_ACK_TIMEOUT_SECONDS must be greater than "
+                "WZB_DB_COMMAND_TIMEOUT_SECONDS"
+            )
+        if self.zulip_idle_queue_timeout_seconds < 1:
+            raise ValueError("WZB_ZULIP_IDLE_QUEUE_TIMEOUT_SECONDS must be positive")
+        if self.zulip_registration_concurrency < 1:
+            raise ValueError("WZB_ZULIP_REGISTRATION_CONCURRENCY must be positive")
+        if self.zulip_message_scan_concurrency < 1:
+            raise ValueError("WZB_ZULIP_MESSAGE_SCAN_CONCURRENCY must be positive")
+        if self.zulip_history_concurrency < 1:
+            raise ValueError("WZB_ZULIP_HISTORY_CONCURRENCY must be positive")
+        if self.zulip_history_concurrency >= self.db_pool_max_size:
+            raise ValueError(
+                "WZB_ZULIP_HISTORY_CONCURRENCY must be smaller than "
+                "WZB_DB_POOL_MAX_SIZE"
+            )
+        if not 1 <= self.zulip_message_page_size <= 5000:
+            raise ValueError("WZB_ZULIP_MESSAGE_PAGE_SIZE must be between 1 and 5000")
+        if not 1 <= self.event_processor_batch_size <= 10000:
+            raise ValueError(
+                "WZB_EVENT_PROCESSOR_BATCH_SIZE must be between 1 and 10000"
+            )
+        if not 1 <= self.event_cleanup_batch_size <= 100000:
+            raise ValueError(
+                "WZB_EVENT_CLEANUP_BATCH_SIZE must be between 1 and 100000"
+            )
+        if self.zulip_ca_file is not None and not self.zulip_ca_file.is_file():
+            raise ValueError("WZB_ZULIP_CA_FILE must name a readable file")

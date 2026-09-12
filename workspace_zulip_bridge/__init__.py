@@ -1,3 +1,4 @@
-"""Workspace Zulip bridge service."""
+# Copyright 2026 Genesis Corporation
+# Licensed under the Apache License, Version 2.0 (the "License").
 
-__version__ = "0.0.1"
+"""Workspace and Zulip bridge runtime."""

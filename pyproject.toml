@@ -1,48 +1,88 @@
 [project]
 name = "workspace-zulip-bridge"
-version = "0.0.1"
-description = "Workspace bridge for personal Zulip accounts"
+description = "Low-latency Workspace and Zulip integration bridge"
 readme = "README.md"
-requires-python = ">=3.11"
-license = {text = "Apache-2.0"}
-authors = [{name = "CASSI", email = "cassi@exordos.com"}]
+authors = [{name = "Genesis Corporation", email = "cassi@exordos.com"}]
+dynamic = ["version"]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+classifiers = [
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
 dependencies = [
-    "certifi>=2025.0.0",
-    "cryptography>=45.0.0,<46.0.0",
-    "httpx>=0.27.0,<1.0.0",
-    "markdown-it-py>=4.2.0,<5.0.0",
-    "pyhpke>=0.6.4,<0.7.0",
-    "requests>=2.32.2,<3.0.0",
-    "restalchemy>=15.2.2,<16.0.0",
-    "zulip>=0.9.1,<0.10.0",
+    "asyncpg>=0.31.0,<1.0.0",  # Apache-2.0
+    "httpx>=0.28.1,<1.0.0",  # BSD-3-Clause
+    "uvloop>=0.22.1,<1.0.0; python_version < '3.14'",  # MIT OR Apache-2.0
 ]
 
-[project.optional-dependencies]
-test = [
-    "pytest>=8.0.0,<9.0.0",
-    "pytest-cov>=5.0.0,<7.0.0",
-    "ruff>=0.9.0,<1.0.0",
-]
+[project.urls]
+homepage = "https://github.com/exordos/workspace_zulip_bridge/"
 
 [project.scripts]
 workspace-zulip-bridge = "workspace_zulip_bridge.cli:main"
-workspace-zulip-bridge-healthcheck = "workspace_zulip_bridge.health:main"
-workspace-zulip-bridge-enroll = "workspace_zulip_bridge.enrollment:main"
+workspace-zulip-bridge-monitor = "workspace_zulip_bridge.monitor:main"
+
+[project.optional-dependencies]
+dev = [
+    "tox>=4.58.0,<5.0.0",
+    "tox-uv>=1.29.0,<2.0.0",
+]
+test = [
+    "Jinja2>=3.1.0,<4.0.0",
+    "PyYAML>=6.0.0,<7.0.0",
+    "pytest>=8.0.0,<10.0.0",
+]
+mypy = [
+    "asyncpg-stubs>=0.31.3,<1.0.0",
+    "mypy>=1.18.0,<2.0.0",
+]
+ruff = [
+    "ruff>=0.13.0,<1.0.0",
+]
 
 [build-system]
-requires = ["setuptools>=75"]
+requires = [
+    "setuptools>=83.0.0",
+    "setuptools-scm>=10.0.0",
+]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+fallback_version = "0.1.0.dev0"
+
+[tool.setuptools]
+include-package-data = false
 
 [tool.setuptools.packages.find]
 where = ["."]
+include = ["workspace_zulip_bridge"]
+namespaces = false
 
-[tool.pytest.ini_options]
-testpaths = ["workspace_zulip_bridge/tests"]
-addopts = "-q"
+[tool.setuptools.package-data]
+workspace_zulip_bridge = ["schema.sql"]
 
 [tool.ruff]
 line-length = 88
-target-version = "py311"
+target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F", "I"]
+select = ["ASYNC", "B", "E4", "E7", "E9", "F", "I", "UP"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["workspace_zulip_bridge"]
+force-single-line = true
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+exclude = ["workspace_zulip_bridge/tests"]
+
+[[tool.mypy.overrides]]
+module = "uvloop"
+ignore_missing_imports = true
