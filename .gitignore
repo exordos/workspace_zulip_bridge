@@ -1,12 +1,12 @@
-.coverage*
+.coverage
+.mypy_cache/
 .pytest_cache/
 .ruff_cache/
 .tox/
+.venv/
 __pycache__/
 build/
-cover/
 dist/
+output/
 *.egg-info/
-*.pyc
-*.key
-**/fixtures/*private*.pem
+*.py[cod]

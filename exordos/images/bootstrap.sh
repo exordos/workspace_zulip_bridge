@@ -1,64 +1,42 @@
 #!/usr/bin/env bash
 
-set -eu
-set -o pipefail
+# Copyright 2026 Genesis Corporation
+# Licensed under the Apache License, Version 2.0 (the "License").
 
+set -euo pipefail
+
+# shellcheck disable=SC1091
 source /usr/local/lib/exordos/lib_bootstrap.sh
-source /usr/local/lib/workspace-zulip-bridge/bootstrap-persistence.sh
 
-CONFIG=/etc/workspace-zulip-bridge/bridge.conf
-RUN_DIR=/run/workspace-zulip-bridge
-SOURCE=/opt/workspace-zulip-bridge
-VENV=/opt/workspace-zulip-bridge-venv
-DATABASE_ROLE=workspace-zulip
-DATABASE_NAME=workspace_zulip_bridge
+PG_VERSION="18"
+SERVICE_NAME="workspace-zulip-bridge"
+DATABASE_NAME="workspace_zulip_bridge"
+DATABASE_ROLE="workspace_zulip_bridge"
 
-install -d -m 0755 -o workspace-zulip -g workspace-zulip "$RUN_DIR"
-exec 9>"$RUN_DIR/bootstrap.lock"
-flock -x 9
-
-if [ ! -s "$CONFIG" ]; then
-    echo "Workspace Zulip bridge configuration is not available; deferring."
-    exit 0
+PERSISTENT_DISK=$(find_persistent_disk)
+if [[ -z "$PERSISTENT_DISK" ]]; then
+    echo "workspace-zulip-bridge requires a persistent data disk" >&2
+    exit 1
 fi
 
-bridge_prepare_persistent_mount "$PERSISTENT_MOUNT"
-bridge_make_persistent_mount_private "$PERSISTENT_MOUNT"
+prepare_persistent_disk "$PERSISTENT_DISK" "$PERSISTENT_MOUNT"
+migrate_to_persistent_stop_start \
+    "/var/lib/postgresql" \
+    "${PERSISTENT_MOUNT}/var/lib/postgresql" \
+    "postgresql@${PG_VERSION}-main"
+persist_migrate_complete
 
-# Exordos runs this entrypoint both as the enabled bootstrap service and as the
-# worker's before hook.  A later, serialized invocation must not stop the
-# database underneath a worker that has already started.
-if bridge_persistence_migration_is_required \
-    /var/lib/postgresql \
-    "$PERSISTENT_MOUNT/var/lib/postgresql" \
-    /var/lib/workspace-zulip-bridge \
-    "$PERSISTENT_MOUNT/var/lib/workspace-zulip-bridge"; then
-    systemctl stop postgresql.service || true
-    bridge_migrate_to_persistent \
-        /var/lib/postgresql \
-        "$PERSISTENT_MOUNT/var/lib/postgresql"
-    bridge_migrate_to_persistent \
-        /var/lib/workspace-zulip-bridge \
-        "$PERSISTENT_MOUNT/var/lib/workspace-zulip-bridge"
-    persist_migrate_complete
-fi
-chown -R postgres:postgres /var/lib/postgresql
-chown -R workspace-zulip:workspace-zulip /var/lib/workspace-zulip-bridge
-systemctl start postgresql.service
-bridge_wait_for_postgresql
+sudo systemctl enable --now postgresql
 
-runuser -u workspace-zulip -- "$VENV/bin/workspace-zulip-bridge-enroll" \
-    --config "$CONFIG"
-if ! runuser -u postgres -- psql -tAc \
-    "SELECT 1 FROM pg_roles WHERE rolname='$DATABASE_ROLE'" | grep -qx 1; then
-    runuser -u postgres -- createuser "$DATABASE_ROLE"
+if ! sudo -u postgres psql -tAc \
+    "SELECT 1 FROM pg_roles WHERE rolname = '${DATABASE_ROLE}'" | grep -qx 1; then
+    sudo -u postgres createuser --no-createdb --no-createrole --no-superuser \
+        "$DATABASE_ROLE"
 fi
-if ! runuser -u postgres -- psql -tAc \
-    "SELECT 1 FROM pg_database WHERE datname='$DATABASE_NAME'" | grep -qx 1; then
-    runuser -u postgres -- createdb -O "$DATABASE_ROLE" "$DATABASE_NAME"
-fi
-runuser -u workspace-zulip -- "$VENV/bin/ra-apply-migration" \
-    --config-file "$CONFIG" \
-    --path "$SOURCE/migrations"
 
-echo "Workspace Zulip bridge bootstrap completed."
+if ! sudo -u postgres psql -tAc \
+    "SELECT 1 FROM pg_database WHERE datname = '${DATABASE_NAME}'" | grep -qx 1; then
+    sudo -u postgres createdb --owner "$DATABASE_ROLE" "$DATABASE_NAME"
+fi
+
+sudo systemctl enable --now "$SERVICE_NAME"

@@ -1,0 +1,25 @@
+[Unit]
+Description=Workspace Zulip Bridge
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=workspace_zulip_bridge
+Group=workspace_zulip_bridge
+EnvironmentFile=/etc/workspace_zulip_bridge/bridge.env
+ExecStart=/opt/workspace_zulip_bridge/.venv/bin/workspace-zulip-bridge
+Restart=on-failure
+RestartSec=1s
+TimeoutStopSec=15s
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+UMask=0077
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

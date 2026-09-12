@@ -1,19 +1,18 @@
 build:
   deps:
-    - dst: /opt/workspace-zulip-bridge
+    - dst: /opt/workspace_zulip_bridge
       path:
         src: ../../workspace_zulip_bridge
       exclude:
         - .git
-        - .tox
+        - .mypy_cache
         - .pytest_cache
         - .ruff_cache
-        - __pycache__
-        - "*/__pycache__"
-        - "*.pyc"
+        - .tox
+        - .venv
         - build
         - dist
-        - workspace_zulip_bridge.egg-info
+        - output
 
   elements:
     - manifest: manifests/workspace_zulip_bridge.yaml.j2
@@ -21,6 +20,7 @@ build:
         - name: workspace-zulip-bridge
           format: zst
           profile: exordos_base
+          profile_version: "1.2.1"
           script: images/install.sh
           override:
-            disk_size: "10G"
+            disk_size: "6G"
