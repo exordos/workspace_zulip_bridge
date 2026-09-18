@@ -28,7 +28,8 @@ def test_channel_parameters_and_membership_parameters_are_separated() -> None:
     chat = catalog.chats[0]
     assert chat.chat_key == "channel:7"
     assert chat.chat_type == "channel"
-    assert chat.role == "subscriber"
+    assert chat.role == "member"
+    assert chat.membership_kind == "subscriber"
     assert json.loads(chat.chat_parameters_json) == {
         "description": "Product engineering",
         "invite_only": True,
@@ -92,7 +93,8 @@ def test_direct_conversations_are_deduplicated_by_sorted_participants() -> None:
     direct = chats["direct:10,12"]
     assert direct.chat_type == "direct"
     assert direct.name == "Current User, Second User"
-    assert direct.role == "participant"
+    assert direct.role == "member"
+    assert direct.membership_kind == "participant"
     assert json.loads(direct.chat_parameters_json) == {
         "participant_user_ids": [10, 12],
         "recipient_id": 55,

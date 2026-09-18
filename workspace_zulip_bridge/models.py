@@ -17,7 +17,8 @@ UserStatus = Literal[
     "active",
 ]
 ChatType = Literal["channel", "direct", "group_direct"]
-ChatRole = Literal["subscriber", "participant"]
+MembershipKind = Literal["subscriber", "participant"]
+BindingRole = Literal["owner", "administrator", "moderator", "member", "guest"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +36,7 @@ class ZulipUser:
     role: int | None = None
     disabled: bool = False
     has_pending_history: bool = False
+    realm_uuid: UUID = UUID(int=0)
 
     def connection_signature(self) -> tuple[str, str, str]:
         return self.endpoint, self.login, self.api_key
@@ -76,6 +78,18 @@ class ZulipDirectoryUser:
     role: int
     disabled: bool
     is_bot: bool
+    avatar_url: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ZulipAttachment:
+    attachment_id: int
+    source_path: str
+    name: str
+    size_bytes: int
+    created_at: int
+    message_ids: tuple[int, ...]
+    metadata_hash: bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,7 +109,9 @@ class ZulipChat:
     chat_type: ChatType
     chat_key: str
     name: str
-    role: ChatRole
+    role: BindingRole
+    membership_kind: MembershipKind
+    notification_mode: str
     chat_parameters_json: str
     membership_parameters_json: str
     content_hash: bytes
@@ -135,6 +151,16 @@ class ZulipMessage:
     reactions_json: str
     message_hash: bytes
     sent_at: int
+    reaction_users_json: str = "{}"
+    content_hash: bytes = b"\0" * 32
+    files: tuple["ZulipFileMetadata", ...] = ()
+    write_flags: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class ZulipFileMetadata:
+    source_path: str
+    name: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,6 +178,9 @@ class MessagePageWrite:
     unchanged: int
     unassigned: int
     topics_inserted: int
+    flags_changed: int = 0
+    reactions_changed: int = 0
+    files_changed: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +203,9 @@ class LiveMessageWrite:
     messages_unchanged: int
     messages_deleted: int
     topics_inserted: int
+    flags_changed: int = 0
+    reactions_changed: int = 0
+    files_changed: int = 0
 
 
 @dataclass(frozen=True, slots=True)

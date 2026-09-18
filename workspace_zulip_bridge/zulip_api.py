@@ -1,6 +1,7 @@
 # Copyright 2026 Genesis Corporation
 # Licensed under the Apache License, Version 2.0 (the "License").
 
+import hashlib
 import json
 from collections.abc import Mapping
 from pathlib import Path
@@ -12,6 +13,7 @@ from workspace_zulip_bridge.models import DirectMessagePage
 from workspace_zulip_bridge.models import MessagePage
 from workspace_zulip_bridge.models import RecentPrivateConversation
 from workspace_zulip_bridge.models import RegisteredQueue
+from workspace_zulip_bridge.models import ZulipAttachment
 from workspace_zulip_bridge.models import ZulipDirectoryUser
 from workspace_zulip_bridge.models import ZulipIdentity
 
@@ -21,6 +23,51 @@ class ZulipApiError(Exception):
         super().__init__(code)
         self.code = code
         self.retryable = retryable
+
+
+def parse_attachment(raw: Mapping[str, Any]) -> ZulipAttachment:
+    attachment_id = raw.get("id")
+    path_id = raw.get("path_id")
+    name = raw.get("name")
+    size_bytes = raw.get("size")
+    created_at = raw.get("create_time")
+    message_ids = raw.get("message_ids")
+    if (
+        not isinstance(attachment_id, int)
+        or not isinstance(path_id, str)
+        or not path_id
+        or not isinstance(name, str)
+        or not isinstance(size_bytes, int)
+        or size_bytes < 0
+        or not isinstance(created_at, int)
+        or not isinstance(message_ids, list)
+        or not all(isinstance(message_id, int) for message_id in message_ids)
+    ):
+        raise ZulipApiError("invalid_attachments_response", retryable=True)
+    source_path = "/user_uploads/" + path_id.lstrip("/")
+    metadata_hash = hashlib.sha256(
+        json.dumps(
+            {
+                "id": attachment_id,
+                "source_path": source_path,
+                "name": name,
+                "size": size_bytes,
+                "created_at": created_at,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).digest()
+    return ZulipAttachment(
+        attachment_id=attachment_id,
+        source_path=source_path,
+        name=name,
+        size_bytes=size_bytes,
+        created_at=created_at,
+        message_ids=tuple(sorted(set(message_ids))),
+        metadata_hash=metadata_hash,
+    )
 
 
 class ZulipApiClient:
@@ -185,6 +232,8 @@ class ZulipApiClient:
             is_active = member.get("is_active")
             is_bot = member.get("is_bot")
             role = member.get("role")
+            raw_avatar_url = member.get("avatar_url")
+            avatar_url = raw_avatar_url if isinstance(raw_avatar_url, str) else None
             if (
                 not isinstance(user_id, int)
                 or not isinstance(login, str)
@@ -202,9 +251,26 @@ class ZulipApiClient:
                     role=role,
                     disabled=not is_active,
                     is_bot=is_bot,
+                    avatar_url=avatar_url,
                 )
             )
         return users
+
+    def get_attachments(self) -> list[ZulipAttachment]:
+        payload = self._request(
+            "GET",
+            "/api/v1/attachments",
+            timeout=self._chat_timeout(),
+        )
+        raw_attachments = payload.get("attachments")
+        if not isinstance(raw_attachments, list):
+            raise ZulipApiError("invalid_attachments_response", retryable=True)
+        attachments: list[ZulipAttachment] = []
+        for raw in raw_attachments:
+            if not isinstance(raw, Mapping):
+                raise ZulipApiError("invalid_attachments_response", retryable=True)
+            attachments.append(parse_attachment(raw))
+        return attachments
 
     def get_direct_messages_page(
         self,

@@ -75,19 +75,23 @@ createdb workspace_zulip_bridge
 ```
 
 The daemon applies the idempotent initial schema when it opens the database.
-The schema contains `workspace_zulip_bridge.zulip_users`, with the Zulip
-endpoint, API credentials, queue cursor, lifecycle status, and catalog hash;
-canonical `workspace_zulip_bridge.zulip_chats`; candidate memberships in
-`zulip_chat_users`; canonical `zulip_topics` and `zulip_messages`; and durable
-inbox `workspace_zulip_bridge.zulip_events`. Event payloads remain immutable;
-claim, attempt, outcome, and timing columns track processing. Empty `workspace_chats`,
-`workspace_topics`, and `workspace_messages` tables mirror the three canonical
-Zulip entity tables for the future Workspace-side projection. No runtime path
-writes to those destination mirrors yet. The
-`(endpoint, login)` pair is unique. Disabled human identities remain in
-`zulip_users` for foreign-key resolution but do not own a synchronization
-thread. Bots are neither inserted into the user directory nor materialized as
-messages or reactions.
+`zulip_realms` owns endpoint identity, `zulip_users` contains stable provider
+identities, and `zulip_connections` contains API credentials, queue cursor,
+lifecycle status, and catalog hash. The Workspace-like projection consists of
+canonical `zulip_streams`, `zulip_stream_bindings`, `zulip_topics`,
+`zulip_topic_aliases`, `zulip_messages`, per-user `zulip_message_flags`, and
+normalized `zulip_message_reactions`. `zulip_files` and `zulip_message_files`
+store only upload metadata, ownership, and message relationships: the bridge
+loads each file owner's metadata from `GET /attachments` but never requests or
+persists file bytes. A later Workspace delivery adapter will download a file
+immediately before sending it.
+
+The durable `zulip_events` inbox keeps immutable raw payloads plus claim,
+attempt, outcome, and timing state. `workspace_outbox` is an internal,
+coalescing entity-change journal; it deliberately contains no invented
+Workspace API payload. Disabled human identities remain available for foreign
+key resolution but their connections do not own a synchronization thread.
+Bots are neither inserted nor materialized as message or reaction authors.
 
 A user moves through `init`, `streaming`, `filling`, `scheduling`,
 `backfilling`, and `active`. Queue registration establishes `streaming`.
@@ -114,10 +118,12 @@ a still-valid queue and rebuilds only its in-memory directory and chat-key maps.
 Polling threads only persist non-heartbeat, non-bot events. The event processor
 claims a bounded ordered batch with `FOR UPDATE SKIP LOCKED` and recovers claims
 left stale by a crash. It resolves chat ownership for the whole batch before
-applying data. Message, edit/move, flag, reaction, delete, and channel-update
-events are applied only when the event's queue owner is the selected supplier
-for the destination chat; duplicate observations from other users are marked
-`skipped` with `not_chat_supplier`. Unsupported events are also completed as
+applying data. Message, edit/move, reaction, delete, and channel-update events
+are applied only when the event's queue owner is the selected supplier for the
+destination stream; duplicate common-data observations from other users are
+marked `skipped` with `not_chat_supplier`. Personal flag events update that
+queue owner's `zulip_message_flags` row whenever the user belongs to the stream,
+even when another connection supplies the common message. Unsupported events are also completed as
 skipped so they cannot block the inbox. Consecutive messages, flags, and
 reactions from one supplier are normalized in event order and written as one
 hash-guarded page, which removes per-event PostgreSQL round trips without
@@ -210,6 +216,14 @@ Exact mode scans both message and event tables and counts reactions, so it
 should not be used at a short interval on a large database. `--window`,
 `--interval`, and `--json` customize the sampling window, cadence, and output
 format.
+
+The repeatable synthetic import benchmark requires an explicitly named
+disposable test database and recreates only the bridge schema:
+
+```bash
+WZB_BENCHMARK_DATABASE_DSN=postgresql:///workspace_zulip_bridge_benchmark \
+  .tox/py/bin/python scripts/benchmark_import.py --messages 100000
+```
 
 ## Exordos Core build
 

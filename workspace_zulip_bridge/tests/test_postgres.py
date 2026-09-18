@@ -19,12 +19,15 @@ from workspace_zulip_bridge.database import prepare_database
 from workspace_zulip_bridge.event_processor import ZulipEventProcessor
 from workspace_zulip_bridge.event_store import EventStore
 from workspace_zulip_bridge.models import UserDirectoryWrite
+from workspace_zulip_bridge.models import ZulipAttachment
 from workspace_zulip_bridge.models import ZulipDirectoryUser
 from workspace_zulip_bridge.models import ZulipEvent
+from workspace_zulip_bridge.models import ZulipFileMetadata
 from workspace_zulip_bridge.models import ZulipMessage
 from workspace_zulip_bridge.monitor import collect_snapshot
 from workspace_zulip_bridge.stable_ids import stable_chat_uuid
 from workspace_zulip_bridge.stable_ids import stable_message_uuid
+from workspace_zulip_bridge.stable_ids import stable_realm_uuid
 from workspace_zulip_bridge.stable_ids import stable_topic_uuid
 from workspace_zulip_bridge.stable_ids import stable_user_uuid
 
@@ -50,58 +53,35 @@ async def _pool(dsn: str) -> asyncpg.Pool:
     pool = await open_pool(settings)
     await prepare_database(pool)
     async with pool.acquire() as connection:
-        await connection.execute("TRUNCATE workspace_zulip_bridge.zulip_users CASCADE")
+        await connection.execute("TRUNCATE workspace_zulip_bridge.zulip_realms CASCADE")
     return pool
 
 
-def test_workspace_entity_mirrors_match_source_columns_and_start_empty() -> None:
-    asyncio.run(_workspace_mirror_round_trip(_dsn()))
+def test_normalized_entity_tables_start_empty() -> None:
+    asyncio.run(_normalized_tables_round_trip(_dsn()))
 
 
-async def _workspace_mirror_round_trip(dsn: str) -> None:
+async def _normalized_tables_round_trip(dsn: str) -> None:
     pool = await _pool(dsn)
     try:
-        table_pairs = (
-            ("zulip_chats", "workspace_chats"),
-            ("zulip_topics", "workspace_topics"),
-            ("zulip_messages", "workspace_messages"),
+        tables = (
+            "zulip_realms",
+            "zulip_users",
+            "zulip_connections",
+            "zulip_streams",
+            "zulip_stream_bindings",
+            "zulip_topics",
+            "zulip_message_flags",
+            "zulip_message_reactions",
+            "zulip_files",
+            "zulip_message_files",
+            "workspace_outbox",
         )
         async with pool.acquire() as connection:
-            for source_table, mirror_table in table_pairs:
-                columns = await connection.fetch(
-                    """
-                    SELECT table_name,
-                           column_name,
-                           data_type,
-                           is_nullable,
-                           column_default
-                    FROM information_schema.columns
-                    WHERE table_schema = 'workspace_zulip_bridge'
-                      AND table_name = ANY($1::text[])
-                    ORDER BY ordinal_position
-                    """,
-                    [source_table, mirror_table],
-                )
-                by_table = {
-                    table: [
-                        tuple(
-                            row[key]
-                            for key in (
-                                "column_name",
-                                "data_type",
-                                "is_nullable",
-                                "column_default",
-                            )
-                        )
-                        for row in columns
-                        if row["table_name"] == table
-                    ]
-                    for table in (source_table, mirror_table)
-                }
-                assert by_table[mirror_table] == by_table[source_table]
+            for table in tables:
                 assert (
                     await connection.fetchval(
-                        "SELECT count(*) FROM workspace_zulip_bridge." + mirror_table
+                        "SELECT count(*) FROM workspace_zulip_bridge." + table
                     )
                     == 0
                 )
@@ -121,30 +101,42 @@ async def _insert_user(
     user_uuid = stable_user_uuid(ENDPOINT, user_id)
     await connection.execute(
         """
-        INSERT INTO workspace_zulip_bridge.zulip_users (
-            uuid,
-            endpoint,
-            login,
-            api_key,
-            zulip_user_id,
-            full_name,
-            role,
-            queue_id,
-            last_event_id,
-            status
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $9)
+        INSERT INTO workspace_zulip_bridge.zulip_realms
+            (uuid, identity_key, endpoint)
+        VALUES ($1, $2, $2)
+        ON CONFLICT (uuid) DO NOTHING
+        """,
+        stable_realm_uuid(ENDPOINT),
+        ENDPOINT,
+    )
+    await connection.execute(
+        """
+        INSERT INTO workspace_zulip_bridge.zulip_users
+            (uuid, realm_uuid, zulip_user_id, login, full_name, role)
+        VALUES ($1, $2, $3, $4, $5, $6)
         """,
         user_uuid,
-        ENDPOINT,
-        f"user-{user_id}@example.test",
-        api_key,
+        stable_realm_uuid(ENDPOINT),
         user_id,
+        f"user-{user_id}@example.test",
         f"User {user_id}",
         role,
-        queue_id,
-        status,
     )
+    if api_key is not None:
+        await connection.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.zulip_connections
+                (uuid, realm_uuid, zulip_user_uuid, login, api_key,
+                 queue_id, last_event_id, lifecycle_status)
+            VALUES ($1, $2, $1, $3, $4, $5, 0, $6)
+            """,
+            user_uuid,
+            stable_realm_uuid(ENDPOINT),
+            f"user-{user_id}@example.test",
+            api_key,
+            queue_id,
+            status,
+        )
     return user_uuid
 
 
@@ -153,7 +145,8 @@ def _catalog(
     channels: list[tuple[int, str]],
     counts: dict[str, int],
 ):
-    builder = ChatCatalogBuilder(own_user_id, f"User {own_user_id}")
+    role = {10: 100, 20: 200, 30: 200}.get(own_user_id, 400)
+    builder = ChatCatalogBuilder(own_user_id, f"User {own_user_id}", role)
     builder.add_subscriptions(
         [{"stream_id": stream_id, "name": name} for stream_id, name in channels]
     )
@@ -195,13 +188,16 @@ async def _directory_round_trip(dsn: str) -> None:
         async with pool.acquire() as connection:
             rows = await connection.fetch(
                 """
-                SELECT uuid, login, full_name, role, disabled, api_key
-                FROM workspace_zulip_bridge.zulip_users
+                SELECT zulip_user.uuid, zulip_user.login, zulip_user.full_name,
+                       zulip_user.role, zulip_user.disabled, connection.api_key
+                FROM workspace_zulip_bridge.zulip_users AS zulip_user
+                LEFT JOIN workspace_zulip_bridge.zulip_connections AS connection
+                  ON connection.zulip_user_uuid = zulip_user.uuid
                 """
             )
         assert len(rows) == 1
         assert rows[0]["uuid"] == user_uuid
-        assert rows[0]["login"] == "user-10@example.test"
+        assert rows[0]["login"] == "masked-login@example.test"
         assert rows[0]["full_name"] == "Renamed User"
         assert rows[0]["role"] == 200
         assert rows[0]["disabled"]
@@ -258,21 +254,21 @@ async def _scheduler_round_trip(dsn: str) -> None:
         assert reconciled.assigned == 3
         async with pool.acquire() as connection:
             assignments = {
-                row["chat_key"]: row["supplier_user_uuid"]
+                row["chat_key"]: row["source_connection_uuid"]
                 for row in await connection.fetch(
                     """
-                    SELECT chat_key, supplier_user_uuid
-                    FROM workspace_zulip_bridge.zulip_chats
+                    SELECT chat_key, source_connection_uuid
+                    FROM workspace_zulip_bridge.zulip_streams
                     ORDER BY chat_key
                     """
                 )
             }
             statuses = {
-                row["uuid"]: row["status"]
+                row["uuid"]: row["lifecycle_status"]
                 for row in await connection.fetch(
                     """
-                    SELECT uuid, status
-                    FROM workspace_zulip_bridge.zulip_users
+                    SELECT uuid, lifecycle_status
+                    FROM workspace_zulip_bridge.zulip_connections
                     """
                 )
             }
@@ -290,8 +286,8 @@ async def _scheduler_round_trip(dsn: str) -> None:
         async with pool.acquire() as connection:
             await connection.execute(
                 """
-                UPDATE workspace_zulip_bridge.zulip_users
-                SET status = 'backfilling'
+                UPDATE workspace_zulip_bridge.zulip_connections
+                SET lifecycle_status = 'backfilling'
                 WHERE uuid = $1
                 """,
                 admin_a_uuid,
@@ -301,8 +297,8 @@ async def _scheduler_round_trip(dsn: str) -> None:
             assert (
                 await connection.fetchval(
                     """
-                    SELECT status
-                    FROM workspace_zulip_bridge.zulip_users
+                    SELECT lifecycle_status
+                    FROM workspace_zulip_bridge.zulip_connections
                     WHERE uuid = $1
                     """,
                     admin_a_uuid,
@@ -326,8 +322,8 @@ async def _scheduler_round_trip(dsn: str) -> None:
             assert (
                 await connection.fetchval(
                     """
-                    SELECT supplier_user_uuid
-                    FROM workspace_zulip_bridge.zulip_chats
+                    SELECT source_connection_uuid
+                    FROM workspace_zulip_bridge.zulip_streams
                     WHERE chat_key = 'channel:7'
                     """
                 )
@@ -339,6 +335,142 @@ async def _scheduler_round_trip(dsn: str) -> None:
 
 def test_history_ids_survive_queue_loss_and_supplier_deletion() -> None:
     asyncio.run(_history_round_trip(_dsn()))
+
+
+def test_history_persists_only_file_metadata_and_owner() -> None:
+    asyncio.run(_file_metadata_round_trip(_dsn()))
+
+
+async def _file_metadata_round_trip(dsn: str) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            owner_uuid = await _insert_user(
+                connection, 10, 100, queue_id="queue-owner", status="filling"
+            )
+        catalog = _catalog(10, [(7, "Shared")], {"channel:7": 1})
+        assert (
+            await store.store_chat_catalog(owner_uuid, "queue-owner", catalog)
+        ).activated
+        assert (await store.reconcile_chat_schedules()).assigned == 1
+        assert (
+            await store.store_user_attachments(
+                owner_uuid,
+                "queue-owner",
+                (
+                    ZulipAttachment(
+                        attachment_id=41,
+                        source_path="/user_uploads/a/report.csv",
+                        name="report.csv",
+                        size_bytes=123,
+                        created_at=1_699_999_999,
+                        message_ids=(777,),
+                        metadata_hash=b"m" * 32,
+                    ),
+                ),
+                replace_all=True,
+            )
+            == 1
+        )
+        message = ZulipMessage(
+            message_id=777,
+            chat_key="channel:7",
+            topic_name="Files",
+            sender_user_uuid=owner_uuid,
+            content="[report.csv](/user_uploads/a/report.csv)",
+            is_read=True,
+            is_starred=False,
+            is_collapsed=False,
+            is_mentioned=False,
+            is_stream_wildcard_mentioned=False,
+            is_topic_wildcard_mentioned=False,
+            has_alert_word=False,
+            is_historical=False,
+            reactions_json="[]",
+            message_hash=b"f" * 32,
+            sent_at=1_700_000_000,
+            files=(
+                ZulipFileMetadata(
+                    source_path="/user_uploads/a/report.csv",
+                    name="report.csv",
+                ),
+            ),
+        )
+        await _load_one_chat(store, pool, owner_uuid, "queue-owner", message)
+        async with pool.acquire() as connection:
+            file_row = await connection.fetchrow(
+                """
+                SELECT owner_user_uuid, zulip_attachment_id, source_path, name,
+                       size_bytes, metadata_hash
+                FROM workspace_zulip_bridge.zulip_files
+                """
+            )
+            links = await connection.fetchval(
+                "SELECT count(*) FROM workspace_zulip_bridge.zulip_message_files"
+            )
+            columns = {
+                row["column_name"]
+                for row in await connection.fetch(
+                    """
+                    SELECT column_name FROM information_schema.columns
+                    WHERE table_schema = 'workspace_zulip_bridge'
+                      AND table_name = 'zulip_files'
+                    """
+                )
+            }
+        assert file_row is not None
+        assert dict(file_row) == {
+            "owner_user_uuid": owner_uuid,
+            "zulip_attachment_id": 41,
+            "source_path": "/user_uploads/a/report.csv",
+            "name": "report.csv",
+            "size_bytes": 123,
+            "metadata_hash": b"m" * 32,
+        }
+        assert links == 1
+        assert not ({"content", "data", "body", "blob", "bytes"} & columns)
+
+        updated_attachment = {
+            "id": 1,
+            "type": "attachment",
+            "op": "update",
+            "attachment": {
+                "id": 41,
+                "path_id": "a/report.csv",
+                "name": "report.csv",
+                "size": 456,
+                "create_time": 1_699_999_999,
+                "message_ids": [777],
+            },
+        }
+        assert await store.store_events(
+            owner_uuid,
+            "queue-owner",
+            (
+                ZulipEvent(
+                    event_id=1,
+                    event_type="attachment",
+                    payload_json=json.dumps(updated_attachment),
+                ),
+            ),
+            1,
+        ) == (1, True)
+        processor = ZulipEventProcessor(
+            pool,
+            store,
+            Settings.from_env({"WZB_DATABASE_DSN": dsn}),
+        )
+        assert (await processor.process_once()).applied == 1
+        async with pool.acquire() as connection:
+            assert (
+                await connection.fetchval(
+                    "SELECT size_bytes FROM workspace_zulip_bridge.zulip_files"
+                )
+                == 456
+            )
+    finally:
+        await pool.close()
 
 
 async def _history_round_trip(dsn: str) -> None:
@@ -390,11 +522,16 @@ async def _history_round_trip(dsn: str) -> None:
         async with pool.acquire() as connection:
             row = await connection.fetchrow(
                 """
-                SELECT topic_uuid, content, is_starred, created_at, updated_at
-                FROM workspace_zulip_bridge.zulip_messages
-                WHERE uuid = $1
+                SELECT message.topic_uuid, message.content, flags.is_starred,
+                       message.created_at, message.updated_at
+                FROM workspace_zulip_bridge.zulip_messages AS message
+                JOIN workspace_zulip_bridge.zulip_message_flags AS flags
+                  ON flags.message_uuid = message.uuid
+                 AND flags.zulip_user_uuid = $2
+                WHERE message.uuid = $1
                 """,
                 first_message_uuid,
+                owner_uuid,
             )
         assert row is not None
         assert row["topic_uuid"] == stable_topic_uuid(chat_uuid, "Performance")
@@ -412,8 +549,8 @@ async def _history_round_trip(dsn: str) -> None:
             )
             queue_reset = await connection.fetchrow(
                 """
-                SELECT status, queue_id, catalog_completed_at
-                FROM workspace_zulip_bridge.zulip_users
+                SELECT lifecycle_status AS status, queue_id, catalog_completed_at
+                FROM workspace_zulip_bridge.zulip_connections
                 WHERE uuid = $1
                 """,
                 owner_uuid,
@@ -426,10 +563,10 @@ async def _history_round_trip(dsn: str) -> None:
             }
             await connection.execute(
                 """
-                UPDATE workspace_zulip_bridge.zulip_users
+                UPDATE workspace_zulip_bridge.zulip_connections
                 SET queue_id = 'queue-owner-2',
                     last_event_id = 0,
-                    status = 'filling'
+                    lifecycle_status = 'filling'
                 WHERE uuid = $1
                 """,
                 owner_uuid,
@@ -467,8 +604,8 @@ async def _history_round_trip(dsn: str) -> None:
             assert (
                 await connection.fetchval(
                     """
-                    SELECT supplier_user_uuid
-                    FROM workspace_zulip_bridge.zulip_chats
+                    SELECT source_connection_uuid
+                    FROM workspace_zulip_bridge.zulip_streams
                     WHERE uuid = $1
                     """,
                     chat_uuid,
@@ -487,7 +624,7 @@ async def _history_round_trip(dsn: str) -> None:
         async with pool.acquire() as connection:
             final = await connection.fetchrow(
                 """
-                SELECT uuid, zulip_user_uuid, content
+                SELECT uuid, source_connection_uuid AS zulip_user_uuid, content
                 FROM workspace_zulip_bridge.zulip_messages
                 """
             )
@@ -524,7 +661,7 @@ async def _event_retention_round_trip(dsn: str) -> None:
             await connection.execute(
                 """
                 INSERT INTO workspace_zulip_bridge.zulip_events (
-                    zulip_user_uuid,
+                    zulip_connection_uuid,
                     queue_id,
                     event_id,
                     event_type,
@@ -781,6 +918,14 @@ async def _event_processor_round_trip(dsn: str) -> None:
                 "emoji_code": "274c",
                 "reaction_type": "unicode_emoji",
             },
+            {
+                "id": 5,
+                "type": "update_message_flags",
+                "op": "add",
+                "flag": "read",
+                "messages": [123],
+                "all": False,
+            },
         ]
         assert (
             await store.store_events(
@@ -809,9 +954,9 @@ async def _event_processor_round_trip(dsn: str) -> None:
                     )
                     for event in member_events
                 ],
-                4,
+                5,
             )
-        ) == (4, True)
+        ) == (5, True)
         async with pool.acquire() as connection:
             processing_started_at = await connection.fetchval(
                 "SELECT clock_timestamp()"
@@ -824,7 +969,7 @@ async def _event_processor_round_trip(dsn: str) -> None:
                     GROUP BY processing_status
                     """
                 )
-            ) == {"pending": 15}
+            ) == {"pending": 16}
 
         processor = ZulipEventProcessor(
             pool,
@@ -838,20 +983,20 @@ async def _event_processor_round_trip(dsn: str) -> None:
         )
         stats = await processor.process_once()
         assert (stats.claimed, stats.applied, stats.skipped, stats.failed) == (
-            15,
-            9,
+            16,
+            10,
             5,
             1,
         )
-        assert stats.messages_changed == 7
+        assert stats.messages_changed == 9
         assert stats.chats_changed == 1
 
         async with pool.acquire() as connection:
             final_message = await connection.fetchrow(
                 """
                 SELECT message.content,
-                       message.is_read,
-                       message.is_starred,
+                       flags.is_read,
+                       flags.is_starred,
                        message.reactions::text AS reactions,
                        message.created_at,
                        message.updated_at,
@@ -859,13 +1004,17 @@ async def _event_processor_round_trip(dsn: str) -> None:
                 FROM workspace_zulip_bridge.zulip_messages AS message
                 LEFT JOIN workspace_zulip_bridge.zulip_topics AS topic
                   ON topic.uuid = message.topic_uuid
+                JOIN workspace_zulip_bridge.zulip_message_flags AS flags
+                  ON flags.message_uuid = message.uuid
+                 AND flags.zulip_user_uuid = $1
                 WHERE message.zulip_message_id = 123
-                """
+                """,
+                owner_uuid,
             )
             chat_name = await connection.fetchval(
                 """
                 SELECT name
-                FROM workspace_zulip_bridge.zulip_chats
+                FROM workspace_zulip_bridge.zulip_streams
                 WHERE chat_key = 'channel:7'
                 """
             )
@@ -902,6 +1051,20 @@ async def _event_processor_round_trip(dsn: str) -> None:
                 WHERE zulip_message_id IN (124, 125)
                 """
             )
+            member_read = await connection.fetchval(
+                """
+                SELECT flags.is_read
+                FROM workspace_zulip_bridge.zulip_message_flags AS flags
+                JOIN workspace_zulip_bridge.zulip_messages AS message
+                  ON message.uuid = flags.message_uuid
+                WHERE flags.zulip_user_uuid = $1
+                  AND message.zulip_message_id = 123
+                """,
+                member_uuid,
+            )
+            normalized_reactions = await connection.fetchval(
+                "SELECT count(*) FROM workspace_zulip_bridge.zulip_message_reactions"
+            )
         assert final_message is not None
         assert final_message["content"] == "second"
         assert final_message["is_read"]
@@ -935,7 +1098,9 @@ async def _event_processor_round_trip(dsn: str) -> None:
             }
         ]
         assert live_messages == 2
-        assert statuses == {"applied": 9, "failed": 1, "skipped": 5}
+        assert member_read is True
+        assert normalized_reactions == 3
+        assert statuses == {"applied": 10, "failed": 1, "skipped": 5}
         assert skip_reasons == {
             "not_chat_supplier": 4,
             "unsupported_event_type": 1,
@@ -945,7 +1110,7 @@ async def _event_processor_round_trip(dsn: str) -> None:
             stale_event_uuid = await connection.fetchval(
                 """
                 INSERT INTO workspace_zulip_bridge.zulip_events (
-                    zulip_user_uuid,
+                    zulip_connection_uuid,
                     queue_id,
                     event_id,
                     event_type,
@@ -990,7 +1155,7 @@ async def _event_processor_round_trip(dsn: str) -> None:
                 exact=True,
             )
         assert snapshot.event_processing_statuses == {
-            "applied": 9,
+            "applied": 10,
             "failed": 1,
             "skipped": 6,
         }

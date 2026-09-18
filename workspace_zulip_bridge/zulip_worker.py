@@ -377,8 +377,19 @@ class ZulipEventThread(threading.Thread):
         if identity.user_id not in user_uuids:
             raise RuntimeError("current Zulip user is missing from user directory")
         bot_user_ids = frozenset(user.user_id for user in directory if user.is_bot)
+        attachments = client.get_attachments()
+        attachment_changes = self._submit(
+            self._store.store_user_attachments(
+                self.user.uuid,
+                queue_id,
+                attachments,
+                replace_all=True,
+            )
+        )
         subscriptions = client.get_subscriptions()
-        builder = ChatCatalogBuilder(identity.user_id, identity.full_name)
+        builder = ChatCatalogBuilder(
+            identity.user_id, identity.full_name, identity.role
+        )
         channel_chats = builder.add_subscriptions(subscriptions)
         direct_chats = builder.add_recent_direct_conversations(
             self._recent_private_conversations,
@@ -420,11 +431,14 @@ class ZulipEventThread(threading.Thread):
         self._catalog_builder = builder
         LOG.info(
             "Zulip catalog ready user_uuid=%s users=%s user_changes=%s "
-            "chats=%s chat_upserts=%s chat_deletes=%s "
+            "attachments=%s attachment_changes=%s chats=%s "
+            "chat_upserts=%s chat_deletes=%s "
             "skipped_direct_chats=%s elapsed_seconds=%.3f",
             self.user.uuid,
             directory_result.humans,
             directory_result.changed,
+            len(attachments),
+            attachment_changes,
             len(catalog.chats),
             result.upserted,
             result.deleted,
@@ -568,8 +582,20 @@ class ZulipEventThread(threading.Thread):
         if identity.user_id not in user_uuids:
             raise RuntimeError("current Zulip user is missing from user directory")
         bot_user_ids = frozenset(user.user_id for user in directory if user.is_bot)
+        if self.user.queue_id is None:
+            return False
+        self._submit(
+            self._store.store_user_attachments(
+                self.user.uuid,
+                self.user.queue_id,
+                client.get_attachments(),
+                replace_all=True,
+            )
+        )
         subscriptions = client.get_subscriptions()
-        builder = ChatCatalogBuilder(identity.user_id, identity.full_name)
+        builder = ChatCatalogBuilder(
+            identity.user_id, identity.full_name, identity.role
+        )
         channel_chats = builder.add_subscriptions(subscriptions)
         allowed_chat_keys = self._submit(
             self._store.list_user_chat_keys(self.user.uuid)

@@ -17,9 +17,13 @@ import asyncpg
 from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.event_store import EventStore
 from workspace_zulip_bridge.message_history import build_message_page
+from workspace_zulip_bridge.message_history import extract_file_metadata
+from workspace_zulip_bridge.message_history import message_content_hash
 from workspace_zulip_bridge.message_history import message_state_hash
 from workspace_zulip_bridge.models import ZulipMessage
 from workspace_zulip_bridge.stable_ids import stable_chat_uuid
+from workspace_zulip_bridge.zulip_api import ZulipApiError
+from workspace_zulip_bridge.zulip_api import parse_attachment
 
 LOG = logging.getLogger(__name__)
 
@@ -78,7 +82,7 @@ class _ClaimedEvent:
 @dataclass(frozen=True, slots=True)
 class _MessageRoute:
     chat_key: str
-    supplier_user_uuid: UUID | None
+    source_connection_uuid: UUID | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -325,7 +329,7 @@ class ZulipEventProcessor:
                     WHERE event.processing_status = 'pending'
                       AND event.available_at <= clock_timestamp()
                     ORDER BY event.created_at,
-                             event.zulip_user_uuid,
+                             event.zulip_connection_uuid,
                              event.queue_id,
                              event.event_id
                     LIMIT $1
@@ -343,22 +347,26 @@ class ZulipEventProcessor:
                     RETURNING event.*
                 )
                 SELECT claimed.uuid,
-                       claimed.zulip_user_uuid,
-                       zulip_user.endpoint,
+                       claimed.zulip_connection_uuid,
+                       realm.identity_key AS endpoint,
                        claimed.queue_id,
                        zulip_user.zulip_user_id,
                        claimed.event_type,
                        claimed.payload::text AS payload_json,
                        (
-                           zulip_user.queue_id = claimed.queue_id
+                           connection.queue_id = claimed.queue_id
                            AND NOT zulip_user.disabled
-                           AND zulip_user.api_key IS NOT NULL
+                           AND connection.sync_enabled
                        ) AS active_queue
                 FROM claimed
+                JOIN workspace_zulip_bridge.zulip_connections AS connection
+                  ON connection.uuid = claimed.zulip_connection_uuid
                 JOIN workspace_zulip_bridge.zulip_users AS zulip_user
-                  ON zulip_user.uuid = claimed.zulip_user_uuid
+                  ON zulip_user.uuid = connection.zulip_user_uuid
+                JOIN workspace_zulip_bridge.zulip_realms AS realm
+                  ON realm.uuid = connection.realm_uuid
                 ORDER BY claimed.created_at,
-                         claimed.zulip_user_uuid,
+                         claimed.zulip_connection_uuid,
                          claimed.queue_id,
                          claimed.event_id
                 """,
@@ -372,7 +380,7 @@ class ZulipEventProcessor:
             events.append(
                 _ClaimedEvent(
                     uuid=row["uuid"],
-                    user_uuid=row["zulip_user_uuid"],
+                    user_uuid=row["zulip_connection_uuid"],
                     endpoint=row["endpoint"],
                     queue_id=row["queue_id"],
                     own_user_id=row["zulip_user_id"],
@@ -415,14 +423,17 @@ class ZulipEventProcessor:
             if chat_uuids:
                 rows = await connection.fetch(
                     """
-                    SELECT endpoint, chat_key, supplier_user_uuid
-                    FROM workspace_zulip_bridge.zulip_chats
-                    WHERE uuid = ANY($1::uuid[])
+                    SELECT realm.identity_key AS endpoint, stream.chat_key,
+                           stream.source_connection_uuid
+                    FROM workspace_zulip_bridge.zulip_streams AS stream
+                    JOIN workspace_zulip_bridge.zulip_realms AS realm
+                      ON realm.uuid = stream.realm_uuid
+                    WHERE stream.uuid = ANY($1::uuid[])
                     """,
                     list(chat_uuids),
                 )
                 chat_suppliers = {
-                    (row["endpoint"], row["chat_key"]): row["supplier_user_uuid"]
+                    (row["endpoint"], row["chat_key"]): row["source_connection_uuid"]
                     for row in rows
                 }
             for endpoint, message_ids in message_ids_by_endpoint.items():
@@ -430,11 +441,13 @@ class ZulipEventProcessor:
                     """
                     SELECT message.zulip_message_id,
                            chat.chat_key,
-                           chat.supplier_user_uuid
+                           chat.source_connection_uuid
                     FROM workspace_zulip_bridge.zulip_messages AS message
-                    JOIN workspace_zulip_bridge.zulip_chats AS chat
-                      ON chat.uuid = message.zulip_chat_uuid
-                    WHERE chat.endpoint = $1
+                    JOIN workspace_zulip_bridge.zulip_streams AS chat
+                      ON chat.uuid = message.zulip_stream_uuid
+                    JOIN workspace_zulip_bridge.zulip_realms AS realm
+                      ON realm.uuid = chat.realm_uuid
+                    WHERE realm.identity_key = $1
                       AND message.zulip_message_id = ANY($2::bigint[])
                     """,
                     endpoint,
@@ -443,7 +456,7 @@ class ZulipEventProcessor:
                 for row in rows:
                     message_routes[(endpoint, row["zulip_message_id"])] = _MessageRoute(
                         chat_key=row["chat_key"],
-                        supplier_user_uuid=row["supplier_user_uuid"],
+                        source_connection_uuid=row["source_connection_uuid"],
                     )
         # A message and its first reaction or flag update may be in the same
         # claimed batch before that message exists in PostgreSQL. Seed routes
@@ -458,7 +471,7 @@ class ZulipEventProcessor:
                 continue
             route = _MessageRoute(
                 chat_key=chat_key,
-                supplier_user_uuid=chat_suppliers.get((event.endpoint, chat_key)),
+                source_connection_uuid=chat_suppliers.get((event.endpoint, chat_key)),
             )
             for message_id in announced_message_ids:
                 message_routes.setdefault((event.endpoint, message_id), route)
@@ -472,8 +485,10 @@ class ZulipEventProcessor:
     ) -> _RoutedEvent:
         if not event.active_queue:
             return _RoutedEvent(event, skip_reason="stale_queue")
-        if event.event_type not in _MESSAGE_EVENT_TYPES | {"stream"}:
+        if event.event_type not in _MESSAGE_EVENT_TYPES | {"attachment", "stream"}:
             return _RoutedEvent(event, skip_reason="unsupported_event_type")
+        if event.event_type == "attachment":
+            return _RoutedEvent(event)
         if event.event_type == "stream":
             if event.payload.get("op") != "update":
                 return _RoutedEvent(event, skip_reason="unsupported_stream_operation")
@@ -515,6 +530,16 @@ class ZulipEventProcessor:
         if not message_ids:
             return _RoutedEvent(event, skip_reason="missing_message_target")
 
+        if event.event_type == "update_message_flags":
+            accepted_flags = [
+                message_id
+                for message_id in message_ids
+                if (event.endpoint, message_id) in message_routes
+            ]
+            if not accepted_flags:
+                return _RoutedEvent(event, skip_reason="message_not_materialized")
+            return _RoutedEvent(event, message_ids=tuple(accepted_flags))
+
         destination_stream_id = event.payload.get("new_stream_id")
         accepted: list[int] = []
         for message_id in message_ids:
@@ -523,7 +548,7 @@ class ZulipEventProcessor:
                 destination_key = f"channel:{destination_stream_id}"
                 supplier = chat_suppliers.get((event.endpoint, destination_key))
             elif route is not None:
-                supplier = route.supplier_user_uuid
+                supplier = route.source_connection_uuid
             else:
                 supplier = None
             if supplier == event.user_uuid:
@@ -554,7 +579,46 @@ class ZulipEventProcessor:
             return await self._apply_delete(item)
         if event_type == "stream":
             return await self._apply_stream_update(item)
+        if event_type == "attachment":
+            return await self._apply_attachment(item)
         return _Outcome(item.event.uuid, "skipped", "unsupported_event_type")
+
+    async def _apply_attachment(self, item: _RoutedEvent) -> _Outcome:
+        raw = item.event.payload.get("attachment")
+        operation = item.event.payload.get("op")
+        if not isinstance(raw, Mapping):
+            return _Outcome(item.event.uuid, "failed", "invalid_attachment_event")
+        if operation == "remove":
+            attachment_id = raw.get("id")
+            if not isinstance(attachment_id, int):
+                return _Outcome(item.event.uuid, "failed", "invalid_attachment_event")
+            removed = await self._store.remove_user_attachment(
+                item.event.user_uuid,
+                item.event.queue_id,
+                attachment_id,
+            )
+            return _Outcome(
+                item.event.uuid,
+                "applied" if removed else "skipped",
+                "attachment_removed" if removed else "attachment_not_materialized",
+            )
+        if operation not in {"add", "update"}:
+            return _Outcome(item.event.uuid, "skipped", "unsupported_attachment_event")
+        try:
+            attachment = parse_attachment(raw)
+        except ZulipApiError:
+            return _Outcome(item.event.uuid, "failed", "invalid_attachment_event")
+        changed = await self._store.store_user_attachments(
+            item.event.user_uuid,
+            item.event.queue_id,
+            (attachment,),
+            replace_all=False,
+        )
+        return _Outcome(
+            item.event.uuid,
+            "applied" if changed else "skipped",
+            "attachment" if changed else "attachment_unchanged",
+        )
 
     async def _apply_new_message(self, item: _RoutedEvent) -> _Outcome:
         raw_message = item.event.payload.get("message")
@@ -795,21 +859,14 @@ class ZulipEventProcessor:
         if payload.get("all"):
             if flag != "read" or operation != "add":
                 return _Outcome(item.event.uuid, "skipped", "unsupported_bulk_flag")
-            message_ids = await self._load_supplier_message_ids(item.event.user_uuid)
-        changed = 0
-        for offset in range(
-            0, len(message_ids), self._settings.zulip_message_page_size
-        ):
-            snapshots = await self._load_message_snapshots(
-                item.event.endpoint,
-                message_ids[offset : offset + self._settings.zulip_message_page_size],
-            )
-            messages = [
-                _snapshot_message(_snapshot_with_flag(snapshot, field, value))
-                for snapshot in snapshots
-            ]
-            outcome = await self._store_messages(item, messages, "message_flags")
-            changed += outcome.messages_changed
+            message_ids = await self._load_user_message_ids(item.event.user_uuid)
+        changed = await self._store.apply_message_flags(
+            item.event.user_uuid,
+            item.event.queue_id,
+            message_ids,
+            field,
+            value,
+        )
         return _Outcome(
             item.event.uuid,
             "applied",
@@ -821,18 +878,6 @@ class ZulipEventProcessor:
         self,
         items: list[_RoutedEvent],
     ) -> list[_Outcome]:
-        first = items[0]
-        message_ids = tuple(
-            sorted({message_id for item in items for message_id in item.message_ids})
-        )
-        snapshots = {
-            snapshot.message_id: snapshot
-            for snapshot in await self._load_message_snapshots(
-                first.event.endpoint,
-                message_ids,
-            )
-        }
-        touched: set[int] = set()
         outcomes: list[_Outcome] = []
         for item in items:
             change = _batchable_flag_change(item.event.payload)
@@ -842,47 +887,21 @@ class ZulipEventProcessor:
                 )
                 continue
             field, value = change
-            materialized = False
-            for message_id in item.message_ids:
-                snapshot = snapshots.get(message_id)
-                if snapshot is None:
-                    continue
-                snapshots[message_id] = _snapshot_with_flag(snapshot, field, value)
-                touched.add(message_id)
-                materialized = True
+            changed = await self._store.apply_message_flags(
+                item.event.user_uuid,
+                item.event.queue_id,
+                item.message_ids,
+                field,
+                value,
+            )
             outcomes.append(
                 _Outcome(
                     item.event.uuid,
-                    "applied" if materialized else "skipped",
-                    "message_flags" if materialized else "message_not_materialized",
+                    "applied" if changed else "skipped",
+                    "message_flags" if changed else "unchanged_or_not_materialized",
+                    messages_changed=changed,
                 )
             )
-        if not touched:
-            return outcomes
-        messages = [
-            _snapshot_message(snapshots[message_id]) for message_id in sorted(touched)
-        ]
-        result = await self._store.apply_live_messages(
-            first.event.user_uuid,
-            first.event.queue_id,
-            (),
-            messages,
-            (),
-        )
-        if result.messages_changed == 0 and result.messages_unchanged == 0:
-            return [
-                _Outcome(outcome.event_uuid, "skipped", "not_chat_supplier")
-                if outcome.status == "applied"
-                else outcome
-                for outcome in outcomes
-            ]
-        for index, outcome in enumerate(outcomes):
-            if outcome.status == "applied":
-                outcomes[index] = replace(
-                    outcome,
-                    messages_changed=result.messages_changed,
-                )
-                break
         return outcomes
 
     async def _apply_message_update(self, item: _RoutedEvent) -> _Outcome:
@@ -905,28 +924,6 @@ class ZulipEventProcessor:
                 content = payload.get("content")
                 if isinstance(content, str):
                     changes["content"] = content
-                raw_flags = payload.get("flags")
-                if isinstance(raw_flags, list) and all(
-                    isinstance(flag, str) for flag in raw_flags
-                ):
-                    flags = set(raw_flags)
-                    changes.update(
-                        {
-                            "is_read": "read" in flags,
-                            "is_starred": "starred" in flags,
-                            "is_collapsed": "collapsed" in flags,
-                            "is_mentioned": "mentioned" in flags,
-                            "is_stream_wildcard_mentioned": (
-                                "stream_wildcard_mentioned" in flags
-                                or "wildcard_mentioned" in flags
-                            ),
-                            "is_topic_wildcard_mentioned": (
-                                "topic_wildcard_mentioned" in flags
-                            ),
-                            "has_alert_word": "has_alert_word" in flags,
-                            "is_historical": "historical" in flags,
-                        }
-                    )
             messages.append(_snapshot_message(snapshot, **changes))
         return await self._store_messages(item, messages, "message_update")
 
@@ -958,9 +955,9 @@ class ZulipEventProcessor:
             row = await connection.fetchrow(
                 """
                 SELECT name, chat_parameters::text AS parameters_json
-                FROM workspace_zulip_bridge.zulip_chats
+                FROM workspace_zulip_bridge.zulip_streams
                 WHERE uuid = $1
-                  AND supplier_user_uuid = $2
+                  AND source_connection_uuid = $2
                 FOR UPDATE
                 """,
                 chat_uuid,
@@ -997,12 +994,12 @@ class ZulipEventProcessor:
             )
             status = await connection.execute(
                 """
-                UPDATE workspace_zulip_bridge.zulip_chats
+                UPDATE workspace_zulip_bridge.zulip_streams
                 SET name = $3,
                     chat_parameters = $4::jsonb,
                     content_hash = $5
                 WHERE uuid = $1
-                  AND supplier_user_uuid = $2
+                  AND source_connection_uuid = $2
                   AND content_hash IS DISTINCT FROM $5
                 """,
                 chat_uuid,
@@ -1049,24 +1046,23 @@ class ZulipEventProcessor:
             await connection.execute(
                 """
                 DELETE FROM workspace_zulip_bridge.zulip_topics AS topic
-                WHERE topic.zulip_user_uuid = $1
-                  AND NOT EXISTS (
+                WHERE NOT EXISTS (
                       SELECT 1
                       FROM workspace_zulip_bridge.zulip_messages AS message
                       WHERE message.topic_uuid = topic.uuid
                   )
-                """,
-                user_uuid,
+                """
             )
 
     async def _load_user_uuids(self, endpoint: str) -> dict[int, UUID]:
         async with self._pool.acquire() as connection:
             rows = await connection.fetch(
                 """
-                SELECT zulip_user_id, uuid
-                FROM workspace_zulip_bridge.zulip_users
-                WHERE endpoint = $1
-                  AND zulip_user_id IS NOT NULL
+                SELECT zulip_user.zulip_user_id, zulip_user.uuid
+                FROM workspace_zulip_bridge.zulip_users AS zulip_user
+                JOIN workspace_zulip_bridge.zulip_realms AS realm
+                  ON realm.uuid = zulip_user.realm_uuid
+                WHERE realm.identity_key = $1
                 """,
                 endpoint,
             )
@@ -1087,22 +1083,16 @@ class ZulipEventProcessor:
                        topic.name AS topic_name,
                        message.sender_user_uuid,
                        message.content,
-                       message.is_read,
-                       message.is_starred,
-                       message.is_collapsed,
-                       message.is_mentioned,
-                       message.is_stream_wildcard_mentioned,
-                       message.is_topic_wildcard_mentioned,
-                       message.has_alert_word,
-                       message.is_historical,
                        message.reactions::text AS reactions_json,
                        extract(epoch FROM message.created_at)::bigint AS sent_at
                 FROM workspace_zulip_bridge.zulip_messages AS message
-                JOIN workspace_zulip_bridge.zulip_chats AS chat
-                  ON chat.uuid = message.zulip_chat_uuid
+                JOIN workspace_zulip_bridge.zulip_streams AS chat
+                  ON chat.uuid = message.zulip_stream_uuid
                 LEFT JOIN workspace_zulip_bridge.zulip_topics AS topic
                   ON topic.uuid = message.topic_uuid
-                WHERE chat.endpoint = $1
+                JOIN workspace_zulip_bridge.zulip_realms AS realm
+                  ON realm.uuid = chat.realm_uuid
+                WHERE realm.identity_key = $1
                   AND message.zulip_message_id = ANY($2::bigint[])
                 ORDER BY message.zulip_message_id
                 """,
@@ -1123,29 +1113,31 @@ class ZulipEventProcessor:
                     topic_name=row["topic_name"],
                     sender_user_uuid=row["sender_user_uuid"],
                     content=row["content"],
-                    is_read=row["is_read"],
-                    is_starred=row["is_starred"],
-                    is_collapsed=row["is_collapsed"],
-                    is_mentioned=row["is_mentioned"],
-                    is_stream_wildcard_mentioned=(row["is_stream_wildcard_mentioned"]),
-                    is_topic_wildcard_mentioned=(row["is_topic_wildcard_mentioned"]),
-                    has_alert_word=row["has_alert_word"],
-                    is_historical=row["is_historical"],
+                    is_read=False,
+                    is_starred=False,
+                    is_collapsed=False,
+                    is_mentioned=False,
+                    is_stream_wildcard_mentioned=False,
+                    is_topic_wildcard_mentioned=False,
+                    has_alert_word=False,
+                    is_historical=False,
                     reactions=tuple(reactions),
                     sent_at=row["sent_at"],
                 )
             )
         return snapshots
 
-    async def _load_supplier_message_ids(self, user_uuid: UUID) -> tuple[int, ...]:
+    async def _load_user_message_ids(self, user_uuid: UUID) -> tuple[int, ...]:
         async with self._pool.acquire() as connection:
             rows = await connection.fetch(
                 """
                 SELECT message.zulip_message_id
-                FROM workspace_zulip_bridge.zulip_messages AS message
-                JOIN workspace_zulip_bridge.zulip_chats AS chat
-                  ON chat.uuid = message.zulip_chat_uuid
-                 AND chat.supplier_user_uuid = $1
+                FROM workspace_zulip_bridge.zulip_connections AS source
+                JOIN workspace_zulip_bridge.zulip_message_flags AS flags
+                  ON flags.zulip_user_uuid = source.zulip_user_uuid
+                JOIN workspace_zulip_bridge.zulip_messages AS message
+                  ON message.uuid = flags.message_uuid
+                WHERE source.uuid = $1
                 ORDER BY message.zulip_message_id
                 """,
                 user_uuid,
@@ -1305,20 +1297,24 @@ def _snapshot_message(
 ) -> ZulipMessage:
     updated = replace(snapshot, **changes)
     reactions = [dict(reaction) for reaction in updated.reactions]
+    reaction_users: dict[str, list[str]] = {}
+    for reaction in reactions:
+        reaction_users.setdefault(reaction["emoji_name"], []).append(
+            reaction["user_uuid"]
+        )
+    content_hash = message_content_hash(
+        sender_user_uuid=updated.sender_user_uuid,
+        chat_key=updated.chat_key,
+        topic_name=updated.topic_name,
+        content=updated.content,
+        sent_at=updated.sent_at,
+    )
     message_hash = message_state_hash(
         sender_user_uuid=updated.sender_user_uuid,
         chat_key=updated.chat_key,
         topic_name=updated.topic_name,
         content=updated.content,
         sent_at=updated.sent_at,
-        is_read=updated.is_read,
-        is_starred=updated.is_starred,
-        is_collapsed=updated.is_collapsed,
-        is_mentioned=updated.is_mentioned,
-        is_stream_wildcard_mentioned=updated.is_stream_wildcard_mentioned,
-        is_topic_wildcard_mentioned=updated.is_topic_wildcard_mentioned,
-        has_alert_word=updated.has_alert_word,
-        is_historical=updated.is_historical,
         reactions=reactions,
     )
     return ZulipMessage(
@@ -1341,7 +1337,16 @@ def _snapshot_message(
             sort_keys=True,
             separators=(",", ":"),
         ),
+        reaction_users_json=json.dumps(
+            reaction_users,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        content_hash=content_hash,
         message_hash=message_hash,
+        files=extract_file_metadata(updated.content),
+        write_flags=False,
         sent_at=updated.sent_at,
     )
 

@@ -8,8 +8,9 @@ from dataclasses import dataclass
 from dataclasses import replace
 from typing import Any
 
-from workspace_zulip_bridge.models import ChatRole
+from workspace_zulip_bridge.models import BindingRole
 from workspace_zulip_bridge.models import ChatType
+from workspace_zulip_bridge.models import MembershipKind
 from workspace_zulip_bridge.models import RecentPrivateConversation
 from workspace_zulip_bridge.models import ZulipChat
 from workspace_zulip_bridge.models import ZulipChatCatalog
@@ -37,9 +38,15 @@ class _DirectConversation:
 
 
 class ChatCatalogBuilder:
-    def __init__(self, identity_user_id: int, identity_full_name: str) -> None:
+    def __init__(
+        self,
+        identity_user_id: int,
+        identity_full_name: str,
+        identity_role: int = 400,
+    ) -> None:
         self._identity_user_id = identity_user_id
         self._identity_full_name = identity_full_name
+        self._identity_role = _binding_role(identity_role)
         self._channels: dict[str, ZulipChat] = {}
         self._direct_conversations: dict[str, _DirectConversation] = {}
 
@@ -67,7 +74,11 @@ class ChatCatalogBuilder:
                 chat_type="channel",
                 chat_key=chat_key,
                 name=name,
-                role="subscriber",
+                role=self._identity_role,
+                membership_kind="subscriber",
+                notification_mode=(
+                    "muted" if membership_parameters.get("is_muted") else "all_messages"
+                ),
                 chat_parameters=chat_parameters,
                 membership_parameters=membership_parameters,
             )
@@ -191,7 +202,9 @@ class ChatCatalogBuilder:
             chat_type=chat_type,
             chat_key=chat_key,
             name=name,
-            role="participant",
+            role=self._identity_role,
+            membership_kind="participant",
+            notification_mode="all_messages",
             chat_parameters=parameters,
             membership_parameters={},
         )
@@ -202,7 +215,9 @@ def _make_chat(
     chat_type: ChatType,
     chat_key: str,
     name: str,
-    role: ChatRole,
+    role: BindingRole,
+    membership_kind: MembershipKind,
+    notification_mode: str,
     chat_parameters: Mapping[str, object],
     membership_parameters: Mapping[str, object],
 ) -> ZulipChat:
@@ -220,6 +235,8 @@ def _make_chat(
     membership_digest = hashlib.sha256()
     for value in (
         role,
+        membership_kind,
+        notification_mode,
         membership_parameters_json,
     ):
         membership_digest.update(value.encode("utf-8"))
@@ -229,11 +246,27 @@ def _make_chat(
         chat_key=chat_key,
         name=name,
         role=role,
+        membership_kind=membership_kind,
+        notification_mode=notification_mode,
         chat_parameters_json=chat_parameters_json,
         membership_parameters_json=membership_parameters_json,
         content_hash=canonical_digest.digest(),
         membership_hash=membership_digest.digest(),
     )
+
+
+def _binding_role(role: int) -> BindingRole:
+    if role == 100:
+        return "owner"
+    if role == 200:
+        return "administrator"
+    if role == 300:
+        return "moderator"
+    if role == 400:
+        return "member"
+    if role == 600:
+        return "guest"
+    raise ValueError(f"unsupported Zulip role: {role}")
 
 
 def _canonical_json(value: Mapping[str, object]) -> str:

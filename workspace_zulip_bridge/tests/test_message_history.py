@@ -90,6 +90,17 @@ def test_message_fields_flags_reactions_and_hash_are_canonical() -> None:
     )
     assert second.messages[0].message_hash == message.message_hash
 
+    personal_change = deepcopy(raw)
+    personal_change["flags"] = []
+    personal = build_message_page(
+        [personal_change],
+        own_user_id=10,
+        user_uuids={10: USER_ONE, 12: USER_TWO},
+        stream_ids_by_name={"Engineering": 7},
+        allowed_chat_keys={"channel:7"},
+    )
+    assert personal.messages[0].message_hash == message.message_hash
+
     changed = deepcopy(raw)
     changed["content"] = "Changed"
     third = build_message_page(
@@ -100,6 +111,27 @@ def test_message_fields_flags_reactions_and_hash_are_canonical() -> None:
         allowed_chat_keys={"channel:7"},
     )
     assert third.messages[0].message_hash != message.message_hash
+
+
+def test_upload_links_create_metadata_without_file_content() -> None:
+    raw = _channel_message()
+    raw["content"] = (
+        "[report.csv](/user_uploads/1a/ab/report.csv) and "
+        "![plot](https://zulip.example.test/user_uploads/2b/cd/plot.png)"
+    )
+    result = build_message_page(
+        [raw],
+        own_user_id=10,
+        user_uuids={10: USER_ONE, 12: USER_TWO},
+        stream_ids_by_name={"Engineering": 7},
+        allowed_chat_keys={"channel:7"},
+    )
+
+    files = result.messages[0].files
+    assert [(file.source_path, file.name) for file in files] == [
+        ("/user_uploads/1a/ab/report.csv", "report.csv"),
+        ("/user_uploads/2b/cd/plot.png", "plot.png"),
+    ]
 
 
 def test_direct_message_with_excluded_participant_is_skipped() -> None:

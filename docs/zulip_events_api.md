@@ -14,14 +14,15 @@ Authoritative sources:
 
 ## Authentication and queue lifecycle
 
-Each `zulip_users` row starts one native thread and one persistent HTTP client.
+Each enabled `zulip_connections` row starts one native thread and one persistent
+HTTP client. Its referenced `zulip_users` row is the stable provider identity.
 The stored login and API key are used directly as HTTP Basic credentials. The
 collector never accepts, stores, or exchanges a Zulip account password.
 
 Zulip 12 can store only an API-key hash in its `UserProfile.api_key` database
 column, with the usable value kept in Zulip's protected key storage. A seeding
 tool must therefore obtain the plaintext key through a supported Zulip
-mechanism; copying that database column into `zulip_users.api_key` produces an
+mechanism; copying that database column into `zulip_connections.api_key` produces an
 invalid credential. The bridge treats provisioning as an external operation
 and never attempts to decrypt or regenerate credentials at runtime.
 
@@ -34,8 +35,8 @@ response, the configured long-poll timeout is used. An extended idle timeout
 protects a queue during short network interruptions.
 
 Authentication and account-policy failures are not retried in a loop. The
-worker remains parked until its `zulip_users` connection fields change or the
-row is removed. This keeps unsupported bot types and rotated keys from creating
+worker remains parked until its `zulip_connections` row changes or is removed.
+This keeps unsupported bot types and rotated keys from creating
 an authentication storm while preserving the one-thread-per-row contract.
 
 The thread repeatedly calls `GET /api/v1/events` with the persisted `queue_id`
@@ -58,7 +59,8 @@ requests and prevents a restart from registering every user simultaneously.
 
 The queue is created before catalog loading, so events arriving during a fill
 remain buffered by Zulip. The lifecycle is `init -> streaming -> filling ->
-active`. A bounded semaphore limits simultaneous full-history readers. This is
+scheduling -> backfilling -> active`. A bounded semaphore limits simultaneous
+full-history readers. This is
 backpressure for the shared Zulip HTTP/database capacity, not a correctness
 lock between `user_uuid` rows.
 
@@ -68,9 +70,10 @@ non-disabled row with an API key owns a worker thread.
 
 For channels, the worker calls `GET /api/v1/users/me/subscriptions` with
 `include_subscribers=false`. This avoids transferring the potentially large
-subscriber list. One `zulip_chats` row is written per subscribed channel. The
-role is `subscriber`; channel-wide values and per-user notification or view
-settings are stored in separate JSON objects.
+subscriber list. One `zulip_streams` row is written per subscribed channel. The
+user's realm role (owner, administrator, moderator, member, or guest),
+membership kind, and notification mode live in `zulip_stream_bindings`;
+channel-wide values remain on the stream.
 
 After every user has published a catalog, one reconciliation pass selects a
 single supplier for each canonical chat by realm role, then stable user UUID.
@@ -84,13 +87,22 @@ Zulip exposes topic names rather than native topic IDs. Bot-authored messages
 and direct conversations containing a bot are discarded at normalization.
 
 Each API page is normalized in the worker thread. Known personal flags become
-boolean columns, reactions contain bridge user UUIDs, and SHA-256 covers the
-canonical stored message state. PostgreSQL receives the page through binary
+boolean columns in `zulip_message_flags`. Reactions are both normalized in
+`zulip_message_reactions` and cached as a display-ready JSON aggregate on the
+message. SHA-256 covers common message data and reactions; personal flags have
+an independent hash and cannot move the common message's `updated_at`.
+PostgreSQL receives the page through binary
 COPY into a temporary table, inserts missing topics, and performs one
 hash-guarded upsert. `created_at` is the Zulip send time. `updated_at` is the
 backend write time and changes only when the hash changes. A temporary seen-ID
 table supports physical deletion of records absent from a completed full
 reload without adding a persistent synchronization column.
+
+Each connection reads `GET /attachments`, which returns metadata only for files
+uploaded by that user. This is the authority for file ownership, size, upload
+time, path, and provider ID. Markdown upload links and attachment events maintain
+`zulip_message_files` relationships. Neither path requests the upload body, and
+no database column can contain file bytes.
 
 Every chat has a SHA-256 hash over canonical JSON and its normalized scalar
 fields. The sorted row hashes form the user's aggregate catalog hash. An equal
@@ -108,7 +120,7 @@ the whole returned batch with `ON CONFLICT DO NOTHING`, and advances
 acknowledge the batch to Zulip until the inbox transaction completes, so a
 retry is safe after an uncertain database result.
 
-The uniqueness key is `(zulip_user_uuid, queue_id, event_id)`: Zulip event IDs
+The uniqueness key is `(zulip_connection_uuid, queue_id, event_id)`: Zulip event IDs
 are queue-local and can restart after a queue is replaced.
 
 One asynchronous processor claims bounded ordered batches with
@@ -116,10 +128,12 @@ One asynchronous processor claims bounded ordered batches with
 routes for the entire batch. An event from an expired queue, an unsupported
 type, or a user who is not the selected supplier for the affected chat is
 completed as `skipped` before entity mutation. Accepted message, edit/move,
-flag, reaction, delete, and channel-update events update the canonical tables.
-Explicit deletes physically remove the canonical message. Message state hashes
-include content, flags, and reactions, so replay after a crash does not move
-`updated_at` unless the stored state actually changes. Stale `processing`
+reaction, delete, and channel-update events update common canonical tables after
+the supplier gate. Flag events update only the originating identity's personal
+flag row and therefore do not require that connection to be the common-data
+supplier. Explicit deletes physically remove the canonical message. Message
+state hashes include content and reactions. Personal flag hashes are stored
+separately, so replay after a crash does not move unrelated timestamps. Stale `processing`
 claims return to `pending` after a configured timeout. Consecutive messages,
 flag deltas, and reaction deltas from the same supplier are normalized in event
 order and flushed through one hash-guarded page write.

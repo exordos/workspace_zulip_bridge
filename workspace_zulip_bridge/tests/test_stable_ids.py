@@ -7,7 +7,12 @@ import pytest
 
 from workspace_zulip_bridge.stable_ids import canonical_endpoint
 from workspace_zulip_bridge.stable_ids import stable_chat_uuid
+from workspace_zulip_bridge.stable_ids import stable_file_uuid
+from workspace_zulip_bridge.stable_ids import stable_message_flag_uuid
 from workspace_zulip_bridge.stable_ids import stable_message_uuid
+from workspace_zulip_bridge.stable_ids import stable_reaction_uuid
+from workspace_zulip_bridge.stable_ids import stable_realm_uuid
+from workspace_zulip_bridge.stable_ids import stable_stream_binding_uuid
 from workspace_zulip_bridge.stable_ids import stable_topic_uuid
 from workspace_zulip_bridge.stable_ids import stable_user_uuid
 
@@ -25,6 +30,7 @@ def test_endpoint_and_provider_entities_have_stable_uuid5_values() -> None:
     assert stable_user_uuid(endpoint, 42).version == 5
     assert stable_chat_uuid(endpoint, "channel:7").version == 5
     assert stable_message_uuid(endpoint, 123).version == 5
+    assert stable_realm_uuid(endpoint) == stable_realm_uuid(canonical)
 
 
 def test_entity_namespaces_and_provider_keys_do_not_collide() -> None:
@@ -53,6 +59,21 @@ def test_topic_ids_are_stable_within_their_chat() -> None:
     assert stable_topic_uuid(chat_uuid, "Performance") != stable_topic_uuid(
         uuid4(), "Performance"
     )
+
+
+def test_relationship_and_file_ids_are_stable() -> None:
+    endpoint = "https://zulip.example.test"
+    stream_uuid = stable_chat_uuid(endpoint, "channel:7")
+    message_uuid = stable_message_uuid(endpoint, 123)
+    user_uuid = stable_user_uuid(endpoint, 42)
+
+    assert stable_stream_binding_uuid(stream_uuid, user_uuid).version == 5
+    assert stable_message_flag_uuid(message_uuid, user_uuid).version == 5
+    assert (
+        stable_reaction_uuid(message_uuid, user_uuid, "unicode_emoji", "1f44d").version
+        == 5
+    )
+    assert stable_file_uuid(endpoint, "/user_uploads/a/report.csv").version == 5
 
 
 @pytest.mark.parametrize(

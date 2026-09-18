@@ -3,13 +3,21 @@
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping
 from collections.abc import Sequence
 from typing import Any
+from urllib.parse import unquote
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from workspace_zulip_bridge.models import MessagePageBuild
+from workspace_zulip_bridge.models import ZulipFileMetadata
 from workspace_zulip_bridge.models import ZulipMessage
+
+_UPLOAD_LINK = re.compile(
+    r"(?:!?)\[[^\]]*\]\((?P<target>(?:https?://[^)\s]+|/user_uploads/[^)\s]+))\)"
+)
 
 _KNOWN_FLAGS = frozenset(
     {
@@ -33,14 +41,6 @@ def message_state_hash(
     topic_name: str | None,
     content: str,
     sent_at: int,
-    is_read: bool,
-    is_starred: bool,
-    is_collapsed: bool,
-    is_mentioned: bool,
-    is_stream_wildcard_mentioned: bool,
-    is_topic_wildcard_mentioned: bool,
-    has_alert_word: bool,
-    is_historical: bool,
     reactions: Sequence[Mapping[str, str]],
 ) -> bytes:
     state = {
@@ -49,14 +49,6 @@ def message_state_hash(
         "topic_name": topic_name,
         "content": content,
         "created_at": sent_at,
-        "is_read": is_read,
-        "is_starred": is_starred,
-        "is_collapsed": is_collapsed,
-        "is_mentioned": is_mentioned,
-        "is_stream_wildcard_mentioned": is_stream_wildcard_mentioned,
-        "is_topic_wildcard_mentioned": is_topic_wildcard_mentioned,
-        "has_alert_word": has_alert_word,
-        "is_historical": is_historical,
         "reactions": list(reactions),
     }
     return hashlib.sha256(
@@ -66,6 +58,57 @@ def message_state_hash(
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
+    ).digest()
+
+
+def message_content_hash(
+    *,
+    sender_user_uuid: UUID,
+    chat_key: str,
+    topic_name: str | None,
+    content: str,
+    sent_at: int,
+) -> bytes:
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "sender_user_uuid": str(sender_user_uuid),
+                "chat_key": chat_key,
+                "topic_name": topic_name,
+                "content": content,
+                "created_at": sent_at,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).digest()
+
+
+def message_flags_hash(
+    *,
+    is_read: bool,
+    is_starred: bool,
+    is_collapsed: bool,
+    is_mentioned: bool,
+    is_stream_wildcard_mentioned: bool,
+    is_topic_wildcard_mentioned: bool,
+    has_alert_word: bool,
+    is_historical: bool,
+) -> bytes:
+    return hashlib.sha256(
+        bytes(
+            (
+                is_read,
+                is_starred,
+                is_collapsed,
+                is_mentioned,
+                is_stream_wildcard_mentioned,
+                is_topic_wildcard_mentioned,
+                has_alert_word,
+                is_historical,
+            )
+        )
     ).digest()
 
 
@@ -215,28 +258,39 @@ def _parse_message(
         sort_keys=True,
         separators=(",", ":"),
     )
+    reaction_users: dict[str, list[str]] = {}
+    for reaction in reactions:
+        reaction_users.setdefault(reaction["emoji_name"], []).append(
+            reaction["user_uuid"]
+        )
+    reaction_users_json = json.dumps(
+        reaction_users,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     is_read = "read" in flags
     is_starred = "starred" in flags
     is_collapsed = "collapsed" in flags
     is_mentioned = "mentioned" in flags
     has_alert_word = "has_alert_word" in flags
     is_historical = "historical" in flags
+    content_hash = message_content_hash(
+        sender_user_uuid=sender_user_uuid,
+        chat_key=chat_key,
+        topic_name=topic_name,
+        content=content,
+        sent_at=sent_at,
+    )
     message_hash = message_state_hash(
         sender_user_uuid=sender_user_uuid,
         chat_key=chat_key,
         topic_name=topic_name,
         content=content,
         sent_at=sent_at,
-        is_read=is_read,
-        is_starred=is_starred,
-        is_collapsed=is_collapsed,
-        is_mentioned=is_mentioned,
-        is_stream_wildcard_mentioned=stream_wildcard,
-        is_topic_wildcard_mentioned=topic_wildcard,
-        has_alert_word=has_alert_word,
-        is_historical=is_historical,
         reactions=reactions,
     )
+    files = extract_file_metadata(content)
     return (
         ZulipMessage(
             message_id=message_id,
@@ -253,9 +307,30 @@ def _parse_message(
             has_alert_word=has_alert_word,
             is_historical=is_historical,
             reactions_json=reactions_json,
+            reaction_users_json=reaction_users_json,
+            content_hash=content_hash,
             message_hash=message_hash,
+            files=files,
             sent_at=sent_at,
         ),
         skipped_reactions,
         unknown_flags,
     )
+
+
+def extract_file_metadata(
+    content: str,
+) -> tuple[ZulipFileMetadata, ...]:
+    files: dict[str, ZulipFileMetadata] = {}
+    for match in _UPLOAD_LINK.finditer(content):
+        target = match.group("target")
+        parsed = urlsplit(target)
+        source_path = parsed.path
+        if not source_path.startswith("/user_uploads/"):
+            continue
+        name = unquote(source_path.rsplit("/", 1)[-1])
+        files[source_path] = ZulipFileMetadata(
+            source_path=source_path,
+            name=name,
+        )
+    return tuple(files[path] for path in sorted(files))

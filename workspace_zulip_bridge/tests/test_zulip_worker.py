@@ -176,6 +176,16 @@ class FakeStore:
         self.stored.set()
         return len(events), True
 
+    async def store_user_attachments(
+        self,
+        user_uuid: UUID,
+        queue_id: str,
+        attachments: object,
+        *,
+        replace_all: bool,
+    ) -> int:
+        return 0
+
 
 class FakeApi:
     def __init__(self) -> None:
@@ -195,6 +205,9 @@ class FakeApi:
 
     def get_subscriptions(self) -> list[dict[str, object]]:
         return [{"stream_id": 7, "name": "Engineering"}]
+
+    def get_attachments(self) -> list[object]:
+        return []
 
     def get_users(self) -> list[ZulipDirectoryUser]:
         return [

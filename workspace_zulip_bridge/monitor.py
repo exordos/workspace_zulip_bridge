@@ -50,6 +50,10 @@ class MonitorSnapshot:
     chat_table_bytes: int
     chat_user_table_bytes: int
     database_bytes: int
+    connections_total: int = 0
+    message_flags_total: int = 0
+    file_metadata_total: int = 0
+    outbox_pending: int = 0
     total_event_types: dict[str, int] | None = None
 
     @property
@@ -119,16 +123,19 @@ async def collect_snapshot(
     summary = await connection.fetchrow(
         """
         WITH user_counts AS (
-            SELECT count(*) AS users_total,
+            SELECT (SELECT count(*) FROM workspace_zulip_bridge.zulip_users)
+                       AS users_total,
+                   count(*) AS connections_total,
                    count(*) FILTER (
-                       WHERE NOT disabled AND api_key IS NOT NULL
+                       WHERE connection.sync_enabled AND NOT zulip_user.disabled
                    ) AS users_sync_enabled,
                    count(*) FILTER (
-                       WHERE NOT disabled
-                         AND api_key IS NOT NULL
-                         AND queue_id IS NOT NULL
+                       WHERE connection.sync_enabled AND NOT zulip_user.disabled
+                         AND connection.queue_id IS NOT NULL
                    ) AS queues_ready
-            FROM workspace_zulip_bridge.zulip_users
+            FROM workspace_zulip_bridge.zulip_connections AS connection
+            JOIN workspace_zulip_bridge.zulip_users AS zulip_user
+              ON zulip_user.uuid = connection.zulip_user_uuid
         ),
         relation_stats AS (
             SELECT COALESCE(max(n_live_tup) FILTER (
@@ -143,16 +150,17 @@ async def collect_snapshot(
         ),
         chat_counts AS (
             SELECT count(*) FILTER (
-                       WHERE supplier_user_uuid IS NOT NULL
+                       WHERE source_connection_uuid IS NOT NULL
                    ) AS chats_assigned,
                    count(*) FILTER (
-                       WHERE supplier_user_uuid IS NOT NULL
+                       WHERE source_connection_uuid IS NOT NULL
                          AND history_loaded_at IS NULL
                    ) AS chats_pending_history
-            FROM workspace_zulip_bridge.zulip_chats
+            FROM workspace_zulip_bridge.zulip_streams
         )
         SELECT clock_timestamp() AS sampled_at,
                user_counts.users_total,
+               user_counts.connections_total,
                user_counts.users_sync_enabled,
                user_counts.queues_ready,
                relation_stats.events_estimate,
@@ -161,8 +169,14 @@ async def collect_snapshot(
                chat_counts.chats_pending_history,
                (
                    SELECT count(*)
-                   FROM workspace_zulip_bridge.zulip_chat_users
+                   FROM workspace_zulip_bridge.zulip_stream_bindings
                ) AS chat_memberships_total,
+               (SELECT count(*) FROM workspace_zulip_bridge.zulip_message_flags)
+                   AS message_flags_total,
+               (SELECT count(*) FROM workspace_zulip_bridge.zulip_files)
+                   AS file_metadata_total,
+               (SELECT count(*) FROM workspace_zulip_bridge.workspace_outbox
+                WHERE delivery_status = 'pending') AS outbox_pending,
                pg_total_relation_size(
                    'workspace_zulip_bridge.zulip_events'
                ) AS event_table_bytes,
@@ -179,10 +193,10 @@ async def collect_snapshot(
                    'workspace_zulip_bridge.zulip_topics'
                ) AS topic_table_bytes,
                pg_total_relation_size(
-                   'workspace_zulip_bridge.zulip_chats'
+                   'workspace_zulip_bridge.zulip_streams'
                ) AS chat_table_bytes,
                pg_total_relation_size(
-                   'workspace_zulip_bridge.zulip_chat_users'
+                   'workspace_zulip_bridge.zulip_stream_bindings'
                ) AS chat_user_table_bytes,
                pg_database_size(current_database()) AS database_bytes
         FROM user_counts
@@ -195,16 +209,16 @@ async def collect_snapshot(
 
     user_status_rows = await connection.fetch(
         """
-        SELECT status, count(*) AS users
-        FROM workspace_zulip_bridge.zulip_users
-        GROUP BY status
-        ORDER BY status
+        SELECT lifecycle_status AS status, count(*) AS users
+        FROM workspace_zulip_bridge.zulip_connections
+        GROUP BY lifecycle_status
+        ORDER BY lifecycle_status
         """
     )
     chat_type_rows = await connection.fetch(
         """
         SELECT chat_type, count(*) AS chats
-        FROM workspace_zulip_bridge.zulip_chats
+        FROM workspace_zulip_bridge.zulip_streams
         GROUP BY chat_type
         ORDER BY chat_type
         """
@@ -309,9 +323,11 @@ async def collect_snapshot(
     if exact:
         message_row = await connection.fetchrow(
             """
-            SELECT count(*) AS messages,
-                   COALESCE(sum(jsonb_array_length(reactions)), 0) AS reactions
-            FROM workspace_zulip_bridge.zulip_messages
+            SELECT (SELECT count(*) FROM workspace_zulip_bridge.zulip_messages)
+                       AS messages,
+                   (SELECT count(*) FROM
+                        workspace_zulip_bridge.zulip_message_reactions)
+                       AS reactions
             """
         )
         if message_row is None:
@@ -369,6 +385,7 @@ async def collect_snapshot(
     return MonitorSnapshot(
         sampled_at=sampled_at,
         users_total=summary["users_total"],
+        connections_total=summary["connections_total"],
         users_sync_enabled=summary["users_sync_enabled"],
         user_statuses=user_statuses,
         queues_ready=summary["queues_ready"],
@@ -382,6 +399,9 @@ async def collect_snapshot(
         messages_total_exact=exact,
         recent_message_changes=recent_message_changes,
         reactions_total=reactions_total,
+        message_flags_total=summary["message_flags_total"],
+        file_metadata_total=summary["file_metadata_total"],
+        outbox_pending=summary["outbox_pending"],
         events_total=events_total,
         events_total_exact=exact,
         recent_window_seconds=window_seconds,
@@ -424,6 +444,7 @@ def format_snapshot(snapshot: MonitorSnapshot, *, as_json: bool) -> str:
     fields = [
         snapshot.sampled_at.isoformat(),
         f"users={snapshot.users_total}",
+        f"connections={snapshot.connections_total}",
         f"sync_enabled={snapshot.users_sync_enabled}",
         "statuses=" + json.dumps(snapshot.user_statuses, separators=(",", ":")),
         f"queues={snapshot.queues_ready}/{snapshot.users_sync_enabled}",
@@ -440,6 +461,9 @@ def format_snapshot(snapshot: MonitorSnapshot, *, as_json: bool) -> str:
         f"message_changes={snapshot.recent_message_changes}/"
         f"{snapshot.recent_window_seconds:g}s",
         f"message_rate={snapshot.messages_per_second:.3f}/s",
+        f"message_flags={snapshot.message_flags_total}",
+        f"file_metadata={snapshot.file_metadata_total}",
+        f"outbox_pending={snapshot.outbox_pending}",
         f"{event_label}={snapshot.events_total}",
         f"recent={snapshot.recent_events}/{snapshot.recent_window_seconds:g}s",
         f"rate={snapshot.events_per_second:.3f}/s",

@@ -251,6 +251,41 @@ def test_messages_can_be_refetched_by_id_for_live_updates() -> None:
     assert messages == [{"id": 4}, {"id": 15}]
 
 
+def test_attachment_directory_contains_metadata_without_file_bytes() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/attachments")
+        return httpx.Response(
+            200,
+            json={
+                "result": "success",
+                "msg": "",
+                "attachments": [
+                    {
+                        "id": 41,
+                        "path_id": "1/a/report.csv",
+                        "name": "report.csv",
+                        "size": 123,
+                        "create_time": 1_700_000_000,
+                        "message_ids": [9, 7, 9],
+                    }
+                ],
+            },
+        )
+
+    client = _client(handler)
+    try:
+        attachments = client.get_attachments()
+    finally:
+        client.close()
+
+    assert len(attachments) == 1
+    attachment = attachments[0]
+    assert attachment.source_path == "/user_uploads/1/a/report.csv"
+    assert attachment.message_ids == (7, 9)
+    assert attachment.size_bytes == 123
+    assert len(attachment.metadata_hash) == 32
+
+
 @pytest.mark.parametrize(
     ("chat_key", "own_user_id", "expected_narrow"),
     [
