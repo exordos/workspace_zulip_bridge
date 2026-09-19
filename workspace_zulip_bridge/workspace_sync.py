@@ -494,6 +494,8 @@ class WorkspaceDiffWorker:
                        OR target.source_updated_at IS DISTINCT FROM {timestamp_column}
                        OR ({source["hash"]} IS NOT NULL
                            AND target.content_hash IS DISTINCT FROM {source["hash"]}))
+                ORDER BY {timestamp_column}, source.uuid
+                LIMIT $5
                 ON CONFLICT (provider_uuid, entity_type, entity_uuid)
                 DO UPDATE SET
                     direction = EXCLUDED.direction,
@@ -515,6 +517,7 @@ class WorkspaceDiffWorker:
                 entity_type,
                 realm_uuid,
                 generation,
+                self._settings.workspace_sync_plan_batch_size,
             )
             total += int(result.rsplit(" ", 1)[-1])
         return total
@@ -897,44 +900,156 @@ _SOURCE_TABLES = {
     },
     "streams": {
         "from": "workspace_zulip_bridge.zulip_streams",
-        "joins": "",
-        "where": "source.realm_uuid = $3 AND source.source_connection_uuid IS NOT NULL",
+        "joins": """
+            LEFT JOIN workspace_zulip_bridge.zulip_connections AS supplier
+              ON supplier.uuid = source.source_connection_uuid
+        """,
+        "where": """
+            source.realm_uuid = $3 AND source.source_connection_uuid IS NOT NULL
+            AND EXISTS (
+                SELECT 1 FROM workspace_zulip_bridge.workspace_users AS owner
+                WHERE owner.provider_uuid = $1
+                  AND owner.snapshot_generation = $4
+                  AND owner.uuid = COALESCE(
+                      source.owner_user_uuid, supplier.zulip_user_uuid
+                  )
+            )
+            AND (
+                source.direct_user_uuid IS NULL OR EXISTS (
+                    SELECT 1
+                    FROM workspace_zulip_bridge.workspace_users AS direct_user
+                    WHERE direct_user.provider_uuid = $1
+                      AND direct_user.snapshot_generation = $4
+                      AND direct_user.uuid = source.direct_user_uuid
+                )
+            )
+        """,
         "hash": "source.content_hash",
     },
     "stream_bindings": {
         "from": "workspace_zulip_bridge.zulip_stream_bindings",
         "joins": "JOIN workspace_zulip_bridge.zulip_streams AS parent ON parent.uuid = source.zulip_stream_uuid",
-        "where": "parent.realm_uuid = $3 AND parent.source_connection_uuid IS NOT NULL",
+        "where": """
+            parent.realm_uuid = $3 AND parent.source_connection_uuid IS NOT NULL
+            AND EXISTS (
+                SELECT 1 FROM workspace_zulip_bridge.workspace_streams AS target_parent
+                WHERE target_parent.provider_uuid = $1
+                  AND target_parent.snapshot_generation = $4
+                  AND target_parent.uuid = source.zulip_stream_uuid
+            )
+            AND EXISTS (
+                SELECT 1 FROM workspace_zulip_bridge.workspace_users AS target_user
+                WHERE target_user.provider_uuid = $1
+                  AND target_user.snapshot_generation = $4
+                  AND target_user.uuid = source.zulip_user_uuid
+            )
+        """,
         "hash": "source.content_hash",
     },
     "topics": {
         "from": "workspace_zulip_bridge.zulip_topics",
         "joins": "JOIN workspace_zulip_bridge.zulip_streams AS parent ON parent.uuid = source.zulip_stream_uuid",
-        "where": "parent.realm_uuid = $3 AND parent.source_connection_uuid IS NOT NULL",
+        "where": """
+            parent.realm_uuid = $3 AND parent.source_connection_uuid IS NOT NULL
+            AND EXISTS (
+                SELECT 1 FROM workspace_zulip_bridge.workspace_streams AS target_parent
+                WHERE target_parent.provider_uuid = $1
+                  AND target_parent.snapshot_generation = $4
+                  AND target_parent.uuid = source.zulip_stream_uuid
+            )
+        """,
         "hash": "source.content_hash",
     },
     "topic_bindings": {
         "from": "workspace_zulip_bridge.zulip_topic_bindings",
         "joins": "JOIN workspace_zulip_bridge.zulip_streams AS parent ON parent.uuid = source.zulip_stream_uuid",
-        "where": "parent.realm_uuid = $3 AND parent.source_connection_uuid IS NOT NULL",
+        "where": """
+            parent.realm_uuid = $3 AND parent.source_connection_uuid IS NOT NULL
+            AND EXISTS (
+                SELECT 1 FROM workspace_zulip_bridge.workspace_streams AS target_stream
+                WHERE target_stream.provider_uuid = $1
+                  AND target_stream.snapshot_generation = $4
+                  AND target_stream.uuid = source.zulip_stream_uuid
+            )
+            AND EXISTS (
+                SELECT 1 FROM workspace_zulip_bridge.workspace_topics AS target_topic
+                WHERE target_topic.provider_uuid = $1
+                  AND target_topic.snapshot_generation = $4
+                  AND target_topic.uuid = source.topic_uuid
+            )
+            AND EXISTS (
+                SELECT 1 FROM workspace_zulip_bridge.workspace_users AS target_user
+                WHERE target_user.provider_uuid = $1
+                  AND target_user.snapshot_generation = $4
+                  AND target_user.uuid = source.zulip_user_uuid
+            )
+        """,
         "hash": "source.content_hash",
     },
     "messages": {
         "from": "workspace_zulip_bridge.zulip_messages",
         "joins": "",
-        "where": "source.realm_uuid = $3",
+        "where": """
+            source.realm_uuid = $3
+            AND EXISTS (
+                SELECT 1 FROM workspace_zulip_bridge.workspace_streams AS target_stream
+                WHERE target_stream.provider_uuid = $1
+                  AND target_stream.snapshot_generation = $4
+                  AND target_stream.uuid = source.zulip_stream_uuid
+            )
+            AND EXISTS (
+                SELECT 1 FROM workspace_zulip_bridge.workspace_topics AS target_topic
+                WHERE target_topic.provider_uuid = $1
+                  AND target_topic.snapshot_generation = $4
+                  AND target_topic.uuid = source.topic_uuid
+            )
+            AND EXISTS (
+                SELECT 1 FROM workspace_zulip_bridge.workspace_users AS target_user
+                WHERE target_user.provider_uuid = $1
+                  AND target_user.snapshot_generation = $4
+                  AND target_user.uuid = source.sender_user_uuid
+            )
+        """,
         "hash": "source.content_hash",
     },
     "message_flags": {
         "from": "workspace_zulip_bridge.zulip_message_flags",
         "joins": "",
-        "where": "source.realm_uuid = $3",
+        "where": """
+            source.realm_uuid = $3
+            AND EXISTS (
+                SELECT 1 FROM workspace_zulip_bridge.workspace_messages AS target_message
+                WHERE target_message.provider_uuid = $1
+                  AND target_message.snapshot_generation = $4
+                  AND target_message.uuid = source.message_uuid
+            )
+            AND EXISTS (
+                SELECT 1 FROM workspace_zulip_bridge.workspace_users AS target_user
+                WHERE target_user.provider_uuid = $1
+                  AND target_user.snapshot_generation = $4
+                  AND target_user.uuid = source.zulip_user_uuid
+            )
+        """,
         "hash": "source.flags_hash",
     },
     "message_reactions": {
         "from": "workspace_zulip_bridge.zulip_message_reactions",
         "joins": "",
-        "where": "source.realm_uuid = $3",
+        "where": """
+            source.realm_uuid = $3
+            AND EXISTS (
+                SELECT 1 FROM workspace_zulip_bridge.workspace_messages AS target_message
+                WHERE target_message.provider_uuid = $1
+                  AND target_message.snapshot_generation = $4
+                  AND target_message.uuid = source.message_uuid
+            )
+            AND EXISTS (
+                SELECT 1 FROM workspace_zulip_bridge.workspace_users AS target_user
+                WHERE target_user.provider_uuid = $1
+                  AND target_user.snapshot_generation = $4
+                  AND target_user.uuid = source.zulip_user_uuid
+            )
+        """,
         "hash": "NULL::bytea",
     },
 }

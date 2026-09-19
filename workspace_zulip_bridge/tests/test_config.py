@@ -24,6 +24,7 @@ def test_defaults_use_local_postgresql_socket() -> None:
     assert settings.event_cleanup_batch_size == 10000
     assert not settings.workspace_events_enabled
     assert settings.workspace_event_batch_size == 500
+    assert settings.workspace_sync_plan_batch_size == 5000
     assert settings.workspace_sync_batch_size == 50
 
 
@@ -60,6 +61,7 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
             "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
             "WZB_WORKSPACE_EVENT_BATCH_SIZE": "250",
             "WZB_WORKSPACE_EVENT_FLUSH_SECONDS": "0.02",
+            "WZB_WORKSPACE_SYNC_PLAN_BATCH_SIZE": "2500",
         }
     )
 
@@ -85,6 +87,7 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
     assert settings.workspace_project_id == UUID("10000000-0000-0000-0000-000000000001")
     assert settings.workspace_event_batch_size == 250
     assert settings.workspace_event_flush_seconds == 0.02
+    assert settings.workspace_sync_plan_batch_size == 2500
 
 
 @pytest.mark.parametrize(
@@ -111,6 +114,8 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
         ("WZB_WORKSPACE_EVENT_BATCH_SIZE", "0"),
         ("WZB_WORKSPACE_EVENT_BATCH_SIZE", "10001"),
         ("WZB_WORKSPACE_EVENT_FLUSH_SECONDS", "0"),
+        ("WZB_WORKSPACE_SYNC_PLAN_BATCH_SIZE", "0"),
+        ("WZB_WORKSPACE_SYNC_PLAN_BATCH_SIZE", "100001"),
         ("WZB_ZULIP_RETRY_CAP_SECONDS", "0"),
     ],
 )

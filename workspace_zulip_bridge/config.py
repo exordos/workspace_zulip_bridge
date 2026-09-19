@@ -80,6 +80,7 @@ class Settings:
     workspace_bootstrap_timeout_seconds: float = 600.0
     workspace_request_timeout_seconds: float = 60.0
     workspace_sync_poll_seconds: float = 0.1
+    workspace_sync_plan_batch_size: int = 5000
     workspace_sync_batch_size: int = 50
     thread_stop_timeout_seconds: float = 5.0
     log_level: str = "INFO"
@@ -196,6 +197,9 @@ class Settings:
             workspace_sync_poll_seconds=_read_float(
                 source, "WZB_WORKSPACE_SYNC_POLL_SECONDS", 0.1
             ),
+            workspace_sync_plan_batch_size=_read_int(
+                source, "WZB_WORKSPACE_SYNC_PLAN_BATCH_SIZE", 5000
+            ),
             workspace_sync_batch_size=_read_int(
                 source, "WZB_WORKSPACE_SYNC_BATCH_SIZE", 50
             ),
@@ -296,6 +300,10 @@ class Settings:
             )
         if not 1 <= self.workspace_sync_batch_size <= 500:
             raise ValueError("WZB_WORKSPACE_SYNC_BATCH_SIZE must be between 1 and 500")
+        if not 1 <= self.workspace_sync_plan_batch_size <= 100000:
+            raise ValueError(
+                "WZB_WORKSPACE_SYNC_PLAN_BATCH_SIZE must be between 1 and 100000"
+            )
         if self.workspace_retry_cap_seconds < self.workspace_retry_base_seconds:
             raise ValueError(
                 "WZB_WORKSPACE_RETRY_CAP_SECONDS must be at least "
