@@ -40,6 +40,7 @@ from workspace_zulip_bridge.workspace_events import WorkspaceEventReceiver
 from workspace_zulip_bridge.workspace_events import WorkspaceEventStore
 from workspace_zulip_bridge.workspace_sync import WorkspaceBootstrapper
 from workspace_zulip_bridge.workspace_sync import WorkspaceDiffWorker
+from workspace_zulip_bridge.workspace_sync import WorkspaceEventProcessor
 
 ENDPOINT = "https://zulip.example.test"
 
@@ -66,6 +67,7 @@ async def _pool(dsn: str) -> asyncpg.Pool:
         await connection.execute(
             """
             TRUNCATE workspace_zulip_bridge.sync_diffs,
+                     workspace_zulip_bridge.sync_plan_cursors,
                      workspace_zulip_bridge.workspace_users,
                      workspace_zulip_bridge.workspace_streams,
                      workspace_zulip_bridge.workspace_stream_bindings,
@@ -248,6 +250,110 @@ def test_workspace_bootstrap_activates_verified_generation(
     tmp_path: Path,
 ) -> None:
     asyncio.run(_workspace_bootstrap_round_trip(_dsn(), tmp_path))
+
+
+def test_workspace_event_uses_entity_timestamp_for_diff_direction() -> None:
+    asyncio.run(_workspace_event_uses_entity_timestamp(_dsn()))
+
+
+async def _workspace_event_uses_entity_timestamp(dsn: str) -> None:
+    pool = await _pool(dsn)
+    provider_uuid = UUID("10000000-0000-0000-0000-000000000081")
+    project_uuid = UUID("10000000-0000-0000-0000-000000000082")
+    generation = UUID("10000000-0000-0000-0000-000000000083")
+    entity_time = datetime(2026, 9, 19, 10, tzinfo=UTC)
+    event_time = datetime(2026, 9, 19, 11, tzinfo=UTC)
+    try:
+        async with pool.acquire() as connection:
+            user_uuid = await _insert_user(connection, 81, 400)
+            realm_uuid = stable_realm_uuid(ENDPOINT)
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_realms
+                SET workspace_project_id = $2, workspace_provider_uuid = $3
+                WHERE uuid = $1
+                """,
+                realm_uuid,
+                project_uuid,
+                provider_uuid,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.workspace_mirror_state (
+                    provider_uuid, workspace_project_id, active_generation,
+                    bootstrap_status
+                ) VALUES ($1, $2, $3, 'ready')
+                """,
+                provider_uuid,
+                project_uuid,
+                generation,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.sync_diffs (
+                    provider_uuid, entity_type, entity_uuid, realm_uuid,
+                    direction, processing_status, source_hash, target_hash,
+                    source_updated_at, target_updated_at
+                ) VALUES ($1, 'users', $2, $3, 'to_workspace', 'applied',
+                          decode(repeat('01', 32), 'hex'),
+                          decode(repeat('01', 32), 'hex'), $4, $4)
+                """,
+                provider_uuid,
+                user_uuid,
+                realm_uuid,
+                entity_time,
+            )
+            frame = {
+                "updated_at": event_time.isoformat().replace("+00:00", "Z"),
+                "payload": {
+                    "kind": "user.updated",
+                    "uuid": str(user_uuid),
+                    "display_name": "Updated from Workspace",
+                    "updated_at": entity_time.isoformat().replace("+00:00", "Z"),
+                },
+            }
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.workspace_events (
+                    uuid, provider_uuid, workspace_project_id, epoch_version,
+                    object_type, action, entity_uuid, payload
+                ) VALUES ($1, $2, $3, 1, 'user', 'updated', $4, $5::jsonb)
+                """,
+                UUID("10000000-0000-0000-0000-000000000084"),
+                provider_uuid,
+                project_uuid,
+                user_uuid,
+                json.dumps(frame),
+            )
+            event = await connection.fetchrow(
+                "SELECT * FROM workspace_zulip_bridge.workspace_events "
+                "WHERE provider_uuid = $1",
+                provider_uuid,
+            )
+        assert event is not None
+        processor = WorkspaceEventProcessor.__new__(WorkspaceEventProcessor)
+        processor._pool = pool
+        processor._provider_uuid = provider_uuid
+        assert await processor._apply(event)
+        target_time = await pool.fetchval(
+            "SELECT source_updated_at FROM workspace_zulip_bridge.workspace_users "
+            "WHERE provider_uuid = $1 AND snapshot_generation = $2 AND uuid = $3",
+            provider_uuid,
+            generation,
+            user_uuid,
+        )
+        assert target_time == entity_time
+        diff = await pool.fetchrow(
+            "SELECT target_updated_at, direction, processing_status "
+            "FROM workspace_zulip_bridge.sync_diffs "
+            "WHERE provider_uuid = $1 AND entity_type = 'users' AND entity_uuid = $2",
+            provider_uuid,
+            user_uuid,
+        )
+        assert diff is not None
+        assert tuple(diff) == (entity_time, "to_workspace", "pending")
+    finally:
+        await pool.close()
 
 
 async def _workspace_bootstrap_round_trip(dsn: str, tmp_path: Path) -> None:
@@ -465,6 +571,7 @@ async def _workspace_diff_worker_round_trip(dsn: str, tmp_path: Path) -> None:
                 user_uuid,
             )
             assert await worker.process_once(client) == 0
+            assert await worker._complete_initial_sync()
             assert await pool.fetchval(
                 """
                 SELECT initial_sync_completed_at IS NOT NULL

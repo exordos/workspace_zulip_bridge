@@ -380,9 +380,14 @@ class WorkspaceEventProcessor:
                     generation,
                     entity_uuid,
                 )
+                target_hash = None
+                source_updated_at = _timestamp(str(frame["updated_at"]))
             else:
                 data = {key: item for key, item in value.items() if key != "kind"}
-                source_updated_at = _timestamp(str(frame["updated_at"]))
+                source_updated_at = _timestamp(
+                    str(value.get("updated_at") or frame["updated_at"])
+                )
+                target_hash = canonical_hash(data)
                 await self._pool.execute(
                     f"""
                     INSERT INTO workspace_zulip_bridge.workspace_{entity_type} (
@@ -398,12 +403,56 @@ class WorkspaceEventProcessor:
                     generation,
                     entity_uuid,
                     row["workspace_project_id"],
-                    canonical_hash(data),
+                    target_hash,
                     source_updated_at,
                     json.dumps(data, separators=(",", ":")),
                 )
+            await self._refresh_existing_diff(
+                entity_type,
+                entity_uuid,
+                target_hash,
+                source_updated_at,
+            )
             applied = True
         return applied
+
+    async def _refresh_existing_diff(
+        self,
+        entity_type: str,
+        entity_uuid: UUID,
+        target_hash: bytes | None,
+        target_updated_at: datetime,
+    ) -> None:
+        await self._pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.sync_diffs
+            SET direction = CASE
+                    WHEN $5 > source_updated_at THEN 'to_zulip'
+                    ELSE 'to_workspace'
+                END,
+                processing_status = CASE
+                    WHEN target_hash IS DISTINCT FROM $4
+                      OR target_updated_at IS DISTINCT FROM $5
+                    THEN 'pending' ELSE processing_status END,
+                available_at = CASE
+                    WHEN target_hash IS DISTINCT FROM $4
+                      OR target_updated_at IS DISTINCT FROM $5
+                    THEN clock_timestamp() ELSE available_at END,
+                last_error = CASE
+                    WHEN target_hash IS DISTINCT FROM $4
+                      OR target_updated_at IS DISTINCT FROM $5
+                    THEN NULL ELSE last_error END,
+                target_hash = $4, target_updated_at = $5,
+                updated_at = clock_timestamp()
+            WHERE provider_uuid = $1 AND entity_type = $2
+              AND entity_uuid = $3
+            """,
+            self._provider_uuid,
+            entity_type,
+            entity_uuid,
+            target_hash,
+            target_updated_at,
+        )
 
 
 class WorkspaceDiffWorker:
@@ -488,12 +537,63 @@ class WorkspaceDiffWorker:
         generation = state["active_generation"]
         total = 0
         for entity_type, source in _SOURCE_TABLES.items():
-            timestamp_column = (
-                "source.source_updated_at"
-                if entity_type == "messages"
-                else "source.updated_at"
+            planned = await self._plan_entity(
+                entity_type,
+                source,
+                realm_uuid,
+                generation,
             )
-            result = await self._pool.execute(
+            total += planned
+            if planned:
+                break
+        return total
+
+    async def _plan_entity(
+        self,
+        entity_type: str,
+        source: Mapping[str, str],
+        realm_uuid: UUID,
+        generation: UUID,
+    ) -> int:
+        timestamp_column = (
+            "source.source_updated_at"
+            if entity_type == "messages"
+            else "source.updated_at"
+        )
+        async with self._pool.acquire() as connection, connection.transaction():
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.sync_plan_cursors (
+                    provider_uuid, entity_type, snapshot_generation
+                ) VALUES ($1, $2, $3)
+                ON CONFLICT (provider_uuid, entity_type) DO UPDATE
+                SET snapshot_generation = EXCLUDED.snapshot_generation,
+                    source_updated_at = CASE
+                        WHEN sync_plan_cursors.snapshot_generation
+                             IS DISTINCT FROM EXCLUDED.snapshot_generation
+                        THEN NULL ELSE sync_plan_cursors.source_updated_at END,
+                    entity_uuid = CASE
+                        WHEN sync_plan_cursors.snapshot_generation
+                             IS DISTINCT FROM EXCLUDED.snapshot_generation
+                        THEN NULL ELSE sync_plan_cursors.entity_uuid END,
+                    updated_at = clock_timestamp()
+                """,
+                self._provider_uuid,
+                entity_type,
+                generation,
+            )
+            cursor = await connection.fetchrow(
+                """
+                SELECT source_updated_at, entity_uuid
+                FROM workspace_zulip_bridge.sync_plan_cursors
+                WHERE provider_uuid = $1 AND entity_type = $2
+                FOR UPDATE
+                """,
+                self._provider_uuid,
+                entity_type,
+            )
+            assert cursor is not None
+            rows = await connection.fetch(
                 f"""
                 INSERT INTO workspace_zulip_bridge.sync_diffs (
                     provider_uuid, entity_type, entity_uuid, realm_uuid,
@@ -512,21 +612,13 @@ class WorkspaceDiffWorker:
                   ON target.provider_uuid = $1
                  AND target.snapshot_generation = $4
                  AND target.uuid = source.uuid
-                LEFT JOIN workspace_zulip_bridge.sync_diffs AS previous
-                  ON previous.provider_uuid = $1
-                 AND previous.entity_type = $2
-                 AND previous.entity_uuid = source.uuid
                 WHERE {source["where"]}
                   AND (
-                      target.uuid IS NULL OR previous.entity_uuid IS NULL
-                      OR previous.source_updated_at IS DISTINCT FROM {timestamp_column}
-                      OR previous.source_hash IS DISTINCT FROM {source["hash"]}
-                      OR previous.target_updated_at
-                         IS DISTINCT FROM target.source_updated_at
-                      OR previous.target_hash IS DISTINCT FROM target.content_hash
+                      $5::timestamptz IS NULL
+                      OR ({timestamp_column}, source.uuid) > ($5, $6)
                   )
                 ORDER BY {timestamp_column}, source.uuid
-                LIMIT $5
+                LIMIT $7
                 ON CONFLICT (provider_uuid, entity_type, entity_uuid)
                 DO UPDATE SET
                     direction = EXCLUDED.direction,
@@ -554,15 +646,35 @@ class WorkspaceDiffWorker:
                           OR sync_diffs.direction IS DISTINCT FROM EXCLUDED.direction
                         THEN clock_timestamp() ELSE sync_diffs.available_at END,
                     updated_at = clock_timestamp()
+                RETURNING entity_uuid, source_updated_at
                 """,
                 self._provider_uuid,
                 entity_type,
                 realm_uuid,
                 generation,
+                cursor["source_updated_at"],
+                cursor["entity_uuid"],
                 self._settings.workspace_sync_plan_batch_size,
             )
-            total += int(result.rsplit(" ", 1)[-1])
-        return total
+            if not rows:
+                return 0
+            last = max(
+                rows,
+                key=lambda row: (row["source_updated_at"], row["entity_uuid"]),
+            )
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.sync_plan_cursors
+                SET source_updated_at = $3, entity_uuid = $4,
+                    updated_at = clock_timestamp()
+                WHERE provider_uuid = $1 AND entity_type = $2
+                """,
+                self._provider_uuid,
+                entity_type,
+                last["source_updated_at"],
+                last["entity_uuid"],
+            )
+            return len(rows)
 
     async def process_once(self, client: httpx.AsyncClient) -> int:
         mirror = await self._pool.fetchrow(
