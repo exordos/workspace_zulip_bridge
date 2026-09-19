@@ -570,8 +570,6 @@ class WorkspaceDiffWorker:
                 generation,
             )
             total += planned
-            if planned:
-                break
         return total
 
     async def _plan_entity(

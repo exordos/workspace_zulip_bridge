@@ -4,6 +4,7 @@
 import asyncio
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import pytest
 
@@ -123,6 +124,69 @@ def test_workspace_diff_worker_rejects_invalid_partition(tmp_path: Path) -> None
             partition=2,
             partition_count=2,
         )
+
+
+def test_workspace_diff_worker_plans_every_entity_without_starvation(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    asyncio.run(_run_workspace_diff_worker_fair_plan_test(monkeypatch, tmp_path))
+
+
+async def _run_workspace_diff_worker_fair_plan_test(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    token_file = tmp_path / "workspace.token"
+    token_file.write_text("token")
+    settings = Settings.from_env(
+        {
+            "WZB_WORKSPACE_WEBSOCKET_URL": "wss://workspace.example/events/ws",
+            "WZB_WORKSPACE_PROJECT_ID": "10000000-0000-0000-0000-000000000001",
+            "WZB_WORKSPACE_PROVIDER_UUID": "10000000-0000-0000-0000-000000000002",
+            "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+        }
+    )
+
+    class PlanningPool:
+        async def fetchrow(self, query: str, *args: object) -> dict[str, UUID]:
+            assert "active_generation" in query
+            return {"active_generation": UUID("20000000-0000-0000-0000-000000000001")}
+
+    worker = WorkspaceDiffWorker(PlanningPool(), settings)  # type: ignore[arg-type]
+    calls: list[str] = []
+
+    async def fake_link_realm() -> UUID:
+        return UUID("30000000-0000-0000-0000-000000000001")
+
+    async def fake_ensure_direct_topics(realm_uuid: UUID) -> None:
+        assert realm_uuid == UUID("30000000-0000-0000-0000-000000000001")
+
+    async def fake_plan_entity(
+        entity_type: str,
+        source: object,
+        realm_uuid: UUID,
+        generation: UUID,
+    ) -> int:
+        del source, realm_uuid, generation
+        calls.append(entity_type)
+        return 1 if entity_type == "users" else 0
+
+    monkeypatch.setattr(worker, "_link_realm", fake_link_realm)
+    monkeypatch.setattr(worker, "_ensure_direct_topics", fake_ensure_direct_topics)
+    monkeypatch.setattr(worker, "_plan_entity", fake_plan_entity)
+
+    assert await worker.plan() == 1
+    assert calls == [
+        "users",
+        "streams",
+        "stream_bindings",
+        "topics",
+        "topic_bindings",
+        "messages",
+        "message_flags",
+        "message_reactions",
+    ]
 
 
 async def _run_workspace_diff_worker_drain_test(
