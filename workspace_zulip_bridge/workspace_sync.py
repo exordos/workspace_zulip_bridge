@@ -822,37 +822,46 @@ class WorkspaceDiffWorker:
             )
             for row in rows
         ]
-        if not values:
-            return
         topic_uuids = [value[0] for value in values]
         stream_uuids = [value[1] for value in values]
         content_hashes = [value[2] for value in values]
         async with self._pool.acquire() as connection, connection.transaction():
+            if values:
+                await connection.execute(
+                    """
+                    INSERT INTO workspace_zulip_bridge.zulip_topics
+                        (uuid, zulip_stream_uuid, name, content_hash)
+                    SELECT input.topic_uuid, input.stream_uuid, 'General',
+                           input.content_hash
+                    FROM unnest($1::uuid[], $2::uuid[], $3::bytea[])
+                        AS input(topic_uuid, stream_uuid, content_hash)
+                    ON CONFLICT (uuid) DO NOTHING
+                    """,
+                    topic_uuids,
+                    stream_uuids,
+                    content_hashes,
+                )
             await connection.execute(
                 """
-                INSERT INTO workspace_zulip_bridge.zulip_topics
-                    (uuid, zulip_stream_uuid, name, content_hash)
-                SELECT input.topic_uuid, input.stream_uuid, 'General',
-                       input.content_hash
-                FROM unnest($1::uuid[], $2::uuid[], $3::bytea[])
-                    AS input(topic_uuid, stream_uuid, content_hash)
-                ON CONFLICT (uuid) DO NOTHING
-                """,
-                topic_uuids,
-                stream_uuids,
-                content_hashes,
-            )
-            await connection.execute(
-                """
+                WITH pending AS MATERIALIZED (
+                    SELECT message.ctid, topic.uuid AS topic_uuid
+                    FROM workspace_zulip_bridge.zulip_messages AS message
+                    JOIN workspace_zulip_bridge.zulip_streams AS stream
+                      ON stream.uuid = message.zulip_stream_uuid
+                    JOIN workspace_zulip_bridge.zulip_topics AS topic
+                      ON topic.zulip_stream_uuid = stream.uuid
+                     AND topic.name = 'General'
+                    WHERE stream.realm_uuid = $1
+                      AND stream.chat_type <> 'channel'
+                      AND message.topic_uuid IS NULL
+                    LIMIT 10000
+                    FOR UPDATE OF message SKIP LOCKED
+                )
                 UPDATE workspace_zulip_bridge.zulip_messages AS message
-                SET topic_uuid = input.topic_uuid
-                FROM unnest($1::uuid[], $2::uuid[])
-                    AS input(topic_uuid, stream_uuid)
-                WHERE message.zulip_stream_uuid = input.stream_uuid
-                  AND message.topic_uuid IS NULL
+                SET topic_uuid = pending.topic_uuid
+                FROM pending WHERE message.ctid = pending.ctid
                 """,
-                topic_uuids,
-                stream_uuids,
+                realm_uuid,
             )
 
     async def _load_zulip_entities(

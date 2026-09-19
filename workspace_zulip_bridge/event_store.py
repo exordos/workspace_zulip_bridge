@@ -986,11 +986,8 @@ class HistorySession:
         for message in messages:
             message_uuid = stable_message_uuid(self._endpoint, message.message_id)
             stream_uuid = stable_chat_uuid(self._endpoint, message.chat_key)
-            topic_uuid = (
-                stable_topic_uuid(stream_uuid, message.topic_name)
-                if message.topic_name is not None
-                else None
-            )
+            topic_name = message.topic_name or "General"
+            topic_uuid = stable_topic_uuid(stream_uuid, topic_name)
             flags_hash = message_flags_hash(
                 is_read=message.is_read,
                 is_starred=message.is_starred,
@@ -1007,12 +1004,8 @@ class HistorySession:
                     message.message_id,
                     stream_uuid,
                     topic_uuid,
-                    message.topic_name,
-                    (
-                        hashlib.sha256(message.topic_name.encode("utf-8")).digest()
-                        if message.topic_name is not None
-                        else None
-                    ),
+                    topic_name,
+                    hashlib.sha256(topic_name.encode("utf-8")).digest(),
                     message.sender_user_uuid,
                     message.content,
                     message.reactions_json,
