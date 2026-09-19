@@ -3,10 +3,12 @@
 
 import asyncio
 from pathlib import Path
+from typing import Any
 
 import workspace_zulip_bridge.service as service_module
 from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.service import BridgeService
+from workspace_zulip_bridge.workspace_sync import WorkspaceDiffWorker
 
 
 class FakePool:
@@ -81,6 +83,46 @@ class FakeWorkspaceEventProcessor(FakeWorkspaceWorker):
 
 class FakeWorkspaceDiffWorker(FakeWorkspaceWorker):
     label = "workspace-diff-worker"
+
+
+def test_workspace_diff_worker_plans_once_before_draining(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    asyncio.run(_run_workspace_diff_worker_drain_test(monkeypatch, tmp_path))
+
+
+async def _run_workspace_diff_worker_drain_test(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    token_file = tmp_path / "workspace.token"
+    token_file.write_text("token")
+    settings = Settings.from_env(
+        {
+            "WZB_WORKSPACE_WEBSOCKET_URL": "wss://workspace.example/events/ws",
+            "WZB_WORKSPACE_PROJECT_ID": "10000000-0000-0000-0000-000000000001",
+            "WZB_WORKSPACE_PROVIDER_UUID": "10000000-0000-0000-0000-000000000002",
+            "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+        }
+    )
+    worker = WorkspaceDiffWorker(object(), settings)  # type: ignore[arg-type]
+    calls: list[str] = []
+    batches = iter((100, 100, 0))
+
+    async def fake_plan() -> int:
+        calls.append("plan")
+        return 200
+
+    async def fake_process_once(client: object) -> int:
+        calls.append("process")
+        return next(batches)
+
+    monkeypatch.setattr(worker, "plan", fake_plan)
+    monkeypatch.setattr(worker, "process_once", fake_process_once)
+
+    assert await worker._plan_and_drain(object()) == 200  # type: ignore[arg-type]
+    assert calls == ["plan", "process", "process", "process"]
 
 
 def test_daemon_prepares_probes_and_closes_database(monkeypatch: object) -> None:

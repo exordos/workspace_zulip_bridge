@@ -430,10 +430,15 @@ class WorkspaceDiffWorker:
             timeout=httpx.Timeout(self._settings.workspace_request_timeout_seconds),
         ) as client:
             while True:
-                await self.plan()
-                changed = await self.process_once(client)
-                if not changed:
-                    await asyncio.sleep(self._settings.workspace_sync_poll_seconds)
+                await self._plan_and_drain(client)
+                await asyncio.sleep(self._settings.workspace_sync_poll_seconds)
+
+    async def _plan_and_drain(self, client: httpx.AsyncClient) -> int:
+        await self.plan()
+        processed = 0
+        while changed := await self.process_once(client):
+            processed += changed
+        return processed
 
     async def plan(self) -> int:
         realm_uuid = await self._link_realm()
