@@ -375,6 +375,39 @@ class ZulipApiClient:
             narrow=narrow,
         )
 
+    def get_first_accessible_channel_message_id(self, stream_id: int) -> int | None:
+        payload = self._request(
+            "GET",
+            "/api/v1/messages",
+            params={
+                "anchor": "oldest",
+                "include_anchor": "true",
+                "num_before": "0",
+                "num_after": "1",
+                "apply_markdown": "false",
+                "allow_empty_topic_name": "true",
+                "narrow": json.dumps(
+                    [{"operator": "channel", "operand": stream_id}],
+                    separators=(",", ":"),
+                ),
+            },
+            timeout=self._chat_timeout(),
+        )
+        messages = payload.get("messages")
+        found_oldest = payload.get("found_oldest")
+        if not isinstance(messages, list) or not all(
+            isinstance(message, dict) for message in messages
+        ):
+            raise ZulipApiError("invalid_messages_response", retryable=True)
+        if found_oldest is not True:
+            raise ZulipApiError("invalid_messages_response", retryable=True)
+        if not messages:
+            return None
+        message_id = messages[0].get("id")
+        if not isinstance(message_id, int):
+            raise ZulipApiError("invalid_messages_response", retryable=True)
+        return message_id
+
     def get_messages_by_ids(
         self,
         message_ids: list[int],

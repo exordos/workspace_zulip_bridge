@@ -51,9 +51,13 @@ class ChatCatalogBuilder:
         self._direct_conversations: dict[str, _DirectConversation] = {}
 
     def add_subscriptions(
-        self, subscriptions: list[Mapping[str, Any]]
+        self,
+        subscriptions: list[Mapping[str, Any]],
+        *,
+        first_visible_message_ids: Mapping[int, int | None] | None = None,
     ) -> tuple[ZulipChat, ...]:
         added: list[ZulipChat] = []
+        visible_message_ids = first_visible_message_ids or {}
         for subscription in subscriptions:
             stream_id = subscription.get("stream_id")
             name = subscription.get("name")
@@ -81,6 +85,7 @@ class ChatCatalogBuilder:
                 ),
                 chat_parameters=chat_parameters,
                 membership_parameters=membership_parameters,
+                first_visible_message_id=visible_message_ids.get(stream_id),
             )
             self._channels[chat_key] = chat
             added.append(chat)
@@ -220,6 +225,7 @@ def _make_chat(
     notification_mode: str,
     chat_parameters: Mapping[str, object],
     membership_parameters: Mapping[str, object],
+    first_visible_message_id: int | None = None,
 ) -> ZulipChat:
     chat_parameters_json = _canonical_json(chat_parameters)
     membership_parameters_json = _canonical_json(membership_parameters)
@@ -238,6 +244,7 @@ def _make_chat(
         membership_kind,
         notification_mode,
         membership_parameters_json,
+        str(first_visible_message_id or 0),
     ):
         membership_digest.update(value.encode("utf-8"))
         membership_digest.update(b"\0")
@@ -252,6 +259,7 @@ def _make_chat(
         membership_parameters_json=membership_parameters_json,
         content_hash=canonical_digest.digest(),
         membership_hash=membership_digest.digest(),
+        first_visible_message_id=first_visible_message_id,
     )
 
 

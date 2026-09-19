@@ -9,6 +9,7 @@ from workspace_zulip_bridge.message_history import build_message_page
 
 USER_ONE = UUID("00000000-0000-0000-0000-000000000001")
 USER_TWO = UUID("00000000-0000-0000-0000-000000000002")
+BOT_USER = UUID("00000000-0000-0000-0000-000000000099")
 
 
 def _channel_message() -> dict[str, object]:
@@ -134,7 +135,7 @@ def test_upload_links_create_metadata_without_file_content() -> None:
     ]
 
 
-def test_direct_message_with_excluded_participant_is_skipped() -> None:
+def test_direct_message_with_bot_participant_is_imported() -> None:
     result = build_message_page(
         [
             {
@@ -152,13 +153,41 @@ def test_direct_message_with_excluded_participant_is_skipped() -> None:
             }
         ],
         own_user_id=10,
-        user_uuids={10: USER_ONE},
+        user_uuids={10: USER_ONE, 99: BOT_USER},
         stream_ids_by_name={},
-        allowed_chat_keys=set(),
+        allowed_chat_keys={"direct:10,99"},
     )
 
-    assert result.messages == ()
-    assert result.skipped_messages == 1
+    assert result.skipped_messages == 0
+    assert result.messages[0].chat_key == "direct:10,99"
+    assert result.messages[0].sender_user_uuid == USER_ONE
+
+
+def test_bot_authored_message_and_reaction_are_imported() -> None:
+    raw = _channel_message()
+    raw["sender_id"] = 99
+    raw["reactions"] = [
+        {
+            "user_id": 99,
+            "emoji_name": "robot",
+            "emoji_code": "1f916",
+            "reaction_type": "unicode_emoji",
+        }
+    ]
+    result = build_message_page(
+        [raw],
+        own_user_id=10,
+        user_uuids={10: USER_ONE, 99: BOT_USER},
+        stream_ids_by_name={"Engineering": 7},
+        allowed_chat_keys={"channel:7"},
+    )
+
+    assert result.skipped_messages == 0
+    assert result.skipped_reactions == 0
+    assert result.messages[0].sender_user_uuid == BOT_USER
+    assert json.loads(result.messages[0].reactions_json)[0]["user_uuid"] == str(
+        BOT_USER
+    )
 
 
 def test_legacy_wildcard_flag_maps_to_stream_wildcard() -> None:

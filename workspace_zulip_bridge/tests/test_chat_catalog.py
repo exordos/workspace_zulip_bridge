@@ -14,13 +14,16 @@ def test_channel_parameters_and_membership_parameters_are_separated() -> None:
             {
                 "stream_id": 7,
                 "name": "Engineering",
+                "first_message_id": 11,
+                "history_public_to_subscribers": False,
                 "description": "Product engineering",
                 "invite_only": True,
                 "color": "#123456",
                 "is_muted": False,
                 "desktop_notifications": 1,
             }
-        ]
+        ],
+        first_visible_message_ids={7: 105},
     )
     catalog = first.build()
 
@@ -30,8 +33,11 @@ def test_channel_parameters_and_membership_parameters_are_separated() -> None:
     assert chat.chat_type == "channel"
     assert chat.role == "member"
     assert chat.membership_kind == "subscriber"
+    assert chat.first_visible_message_id == 105
     assert json.loads(chat.chat_parameters_json) == {
         "description": "Product engineering",
+        "first_message_id": 11,
+        "history_public_to_subscribers": False,
         "invite_only": True,
         "stream_id": 7,
     }
@@ -50,10 +56,13 @@ def test_channel_parameters_and_membership_parameters_are_separated() -> None:
                 "color": "#123456",
                 "invite_only": True,
                 "description": "Product engineering",
+                "history_public_to_subscribers": False,
+                "first_message_id": 11,
                 "name": "Engineering",
                 "stream_id": 7,
             }
-        ]
+        ],
+        first_visible_message_ids={7: 105},
     )
     assert reordered.build().content_hash == catalog.content_hash
 

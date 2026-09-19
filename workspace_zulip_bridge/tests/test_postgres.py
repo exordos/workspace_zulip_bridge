@@ -97,6 +97,7 @@ async def _insert_user(
     api_key: str | None = "api-key-placeholder",
     queue_id: str | None = None,
     status: str = "init",
+    is_bot: bool = False,
 ) -> UUID:
     user_uuid = stable_user_uuid(ENDPOINT, user_id)
     await connection.execute(
@@ -112,8 +113,8 @@ async def _insert_user(
     await connection.execute(
         """
         INSERT INTO workspace_zulip_bridge.zulip_users
-            (uuid, realm_uuid, zulip_user_id, login, full_name, role)
-        VALUES ($1, $2, $3, $4, $5, $6)
+            (uuid, realm_uuid, zulip_user_id, login, full_name, role, is_bot)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         """,
         user_uuid,
         stable_realm_uuid(ENDPOINT),
@@ -121,6 +122,7 @@ async def _insert_user(
         f"user-{user_id}@example.test",
         f"User {user_id}",
         role,
+        is_bot,
     )
     if api_key is not None:
         await connection.execute(
@@ -144,16 +146,18 @@ def _catalog(
     own_user_id: int,
     channels: list[tuple[int, str]],
     counts: dict[str, int],
+    first_visible_message_ids: dict[int, int | None] | None = None,
 ):
-    role = {10: 100, 20: 200, 30: 200}.get(own_user_id, 400)
+    role = {10: 100, 20: 200, 30: 200, 99: 100}.get(own_user_id, 400)
     builder = ChatCatalogBuilder(own_user_id, f"User {own_user_id}", role)
     builder.add_subscriptions(
-        [{"stream_id": stream_id, "name": name} for stream_id, name in channels]
+        [{"stream_id": stream_id, "name": name} for stream_id, name in channels],
+        first_visible_message_ids=first_visible_message_ids,
     )
     return builder.build(counts)
 
 
-def test_directory_uses_stable_user_ids_and_excludes_bots() -> None:
+def test_directory_uses_stable_user_ids_and_keeps_bots_without_connections() -> None:
     asyncio.run(_directory_round_trip(_dsn()))
 
 
@@ -184,30 +188,115 @@ async def _directory_round_trip(dsn: str) -> None:
                 ),
             ],
         )
-        assert result == UserDirectoryWrite(humans=1, changed=1)
+        assert result == UserDirectoryWrite(users=2, bots=1, changed=2)
         async with pool.acquire() as connection:
             rows = await connection.fetch(
                 """
                 SELECT zulip_user.uuid, zulip_user.login, zulip_user.full_name,
-                       zulip_user.role, zulip_user.disabled, connection.api_key
+                       zulip_user.role, zulip_user.disabled, zulip_user.is_bot,
+                       connection.api_key
                 FROM workspace_zulip_bridge.zulip_users AS zulip_user
                 LEFT JOIN workspace_zulip_bridge.zulip_connections AS connection
                   ON connection.zulip_user_uuid = zulip_user.uuid
+                ORDER BY zulip_user.zulip_user_id
                 """
             )
-        assert len(rows) == 1
+        assert len(rows) == 2
         assert rows[0]["uuid"] == user_uuid
         assert rows[0]["login"] == "masked-login@example.test"
         assert rows[0]["full_name"] == "Renamed User"
         assert rows[0]["role"] == 200
         assert rows[0]["disabled"]
+        assert not rows[0]["is_bot"]
         assert rows[0]["api_key"] == "api-key-placeholder"
+        assert rows[1]["uuid"] == stable_user_uuid(ENDPOINT, 99)
+        assert rows[1]["is_bot"]
+        assert rows[1]["api_key"] is None
     finally:
         await pool.close()
 
 
 def test_scheduler_uses_role_then_stable_uuid() -> None:
     asyncio.run(_scheduler_round_trip(_dsn()))
+
+
+def test_bot_connections_are_not_started_or_scheduled() -> None:
+    asyncio.run(_bot_connection_round_trip(_dsn()))
+
+
+async def _bot_connection_round_trip(dsn: str) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            human_uuid = await _insert_user(
+                connection, 20, 200, queue_id="queue-human", status="filling"
+            )
+            bot_uuid = await _insert_user(
+                connection,
+                99,
+                100,
+                queue_id="queue-bot",
+                status="filling",
+                is_bot=True,
+            )
+
+        assert (
+            await store.store_chat_catalog(
+                human_uuid, "queue-human", _catalog(20, [(7, "Shared")], {})
+            )
+        ).activated
+        assert (
+            await store.store_chat_catalog(
+                bot_uuid, "queue-bot", _catalog(99, [(7, "Shared")], {})
+            )
+        ).activated
+
+        assert [user.uuid for user in await store.list_users()] == [human_uuid]
+        assert (await store.reconcile_chat_schedules()).assigned == 1
+        async with pool.acquire() as connection:
+            assert (
+                await connection.fetchval(
+                    "SELECT source_connection_uuid "
+                    "FROM workspace_zulip_bridge.zulip_streams "
+                    "WHERE chat_key = 'channel:7'"
+                )
+                == human_uuid
+            )
+    finally:
+        await pool.close()
+
+
+def test_lifecycle_updates_require_current_queue() -> None:
+    asyncio.run(_lifecycle_queue_round_trip(_dsn()))
+
+
+async def _lifecycle_queue_round_trip(dsn: str) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            user_uuid = await _insert_user(
+                connection, 10, 400, queue_id="queue-current", status="streaming"
+            )
+
+        assert not await store.begin_catalog_fill(user_uuid, "queue-stale")
+        assert await store.begin_catalog_fill(user_uuid, "queue-current")
+        assert not await store.set_user_status(user_uuid, "queue-stale", "active")
+        assert await store.set_user_status(user_uuid, "queue-current", "scheduling")
+
+        async with pool.acquire() as connection:
+            assert (
+                await connection.fetchval(
+                    "SELECT lifecycle_status "
+                    "FROM workspace_zulip_bridge.zulip_connections "
+                    "WHERE uuid = $1",
+                    user_uuid,
+                )
+                == "scheduling"
+            )
+    finally:
+        await pool.close()
 
 
 async def _scheduler_round_trip(dsn: str) -> None:
@@ -225,7 +314,12 @@ async def _scheduler_round_trip(dsn: str) -> None:
                 connection, 30, 200, queue_id="queue-admin-b", status="filling"
             )
 
-        owner_catalog = _catalog(10, [(7, "Shared")], {"channel:7": 1})
+        owner_catalog = _catalog(
+            10,
+            [(7, "Shared")],
+            {"channel:7": 1},
+            {7: 101},
+        )
         admin_a_catalog = _catalog(
             20,
             [(7, "Shared"), (8, "Admins"), (9, "Tie")],
@@ -272,6 +366,17 @@ async def _scheduler_round_trip(dsn: str) -> None:
                     """
                 )
             }
+            first_visible_message_id = await connection.fetchval(
+                """
+                SELECT binding.first_visible_message_id
+                FROM workspace_zulip_bridge.zulip_stream_bindings AS binding
+                JOIN workspace_zulip_bridge.zulip_streams AS stream
+                  ON stream.uuid = binding.zulip_stream_uuid
+                WHERE stream.chat_key = 'channel:7'
+                  AND binding.zulip_user_uuid = $1
+                """,
+                owner_uuid,
+            )
         assert assignments == {
             "channel:7": owner_uuid,
             "channel:8": min(admin_a_uuid, admin_b_uuid),
@@ -282,6 +387,7 @@ async def _scheduler_round_trip(dsn: str) -> None:
             admin_a_uuid: "active",
             admin_b_uuid: "backfilling",
         }
+        assert first_visible_message_id == 101
 
         async with pool.acquire() as connection:
             await connection.execute(

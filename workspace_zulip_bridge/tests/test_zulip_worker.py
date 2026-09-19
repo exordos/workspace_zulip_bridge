@@ -60,7 +60,7 @@ def test_directory_cache_coalesces_concurrent_endpoint_loads() -> None:
         with lock:
             calls += 1
         time.sleep(0.02)
-        return directory, UserDirectoryWrite(1, 1)
+        return directory, UserDirectoryWrite(users=1, bots=0, changed=1)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         results = list(
@@ -109,7 +109,11 @@ class FakeStore:
     async def store_user_directory(
         self, endpoint: str, users: list[ZulipDirectoryUser]
     ) -> UserDirectoryWrite:
-        return UserDirectoryWrite(humans=2, changed=2)
+        return UserDirectoryWrite(
+            users=len(users),
+            bots=sum(user.is_bot for user in users),
+            changed=len(users),
+        )
 
     async def list_user_chat_keys(self, user_uuid: UUID) -> set[str]:
         return {"channel:7", "direct:10,12"}
@@ -197,14 +201,27 @@ class FakeApi:
             "queue-1",
             -1,
             90,
-            (RecentPrivateConversation((12,), 100),),
+            (
+                RecentPrivateConversation((12,), 100),
+                RecentPrivateConversation((99,), 101),
+            ),
         )
 
     def get_own_user(self) -> ZulipIdentity:
         return ZulipIdentity(10, "Current User", 400)
 
     def get_subscriptions(self) -> list[dict[str, object]]:
-        return [{"stream_id": 7, "name": "Engineering"}]
+        return [
+            {
+                "stream_id": 7,
+                "name": "Engineering",
+                "history_public_to_subscribers": False,
+            }
+        ]
+
+    def get_first_accessible_channel_message_id(self, stream_id: int) -> int:
+        assert stream_id == 7
+        return 55
 
     def get_attachments(self) -> list[object]:
         return []
@@ -217,6 +234,7 @@ class FakeApi:
             ZulipDirectoryUser(
                 12, "two@example.test", "Second User", 400, False, False
             ),
+            ZulipDirectoryUser(99, "bot@example.test", "Build Bot", 400, False, True),
         ]
 
     def get_direct_messages_page(
@@ -286,7 +304,11 @@ class FakeApi:
         if self.polls == 1:
             return [
                 {"id": 1, "type": "heartbeat"},
-                {"id": 2, "type": "message", "message": {"id": 42}},
+                {
+                    "id": 2,
+                    "type": "message",
+                    "message": {"id": 42, "sender_id": 99},
+                },
             ]
         self.closed.wait(5)
         return []
@@ -341,7 +363,9 @@ async def _thread_test() -> None:
     assert [chat.chat_key for chat in store.catalogs[0][2].chats] == [
         "channel:7",
         "direct:10,12",
+        "direct:10,99",
     ]
+    assert store.catalogs[0][2].chats[0].first_visible_message_id == 55
     assert len(store.batches) == 1
     assert store.live_message_counts == []
     user_uuid, queue_id, events, last_event_id = store.batches[0]

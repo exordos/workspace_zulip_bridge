@@ -19,6 +19,7 @@ def test_schema_separates_realm_identities_and_sync_connections() -> None:
         assert f"workspace_zulip_bridge.{table}" in schema
     assert "identity_key text NOT NULL UNIQUE" in schema
     assert "zulip_user_id bigint NOT NULL" in schema
+    assert "is_bot boolean NOT NULL DEFAULT false" in schema
     assert "api_key text NOT NULL" in schema
     assert "lifecycle_status text NOT NULL DEFAULT 'init'" in schema
     assert "streams_hash bytea" in schema
@@ -44,6 +45,7 @@ def test_schema_normalizes_workspace_like_entities_and_personal_state() -> None:
     assert "source_connection_uuid uuid" in schema
     assert "UNIQUE (realm_uuid, chat_key)" in schema
     assert "UNIQUE (zulip_stream_uuid, zulip_user_uuid)" in schema
+    assert "first_visible_message_id bigint" in schema
     assert "UNIQUE (zulip_stream_uuid, name)" in schema
     assert "reaction_users jsonb NOT NULL DEFAULT '{}'::jsonb" in schema
     assert "flags_hash bytea NOT NULL" in schema

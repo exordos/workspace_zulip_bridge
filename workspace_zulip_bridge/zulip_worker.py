@@ -78,7 +78,11 @@ class EndpointDirectoryCache:
                 entry = self._entries.get(endpoint)
                 now = time.monotonic()
                 if entry is not None and now - entry.loaded_at < self._ttl_seconds:
-                    return entry.users, UserDirectoryWrite(len(entry.users), 0)
+                    return entry.users, UserDirectoryWrite(
+                        users=len(entry.users),
+                        bots=sum(user.is_bot for user in entry.users),
+                        changed=0,
+                    )
                 if endpoint not in self._loading:
                     self._loading.add(endpoint)
                     break
@@ -145,7 +149,6 @@ class ZulipEventThread(threading.Thread):
         )
         self._identity: ZulipIdentity | None = None
         self._user_uuids: dict[int, UUID] = {}
-        self._bot_user_ids: frozenset[int] = frozenset()
         self._stream_ids_by_name: dict[str, int] = {}
         self._allowed_chat_keys: set[str] = set()
         self._catalog_builder: ChatCatalogBuilder | None = None
@@ -321,7 +324,6 @@ class ZulipEventThread(threading.Thread):
                 self._resume_existing_queue = False
                 self._identity = None
                 self._user_uuids.clear()
-                self._bot_user_ids = frozenset()
                 self._stream_ids_by_name.clear()
                 self._allowed_chat_keys.clear()
                 self._catalog_builder = None
@@ -372,11 +374,9 @@ class ZulipEventThread(threading.Thread):
         user_uuids = {
             user.user_id: stable_user_uuid(self.user.endpoint, user.user_id)
             for user in directory
-            if not user.is_bot
         }
         if identity.user_id not in user_uuids:
             raise RuntimeError("current Zulip user is missing from user directory")
-        bot_user_ids = frozenset(user.user_id for user in directory if user.is_bot)
         attachments = client.get_attachments()
         attachment_changes = self._submit(
             self._store.store_user_attachments(
@@ -387,16 +387,33 @@ class ZulipEventThread(threading.Thread):
             )
         )
         subscriptions = client.get_subscriptions()
+        first_visible_message_ids: dict[int, int | None] = {}
+        visibility_probes = 0
+        for subscription in subscriptions:
+            stream_id = subscription.get("stream_id")
+            if not isinstance(stream_id, int):
+                continue
+            first_message_id = subscription.get("first_message_id")
+            if subscription.get("history_public_to_subscribers") is not False:
+                first_visible_message_ids[stream_id] = (
+                    first_message_id if isinstance(first_message_id, int) else None
+                )
+            else:
+                visibility_probes += 1
+                with self._message_scan_gate:
+                    first_visible_message_ids[stream_id] = (
+                        client.get_first_accessible_channel_message_id(stream_id)
+                    )
         builder = ChatCatalogBuilder(
             identity.user_id, identity.full_name, identity.role
         )
-        channel_chats = builder.add_subscriptions(subscriptions)
+        channel_chats = builder.add_subscriptions(
+            subscriptions,
+            first_visible_message_ids=first_visible_message_ids,
+        )
         direct_chats = builder.add_recent_direct_conversations(
             self._recent_private_conversations,
-            user_names={
-                user.user_id: user.full_name for user in directory if not user.is_bot
-            },
-            excluded_user_ids=bot_user_ids,
+            user_names={user.user_id: user.full_name for user in directory},
         )
         stream_ids_by_name: dict[str, int] = {}
         for subscription in subscriptions:
@@ -407,9 +424,6 @@ class ZulipEventThread(threading.Thread):
 
         allowed_chat_keys = {chat.chat_key for chat in (*channel_chats, *direct_chats)}
         catalog = builder.build()
-        skipped_direct_chats = len(self._recent_private_conversations) - len(
-            direct_chats
-        )
         with self._catalog_write_gate:
             if self._stop_requested.is_set():
                 return False
@@ -425,24 +439,24 @@ class ZulipEventThread(threading.Thread):
         elapsed = time.monotonic() - started_at
         self._identity = identity
         self._user_uuids = user_uuids
-        self._bot_user_ids = bot_user_ids
         self._stream_ids_by_name = stream_ids_by_name
         self._allowed_chat_keys = allowed_chat_keys
         self._catalog_builder = builder
         LOG.info(
-            "Zulip catalog ready user_uuid=%s users=%s user_changes=%s "
+            "Zulip catalog ready user_uuid=%s users=%s bots=%s user_changes=%s "
             "attachments=%s attachment_changes=%s chats=%s "
-            "chat_upserts=%s chat_deletes=%s "
-            "skipped_direct_chats=%s elapsed_seconds=%.3f",
+            "visibility_probes=%s chat_upserts=%s chat_deletes=%s "
+            "elapsed_seconds=%.3f",
             self.user.uuid,
-            directory_result.humans,
+            directory_result.users,
+            directory_result.bots,
             directory_result.changed,
             len(attachments),
             attachment_changes,
             len(catalog.chats),
+            visibility_probes,
             result.upserted,
             result.deleted,
-            skipped_direct_chats,
             elapsed,
         )
         return True
@@ -577,11 +591,9 @@ class ZulipEventThread(threading.Thread):
         user_uuids = {
             user.user_id: stable_user_uuid(self.user.endpoint, user.user_id)
             for user in directory
-            if not user.is_bot
         }
         if identity.user_id not in user_uuids:
             raise RuntimeError("current Zulip user is missing from user directory")
-        bot_user_ids = frozenset(user.user_id for user in directory if user.is_bot)
         if self.user.queue_id is None:
             return False
         self._submit(
@@ -603,7 +615,6 @@ class ZulipEventThread(threading.Thread):
         allowed_chat_keys.update(chat.chat_key for chat in channel_chats)
         self._identity = identity
         self._user_uuids = user_uuids
-        self._bot_user_ids = bot_user_ids
         self._stream_ids_by_name = {
             name: stream_id
             for subscription in subscriptions
@@ -658,7 +669,7 @@ class ZulipEventThread(threading.Thread):
             if not isinstance(event_id, int) or not isinstance(event_type, str):
                 raise ZulipApiError("invalid_event", retryable=True)
             next_event_id = max(next_event_id, event_id)
-            if event_type == "heartbeat" or self._event_is_bot_related(raw_event):
+            if event_type == "heartbeat":
                 continue
             events.append(
                 ZulipEvent(
@@ -672,22 +683,6 @@ class ZulipEventThread(threading.Thread):
                 )
             )
         return events, next_event_id
-
-    def _event_is_bot_related(self, event: Mapping[str, Any]) -> bool:
-        user_id = event.get("user_id")
-        if isinstance(user_id, int) and user_id in self._bot_user_ids:
-            return True
-        message = event.get("message")
-        if isinstance(message, Mapping):
-            sender_id = message.get("sender_id")
-            if isinstance(sender_id, int) and sender_id in self._bot_user_ids:
-                return True
-        person = event.get("person")
-        if isinstance(person, Mapping):
-            person_user_id = person.get("user_id")
-            if isinstance(person_user_id, int) and person_user_id in self._bot_user_ids:
-                return True
-        return False
 
     def _submit(self, coroutine: Coroutine[Any, Any, Any]) -> Any:
         future = asyncio.run_coroutine_threadsafe(coroutine, self._loop)

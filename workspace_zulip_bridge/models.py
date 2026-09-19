@@ -117,6 +117,7 @@ class ZulipChat:
     content_hash: bytes
     membership_hash: bytes
     available_message_count: int = 0
+    first_visible_message_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,7 +194,8 @@ class HistoryWrite:
 
 @dataclass(frozen=True, slots=True)
 class UserDirectoryWrite:
-    humans: int
+    users: int
+    bots: int
     changed: int
 
 

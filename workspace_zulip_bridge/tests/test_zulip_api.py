@@ -328,6 +328,33 @@ def test_history_pages_are_narrowed_to_one_scheduled_chat(
     assert page.found_oldest
 
 
+def test_first_accessible_channel_message_uses_oldest_narrow() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/messages")
+        assert request.url.params["anchor"] == "oldest"
+        assert request.url.params["num_before"] == "0"
+        assert request.url.params["num_after"] == "1"
+        assert json.loads(request.url.params["narrow"]) == [
+            {"operator": "channel", "operand": 7}
+        ]
+        return httpx.Response(
+            200,
+            json={
+                "result": "success",
+                "msg": "",
+                "found_oldest": True,
+                "messages": [{"id": 105}],
+            },
+        )
+
+    client = _client(handler)
+    try:
+        message_id = client.get_first_accessible_channel_message_id(7)
+    finally:
+        client.close()
+    assert message_id == 105
+
+
 def _client(handler: object) -> ZulipApiClient:
     return ZulipApiClient(
         "https://zulip.example.test",

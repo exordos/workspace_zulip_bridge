@@ -66,6 +66,7 @@ class EventStore:
                 JOIN workspace_zulip_bridge.zulip_realms AS realm
                   ON realm.uuid = connection.realm_uuid
                 WHERE connection.sync_enabled AND NOT zulip_user.disabled
+                  AND NOT zulip_user.is_bot
                 ORDER BY connection.uuid
                 """
             )
@@ -112,6 +113,7 @@ class EventStore:
                   AND zulip_user.zulip_user_id = $2
                   AND realm.identity_key = $5
                   AND connection.sync_enabled AND NOT zulip_user.disabled
+                  AND NOT zulip_user.is_bot
                 """,
                 user_uuid,
                 zulip_user_id,
@@ -181,7 +183,8 @@ class EventStore:
                      AND binding.zulip_user_uuid = connection.zulip_user_uuid
                     WHERE stream.source_connection_uuid IS NOT NULL
                       AND (connection.uuid IS NULL OR NOT connection.sync_enabled
-                           OR zulip_user.disabled OR binding.uuid IS NULL)
+                           OR zulip_user.disabled OR zulip_user.is_bot
+                           OR binding.uuid IS NULL)
                     FOR UPDATE OF stream
                 ), removed AS (
                     DELETE FROM workspace_zulip_bridge.zulip_messages AS message
@@ -201,11 +204,14 @@ class EventStore:
             assigned = await connection.fetchrow(
                 """
                 WITH ready_realms AS MATERIALIZED (
-                    SELECT realm_uuid
-                    FROM workspace_zulip_bridge.zulip_connections
-                    WHERE sync_enabled
-                    GROUP BY realm_uuid
-                    HAVING bool_and(catalog_completed_at IS NOT NULL)
+                    SELECT connection.realm_uuid
+                    FROM workspace_zulip_bridge.zulip_connections AS connection
+                    JOIN workspace_zulip_bridge.zulip_users AS zulip_user
+                      ON zulip_user.uuid = connection.zulip_user_uuid
+                    WHERE connection.sync_enabled AND NOT zulip_user.disabled
+                      AND NOT zulip_user.is_bot
+                    GROUP BY connection.realm_uuid
+                    HAVING bool_and(connection.catalog_completed_at IS NOT NULL)
                 ), winners AS MATERIALIZED (
                     SELECT DISTINCT ON (stream.uuid)
                            stream.uuid AS stream_uuid,
@@ -216,7 +222,7 @@ class EventStore:
                       ON binding.zulip_stream_uuid = stream.uuid
                     JOIN workspace_zulip_bridge.zulip_users AS zulip_user
                       ON zulip_user.uuid = binding.zulip_user_uuid
-                     AND NOT zulip_user.disabled
+                     AND NOT zulip_user.disabled AND NOT zulip_user.is_bot
                     JOIN workspace_zulip_bridge.zulip_connections AS connection
                       ON connection.zulip_user_uuid = zulip_user.uuid
                      AND connection.sync_enabled
@@ -259,7 +265,10 @@ class EventStore:
                     WHERE stream.source_connection_uuid = connection.uuid
                       AND stream.history_loaded_at IS NULL
                 ) THEN 'backfilling' ELSE 'active' END
-                WHERE connection.sync_enabled
+                FROM workspace_zulip_bridge.zulip_users AS zulip_user
+                WHERE connection.zulip_user_uuid = zulip_user.uuid
+                  AND connection.sync_enabled
+                  AND NOT zulip_user.disabled AND NOT zulip_user.is_bot
                   AND connection.catalog_completed_at IS NOT NULL
                 """
             )
@@ -278,7 +287,8 @@ class EventStore:
     ) -> UserDirectoryWrite:
         endpoint = canonical_endpoint(endpoint)
         realm_uuid = stable_realm_uuid(endpoint)
-        users = tuple(user for user in users if not user.is_bot)
+        users = tuple(users)
+        bot_count = sum(user.is_bot for user in users)
         async with self._pool.acquire() as connection, connection.transaction():
             await connection.execute(
                 """
@@ -293,26 +303,31 @@ class EventStore:
             row = await connection.fetchrow(
                 """
                 WITH incoming AS MATERIALIZED (
-                    SELECT uuid, user_id, login, full_name, role, disabled, avatar_url
+                    SELECT uuid, user_id, login, full_name, role, disabled, is_bot,
+                           avatar_url
                     FROM unnest($2::uuid[], $3::bigint[], $4::text[], $5::text[],
-                                $6::smallint[], $7::boolean[], $8::text[])
+                                $6::smallint[], $7::boolean[], $8::boolean[],
+                                $9::text[])
                       AS directory(uuid, user_id, login, full_name, role, disabled,
-                                   avatar_url)
+                                   is_bot, avatar_url)
                 ), upserted AS (
                     INSERT INTO workspace_zulip_bridge.zulip_users
                         (uuid, realm_uuid, zulip_user_id, login, full_name, role,
-                         disabled, avatar_url)
+                         disabled, is_bot, avatar_url)
                     SELECT uuid, $1, user_id, login, full_name, role, disabled,
-                           avatar_url FROM incoming
+                           is_bot, avatar_url FROM incoming
                     ON CONFLICT (uuid) DO UPDATE
                     SET login = EXCLUDED.login, full_name = EXCLUDED.full_name,
                         role = EXCLUDED.role, disabled = EXCLUDED.disabled,
+                        is_bot = EXCLUDED.is_bot,
                         avatar_url = EXCLUDED.avatar_url
                     WHERE (zulip_users.login, zulip_users.full_name, zulip_users.role,
-                           zulip_users.disabled, zulip_users.avatar_url)
+                           zulip_users.disabled, zulip_users.is_bot,
+                           zulip_users.avatar_url)
                           IS DISTINCT FROM
                           (EXCLUDED.login, EXCLUDED.full_name, EXCLUDED.role,
-                           EXCLUDED.disabled, EXCLUDED.avatar_url)
+                           EXCLUDED.disabled, EXCLUDED.is_bot,
+                           EXCLUDED.avatar_url)
                     RETURNING 1
                 ) SELECT count(*) AS changed_count FROM upserted
                 """,
@@ -323,11 +338,14 @@ class EventStore:
                 [user.full_name for user in users],
                 [user.role for user in users],
                 [user.disabled for user in users],
+                [user.is_bot for user in users],
                 [user.avatar_url for user in users],
             )
         if row is None:
             raise RuntimeError("user directory query returned no row")
-        return UserDirectoryWrite(humans=len(users), changed=row["changed_count"])
+        return UserDirectoryWrite(
+            users=len(users), bots=bot_count, changed=row["changed_count"]
+        )
 
     async def store_user_attachments(
         self,
@@ -683,9 +701,15 @@ class EventStore:
     async def set_user_status(
         self, user_uuid: UUID, queue_id: str, status: UserStatus
     ) -> bool:
-        return await self._update_connection(
-            user_uuid, "lifecycle_status = $3", queue_id, status
-        )
+        async with self._pool.acquire() as connection:
+            result = await connection.execute(
+                "UPDATE workspace_zulip_bridge.zulip_connections "
+                "SET lifecycle_status = $3 WHERE uuid = $1 AND queue_id = $2",
+                user_uuid,
+                queue_id,
+                status,
+            )
+        return result == "UPDATE 1"
 
     async def get_user_status(
         self, user_uuid: UUID, queue_id: str
@@ -700,11 +724,15 @@ class EventStore:
         return cast(UserStatus | None, value)
 
     async def begin_catalog_fill(self, user_uuid: UUID, queue_id: str) -> bool:
-        return await self._update_connection(
-            user_uuid,
-            "lifecycle_status = 'filling', catalog_completed_at = NULL",
-            queue_id,
-        )
+        async with self._pool.acquire() as connection:
+            result = await connection.execute(
+                "UPDATE workspace_zulip_bridge.zulip_connections "
+                "SET lifecycle_status = 'filling', catalog_completed_at = NULL "
+                "WHERE uuid = $1 AND queue_id = $2",
+                user_uuid,
+                queue_id,
+            )
+        return result == "UPDATE 1"
 
     async def _update_connection(
         self, user_uuid: UUID, assignment: str, *values: object
@@ -1355,19 +1383,19 @@ async def _store_chats(
             SELECT stream_uuid, binding_uuid, chat_type, chat_key, name, role,
                    membership_kind, notification_mode, chat_parameters::jsonb,
                    membership_parameters::jsonb, content_hash, membership_hash,
-                   available_message_count
+                   available_message_count, first_visible_message_id
             FROM unnest($1::uuid[], $2::uuid[], $3::text[], $4::text[], $5::text[],
                         $6::text[], $7::text[], $8::text[], $9::text[], $10::text[],
-                        $11::bytea[], $12::bytea[], $13::bigint[])
+                        $11::bytea[], $12::bytea[], $13::bigint[], $14::bigint[])
               AS value(stream_uuid, binding_uuid, chat_type, chat_key, name, role,
                        membership_kind, notification_mode, chat_parameters,
                        membership_parameters, content_hash, membership_hash,
-                       available_message_count)
+                       available_message_count, first_visible_message_id)
         ), streams AS (
             INSERT INTO workspace_zulip_bridge.zulip_streams
                 (uuid, realm_uuid, chat_type, chat_key, name, chat_parameters,
                  content_hash)
-            SELECT stream_uuid, $14, chat_type, chat_key, name, chat_parameters,
+            SELECT stream_uuid, $15, chat_type, chat_key, name, chat_parameters,
                    content_hash FROM incoming
             ON CONFLICT (uuid) DO UPDATE SET chat_type = EXCLUDED.chat_type,
                 name = EXCLUDED.name, chat_parameters = EXCLUDED.chat_parameters,
@@ -1378,23 +1406,26 @@ async def _store_chats(
             INSERT INTO workspace_zulip_bridge.zulip_stream_bindings
                 (uuid, zulip_stream_uuid, zulip_user_uuid, role, membership_kind,
                  notification_mode, membership_parameters, content_hash,
-                 available_message_count)
-            SELECT binding_uuid, stream_uuid, $15, role, membership_kind,
+                 available_message_count, first_visible_message_id)
+            SELECT binding_uuid, stream_uuid, $16, role, membership_kind,
                    notification_mode, membership_parameters, membership_hash,
-                   available_message_count FROM incoming
+                   available_message_count, first_visible_message_id FROM incoming
             ON CONFLICT (zulip_stream_uuid, zulip_user_uuid) DO UPDATE SET
                 role = EXCLUDED.role, membership_kind = EXCLUDED.membership_kind,
                 notification_mode = EXCLUDED.notification_mode,
                 membership_parameters = EXCLUDED.membership_parameters,
                 content_hash = EXCLUDED.content_hash,
-                available_message_count = EXCLUDED.available_message_count
+                available_message_count = EXCLUDED.available_message_count,
+                first_visible_message_id = EXCLUDED.first_visible_message_id
             WHERE (zulip_stream_bindings.content_hash,
-                   zulip_stream_bindings.available_message_count) IS DISTINCT FROM
-                  (EXCLUDED.content_hash, EXCLUDED.available_message_count)
+                   zulip_stream_bindings.available_message_count,
+                   zulip_stream_bindings.first_visible_message_id) IS DISTINCT FROM
+                  (EXCLUDED.content_hash, EXCLUDED.available_message_count,
+                   EXCLUDED.first_visible_message_id)
             RETURNING 1
         ), removed AS (
             DELETE FROM workspace_zulip_bridge.zulip_stream_bindings AS binding
-            WHERE $16 AND binding.zulip_user_uuid = $15
+            WHERE $17 AND binding.zulip_user_uuid = $16
               AND NOT (binding.zulip_stream_uuid = ANY($1::uuid[]))
             RETURNING binding.zulip_stream_uuid
         ), cleared AS (
@@ -1404,7 +1435,7 @@ async def _store_chats(
             WHERE stream.uuid = removed.zulip_stream_uuid
               AND stream.source_connection_uuid IN (
                   SELECT uuid FROM workspace_zulip_bridge.zulip_connections
-                  WHERE zulip_user_uuid = $15
+                  WHERE zulip_user_uuid = $16
               ) RETURNING 1
         )
         SELECT (SELECT count(*) FROM bindings) AS changed_count,
@@ -1423,6 +1454,7 @@ async def _store_chats(
         [chat.content_hash for chat in chats],
         [chat.membership_hash for chat in chats],
         [chat.available_message_count for chat in chats],
+        [chat.first_visible_message_id for chat in chats],
         realm_uuid,
         zulip_user_uuid,
         replace_catalog,

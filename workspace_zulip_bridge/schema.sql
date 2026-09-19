@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_users (
     full_name text NOT NULL,
     role smallint NOT NULL CHECK (role IN (100, 200, 300, 400, 600)),
     disabled boolean NOT NULL DEFAULT false,
+    is_bot boolean NOT NULL DEFAULT false,
     avatar_url text,
     presence_status text NOT NULL DEFAULT 'offline'
         CHECK (presence_status IN ('active', 'idle', 'offline', 'do_not_disturb')),
@@ -31,6 +32,8 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_users (
     UNIQUE (realm_uuid, zulip_user_id),
     UNIQUE (realm_uuid, login)
 );
+ALTER TABLE workspace_zulip_bridge.zulip_users
+    ADD COLUMN IF NOT EXISTS is_bot boolean NOT NULL DEFAULT false;
 
 CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_connections (
     uuid uuid PRIMARY KEY,
@@ -108,11 +111,32 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_stream_bindings (
         CHECK (jsonb_typeof(membership_parameters) = 'object'),
     content_hash bytea NOT NULL CHECK (octet_length(content_hash) = 32),
     available_message_count bigint NOT NULL DEFAULT 0 CHECK (available_message_count >= 0),
+    first_visible_message_id bigint,
     personal_state_loaded_at timestamptz,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     UNIQUE (zulip_stream_uuid, zulip_user_uuid)
 );
+
+ALTER TABLE workspace_zulip_bridge.zulip_stream_bindings
+    ADD COLUMN IF NOT EXISTS first_visible_message_id bigint;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'zulip_stream_bindings_first_visible_message_id_check'
+          AND conrelid =
+              'workspace_zulip_bridge.zulip_stream_bindings'::regclass
+    ) THEN
+        ALTER TABLE workspace_zulip_bridge.zulip_stream_bindings
+            ADD CONSTRAINT zulip_stream_bindings_first_visible_message_id_check
+            CHECK (
+                first_visible_message_id IS NULL
+                OR first_visible_message_id >= 0
+            );
+    END IF;
+END;
+$$;
 
 CREATE INDEX IF NOT EXISTS zulip_stream_bindings_user_idx
     ON workspace_zulip_bridge.zulip_stream_bindings (zulip_user_uuid, zulip_stream_uuid);
