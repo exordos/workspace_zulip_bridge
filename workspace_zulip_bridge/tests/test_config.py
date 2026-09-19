@@ -24,6 +24,7 @@ def test_defaults_use_local_postgresql_socket() -> None:
     assert settings.event_cleanup_batch_size == 10000
     assert not settings.workspace_events_enabled
     assert settings.workspace_event_batch_size == 500
+    assert settings.workspace_sync_batch_size == 50
 
 
 def test_environment_overrides_are_parsed(tmp_path: Path) -> None:

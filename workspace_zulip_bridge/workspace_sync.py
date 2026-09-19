@@ -430,7 +430,17 @@ class WorkspaceDiffWorker:
             timeout=httpx.Timeout(self._settings.workspace_request_timeout_seconds),
         ) as client:
             while True:
-                await self._plan_and_drain(client)
+                try:
+                    await self._plan_and_drain(client)
+                except (
+                    TimeoutError,
+                    asyncpg.PostgresError,
+                    httpx.HTTPError,
+                    RuntimeError,
+                ):
+                    LOG.warning("Workspace diff pass failed; retrying", exc_info=True)
+                    await asyncio.sleep(self._settings.workspace_retry_base_seconds)
+                    continue
                 await asyncio.sleep(self._settings.workspace_sync_poll_seconds)
 
     async def _plan_and_drain(self, client: httpx.AsyncClient) -> int:
@@ -814,21 +824,35 @@ class WorkspaceDiffWorker:
         ]
         if not values:
             return
+        topic_uuids = [value[0] for value in values]
+        stream_uuids = [value[1] for value in values]
+        content_hashes = [value[2] for value in values]
         async with self._pool.acquire() as connection, connection.transaction():
-            await connection.executemany(
+            await connection.execute(
                 """
                 INSERT INTO workspace_zulip_bridge.zulip_topics
                     (uuid, zulip_stream_uuid, name, content_hash)
-                VALUES ($1, $2, 'General', $3) ON CONFLICT (uuid) DO NOTHING
+                SELECT input.topic_uuid, input.stream_uuid, 'General',
+                       input.content_hash
+                FROM unnest($1::uuid[], $2::uuid[], $3::bytea[])
+                    AS input(topic_uuid, stream_uuid, content_hash)
+                ON CONFLICT (uuid) DO NOTHING
                 """,
-                values,
+                topic_uuids,
+                stream_uuids,
+                content_hashes,
             )
-            await connection.executemany(
+            await connection.execute(
                 """
-                UPDATE workspace_zulip_bridge.zulip_messages
-                SET topic_uuid = $1 WHERE zulip_stream_uuid = $2 AND topic_uuid IS NULL
+                UPDATE workspace_zulip_bridge.zulip_messages AS message
+                SET topic_uuid = input.topic_uuid
+                FROM unnest($1::uuid[], $2::uuid[])
+                    AS input(topic_uuid, stream_uuid)
+                WHERE message.zulip_stream_uuid = input.stream_uuid
+                  AND message.topic_uuid IS NULL
                 """,
-                [(value[0], value[1]) for value in values],
+                topic_uuids,
+                stream_uuids,
             )
 
     async def _load_zulip_entities(
