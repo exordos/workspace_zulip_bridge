@@ -334,7 +334,8 @@ async def _workspace_diff_worker_round_trip(dsn: str, tmp_path: Path) -> None:
             await connection.execute(
                 """
                 UPDATE workspace_zulip_bridge.zulip_users
-                SET profile_hash = decode(repeat('01', 32), 'hex')
+                SET avatar_url = '/user_avatars/10/avatar.png',
+                    profile_hash = decode(repeat('01', 32), 'hex')
                 WHERE uuid = $1
                 """,
                 user_uuid,
@@ -435,6 +436,9 @@ async def _workspace_diff_worker_round_trip(dsn: str, tmp_path: Path) -> None:
         operation = requests[0]["operations"][0]  # type: ignore[index]
         assert operation["type"] == "users"  # type: ignore[index]
         assert operation["data"]["display_name"] == "User 10"  # type: ignore[index]
+        assert operation["data"]["avatar"] == (  # type: ignore[index]
+            "urn:url:https://zulip.example.test/user_avatars/10/avatar.png"
+        )
         assert (
             await pool.fetchval(
                 "SELECT count(*) FROM workspace_zulip_bridge.workspace_users"

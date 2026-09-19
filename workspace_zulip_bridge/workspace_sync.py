@@ -904,14 +904,35 @@ _SOURCE_TABLES = {
 
 _ENTITY_QUERIES = {
     "users": """
-        SELECT uuid AS entity_uuid, jsonb_build_object(
-            'username', login, 'display_name', full_name, 'email', login,
-            'status', presence_status, 'disabled', disabled, 'is_bot', is_bot,
-            'avatar', avatar_url, 'last_ping_at', last_ping_at,
-            'status_text', status_text, 'status_emoji', status_emoji,
-            'created_at', created_at
-        ) AS data FROM workspace_zulip_bridge.zulip_users
-        WHERE uuid = ANY($1::uuid[])
+        SELECT zulip_user.uuid AS entity_uuid, jsonb_build_object(
+            'username', zulip_user.login,
+            'display_name', zulip_user.full_name,
+            'email', zulip_user.login,
+            'status', zulip_user.presence_status,
+            'disabled', zulip_user.disabled,
+            'is_bot', zulip_user.is_bot,
+            'avatar', CASE
+                WHEN zulip_user.avatar_url IS NULL OR zulip_user.avatar_url = ''
+                    THEN NULL
+                WHEN zulip_user.avatar_url LIKE 'urn:%'
+                    THEN zulip_user.avatar_url
+                WHEN zulip_user.avatar_url LIKE 'http://%'
+                     OR zulip_user.avatar_url LIKE 'https://%'
+                    THEN 'urn:url:' || zulip_user.avatar_url
+                WHEN zulip_user.avatar_url LIKE '/%'
+                    THEN 'urn:url:' || rtrim(realm.endpoint, '/')
+                         || zulip_user.avatar_url
+                ELSE NULL
+            END,
+            'last_ping_at', zulip_user.last_ping_at,
+            'status_text', zulip_user.status_text,
+            'status_emoji', zulip_user.status_emoji,
+            'created_at', zulip_user.created_at
+        ) AS data
+        FROM workspace_zulip_bridge.zulip_users AS zulip_user
+        JOIN workspace_zulip_bridge.zulip_realms AS realm
+          ON realm.uuid = zulip_user.realm_uuid
+        WHERE zulip_user.uuid = ANY($1::uuid[])
     """,
     "streams": """
         SELECT stream.uuid AS entity_uuid, jsonb_build_object(
