@@ -407,15 +407,28 @@ class WorkspaceEventProcessor:
 
 
 class WorkspaceDiffWorker:
-    def __init__(self, pool: asyncpg.Pool, settings: Settings) -> None:
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        settings: Settings,
+        *,
+        plan_enabled: bool = True,
+        partition: int = 0,
+        partition_count: int = 1,
+    ) -> None:
         assert settings.workspace_provider_uuid is not None
         assert settings.workspace_project_id is not None
         assert settings.workspace_token_file is not None
+        if partition_count < 1 or not 0 <= partition < partition_count:
+            raise ValueError("invalid Workspace sync partition")
         self._pool = pool
         self._settings = settings
         self._provider_uuid = settings.workspace_provider_uuid
         self._project_uuid = settings.workspace_project_id
         self._token_file = settings.workspace_token_file
+        self._plan_enabled = plan_enabled
+        self._partition = partition
+        self._partition_count = partition_count
 
     async def run(self) -> None:
         token = await asyncio.to_thread(_read_token, self._token_file)
@@ -431,7 +444,10 @@ class WorkspaceDiffWorker:
         ) as client:
             while True:
                 try:
-                    await self._plan_and_drain(client)
+                    if self._plan_enabled:
+                        await self._plan_and_drain(client)
+                    else:
+                        await self._drain(client)
                 except (
                     TimeoutError,
                     asyncpg.PostgresError,
@@ -444,7 +460,13 @@ class WorkspaceDiffWorker:
                 await asyncio.sleep(self._settings.workspace_sync_poll_seconds)
 
     async def _plan_and_drain(self, client: httpx.AsyncClient) -> int:
-        await self.plan()
+        planned = await self.plan()
+        processed = await self._drain(client)
+        if planned == 0 and processed == 0:
+            await self._complete_initial_sync()
+        return processed
+
+    async def _drain(self, client: httpx.AsyncClient) -> int:
         processed = 0
         while changed := await self.process_once(client):
             processed += changed
@@ -475,10 +497,11 @@ class WorkspaceDiffWorker:
                 f"""
                 INSERT INTO workspace_zulip_bridge.sync_diffs (
                     provider_uuid, entity_type, entity_uuid, realm_uuid,
+                    partition_key,
                     direction, source_hash, target_hash,
                     source_updated_at, target_updated_at
                 )
-                SELECT $1, $2, source.uuid, $3,
+                SELECT $1, $2, source.uuid, $3, {source["partition"]},
                        CASE WHEN target.source_updated_at > {timestamp_column}
                             THEN 'to_zulip' ELSE 'to_workspace' END,
                        {source["hash"]}, target.content_hash,
@@ -499,6 +522,7 @@ class WorkspaceDiffWorker:
                 ON CONFLICT (provider_uuid, entity_type, entity_uuid)
                 DO UPDATE SET
                     direction = EXCLUDED.direction,
+                    partition_key = EXCLUDED.partition_key,
                     source_hash = EXCLUDED.source_hash,
                     target_hash = EXCLUDED.target_hash,
                     source_updated_at = EXCLUDED.source_updated_at,
@@ -545,6 +569,27 @@ class WorkspaceDiffWorker:
                     WHERE provider_uuid = $1
                       AND processing_status IN ('pending', 'failed')
                       AND available_at <= clock_timestamp()
+                      AND (
+                          ($3 = 0 AND entity_type NOT IN (
+                              'messages', 'message_flags', 'message_reactions'
+                          ))
+                          OR (
+                              entity_type IN (
+                                  'messages', 'message_flags',
+                                  'message_reactions'
+                              )
+                              AND (
+                                  (
+                                      hashtextextended(
+                                          COALESCE(
+                                              partition_key, entity_uuid
+                                          )::text,
+                                          0
+                                      ) % $4 + $4
+                                  ) % $4
+                              ) = $3
+                          )
+                      )
                     ORDER BY CASE entity_type
                         WHEN 'users' THEN 0 WHEN 'streams' THEN 1
                         WHEN 'stream_bindings' THEN 2 WHEN 'topics' THEN 3
@@ -563,9 +608,10 @@ class WorkspaceDiffWorker:
                 """,
                 self._provider_uuid,
                 self._settings.workspace_sync_batch_size,
+                self._partition,
+                self._partition_count,
             )
         if not rows:
-            await self._complete_initial_sync()
             return 0
         to_workspace = [row for row in rows if row["direction"] == "to_workspace"]
         to_zulip = [row for row in rows if row["direction"] == "to_zulip"]
@@ -897,6 +943,7 @@ _SOURCE_TABLES = {
         "joins": "",
         "where": "source.realm_uuid = $3",
         "hash": "source.profile_hash",
+        "partition": "NULL::uuid",
     },
     "streams": {
         "from": "workspace_zulip_bridge.zulip_streams",
@@ -925,6 +972,7 @@ _SOURCE_TABLES = {
             )
         """,
         "hash": "source.content_hash",
+        "partition": "NULL::uuid",
     },
     "stream_bindings": {
         "from": "workspace_zulip_bridge.zulip_stream_bindings",
@@ -945,6 +993,7 @@ _SOURCE_TABLES = {
             )
         """,
         "hash": "source.content_hash",
+        "partition": "NULL::uuid",
     },
     "topics": {
         "from": "workspace_zulip_bridge.zulip_topics",
@@ -959,6 +1008,7 @@ _SOURCE_TABLES = {
             )
         """,
         "hash": "source.content_hash",
+        "partition": "NULL::uuid",
     },
     "topic_bindings": {
         "from": "workspace_zulip_bridge.zulip_topic_bindings",
@@ -985,6 +1035,7 @@ _SOURCE_TABLES = {
             )
         """,
         "hash": "source.content_hash",
+        "partition": "NULL::uuid",
     },
     "messages": {
         "from": "workspace_zulip_bridge.zulip_messages",
@@ -1011,6 +1062,7 @@ _SOURCE_TABLES = {
             )
         """,
         "hash": "source.content_hash",
+        "partition": "source.zulip_stream_uuid",
     },
     "message_flags": {
         "from": "workspace_zulip_bridge.zulip_message_flags",
@@ -1031,10 +1083,11 @@ _SOURCE_TABLES = {
             )
         """,
         "hash": "source.flags_hash",
+        "partition": "source.zulip_stream_uuid",
     },
     "message_reactions": {
         "from": "workspace_zulip_bridge.zulip_message_reactions",
-        "joins": "",
+        "joins": "JOIN workspace_zulip_bridge.zulip_messages AS message ON message.uuid = source.message_uuid",
         "where": """
             source.realm_uuid = $3
             AND EXISTS (
@@ -1051,6 +1104,7 @@ _SOURCE_TABLES = {
             )
         """,
         "hash": "NULL::bytea",
+        "partition": "message.zulip_stream_uuid",
     },
 }
 

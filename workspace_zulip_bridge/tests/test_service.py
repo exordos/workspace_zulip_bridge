@@ -5,6 +5,8 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 import workspace_zulip_bridge.service as service_module
 from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.service import BridgeService
@@ -69,8 +71,18 @@ class FakeWorkspaceWorker:
     calls: list[str]
     label = "workspace-worker"
 
-    def __init__(self, pool: object, settings: Settings) -> None:
-        self.calls.append(f"{self.label}-init")
+    def __init__(
+        self,
+        pool: object,
+        settings: Settings,
+        *,
+        plan_enabled: bool = True,
+        partition: int = 0,
+        partition_count: int = 1,
+    ) -> None:
+        self.calls.append(
+            f"{self.label}-init-{plan_enabled}-{partition}/{partition_count}"
+        )
 
     async def run(self) -> None:
         self.calls.append(f"{self.label}-run")
@@ -90,6 +102,27 @@ def test_workspace_diff_worker_plans_once_before_draining(
     tmp_path: Path,
 ) -> None:
     asyncio.run(_run_workspace_diff_worker_drain_test(monkeypatch, tmp_path))
+
+
+def test_workspace_diff_worker_rejects_invalid_partition(tmp_path: Path) -> None:
+    token_file = tmp_path / "workspace.token"
+    token_file.write_text("token")
+    settings = Settings.from_env(
+        {
+            "WZB_WORKSPACE_WEBSOCKET_URL": "wss://workspace.example/events/ws",
+            "WZB_WORKSPACE_PROJECT_ID": "10000000-0000-0000-0000-000000000001",
+            "WZB_WORKSPACE_PROVIDER_UUID": "10000000-0000-0000-0000-000000000002",
+            "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+        }
+    )
+
+    with pytest.raises(ValueError, match="partition"):
+        WorkspaceDiffWorker(
+            object(),  # type: ignore[arg-type]
+            settings,
+            partition=2,
+            partition_count=2,
+        )
 
 
 async def _run_workspace_diff_worker_drain_test(
@@ -118,11 +151,60 @@ async def _run_workspace_diff_worker_drain_test(
         calls.append("process")
         return next(batches)
 
+    async def fake_complete() -> bool:
+        calls.append("complete")
+        return True
+
     monkeypatch.setattr(worker, "plan", fake_plan)
     monkeypatch.setattr(worker, "process_once", fake_process_once)
+    monkeypatch.setattr(worker, "_complete_initial_sync", fake_complete)
 
     assert await worker._plan_and_drain(object()) == 200  # type: ignore[arg-type]
     assert calls == ["plan", "process", "process", "process"]
+
+
+def test_workspace_diff_worker_completes_only_after_empty_plan(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    asyncio.run(_run_workspace_diff_worker_completion_test(monkeypatch, tmp_path))
+
+
+async def _run_workspace_diff_worker_completion_test(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    token_file = tmp_path / "workspace.token"
+    token_file.write_text("token")
+    settings = Settings.from_env(
+        {
+            "WZB_WORKSPACE_WEBSOCKET_URL": "wss://workspace.example/events/ws",
+            "WZB_WORKSPACE_PROJECT_ID": "10000000-0000-0000-0000-000000000001",
+            "WZB_WORKSPACE_PROVIDER_UUID": "10000000-0000-0000-0000-000000000002",
+            "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+        }
+    )
+    worker = WorkspaceDiffWorker(object(), settings)  # type: ignore[arg-type]
+    calls: list[str] = []
+
+    async def fake_plan() -> int:
+        calls.append("plan")
+        return 0
+
+    async def fake_process_once(client: object) -> int:
+        calls.append("process")
+        return 0
+
+    async def fake_complete() -> bool:
+        calls.append("complete")
+        return True
+
+    monkeypatch.setattr(worker, "plan", fake_plan)
+    monkeypatch.setattr(worker, "process_once", fake_process_once)
+    monkeypatch.setattr(worker, "_complete_initial_sync", fake_complete)
+
+    assert await worker._plan_and_drain(object()) == 0  # type: ignore[arg-type]
+    assert calls == ["plan", "process", "complete"]
 
 
 def test_daemon_prepares_probes_and_closes_database(monkeypatch: object) -> None:
@@ -250,5 +332,7 @@ async def _run_workspace_receiver_test(
     assert "workspace-receiver-run" in calls
     assert "workspace-bootstrap-ensure" in calls
     assert "workspace-event-processor-run" in calls
-    assert "workspace-diff-worker-run" in calls
+    assert calls.count("workspace-diff-worker-run") == 2
+    assert "workspace-diff-worker-init-True-0/2" in calls
+    assert "workspace-diff-worker-init-False-1/2" in calls
     assert pool.closed

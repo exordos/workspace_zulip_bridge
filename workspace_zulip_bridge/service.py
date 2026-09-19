@@ -63,7 +63,16 @@ class BridgeService:
                 workspace_event_processor = WorkspaceEventProcessor(
                     pool, self._settings
                 )
-                workspace_diff_worker = WorkspaceDiffWorker(pool, self._settings)
+                workspace_diff_workers = [
+                    WorkspaceDiffWorker(
+                        pool,
+                        self._settings,
+                        plan_enabled=index == 0,
+                        partition=index,
+                        partition_count=self._settings.workspace_sync_workers,
+                    )
+                    for index in range(self._settings.workspace_sync_workers)
+                ]
                 supervised_tasks.extend(
                     (
                         asyncio.create_task(
@@ -78,11 +87,14 @@ class BridgeService:
                             workspace_event_processor.run(),
                             name="workspace-event-processor",
                         ),
-                        asyncio.create_task(
-                            workspace_diff_worker.run(),
-                            name="workspace-diff-worker",
-                        ),
                     )
+                )
+                supervised_tasks.extend(
+                    asyncio.create_task(
+                        worker.run(),
+                        name=f"workspace-diff-worker-{index}",
+                    )
+                    for index, worker in enumerate(workspace_diff_workers)
                 )
             LOG.info("bridge daemon is ready")
             try:

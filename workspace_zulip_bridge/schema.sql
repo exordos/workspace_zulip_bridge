@@ -232,6 +232,9 @@ CREATE INDEX IF NOT EXISTS zulip_messages_provider_id_idx
 CREATE INDEX IF NOT EXISTS zulip_messages_updated_at_brin
     ON workspace_zulip_bridge.zulip_messages USING brin (updated_at)
     WITH (pages_per_range = 32);
+CREATE INDEX IF NOT EXISTS zulip_messages_sync_plan_idx
+    ON workspace_zulip_bridge.zulip_messages
+        (realm_uuid, source_updated_at, uuid);
 
 CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_message_flags (
     uuid uuid PRIMARY KEY,
@@ -261,6 +264,9 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_message_flags (
 CREATE INDEX IF NOT EXISTS zulip_message_flags_unread_user_idx
     ON workspace_zulip_bridge.zulip_message_flags
         (zulip_user_uuid, zulip_stream_uuid, message_uuid) WHERE NOT is_read;
+CREATE INDEX IF NOT EXISTS zulip_message_flags_sync_plan_idx
+    ON workspace_zulip_bridge.zulip_message_flags
+        (realm_uuid, updated_at, uuid);
 
 CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_message_reactions (
     uuid uuid PRIMARY KEY,
@@ -280,6 +286,9 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_message_reactions (
 CREATE INDEX IF NOT EXISTS zulip_message_reactions_snapshot_idx
     ON workspace_zulip_bridge.zulip_message_reactions
         (message_uuid, emoji_name, created_at, uuid) INCLUDE (zulip_user_uuid);
+CREATE INDEX IF NOT EXISTS zulip_message_reactions_sync_plan_idx
+    ON workspace_zulip_bridge.zulip_message_reactions
+        (realm_uuid, updated_at, uuid);
 
 CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_files (
     uuid uuid PRIMARY KEY,
@@ -491,6 +500,7 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.sync_diffs (
     entity_uuid uuid NOT NULL,
     realm_uuid uuid NOT NULL
         REFERENCES workspace_zulip_bridge.zulip_realms (uuid) ON DELETE CASCADE,
+    partition_key uuid,
     direction text NOT NULL CHECK (direction IN ('to_workspace', 'to_zulip')),
     processing_status text NOT NULL DEFAULT 'pending'
         CHECK (processing_status IN (
@@ -509,6 +519,8 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.sync_diffs (
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (provider_uuid, entity_type, entity_uuid)
 );
+ALTER TABLE workspace_zulip_bridge.sync_diffs
+    ADD COLUMN IF NOT EXISTS partition_key uuid;
 CREATE INDEX IF NOT EXISTS sync_diffs_pending_idx
     ON workspace_zulip_bridge.sync_diffs
         (available_at, entity_type, source_updated_at, entity_uuid)

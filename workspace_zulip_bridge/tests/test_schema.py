@@ -73,6 +73,10 @@ def test_schema_normalizes_workspace_like_entities_and_personal_state() -> None:
         assert f"workspace_zulip_bridge.{table}" in schema
     assert "workspace_mirror_state" in schema
     assert "sync_diffs" in schema
+    assert "partition_key uuid" in schema
+    assert "zulip_messages_sync_plan_idx" in schema
+    assert "zulip_message_flags_sync_plan_idx" in schema
+    assert "zulip_message_reactions_sync_plan_idx" in schema
 
 
 def test_schema_contains_event_retention_and_workspace_outbox_state() -> None:
