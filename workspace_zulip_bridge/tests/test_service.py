@@ -2,6 +2,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License").
 
 import asyncio
+from pathlib import Path
 
 import workspace_zulip_bridge.service as service_module
 from workspace_zulip_bridge.config import Settings
@@ -37,6 +38,17 @@ class FakeEventProcessor:
 
     async def run(self) -> None:
         self.calls.append("event-processor-run")
+        await asyncio.Future()
+
+
+class FakeWorkspaceEventReceiver:
+    calls: list[str]
+
+    def __init__(self, pool: object, settings: Settings) -> None:
+        self.calls.append("workspace-receiver-init")
+
+    async def run(self) -> None:
+        self.calls.append("workspace-receiver-run")
         await asyncio.Future()
 
 
@@ -89,4 +101,66 @@ async def _run_daemon_lifecycle_test(monkeypatch: object) -> None:
         "supervisor-run",
         "event-processor-run",
     ]
+    assert pool.closed
+
+
+def test_daemon_starts_workspace_receiver_when_configured(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    asyncio.run(_run_workspace_receiver_test(monkeypatch, tmp_path))
+
+
+async def _run_workspace_receiver_test(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    pool = FakePool()
+    stop = asyncio.Event()
+    token_file = tmp_path / "workspace.token"
+    token_file.write_text("token")
+
+    async def fake_open_pool(settings: Settings) -> FakePool:
+        return pool
+
+    async def fake_prepare_database(candidate: FakePool) -> None:
+        return None
+
+    async def fake_probe_database(candidate: FakePool) -> None:
+        return None
+
+    monkeypatch.setattr(service_module, "open_pool", fake_open_pool)  # type: ignore[attr-defined]
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        service_module, "prepare_database", fake_prepare_database
+    )
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        service_module, "probe_database", fake_probe_database
+    )
+    FakeSupervisor.stop = stop
+    FakeSupervisor.calls = calls
+    FakeEventProcessor.calls = calls
+    FakeWorkspaceEventReceiver.calls = calls
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        service_module, "ZulipThreadSupervisor", FakeSupervisor
+    )
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        service_module, "ZulipEventProcessor", FakeEventProcessor
+    )
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        service_module, "WorkspaceEventReceiver", FakeWorkspaceEventReceiver
+    )
+    settings = Settings.from_env(
+        {
+            "WZB_WORKSPACE_WEBSOCKET_URL": "wss://workspace.example/events/ws",
+            "WZB_WORKSPACE_PROJECT_ID": "10000000-0000-0000-0000-000000000001",
+            "WZB_WORKSPACE_PROVIDER_UUID": "10000000-0000-0000-0000-000000000002",
+            "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+        }
+    )
+
+    await BridgeService(settings).run(stop)
+
+    assert "workspace-receiver-init" in calls
+    assert "workspace-receiver-run" in calls
     assert pool.closed

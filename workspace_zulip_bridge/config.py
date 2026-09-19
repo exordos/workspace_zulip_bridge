@@ -5,6 +5,8 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
+from uuid import UUID
 
 
 def _read_int(values: Mapping[str, str], name: str, default: int) -> int:
@@ -25,6 +27,16 @@ def _read_float(values: Mapping[str, str], name: str, default: float) -> float:
         return float(raw)
     except ValueError as exc:
         raise ValueError(f"{name} must be a number") from exc
+
+
+def _read_uuid(values: Mapping[str, str], name: str) -> UUID | None:
+    raw = values.get(name)
+    if not raw:
+        return None
+    try:
+        return UUID(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a UUID") from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +66,16 @@ class Settings:
     event_retention_seconds: float = 86400.0
     event_cleanup_interval_seconds: float = 300.0
     event_cleanup_batch_size: int = 10000
+    workspace_websocket_url: str | None = None
+    workspace_project_id: UUID | None = None
+    workspace_provider_uuid: UUID | None = None
+    workspace_token_file: Path | None = None
+    workspace_ca_file: Path | None = None
+    workspace_event_batch_size: int = 500
+    workspace_event_flush_seconds: float = 0.01
+    workspace_retry_base_seconds: float = 1.0
+    workspace_retry_cap_seconds: float = 60.0
+    workspace_lease_retry_seconds: float = 5.0
     thread_stop_timeout_seconds: float = 5.0
     log_level: str = "INFO"
 
@@ -131,6 +153,34 @@ class Settings:
             event_cleanup_batch_size=_read_int(
                 source, "WZB_EVENT_CLEANUP_BATCH_SIZE", 10000
             ),
+            workspace_websocket_url=(source.get("WZB_WORKSPACE_WEBSOCKET_URL") or None),
+            workspace_project_id=_read_uuid(source, "WZB_WORKSPACE_PROJECT_ID"),
+            workspace_provider_uuid=_read_uuid(source, "WZB_WORKSPACE_PROVIDER_UUID"),
+            workspace_token_file=(
+                Path(source["WZB_WORKSPACE_TOKEN_FILE"])
+                if source.get("WZB_WORKSPACE_TOKEN_FILE")
+                else None
+            ),
+            workspace_ca_file=(
+                Path(source["WZB_WORKSPACE_CA_FILE"])
+                if source.get("WZB_WORKSPACE_CA_FILE")
+                else None
+            ),
+            workspace_event_batch_size=_read_int(
+                source, "WZB_WORKSPACE_EVENT_BATCH_SIZE", 500
+            ),
+            workspace_event_flush_seconds=_read_float(
+                source, "WZB_WORKSPACE_EVENT_FLUSH_SECONDS", 0.01
+            ),
+            workspace_retry_base_seconds=_read_float(
+                source, "WZB_WORKSPACE_RETRY_BASE_SECONDS", 1.0
+            ),
+            workspace_retry_cap_seconds=_read_float(
+                source, "WZB_WORKSPACE_RETRY_CAP_SECONDS", 60.0
+            ),
+            workspace_lease_retry_seconds=_read_float(
+                source, "WZB_WORKSPACE_LEASE_RETRY_SECONDS", 5.0
+            ),
             thread_stop_timeout_seconds=_read_float(
                 source, "WZB_THREAD_STOP_TIMEOUT_SECONDS", 5.0
             ),
@@ -173,6 +223,10 @@ class Settings:
             ),
             "WZB_EVENT_RETENTION_SECONDS": self.event_retention_seconds,
             "WZB_EVENT_CLEANUP_INTERVAL_SECONDS": (self.event_cleanup_interval_seconds),
+            "WZB_WORKSPACE_EVENT_FLUSH_SECONDS": self.workspace_event_flush_seconds,
+            "WZB_WORKSPACE_RETRY_BASE_SECONDS": self.workspace_retry_base_seconds,
+            "WZB_WORKSPACE_RETRY_CAP_SECONDS": self.workspace_retry_cap_seconds,
+            "WZB_WORKSPACE_LEASE_RETRY_SECONDS": self.workspace_lease_retry_seconds,
             "WZB_THREAD_STOP_TIMEOUT_SECONDS": self.thread_stop_timeout_seconds,
         }
         for name, value in positive_float_values.items():
@@ -211,5 +265,39 @@ class Settings:
             raise ValueError(
                 "WZB_EVENT_CLEANUP_BATCH_SIZE must be between 1 and 100000"
             )
+        if not 1 <= self.workspace_event_batch_size <= 10000:
+            raise ValueError(
+                "WZB_WORKSPACE_EVENT_BATCH_SIZE must be between 1 and 10000"
+            )
+        if self.workspace_retry_cap_seconds < self.workspace_retry_base_seconds:
+            raise ValueError(
+                "WZB_WORKSPACE_RETRY_CAP_SECONDS must be at least "
+                "WZB_WORKSPACE_RETRY_BASE_SECONDS"
+            )
         if self.zulip_ca_file is not None and not self.zulip_ca_file.is_file():
             raise ValueError("WZB_ZULIP_CA_FILE must name a readable file")
+        workspace_required = (
+            self.workspace_websocket_url,
+            self.workspace_project_id,
+            self.workspace_provider_uuid,
+            self.workspace_token_file,
+        )
+        if any(value is not None for value in workspace_required) and not all(
+            value is not None for value in workspace_required
+        ):
+            raise ValueError(
+                "Workspace websocket URL, project, provider, and token file "
+                "must be configured together"
+            )
+        if self.workspace_websocket_url is not None:
+            if urlsplit(self.workspace_websocket_url).scheme not in {"ws", "wss"}:
+                raise ValueError("WZB_WORKSPACE_WEBSOCKET_URL must use ws or wss")
+            assert self.workspace_token_file is not None
+            if not self.workspace_token_file.is_file():
+                raise ValueError("WZB_WORKSPACE_TOKEN_FILE must name a readable file")
+        if self.workspace_ca_file is not None and not self.workspace_ca_file.is_file():
+            raise ValueError("WZB_WORKSPACE_CA_FILE must name a readable file")
+
+    @property
+    def workspace_events_enabled(self) -> bool:
+        return self.workspace_websocket_url is not None

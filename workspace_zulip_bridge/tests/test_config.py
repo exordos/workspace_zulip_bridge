@@ -2,6 +2,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License").
 
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
@@ -21,11 +22,15 @@ def test_defaults_use_local_postgresql_socket() -> None:
     assert settings.event_retention_seconds == 86400.0
     assert settings.event_cleanup_interval_seconds == 300.0
     assert settings.event_cleanup_batch_size == 10000
+    assert not settings.workspace_events_enabled
+    assert settings.workspace_event_batch_size == 500
 
 
 def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
     ca_file = tmp_path / "zulip-ca.pem"
     ca_file.write_text("test certificate")
+    token_file = tmp_path / "workspace.token"
+    token_file.write_text("header.payload.signature")
     settings = Settings.from_env(
         {
             "WZB_DATABASE_DSN": "postgresql://database/bridge",
@@ -46,6 +51,14 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
             "WZB_EVENT_RETENTION_SECONDS": "3600",
             "WZB_EVENT_CLEANUP_INTERVAL_SECONDS": "10",
             "WZB_EVENT_CLEANUP_BATCH_SIZE": "2500",
+            "WZB_WORKSPACE_WEBSOCKET_URL": (
+                "wss://workspace.example/api/workspace/v1/events/ws"
+            ),
+            "WZB_WORKSPACE_PROJECT_ID": "10000000-0000-0000-0000-000000000001",
+            "WZB_WORKSPACE_PROVIDER_UUID": "10000000-0000-0000-0000-000000000002",
+            "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+            "WZB_WORKSPACE_EVENT_BATCH_SIZE": "250",
+            "WZB_WORKSPACE_EVENT_FLUSH_SECONDS": "0.02",
         }
     )
 
@@ -67,6 +80,10 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
     assert settings.event_retention_seconds == 3600
     assert settings.event_cleanup_interval_seconds == 10
     assert settings.event_cleanup_batch_size == 2500
+    assert settings.workspace_events_enabled
+    assert settings.workspace_project_id == UUID("10000000-0000-0000-0000-000000000001")
+    assert settings.workspace_event_batch_size == 250
+    assert settings.workspace_event_flush_seconds == 0.02
 
 
 @pytest.mark.parametrize(
@@ -90,6 +107,9 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
         ("WZB_EVENT_CLEANUP_INTERVAL_SECONDS", "0"),
         ("WZB_EVENT_CLEANUP_BATCH_SIZE", "0"),
         ("WZB_EVENT_CLEANUP_BATCH_SIZE", "100001"),
+        ("WZB_WORKSPACE_EVENT_BATCH_SIZE", "0"),
+        ("WZB_WORKSPACE_EVENT_BATCH_SIZE", "10001"),
+        ("WZB_WORKSPACE_EVENT_FLUSH_SECONDS", "0"),
         ("WZB_ZULIP_RETRY_CAP_SECONDS", "0"),
     ],
 )
@@ -141,3 +161,21 @@ def test_database_ack_timeout_must_exceed_command_timeout() -> None:
 def test_ca_file_must_exist() -> None:
     with pytest.raises(ValueError, match="readable file"):
         Settings.from_env({"WZB_ZULIP_CA_FILE": "/missing/zulip-ca.pem"})
+
+
+def test_workspace_websocket_configuration_is_atomic(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="configured together"):
+        Settings.from_env(
+            {"WZB_WORKSPACE_WEBSOCKET_URL": "wss://workspace.example/events/ws"}
+        )
+
+    token_file = tmp_path / "workspace.token"
+    token_file.write_text("token")
+    values = {
+        "WZB_WORKSPACE_WEBSOCKET_URL": "https://workspace.example/events/ws",
+        "WZB_WORKSPACE_PROJECT_ID": "10000000-0000-0000-0000-000000000001",
+        "WZB_WORKSPACE_PROVIDER_UUID": "10000000-0000-0000-0000-000000000002",
+        "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+    }
+    with pytest.raises(ValueError, match="ws or wss"):
+        Settings.from_env(values)

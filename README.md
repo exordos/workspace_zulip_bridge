@@ -15,6 +15,11 @@ documented in [Zulip events API contract](docs/zulip_events_api.md).
 - One native long-polling thread per Zulip user.
 - Batched, idempotent event persistence with an atomic queue cursor update.
 - One asynchronous database-backed event processor with crash-recoverable claims.
+- One provider-wide Workspace WebSocket receiver, independent of the number of
+  Zulip users and realms handled by the process.
+- Batched, durable Workspace event ingestion with UUID deduplication, a
+  transactionally advanced resume cursor, and a PostgreSQL advisory lease for
+  active/passive daemon replicas.
 - Bounded queue-registration concurrency.
 - Concurrent per-user chat discovery with content hashes that suppress unchanged
   writes.
@@ -58,6 +63,7 @@ workspace_zulip_bridge/
 ├── zulip_api.py    # Minimal synchronous Zulip REST client
 ├── zulip_worker.py # Per-user threads and their supervisor
 ├── service.py      # Daemon lifecycle and supervision
+├── workspace_events.py # Provider WebSocket, cursor, and durable inbox
 ├── cli.py          # Console entry point and signal handling
 └── schema.sql      # Initial PostgreSQL schema
 etc/                # Environment example and systemd unit
@@ -89,9 +95,12 @@ immediately before sending it.
 The durable `zulip_events` inbox keeps immutable raw payloads plus claim,
 attempt, outcome, and timing state. `workspace_outbox` is an internal,
 coalescing entity-change journal; it deliberately contains no invented
-Workspace API payload. Disabled human identities remain available for foreign
-key resolution but their connections do not own a synchronization thread.
-Bots are neither inserted nor materialized as message or reaction authors.
+Workspace API payload. `workspace_events` is the independent inbound journal
+for the provider-wide Workspace socket. Disabled identities and bots remain
+available for foreign-key resolution, while only enabled non-bot identities
+own Zulip synchronization threads. Bot-authored messages and reactions are
+still materialized through those human-owned streams, matching what users see
+in Zulip.
 
 A user moves through `init`, `streaming`, `filling`, `scheduling`,
 `backfilling`, and `active`. Queue registration establishes `streaming`.
@@ -115,7 +124,7 @@ selected user clears the affected assignments, removes that source's messages,
 and deterministically selects the next eligible user. A process restart resumes
 a still-valid queue and rebuilds only its in-memory directory and chat-key maps.
 
-Polling threads only persist non-heartbeat, non-bot events. The event processor
+Polling threads discard heartbeats but preserve bot-authored activity. The event processor
 claims a bounded ordered batch with `FOR UPDATE SKIP LOCKED` and recovers claims
 left stale by a crash. It resolves chat ownership for the whole batch before
 applying data. Message, edit/move, reaction, delete, and channel-update events
@@ -182,6 +191,16 @@ deployment.
 | `WZB_EVENT_RETENTION_SECONDS` | `86400` | Terminal event retention from collection time |
 | `WZB_EVENT_CLEANUP_INTERVAL_SECONDS` | `300` | Interval between caught-up retention passes |
 | `WZB_EVENT_CLEANUP_BATCH_SIZE` | `10000` | Rows deleted per short retention transaction |
+| `WZB_WORKSPACE_WEBSOCKET_URL` | disabled | Provider event WebSocket URL; enables the receiver with the next three settings |
+| `WZB_WORKSPACE_PROJECT_ID` | disabled | Workspace project served by the provider consumer |
+| `WZB_WORKSPACE_PROVIDER_UUID` | disabled | Backend provider-consumer UUID used in event frames and cursors |
+| `WZB_WORKSPACE_TOKEN_FILE` | disabled | Root-managed file containing the dedicated IAM bearer token |
+| `WZB_WORKSPACE_CA_FILE` | system trust | Optional Workspace CA bundle |
+| `WZB_WORKSPACE_EVENT_BATCH_SIZE` | `500` | Events written per inbox transaction |
+| `WZB_WORKSPACE_EVENT_FLUSH_SECONDS` | `0.01` | Maximum low-volume persistence delay |
+| `WZB_WORKSPACE_RETRY_BASE_SECONDS` | `1` | Initial reconnect window |
+| `WZB_WORKSPACE_RETRY_CAP_SECONDS` | `60` | Maximum reconnect window |
+| `WZB_WORKSPACE_LEASE_RETRY_SECONDS` | `5` | Standby receiver lease retry interval |
 | `WZB_THREAD_STOP_TIMEOUT_SECONDS` | `5` | Worker shutdown deadline |
 | `WZB_LOG_LEVEL` | `INFO` | Python log level |
 
@@ -223,6 +242,14 @@ disposable test database and recreates only the bridge schema:
 ```bash
 WZB_BENCHMARK_DATABASE_DSN=postgresql:///workspace_zulip_bridge_benchmark \
   .tox/py/bin/python scripts/benchmark_import.py --messages 100000
+```
+
+The Workspace inbox benchmark uses the same disposable-database guard:
+
+```bash
+WZB_BENCHMARK_DATABASE_DSN=postgresql:///workspace_zulip_bridge_benchmark \
+  .tox/py/bin/python scripts/benchmark_workspace_events.py \
+  --events 100000 --batch-size 500
 ```
 
 ## Exordos Core build

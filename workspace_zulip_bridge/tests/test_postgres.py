@@ -7,10 +7,14 @@ import os
 from dataclasses import replace
 from datetime import UTC
 from datetime import datetime
+from pathlib import Path
 from uuid import UUID
 
 import asyncpg
 import pytest
+from websockets.asyncio.server import ServerConnection
+from websockets.asyncio.server import serve
+from websockets.exceptions import ConnectionClosedOK
 
 from workspace_zulip_bridge.chat_catalog import ChatCatalogBuilder
 from workspace_zulip_bridge.config import Settings
@@ -30,6 +34,9 @@ from workspace_zulip_bridge.stable_ids import stable_message_uuid
 from workspace_zulip_bridge.stable_ids import stable_realm_uuid
 from workspace_zulip_bridge.stable_ids import stable_topic_uuid
 from workspace_zulip_bridge.stable_ids import stable_user_uuid
+from workspace_zulip_bridge.workspace_events import WorkspaceEvent
+from workspace_zulip_bridge.workspace_events import WorkspaceEventReceiver
+from workspace_zulip_bridge.workspace_events import WorkspaceEventStore
 
 ENDPOINT = "https://zulip.example.test"
 
@@ -53,7 +60,13 @@ async def _pool(dsn: str) -> asyncpg.Pool:
     pool = await open_pool(settings)
     await prepare_database(pool)
     async with pool.acquire() as connection:
-        await connection.execute("TRUNCATE workspace_zulip_bridge.zulip_realms CASCADE")
+        await connection.execute(
+            """
+            TRUNCATE workspace_zulip_bridge.workspace_events,
+                     workspace_zulip_bridge.workspace_event_cursors,
+                     workspace_zulip_bridge.zulip_realms CASCADE
+            """
+        )
     return pool
 
 
@@ -76,6 +89,8 @@ async def _normalized_tables_round_trip(dsn: str) -> None:
             "zulip_files",
             "zulip_message_files",
             "workspace_outbox",
+            "workspace_event_cursors",
+            "workspace_events",
         )
         async with pool.acquire() as connection:
             for table in tables:
@@ -85,6 +100,155 @@ async def _normalized_tables_round_trip(dsn: str) -> None:
                     )
                     == 0
                 )
+    finally:
+        await pool.close()
+
+
+def test_workspace_event_inbox_deduplicates_and_advances_cursor() -> None:
+    asyncio.run(_workspace_event_inbox_round_trip(_dsn()))
+
+
+async def _workspace_event_inbox_round_trip(dsn: str) -> None:
+    pool = await _pool(dsn)
+    provider_uuid = UUID("10000000-0000-0000-0000-000000000001")
+    project_uuid = UUID("10000000-0000-0000-0000-000000000002")
+    generation = UUID("10000000-0000-0000-0000-000000000003")
+    try:
+        store = WorkspaceEventStore(pool)
+        assert (await store.cursor(provider_uuid, project_uuid)).last_epoch_version == 0
+        events = [
+            WorkspaceEvent(
+                uuid=UUID(f"20000000-0000-0000-0000-{index:012d}"),
+                epoch_version=index,
+                object_type="message",
+                action="updated",
+                entity_uuid=UUID(f"30000000-0000-0000-0000-{index:012d}"),
+                frame={
+                    "uuid": f"20000000-0000-0000-0000-{index:012d}",
+                    "epoch_version": index,
+                    "object_type": "message",
+                    "action": "updated",
+                },
+            )
+            for index in range(1, 1001)
+        ]
+
+        assert (
+            await store.persist(
+                provider_uuid,
+                project_uuid,
+                generation,
+                events,
+            )
+            == 1000
+        )
+        assert (
+            await store.persist(
+                provider_uuid,
+                project_uuid,
+                generation,
+                events,
+            )
+            == 0
+        )
+        cursor = await store.cursor(provider_uuid, project_uuid)
+        assert cursor.epoch_generation == generation
+        assert cursor.last_epoch_version == 1000
+        async with pool.acquire() as connection:
+            assert (
+                await connection.fetchval(
+                    "SELECT count(*) FROM workspace_zulip_bridge.workspace_events"
+                )
+                == 1000
+            )
+    finally:
+        await pool.close()
+
+
+def test_workspace_websocket_round_trip_uses_one_provider_cursor(
+    tmp_path: Path,
+) -> None:
+    asyncio.run(_workspace_websocket_round_trip(_dsn(), tmp_path))
+
+
+async def _workspace_websocket_round_trip(dsn: str, tmp_path: Path) -> None:
+    pool = await _pool(dsn)
+    provider_uuid = UUID("10000000-0000-0000-0000-000000000011")
+    project_uuid = UUID("10000000-0000-0000-0000-000000000012")
+    generation = UUID("10000000-0000-0000-0000-000000000013")
+    token_file = tmp_path / "workspace.token"
+    token_file.write_text("integration-token")
+
+    def frame(version: int) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "uuid": f"20000000-0000-0000-0000-{version:012d}",
+            "epoch_version": version,
+            "project_id": str(project_uuid),
+            "user_uuid": str(provider_uuid),
+            "object_type": "message",
+            "action": "updated",
+            "payload": {
+                "kind": "message.updated",
+                "uuid": f"30000000-0000-0000-0000-{version:012d}",
+            },
+        }
+
+    async def handler(websocket: ServerConnection) -> None:
+        assert websocket.subprotocol == "workspace.events.v1"
+        protocols = websocket.request.headers["Sec-WebSocket-Protocol"]
+        assert "bearer.integration-token" in protocols
+        await websocket.send(json.dumps(frame(1)))
+        await websocket.send(
+            json.dumps(
+                {
+                    "type": "ready",
+                    "epoch_generation": str(generation),
+                    "epoch_version": 1,
+                }
+            )
+        )
+        await websocket.send(json.dumps(frame(2)))
+
+    try:
+        async with serve(
+            handler,
+            "127.0.0.1",
+            0,
+            subprotocols=["workspace.events.v1"],
+        ) as server:
+            port = server.sockets[0].getsockname()[1]
+            settings = Settings.from_env(
+                {
+                    "WZB_DATABASE_DSN": dsn,
+                    "WZB_DB_POOL_MIN_SIZE": "1",
+                    "WZB_DB_POOL_MAX_SIZE": "4",
+                    "WZB_ZULIP_HISTORY_CONCURRENCY": "2",
+                    "WZB_WORKSPACE_WEBSOCKET_URL": f"ws://127.0.0.1:{port}/events/ws",
+                    "WZB_WORKSPACE_PROJECT_ID": str(project_uuid),
+                    "WZB_WORKSPACE_PROVIDER_UUID": str(provider_uuid),
+                    "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+                }
+            )
+            receiver = WorkspaceEventReceiver(pool, settings)
+            cursor = await receiver._store.cursor(provider_uuid, project_uuid)
+            with pytest.raises(ConnectionClosedOK):
+                await receiver._receive(cursor)
+
+        stored = await pool.fetch(
+            """
+            SELECT epoch_generation, epoch_version
+            FROM workspace_zulip_bridge.workspace_events
+            ORDER BY epoch_version
+            """
+        )
+        assert [(row["epoch_generation"], row["epoch_version"]) for row in stored] == [
+            (generation, 1),
+            (generation, 2),
+        ]
+        cursor = await receiver._store.cursor(provider_uuid, project_uuid)
+        assert cursor.epoch_generation == generation
+        assert cursor.last_epoch_version == 2
     finally:
         await pool.close()
 

@@ -12,6 +12,7 @@ from workspace_zulip_bridge.database import prepare_database
 from workspace_zulip_bridge.database import probe_database
 from workspace_zulip_bridge.event_processor import ZulipEventProcessor
 from workspace_zulip_bridge.event_store import EventStore
+from workspace_zulip_bridge.workspace_events import WorkspaceEventReceiver
 from workspace_zulip_bridge.zulip_worker import ZulipThreadSupervisor
 
 LOG = logging.getLogger(__name__)
@@ -52,6 +53,14 @@ class BridgeService:
                 event_processor_task,
                 stop_task,
             ]
+            if self._settings.workspace_events_enabled:
+                receiver = WorkspaceEventReceiver(pool, self._settings)
+                supervised_tasks.append(
+                    asyncio.create_task(
+                        receiver.run(),
+                        name="workspace-event-receiver",
+                    )
+                )
             LOG.info("bridge daemon is ready")
             try:
                 completed, _ = await asyncio.wait(
