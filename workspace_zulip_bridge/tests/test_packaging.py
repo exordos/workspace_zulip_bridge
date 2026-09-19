@@ -32,8 +32,11 @@ def test_exordos_manifest_renders_without_implicit_values() -> None:
         .from_string(source)
         .render(
             version="0.1.0",
-            project_id="00000000-0000-0000-0000-000000000000",
-            repository="https://repo.example.com/exordos-elements",
+            images={
+                "workspace_zulip_bridge": (
+                    "urn:images:00000000-0000-0000-0000-000000000000"
+                )
+            },
         )
     )
     manifest = yaml.safe_load(rendered)
@@ -41,7 +44,12 @@ def test_exordos_manifest_renders_without_implicit_values() -> None:
     node = manifest["resources"]["$core.compute.nodes"]["bridge_node"]
     assert manifest["name"] == "workspace_zulip_bridge"
     assert node["cores"] == 2
+    assert node["ram"] == 4096
     assert node["disk_spec"]["disks"][1] == {"label": "data", "size": 20}
-    assert node["disk_spec"]["disks"][0]["image"].endswith(
-        "/workspace-zulip-bridge/0.1.0/images/workspace-zulip-bridge.raw.zst"
+    assert node["disk_spec"]["disks"][0]["image"] == (
+        "urn:images:00000000-0000-0000-0000-000000000000"
     )
+    assert manifest["exports"]["bridge_node"] == {
+        "kind": "resource",
+        "link": "$core.compute.nodes.$bridge_node",
+    }

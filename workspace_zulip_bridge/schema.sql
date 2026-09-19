@@ -453,9 +453,12 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_mirror_state (
     ),
     last_error text,
     bootstrapped_at timestamptz,
+    initial_sync_completed_at timestamptz,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
+ALTER TABLE workspace_zulip_bridge.workspace_mirror_state
+    ADD COLUMN IF NOT EXISTS initial_sync_completed_at timestamptz;
 
 CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_users (
     provider_uuid uuid NOT NULL, snapshot_generation uuid NOT NULL, uuid uuid NOT NULL,

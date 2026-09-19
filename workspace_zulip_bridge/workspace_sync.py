@@ -244,6 +244,7 @@ class WorkspaceBootstrapper:
                     snapshot_epoch_version = $5, bootstrap_status = 'ready',
                     entity_counts = $6::jsonb, snapshot_hash = $7,
                     last_error = NULL, bootstrapped_at = clock_timestamp(),
+                    initial_sync_completed_at = NULL,
                     updated_at = clock_timestamp()
                 WHERE provider_uuid = $1 AND workspace_project_id = $2
                 """,
@@ -504,6 +505,19 @@ class WorkspaceDiffWorker:
         return total
 
     async def process_once(self, client: httpx.AsyncClient) -> int:
+        mirror = await self._pool.fetchrow(
+            """
+            SELECT initial_sync_completed_at
+            FROM workspace_zulip_bridge.workspace_mirror_state
+            WHERE provider_uuid = $1
+            """,
+            self._provider_uuid,
+        )
+        delivery_class = (
+            "live"
+            if mirror is not None and mirror["initial_sync_completed_at"] is not None
+            else "backfill"
+        )
         async with self._pool.acquire() as connection, connection.transaction():
             rows = await connection.fetch(
                 """
@@ -533,6 +547,7 @@ class WorkspaceDiffWorker:
                 self._settings.workspace_sync_batch_size,
             )
         if not rows:
+            await self._complete_initial_sync()
             return 0
         to_workspace = [row for row in rows if row["direction"] == "to_workspace"]
         to_zulip = [row for row in rows if row["direction"] == "to_zulip"]
@@ -581,7 +596,10 @@ class WorkspaceDiffWorker:
         try:
             response = await client.post(
                 f"{workspace_api_url(self._settings)}/provider/entities/actions/apply/invoke",
-                json={"operations": operations},
+                json={
+                    "delivery_class": delivery_class,
+                    "operations": operations,
+                },
             )
             if response.is_error:
                 raise RuntimeError(
@@ -596,6 +614,44 @@ class WorkspaceDiffWorker:
             await self._mark(to_workspace, "failed", str(exc)[:2048])
             raise
         return len(rows)
+
+    async def _complete_initial_sync(self) -> bool:
+        result = await self._pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.workspace_mirror_state AS mirror
+            SET initial_sync_completed_at = clock_timestamp(),
+                updated_at = clock_timestamp()
+            WHERE mirror.provider_uuid = $1
+              AND mirror.initial_sync_completed_at IS NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM workspace_zulip_bridge.zulip_connections AS connection
+                  JOIN workspace_zulip_bridge.zulip_users AS zulip_user
+                    ON zulip_user.uuid = connection.zulip_user_uuid
+                  WHERE connection.sync_enabled
+                    AND NOT zulip_user.disabled AND NOT zulip_user.is_bot
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM workspace_zulip_bridge.zulip_connections AS connection
+                  JOIN workspace_zulip_bridge.zulip_users AS zulip_user
+                    ON zulip_user.uuid = connection.zulip_user_uuid
+                  WHERE connection.sync_enabled
+                    AND NOT zulip_user.disabled AND NOT zulip_user.is_bot
+                    AND connection.lifecycle_status <> 'active'
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM workspace_zulip_bridge.sync_diffs AS diff
+                  WHERE diff.provider_uuid = mirror.provider_uuid
+                    AND diff.direction = 'to_workspace'
+                    AND diff.processing_status IN (
+                        'pending', 'processing', 'failed'
+                    )
+              )
+            """,
+            self._provider_uuid,
+        )
+        return result == "UPDATE 1"
 
     async def _accept(
         self, records: list[tuple[asyncpg.Record, dict[str, Any], bytes]]

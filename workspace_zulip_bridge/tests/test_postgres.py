@@ -281,6 +281,16 @@ async def _workspace_bootstrap_round_trip(dsn: str, tmp_path: Path) -> None:
         return httpx.Response(200, text=payload)
 
     try:
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.workspace_mirror_state (
+                provider_uuid, workspace_project_id, bootstrap_status,
+                initial_sync_completed_at
+            ) VALUES ($1, $2, 'ready', clock_timestamp())
+            """,
+            provider_uuid,
+            project_uuid,
+        )
         bootstrapper = WorkspaceBootstrapper(pool, settings)
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(handler),
@@ -290,14 +300,14 @@ async def _workspace_bootstrap_round_trip(dsn: str, tmp_path: Path) -> None:
         state = await pool.fetchrow(
             """
             SELECT active_generation, epoch_generation, snapshot_epoch_version,
-                   bootstrap_status
+                   bootstrap_status, initial_sync_completed_at
             FROM workspace_zulip_bridge.workspace_mirror_state
             WHERE provider_uuid = $1
             """,
             provider_uuid,
         )
         assert state is not None
-        assert tuple(state) == (generation, epoch_generation, 41, "ready")
+        assert tuple(state) == (generation, epoch_generation, 41, "ready", None)
         assert (
             await pool.fetchval(
                 "SELECT count(*) FROM workspace_zulip_bridge.workspace_users "
@@ -391,8 +401,37 @@ async def _workspace_diff_worker_round_trip(dsn: str, tmp_path: Path) -> None:
         ) as client:
             assert await worker.process_once(client) == 1
             await worker.plan()
+            await pool.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_connections
+                SET lifecycle_status = 'active'
+                WHERE uuid = $1
+                """,
+                user_uuid,
+            )
             assert await worker.process_once(client) == 0
-        assert len(requests) == 1
+            assert await pool.fetchval(
+                """
+                SELECT initial_sync_completed_at IS NOT NULL
+                FROM workspace_zulip_bridge.workspace_mirror_state
+                WHERE provider_uuid = $1
+                """,
+                provider_uuid,
+            )
+            await pool.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_users
+                SET full_name = 'Updated User 10',
+                    profile_hash = decode(repeat('02', 32), 'hex')
+                WHERE uuid = $1
+                """,
+                user_uuid,
+            )
+            await worker.plan()
+            assert await worker.process_once(client) == 1
+        assert len(requests) == 2
+        assert requests[0]["delivery_class"] == "backfill"
+        assert requests[1]["delivery_class"] == "live"
         operation = requests[0]["operations"][0]  # type: ignore[index]
         assert operation["type"] == "users"  # type: ignore[index]
         assert operation["data"]["display_name"] == "User 10"  # type: ignore[index]

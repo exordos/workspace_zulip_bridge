@@ -13,19 +13,19 @@ resources:
     bridge_node:
       name: "workspace-zulip-bridge"
       description: "Workspace Zulip bridge service and local PostgreSQL"
-      project_id: "{{ project_id }}"
-      cores: {{ cores | default(2) }}
-      ram: {{ ram | default(4096) }}
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      cores: 2
+      ram: 4096
       disk_spec:
         kind: "disks"
         disks:
           - label: "root"
             size: 6
-            image: "{{ repository | default('https://repo.exordos.com/exordos-elements') }}/workspace-zulip-bridge/{{ version }}/images/workspace-zulip-bridge.raw.zst"
+            image: "{{ images['workspace_zulip_bridge'] }}"
           - label: "data"
-            size: {{ data_disk_size | default(20) }}
+            size: 20
 
 exports:
   bridge_node:
     kind: "resource"
-    link: "$workspace_zulip_bridge.compute.nodes.$bridge_node"
+    link: "$core.compute.nodes.$bridge_node"
