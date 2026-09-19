@@ -512,11 +512,19 @@ class WorkspaceDiffWorker:
                   ON target.provider_uuid = $1
                  AND target.snapshot_generation = $4
                  AND target.uuid = source.uuid
+                LEFT JOIN workspace_zulip_bridge.sync_diffs AS previous
+                  ON previous.provider_uuid = $1
+                 AND previous.entity_type = $2
+                 AND previous.entity_uuid = source.uuid
                 WHERE {source["where"]}
-                  AND (target.uuid IS NULL
-                       OR target.source_updated_at IS DISTINCT FROM {timestamp_column}
-                       OR ({source["hash"]} IS NOT NULL
-                           AND target.content_hash IS DISTINCT FROM {source["hash"]}))
+                  AND (
+                      target.uuid IS NULL OR previous.entity_uuid IS NULL
+                      OR previous.source_updated_at IS DISTINCT FROM {timestamp_column}
+                      OR previous.source_hash IS DISTINCT FROM {source["hash"]}
+                      OR previous.target_updated_at
+                         IS DISTINCT FROM target.source_updated_at
+                      OR previous.target_hash IS DISTINCT FROM target.content_hash
+                  )
                 ORDER BY {timestamp_column}, source.uuid
                 LIMIT $5
                 ON CONFLICT (provider_uuid, entity_type, entity_uuid)
@@ -530,10 +538,20 @@ class WorkspaceDiffWorker:
                     processing_status = CASE
                         WHEN sync_diffs.source_hash IS DISTINCT FROM EXCLUDED.source_hash
                           OR sync_diffs.target_hash IS DISTINCT FROM EXCLUDED.target_hash
+                          OR sync_diffs.source_updated_at
+                             IS DISTINCT FROM EXCLUDED.source_updated_at
+                          OR sync_diffs.target_updated_at
+                             IS DISTINCT FROM EXCLUDED.target_updated_at
+                          OR sync_diffs.direction IS DISTINCT FROM EXCLUDED.direction
                         THEN 'pending' ELSE sync_diffs.processing_status END,
                     available_at = CASE
                         WHEN sync_diffs.source_hash IS DISTINCT FROM EXCLUDED.source_hash
                           OR sync_diffs.target_hash IS DISTINCT FROM EXCLUDED.target_hash
+                          OR sync_diffs.source_updated_at
+                             IS DISTINCT FROM EXCLUDED.source_updated_at
+                          OR sync_diffs.target_updated_at
+                             IS DISTINCT FROM EXCLUDED.target_updated_at
+                          OR sync_diffs.direction IS DISTINCT FROM EXCLUDED.direction
                         THEN clock_timestamp() ELSE sync_diffs.available_at END,
                     updated_at = clock_timestamp()
                 """,

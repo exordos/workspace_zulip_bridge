@@ -117,6 +117,60 @@ async def _normalized_tables_round_trip(dsn: str) -> None:
         await pool.close()
 
 
+def test_prepare_database_requeues_claimed_workspace_work() -> None:
+    asyncio.run(_prepare_database_requeues_claimed_workspace_work(_dsn()))
+
+
+async def _prepare_database_requeues_claimed_workspace_work(dsn: str) -> None:
+    pool = await _pool(dsn)
+    provider_uuid = UUID("10000000-0000-0000-0000-000000000071")
+    project_uuid = UUID("10000000-0000-0000-0000-000000000072")
+    entity_uuid = UUID("10000000-0000-0000-0000-000000000073")
+    try:
+        async with pool.acquire() as connection:
+            user_uuid = await _insert_user(connection, 71, 400)
+            realm_uuid = stable_realm_uuid(ENDPOINT)
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.workspace_events (
+                    uuid, provider_uuid, workspace_project_id, epoch_version,
+                    object_type, action, entity_uuid, payload,
+                    processing_status, claimed_at
+                ) VALUES ($1, $2, $3, 1, 'user', 'updated', $4, '{}'::jsonb,
+                          'processing', clock_timestamp())
+                """,
+                UUID("10000000-0000-0000-0000-000000000074"),
+                provider_uuid,
+                project_uuid,
+                user_uuid,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.sync_diffs (
+                    provider_uuid, entity_type, entity_uuid, realm_uuid,
+                    direction, source_updated_at, processing_status, claimed_at
+                ) VALUES ($1, 'users', $2, $3, 'to_workspace',
+                          clock_timestamp(), 'processing', clock_timestamp())
+                """,
+                provider_uuid,
+                entity_uuid,
+                realm_uuid,
+            )
+        await prepare_database(pool)
+        assert await pool.fetchval(
+            "SELECT processing_status = 'pending' AND claimed_at IS NULL "
+            "FROM workspace_zulip_bridge.workspace_events WHERE provider_uuid = $1",
+            provider_uuid,
+        )
+        assert await pool.fetchval(
+            "SELECT processing_status = 'pending' AND claimed_at IS NULL "
+            "FROM workspace_zulip_bridge.sync_diffs WHERE provider_uuid = $1",
+            provider_uuid,
+        )
+    finally:
+        await pool.close()
+
+
 def test_workspace_event_inbox_deduplicates_and_advances_cursor() -> None:
     asyncio.run(_workspace_event_inbox_round_trip(_dsn()))
 
@@ -401,7 +455,7 @@ async def _workspace_diff_worker_round_trip(dsn: str, tmp_path: Path) -> None:
             headers={"Authorization": "Bearer integration-token"},
         ) as client:
             assert await worker.process_once(client) == 1
-            await worker.plan()
+            assert await worker.plan() == 0
             await pool.execute(
                 """
                 UPDATE workspace_zulip_bridge.zulip_connections

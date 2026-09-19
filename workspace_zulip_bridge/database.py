@@ -36,6 +36,22 @@ async def prepare_database(pool: asyncpg.Pool) -> None:
             "hashtextextended('workspace_zulip_bridge:schema', 0))"
         )
         await connection.execute(schema)
+        await connection.execute(
+            """
+            UPDATE workspace_zulip_bridge.workspace_events
+            SET processing_status = 'pending', claimed_at = NULL,
+                updated_at = clock_timestamp()
+            WHERE processing_status = 'processing'
+            """
+        )
+        await connection.execute(
+            """
+            UPDATE workspace_zulip_bridge.sync_diffs
+            SET processing_status = 'pending', claimed_at = NULL,
+                available_at = clock_timestamp(), updated_at = clock_timestamp()
+            WHERE processing_status = 'processing'
+            """
+        )
 
 
 async def probe_database(pool: asyncpg.Pool) -> None:
