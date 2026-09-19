@@ -355,133 +355,164 @@ class EventStore:
         *,
         replace_all: bool,
     ) -> int:
-        async with self._pool.acquire() as connection, connection.transaction():
-            owner = await connection.fetchrow(
-                """
-                SELECT connection.realm_uuid, connection.zulip_user_uuid,
-                       realm.identity_key AS endpoint
-                FROM workspace_zulip_bridge.zulip_connections AS connection
-                JOIN workspace_zulip_bridge.zulip_realms AS realm
-                  ON realm.uuid = connection.realm_uuid
-                WHERE connection.uuid = $1 AND connection.queue_id = $2
-                """,
-                connection_uuid,
-                queue_id,
-            )
-            if owner is None:
-                return 0
-            file_uuids = [
-                stable_file_uuid(owner["endpoint"], attachment.source_path)
-                for attachment in attachments
-            ]
-            row = await connection.fetchrow(
-                """
-                WITH active_connection AS MATERIALIZED (
-                    SELECT $1::uuid AS uuid
-                ), incoming_json AS MATERIALIZED (
-                    SELECT file_uuid, attachment_id, source_path, name, size_bytes,
-                           source_created_at, message_ids, metadata_hash
-                    FROM unnest(
-                        $4::uuid[], $5::bigint[], $6::text[], $7::text[],
-                        $8::bigint[], $9::bigint[], $10::jsonb[], $11::bytea[]
-                    ) AS attachment(
-                        file_uuid, attachment_id, source_path, name, size_bytes,
-                        source_created_at, message_ids, metadata_hash
-                    )
-                ), incoming AS MATERIALIZED (
-                    SELECT file_uuid, attachment_id, source_path, name, size_bytes,
-                           source_created_at,
-                           ARRAY(
-                               SELECT value::bigint
-                               FROM jsonb_array_elements_text(message_ids) AS value
-                           ) AS message_ids,
-                           metadata_hash
-                    FROM incoming_json
-                ), upserted AS (
-                    INSERT INTO workspace_zulip_bridge.zulip_files
-                        (uuid, realm_uuid, owner_user_uuid, zulip_attachment_id,
-                         source_path, name, size_bytes, source_created_at,
-                         message_ids, metadata_hash)
-                    SELECT file_uuid, $2, $3, attachment_id, source_path, name,
-                           size_bytes, to_timestamp(source_created_at), message_ids,
-                           metadata_hash
-                    FROM incoming
-                    ON CONFLICT (uuid) DO UPDATE SET
-                        owner_user_uuid = EXCLUDED.owner_user_uuid,
-                        zulip_attachment_id = EXCLUDED.zulip_attachment_id,
-                        name = EXCLUDED.name,
-                        size_bytes = EXCLUDED.size_bytes,
-                        source_created_at = EXCLUDED.source_created_at,
-                        message_ids = EXCLUDED.message_ids,
-                        metadata_hash = EXCLUDED.metadata_hash
-                    WHERE (zulip_files.owner_user_uuid,
-                           zulip_files.zulip_attachment_id, zulip_files.name,
-                           zulip_files.size_bytes, zulip_files.source_created_at,
-                           zulip_files.message_ids, zulip_files.metadata_hash)
-                        IS DISTINCT FROM
-                          (EXCLUDED.owner_user_uuid,
-                           EXCLUDED.zulip_attachment_id, EXCLUDED.name,
-                           EXCLUDED.size_bytes, EXCLUDED.source_created_at,
-                           EXCLUDED.message_ids, EXCLUDED.metadata_hash)
-                    RETURNING uuid
-                ), removed AS (
-                    DELETE FROM workspace_zulip_bridge.zulip_files AS file
-                    WHERE $12 AND file.realm_uuid = $2
-                      AND file.owner_user_uuid = $3
-                      AND NOT (file.uuid = ANY($4::uuid[]))
-                    RETURNING uuid
-                ), removed_links AS (
-                    DELETE FROM workspace_zulip_bridge.zulip_message_files AS link
-                    USING incoming
-                    WHERE link.file_uuid = incoming.file_uuid
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM workspace_zulip_bridge.zulip_messages AS message
-                          WHERE message.uuid = link.message_uuid
-                            AND message.zulip_message_id = ANY(incoming.message_ids)
-                      )
-                    RETURNING 1
-                ), links AS (
-                    INSERT INTO workspace_zulip_bridge.zulip_message_files
-                        (message_uuid, file_uuid, position)
-                    SELECT message.uuid, incoming.file_uuid, 0
-                    FROM incoming
-                    JOIN workspace_zulip_bridge.zulip_messages AS message
-                      ON message.realm_uuid = $2
-                     AND message.zulip_message_id = ANY(incoming.message_ids)
-                    ON CONFLICT (message_uuid, file_uuid) DO NOTHING
-                    RETURNING 1
-                ), changes AS (
-                    SELECT uuid, 'upsert'::text AS action FROM upserted
-                    UNION ALL SELECT uuid, 'delete'::text FROM removed
-                ), outbox AS (
-                    INSERT INTO workspace_zulip_bridge.workspace_outbox
-                        (realm_uuid, entity_type, action, entity_uuid)
-                    SELECT $2, 'file', action, uuid FROM changes
-                    ON CONFLICT (realm_uuid, entity_type, entity_uuid)
-                        WHERE delivery_status = 'pending'
-                    DO UPDATE SET action = EXCLUDED.action,
-                                  updated_at = clock_timestamp()
-                    RETURNING 1
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                owner = await connection.fetchrow(
+                    """
+                    SELECT connection.realm_uuid, connection.zulip_user_uuid,
+                           realm.identity_key AS endpoint
+                    FROM workspace_zulip_bridge.zulip_connections AS connection
+                    JOIN workspace_zulip_bridge.zulip_realms AS realm
+                      ON realm.uuid = connection.realm_uuid
+                    WHERE connection.uuid = $1 AND connection.queue_id = $2
+                    """,
+                    connection_uuid,
+                    queue_id,
                 )
-                SELECT (SELECT count(*) FROM changes) AS changed_count
-                FROM active_connection
-                """,
-                connection_uuid,
-                owner["realm_uuid"],
-                owner["zulip_user_uuid"],
-                file_uuids,
-                [attachment.attachment_id for attachment in attachments],
-                [attachment.source_path for attachment in attachments],
-                [attachment.name for attachment in attachments],
-                [attachment.size_bytes for attachment in attachments],
-                [attachment.created_at for attachment in attachments],
-                [json.dumps(attachment.message_ids) for attachment in attachments],
-                [attachment.metadata_hash for attachment in attachments],
-                replace_all,
-            )
-        if row is None:
-            raise RuntimeError("attachment metadata query returned no row")
+                if owner is None:
+                    return 0
+                file_uuids = [
+                    stable_file_uuid(owner["endpoint"], attachment.source_path)
+                    for attachment in attachments
+                ]
+                row = await connection.fetchrow(
+                    """
+                    WITH active_connection AS MATERIALIZED (
+                        SELECT $1::uuid AS uuid
+                    ), incoming_json AS MATERIALIZED (
+                        SELECT file_uuid, attachment_id, source_path, name, size_bytes,
+                               source_created_at, message_ids, metadata_hash
+                        FROM unnest(
+                            $4::uuid[], $5::bigint[], $6::text[], $7::text[],
+                            $8::bigint[], $9::bigint[], $10::jsonb[], $11::bytea[]
+                        ) AS attachment(
+                            file_uuid, attachment_id, source_path, name, size_bytes,
+                            source_created_at, message_ids, metadata_hash
+                        )
+                    ), incoming AS MATERIALIZED (
+                        SELECT file_uuid, attachment_id, source_path, name, size_bytes,
+                               source_created_at,
+                               ARRAY(
+                                   SELECT value::bigint
+                                   FROM jsonb_array_elements_text(message_ids) AS value
+                               ) AS message_ids,
+                               metadata_hash
+                        FROM incoming_json
+                    ), upserted AS (
+                        INSERT INTO workspace_zulip_bridge.zulip_files
+                            (uuid, realm_uuid, owner_user_uuid, zulip_attachment_id,
+                             source_path, name, size_bytes, source_created_at,
+                             message_ids, metadata_hash)
+                        SELECT file_uuid, $2, $3, attachment_id, source_path, name,
+                               size_bytes, to_timestamp(source_created_at), message_ids,
+                               metadata_hash
+                        FROM incoming ORDER BY file_uuid
+                        ON CONFLICT (uuid) DO UPDATE SET
+                            owner_user_uuid = EXCLUDED.owner_user_uuid,
+                            zulip_attachment_id = EXCLUDED.zulip_attachment_id,
+                            name = EXCLUDED.name,
+                            size_bytes = EXCLUDED.size_bytes,
+                            source_created_at = EXCLUDED.source_created_at,
+                            message_ids = EXCLUDED.message_ids,
+                            metadata_hash = EXCLUDED.metadata_hash
+                        WHERE (zulip_files.owner_user_uuid,
+                               zulip_files.zulip_attachment_id, zulip_files.name,
+                               zulip_files.size_bytes, zulip_files.source_created_at,
+                               zulip_files.message_ids, zulip_files.metadata_hash)
+                            IS DISTINCT FROM
+                              (EXCLUDED.owner_user_uuid,
+                               EXCLUDED.zulip_attachment_id, EXCLUDED.name,
+                               EXCLUDED.size_bytes, EXCLUDED.source_created_at,
+                               EXCLUDED.message_ids, EXCLUDED.metadata_hash)
+                        RETURNING uuid
+                    ), removed AS (
+                        DELETE FROM workspace_zulip_bridge.zulip_files AS file
+                        WHERE $12 AND file.realm_uuid = $2
+                          AND file.owner_user_uuid = $3
+                          AND NOT (file.uuid = ANY($4::uuid[]))
+                        RETURNING uuid
+                    ), changes AS (
+                        SELECT uuid, 'upsert'::text AS action FROM upserted
+                        UNION ALL SELECT uuid, 'delete'::text FROM removed
+                    ), outbox AS (
+                        INSERT INTO workspace_zulip_bridge.workspace_outbox
+                            (realm_uuid, entity_type, action, entity_uuid)
+                        SELECT $2, 'file', action, uuid FROM changes
+                        ON CONFLICT (realm_uuid, entity_type, entity_uuid)
+                            WHERE delivery_status = 'pending'
+                        DO UPDATE SET action = EXCLUDED.action,
+                                      updated_at = clock_timestamp()
+                        RETURNING 1
+                    )
+                    SELECT (SELECT count(*) FROM changes) AS changed_count
+                    FROM active_connection
+                    """,
+                    connection_uuid,
+                    owner["realm_uuid"],
+                    owner["zulip_user_uuid"],
+                    file_uuids,
+                    [attachment.attachment_id for attachment in attachments],
+                    [attachment.source_path for attachment in attachments],
+                    [attachment.name for attachment in attachments],
+                    [attachment.size_bytes for attachment in attachments],
+                    [attachment.created_at for attachment in attachments],
+                    [json.dumps(attachment.message_ids) for attachment in attachments],
+                    [attachment.metadata_hash for attachment in attachments],
+                    replace_all,
+                )
+            if row is None:
+                raise RuntimeError("attachment metadata query returned no row")
+            async with connection.transaction():
+                await connection.execute(
+                    """
+                    WITH active_connection AS MATERIALIZED (
+                        SELECT 1
+                        FROM workspace_zulip_bridge.zulip_connections
+                        WHERE uuid = $1 AND queue_id = $2
+                    ), incoming_json AS MATERIALIZED (
+                        SELECT file_uuid, message_ids
+                        FROM unnest($4::uuid[], $5::jsonb[])
+                            AS attachment(file_uuid, message_ids)
+                    ), incoming AS MATERIALIZED (
+                        SELECT file_uuid,
+                               ARRAY(
+                                   SELECT value::bigint
+                                   FROM jsonb_array_elements_text(message_ids) AS value
+                               ) AS message_ids
+                        FROM incoming_json
+                    ), removed_links AS (
+                        DELETE FROM workspace_zulip_bridge.zulip_message_files AS link
+                        USING incoming, active_connection
+                        WHERE link.file_uuid = incoming.file_uuid
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM workspace_zulip_bridge.zulip_messages AS message
+                              WHERE message.uuid = link.message_uuid
+                                AND message.zulip_message_id = ANY(incoming.message_ids)
+                          )
+                        RETURNING 1
+                    ), links AS (
+                        INSERT INTO workspace_zulip_bridge.zulip_message_files
+                            (message_uuid, file_uuid, position)
+                        SELECT message.uuid, incoming.file_uuid, 0
+                        FROM active_connection
+                        CROSS JOIN incoming
+                        JOIN workspace_zulip_bridge.zulip_messages AS message
+                          ON message.realm_uuid = $3
+                         AND message.zulip_message_id = ANY(incoming.message_ids)
+                        ORDER BY message.uuid, incoming.file_uuid
+                        ON CONFLICT (message_uuid, file_uuid) DO NOTHING
+                        RETURNING 1
+                    )
+                    SELECT (SELECT count(*) FROM removed_links)
+                         + (SELECT count(*) FROM links)
+                    """,
+                    connection_uuid,
+                    queue_id,
+                    owner["realm_uuid"],
+                    file_uuids,
+                    [json.dumps(attachment.message_ids) for attachment in attachments],
+                )
         return int(row["changed_count"])
 
     async def remove_user_attachment(
