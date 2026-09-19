@@ -152,6 +152,7 @@ class ZulipMessage:
     reactions_json: str
     message_hash: bytes
     sent_at: int
+    source_updated_at: int | None = None
     reaction_users_json: str = "{}"
     content_hash: bytes = b"\0" * 32
     files: tuple["ZulipFileMetadata", ...] = ()

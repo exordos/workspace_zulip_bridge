@@ -186,6 +186,10 @@ class ZulipEventThread(threading.Thread):
                         self.user.uuid,
                         exc.code,
                     )
+                    if exc.code == "UNAUTHORIZED":
+                        self._submit(
+                            self._store.disable_unauthorized_connection(self.user.uuid)
+                        )
                     pause_until_configuration_changes = True
                 else:
                     LOG.warning(

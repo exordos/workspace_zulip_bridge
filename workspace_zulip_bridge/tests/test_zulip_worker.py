@@ -77,6 +77,7 @@ class FakeStore:
         self.users = [USER_ONE, USER_TWO]
         self.queues: list[tuple[UUID, str, int]] = []
         self.cleared: list[tuple[UUID, str]] = []
+        self.disabled: list[UUID] = []
         self.batches: list[tuple[UUID, str, list[ZulipEvent], int]] = []
         self.statuses: list[tuple[UUID, UserStatus]] = []
         self.catalogs: list[tuple[UUID, str, ZulipChatCatalog]] = []
@@ -146,6 +147,10 @@ class FakeStore:
     async def clear_queue(self, user_uuid: UUID, queue_id: str) -> bool:
         self.cleared.append((user_uuid, queue_id))
         self.statuses.append((user_uuid, "init"))
+        return True
+
+    async def disable_unauthorized_connection(self, user_uuid: UUID) -> bool:
+        self.disabled.append(user_uuid)
         return True
 
     async def set_user_status(
@@ -570,6 +575,7 @@ async def _rejected_api_test() -> None:
 
     assert worker.is_alive()
     assert api.attempts == 1
+    assert USER_ONE.uuid in store.disabled
 
     worker.stop()
     await asyncio.to_thread(worker.join, 2)

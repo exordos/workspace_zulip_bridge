@@ -207,11 +207,19 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_messages (
     content_hash bytea NOT NULL CHECK (octet_length(content_hash) = 32),
     message_hash bytea NOT NULL CHECK (octet_length(message_hash) = 32),
     created_at timestamptz NOT NULL,
+    source_updated_at timestamptz NOT NULL,
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     CONSTRAINT zulip_messages_topic_fkey FOREIGN KEY (topic_uuid)
         REFERENCES workspace_zulip_bridge.zulip_topics (uuid) ON DELETE CASCADE,
     UNIQUE (realm_uuid, zulip_message_id)
 );
+ALTER TABLE workspace_zulip_bridge.zulip_messages
+    ADD COLUMN IF NOT EXISTS source_updated_at timestamptz;
+UPDATE workspace_zulip_bridge.zulip_messages
+SET source_updated_at = created_at
+WHERE source_updated_at IS NULL;
+ALTER TABLE workspace_zulip_bridge.zulip_messages
+    ALTER COLUMN source_updated_at SET NOT NULL;
 
 CREATE INDEX IF NOT EXISTS zulip_messages_stream_timeline_idx
     ON workspace_zulip_bridge.zulip_messages
@@ -286,12 +294,17 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_files (
     size_bytes bigint CHECK (size_bytes IS NULL OR size_bytes >= 0),
     source_hash text,
     source_created_at timestamptz NOT NULL,
+    message_ids bigint[] NOT NULL DEFAULT '{}'::bigint[],
     metadata_hash bytea NOT NULL CHECK (octet_length(metadata_hash) = 32),
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     UNIQUE (realm_uuid, source_path),
     UNIQUE (realm_uuid, zulip_attachment_id)
 );
+ALTER TABLE workspace_zulip_bridge.zulip_files
+    ADD COLUMN IF NOT EXISTS message_ids bigint[] NOT NULL DEFAULT '{}'::bigint[];
+CREATE INDEX IF NOT EXISTS zulip_files_message_ids_idx
+    ON workspace_zulip_bridge.zulip_files USING gin (message_ids);
 
 CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_message_files (
     message_uuid uuid NOT NULL
@@ -425,6 +438,82 @@ CREATE INDEX IF NOT EXISTS workspace_events_received_at_brin
     ON workspace_zulip_bridge.workspace_events USING brin (received_at)
     WITH (pages_per_range = 32);
 
+CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_mirror_state (
+    provider_uuid uuid PRIMARY KEY,
+    workspace_project_id uuid NOT NULL,
+    active_generation uuid,
+    epoch_generation uuid,
+    snapshot_epoch_version bigint NOT NULL DEFAULT 0,
+    bootstrap_status text NOT NULL DEFAULT 'required'
+        CHECK (bootstrap_status IN ('required', 'loading', 'ready', 'failed')),
+    entity_counts jsonb NOT NULL DEFAULT '{}'::jsonb
+        CHECK (jsonb_typeof(entity_counts) = 'object'),
+    snapshot_hash bytea CHECK (
+        snapshot_hash IS NULL OR octet_length(snapshot_hash) = 32
+    ),
+    last_error text,
+    bootstrapped_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_users (
+    provider_uuid uuid NOT NULL, snapshot_generation uuid NOT NULL, uuid uuid NOT NULL,
+    workspace_project_id uuid NOT NULL, content_hash bytea NOT NULL,
+    source_updated_at timestamptz NOT NULL, data jsonb NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (provider_uuid, snapshot_generation, uuid)
+);
+CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_streams
+    (LIKE workspace_zulip_bridge.workspace_users INCLUDING ALL);
+CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_stream_bindings
+    (LIKE workspace_zulip_bridge.workspace_users INCLUDING ALL);
+CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_topics
+    (LIKE workspace_zulip_bridge.workspace_users INCLUDING ALL);
+CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_topic_bindings
+    (LIKE workspace_zulip_bridge.workspace_users INCLUDING ALL);
+CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_messages
+    (LIKE workspace_zulip_bridge.workspace_users INCLUDING ALL);
+CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_message_flags
+    (LIKE workspace_zulip_bridge.workspace_users INCLUDING ALL);
+CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_message_reactions
+    (LIKE workspace_zulip_bridge.workspace_users INCLUDING ALL);
+
+CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.sync_diffs (
+    provider_uuid uuid NOT NULL,
+    entity_type text NOT NULL CHECK (entity_type IN (
+        'users', 'streams', 'stream_bindings', 'topics', 'topic_bindings',
+        'messages', 'message_flags', 'message_reactions'
+    )),
+    entity_uuid uuid NOT NULL,
+    realm_uuid uuid NOT NULL
+        REFERENCES workspace_zulip_bridge.zulip_realms (uuid) ON DELETE CASCADE,
+    direction text NOT NULL CHECK (direction IN ('to_workspace', 'to_zulip')),
+    processing_status text NOT NULL DEFAULT 'pending'
+        CHECK (processing_status IN (
+            'pending', 'processing', 'applied', 'skipped', 'failed', 'blocked'
+        )),
+    source_hash bytea,
+    target_hash bytea,
+    source_updated_at timestamptz NOT NULL,
+    target_updated_at timestamptz,
+    attempt_count integer NOT NULL DEFAULT 0,
+    available_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    claimed_at timestamptz,
+    processed_at timestamptz,
+    last_error text,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (provider_uuid, entity_type, entity_uuid)
+);
+CREATE INDEX IF NOT EXISTS sync_diffs_pending_idx
+    ON workspace_zulip_bridge.sync_diffs
+        (available_at, entity_type, source_updated_at, entity_uuid)
+    WHERE processing_status IN ('pending', 'failed');
+CREATE INDEX IF NOT EXISTS sync_diffs_processing_idx
+    ON workspace_zulip_bridge.sync_diffs (claimed_at, entity_uuid)
+    WHERE processing_status = 'processing';
+
 CREATE OR REPLACE FUNCTION workspace_zulip_bridge.touch_updated_at()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -441,7 +530,10 @@ BEGIN
         'zulip_stream_bindings', 'zulip_topics', 'zulip_topic_aliases',
         'zulip_topic_bindings', 'zulip_messages', 'zulip_message_flags',
         'zulip_message_reactions', 'zulip_files', 'workspace_outbox',
-        'workspace_event_cursors', 'workspace_events'
+        'workspace_event_cursors', 'workspace_events', 'workspace_mirror_state',
+        'workspace_users', 'workspace_streams', 'workspace_stream_bindings',
+        'workspace_topics', 'workspace_topic_bindings', 'workspace_messages',
+        'workspace_message_flags', 'workspace_message_reactions', 'sync_diffs'
     ] LOOP
         EXECUTE format(
             'DROP TRIGGER IF EXISTS %I ON workspace_zulip_bridge.%I',

@@ -275,6 +275,11 @@ def _parse_message(
     is_mentioned = "mentioned" in flags
     has_alert_word = "has_alert_word" in flags
     is_historical = "historical" in flags
+    modification_times = [sent_at]
+    for field in ("last_edit_timestamp", "last_moved_timestamp"):
+        value = raw_message.get(field)
+        if isinstance(value, int):
+            modification_times.append(value)
     content_hash = message_content_hash(
         sender_user_uuid=sender_user_uuid,
         chat_key=chat_key,
@@ -312,6 +317,7 @@ def _parse_message(
             message_hash=message_hash,
             files=files,
             sent_at=sent_at,
+            source_updated_at=max(modification_times),
         ),
         skipped_reactions,
         unknown_flags,

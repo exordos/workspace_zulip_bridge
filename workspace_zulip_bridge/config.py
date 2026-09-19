@@ -67,6 +67,7 @@ class Settings:
     event_cleanup_interval_seconds: float = 300.0
     event_cleanup_batch_size: int = 10000
     workspace_websocket_url: str | None = None
+    workspace_api_url: str | None = None
     workspace_project_id: UUID | None = None
     workspace_provider_uuid: UUID | None = None
     workspace_token_file: Path | None = None
@@ -76,6 +77,10 @@ class Settings:
     workspace_retry_base_seconds: float = 1.0
     workspace_retry_cap_seconds: float = 60.0
     workspace_lease_retry_seconds: float = 5.0
+    workspace_bootstrap_timeout_seconds: float = 600.0
+    workspace_request_timeout_seconds: float = 60.0
+    workspace_sync_poll_seconds: float = 0.1
+    workspace_sync_batch_size: int = 100
     thread_stop_timeout_seconds: float = 5.0
     log_level: str = "INFO"
 
@@ -154,6 +159,7 @@ class Settings:
                 source, "WZB_EVENT_CLEANUP_BATCH_SIZE", 10000
             ),
             workspace_websocket_url=(source.get("WZB_WORKSPACE_WEBSOCKET_URL") or None),
+            workspace_api_url=(source.get("WZB_WORKSPACE_API_URL") or None),
             workspace_project_id=_read_uuid(source, "WZB_WORKSPACE_PROJECT_ID"),
             workspace_provider_uuid=_read_uuid(source, "WZB_WORKSPACE_PROVIDER_UUID"),
             workspace_token_file=(
@@ -180,6 +186,18 @@ class Settings:
             ),
             workspace_lease_retry_seconds=_read_float(
                 source, "WZB_WORKSPACE_LEASE_RETRY_SECONDS", 5.0
+            ),
+            workspace_bootstrap_timeout_seconds=_read_float(
+                source, "WZB_WORKSPACE_BOOTSTRAP_TIMEOUT_SECONDS", 600.0
+            ),
+            workspace_request_timeout_seconds=_read_float(
+                source, "WZB_WORKSPACE_REQUEST_TIMEOUT_SECONDS", 60.0
+            ),
+            workspace_sync_poll_seconds=_read_float(
+                source, "WZB_WORKSPACE_SYNC_POLL_SECONDS", 0.1
+            ),
+            workspace_sync_batch_size=_read_int(
+                source, "WZB_WORKSPACE_SYNC_BATCH_SIZE", 100
             ),
             thread_stop_timeout_seconds=_read_float(
                 source, "WZB_THREAD_STOP_TIMEOUT_SECONDS", 5.0
@@ -227,6 +245,13 @@ class Settings:
             "WZB_WORKSPACE_RETRY_BASE_SECONDS": self.workspace_retry_base_seconds,
             "WZB_WORKSPACE_RETRY_CAP_SECONDS": self.workspace_retry_cap_seconds,
             "WZB_WORKSPACE_LEASE_RETRY_SECONDS": self.workspace_lease_retry_seconds,
+            "WZB_WORKSPACE_BOOTSTRAP_TIMEOUT_SECONDS": (
+                self.workspace_bootstrap_timeout_seconds
+            ),
+            "WZB_WORKSPACE_REQUEST_TIMEOUT_SECONDS": (
+                self.workspace_request_timeout_seconds
+            ),
+            "WZB_WORKSPACE_SYNC_POLL_SECONDS": self.workspace_sync_poll_seconds,
             "WZB_THREAD_STOP_TIMEOUT_SECONDS": self.thread_stop_timeout_seconds,
         }
         for name, value in positive_float_values.items():
@@ -269,6 +294,8 @@ class Settings:
             raise ValueError(
                 "WZB_WORKSPACE_EVENT_BATCH_SIZE must be between 1 and 10000"
             )
+        if not 1 <= self.workspace_sync_batch_size <= 500:
+            raise ValueError("WZB_WORKSPACE_SYNC_BATCH_SIZE must be between 1 and 500")
         if self.workspace_retry_cap_seconds < self.workspace_retry_base_seconds:
             raise ValueError(
                 "WZB_WORKSPACE_RETRY_CAP_SECONDS must be at least "
@@ -295,6 +322,9 @@ class Settings:
             assert self.workspace_token_file is not None
             if not self.workspace_token_file.is_file():
                 raise ValueError("WZB_WORKSPACE_TOKEN_FILE must name a readable file")
+        if self.workspace_api_url is not None:
+            if urlsplit(self.workspace_api_url).scheme not in {"http", "https"}:
+                raise ValueError("WZB_WORKSPACE_API_URL must use http or https")
         if self.workspace_ca_file is not None and not self.workspace_ca_file.is_file():
             raise ValueError("WZB_WORKSPACE_CA_FILE must name a readable file")
 

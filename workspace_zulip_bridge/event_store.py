@@ -378,7 +378,7 @@ class EventStore:
                 """
                 WITH active_connection AS MATERIALIZED (
                     SELECT $1::uuid AS uuid
-                ), incoming AS MATERIALIZED (
+                ), incoming_json AS MATERIALIZED (
                     SELECT file_uuid, attachment_id, source_path, name, size_bytes,
                            source_created_at, message_ids, metadata_hash
                     FROM unnest(
@@ -388,13 +388,23 @@ class EventStore:
                         file_uuid, attachment_id, source_path, name, size_bytes,
                         source_created_at, message_ids, metadata_hash
                     )
+                ), incoming AS MATERIALIZED (
+                    SELECT file_uuid, attachment_id, source_path, name, size_bytes,
+                           source_created_at,
+                           ARRAY(
+                               SELECT value::bigint
+                               FROM jsonb_array_elements_text(message_ids) AS value
+                           ) AS message_ids,
+                           metadata_hash
+                    FROM incoming_json
                 ), upserted AS (
                     INSERT INTO workspace_zulip_bridge.zulip_files
                         (uuid, realm_uuid, owner_user_uuid, zulip_attachment_id,
                          source_path, name, size_bytes, source_created_at,
-                         metadata_hash)
+                         message_ids, metadata_hash)
                     SELECT file_uuid, $2, $3, attachment_id, source_path, name,
-                           size_bytes, to_timestamp(source_created_at), metadata_hash
+                           size_bytes, to_timestamp(source_created_at), message_ids,
+                           metadata_hash
                     FROM incoming
                     ON CONFLICT (uuid) DO UPDATE SET
                         owner_user_uuid = EXCLUDED.owner_user_uuid,
@@ -402,15 +412,17 @@ class EventStore:
                         name = EXCLUDED.name,
                         size_bytes = EXCLUDED.size_bytes,
                         source_created_at = EXCLUDED.source_created_at,
+                        message_ids = EXCLUDED.message_ids,
                         metadata_hash = EXCLUDED.metadata_hash
                     WHERE (zulip_files.owner_user_uuid,
                            zulip_files.zulip_attachment_id, zulip_files.name,
                            zulip_files.size_bytes, zulip_files.source_created_at,
-                           zulip_files.metadata_hash) IS DISTINCT FROM
+                           zulip_files.message_ids, zulip_files.metadata_hash)
+                        IS DISTINCT FROM
                           (EXCLUDED.owner_user_uuid,
                            EXCLUDED.zulip_attachment_id, EXCLUDED.name,
                            EXCLUDED.size_bytes, EXCLUDED.source_created_at,
-                           EXCLUDED.metadata_hash)
+                           EXCLUDED.message_ids, EXCLUDED.metadata_hash)
                     RETURNING uuid
                 ), removed AS (
                     DELETE FROM workspace_zulip_bridge.zulip_files AS file
@@ -418,21 +430,25 @@ class EventStore:
                       AND file.owner_user_uuid = $3
                       AND NOT (file.uuid = ANY($4::uuid[]))
                     RETURNING uuid
-                ), reset_links AS (
+                ), removed_links AS (
                     DELETE FROM workspace_zulip_bridge.zulip_message_files AS link
-                    USING incoming WHERE link.file_uuid = incoming.file_uuid
+                    USING incoming
+                    WHERE link.file_uuid = incoming.file_uuid
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM workspace_zulip_bridge.zulip_messages AS message
+                          WHERE message.uuid = link.message_uuid
+                            AND message.zulip_message_id = ANY(incoming.message_ids)
+                      )
                     RETURNING 1
                 ), links AS (
                     INSERT INTO workspace_zulip_bridge.zulip_message_files
                         (message_uuid, file_uuid, position)
                     SELECT message.uuid, incoming.file_uuid, 0
                     FROM incoming
-                    CROSS JOIN LATERAL jsonb_array_elements_text(
-                        incoming.message_ids
-                    ) AS item(message_id)
                     JOIN workspace_zulip_bridge.zulip_messages AS message
                       ON message.realm_uuid = $2
-                     AND message.zulip_message_id = item.message_id::bigint
+                     AND message.zulip_message_id = ANY(incoming.message_ids)
                     ON CONFLICT (message_uuid, file_uuid) DO NOTHING
                     RETURNING 1
                 ), changes AS (
@@ -698,6 +714,21 @@ class EventStore:
             )
         return status == "UPDATE 1"
 
+    async def disable_unauthorized_connection(self, user_uuid: UUID) -> bool:
+        """Remove a connection with rejected credentials from scheduling."""
+        async with self._pool.acquire() as connection:
+            result = await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_connections
+                SET sync_enabled = false, queue_id = NULL, last_event_id = NULL,
+                    lifecycle_status = 'init', catalog_completed_at = NULL,
+                    updated_at = clock_timestamp()
+                WHERE uuid = $1 AND sync_enabled
+                """,
+                user_uuid,
+            )
+        return result == "UPDATE 1"
+
     async def set_user_status(
         self, user_uuid: UUID, queue_id: str, status: UserStatus
     ) -> bool:
@@ -921,7 +952,7 @@ class HistorySession:
                 is_stream_wildcard_mentioned boolean NOT NULL,
                 is_topic_wildcard_mentioned boolean NOT NULL,
                 has_alert_word boolean NOT NULL, is_historical boolean NOT NULL,
-                sent_at bigint NOT NULL
+                sent_at bigint NOT NULL, source_updated_at bigint NOT NULL
             ) ON COMMIT DELETE ROWS;
             CREATE TEMP TABLE IF NOT EXISTS wzb_file_page (
                 message_uuid uuid NOT NULL, file_uuid uuid NOT NULL,
@@ -1000,6 +1031,7 @@ class HistorySession:
                     message.has_alert_word,
                     message.is_historical,
                     message.sent_at,
+                    message.source_updated_at or message.sent_at,
                 )
             )
             file_records.extend(
@@ -1069,6 +1101,7 @@ class HistorySession:
                     "has_alert_word",
                     "is_historical",
                     "sent_at",
+                    "source_updated_at",
                 ),
             )
             if file_records:
@@ -1168,10 +1201,12 @@ class HistorySession:
                 INSERT INTO workspace_zulip_bridge.zulip_messages
                     (uuid, realm_uuid, source_connection_uuid, zulip_stream_uuid,
                      topic_uuid, sender_user_uuid, zulip_message_id, content,
-                     reactions, reaction_users, content_hash, message_hash, created_at)
+                     reactions, reaction_users, content_hash, message_hash, created_at,
+                     source_updated_at)
                 SELECT uuid, $2, $1, stream_uuid, topic_uuid, sender_user_uuid,
                        zulip_message_id, content, reactions, reaction_users,
-                       content_hash, message_hash, to_timestamp(sent_at)
+                       content_hash, message_hash, to_timestamp(sent_at),
+                       to_timestamp(source_updated_at)
                 FROM resolved
                 ON CONFLICT (uuid) DO UPDATE SET
                     source_connection_uuid = EXCLUDED.source_connection_uuid,
@@ -1182,9 +1217,11 @@ class HistorySession:
                     reaction_users = EXCLUDED.reaction_users,
                     content_hash = EXCLUDED.content_hash,
                     message_hash = EXCLUDED.message_hash,
-                    created_at = EXCLUDED.created_at, updated_at = clock_timestamp()
+                    created_at = EXCLUDED.created_at,
+                    source_updated_at = EXCLUDED.source_updated_at,
+                    updated_at = clock_timestamp()
                 WHERE zulip_messages.message_hash IS DISTINCT FROM EXCLUDED.message_hash
-                RETURNING uuid
+                RETURNING uuid, zulip_message_id
             ), flags AS (
                 INSERT INTO workspace_zulip_bridge.zulip_message_flags
                     (uuid, realm_uuid, zulip_stream_uuid, message_uuid,
@@ -1226,14 +1263,25 @@ class HistorySession:
             ), old_links AS (
                 DELETE FROM workspace_zulip_bridge.zulip_message_files AS link
                 USING changed WHERE link.message_uuid = changed.uuid RETURNING 1
-            ), file_links AS (
-                INSERT INTO workspace_zulip_bridge.zulip_message_files
-                    (message_uuid, file_uuid, position)
-                SELECT file.message_uuid, file.file_uuid, file.position
+            ), link_candidates AS MATERIALIZED (
+                SELECT file.message_uuid, file.file_uuid, file.position, 0 AS priority
                 FROM wzb_file_page AS file
                 JOIN changed ON changed.uuid = file.message_uuid
                 JOIN workspace_zulip_bridge.zulip_files AS metadata
                   ON metadata.uuid = file.file_uuid
+                UNION ALL
+                SELECT resolved.uuid, metadata.uuid, 0, 1
+                FROM resolved
+                JOIN workspace_zulip_bridge.zulip_files AS metadata
+                  ON metadata.realm_uuid = $2
+                 AND metadata.message_ids @> ARRAY[resolved.zulip_message_id]
+            ), file_links AS (
+                INSERT INTO workspace_zulip_bridge.zulip_message_files
+                    (message_uuid, file_uuid, position)
+                SELECT DISTINCT ON (message_uuid, file_uuid)
+                       message_uuid, file_uuid, position
+                FROM link_candidates
+                ORDER BY message_uuid, file_uuid, priority
                 ON CONFLICT (message_uuid, file_uuid) DO UPDATE
                 SET position = EXCLUDED.position RETURNING 1
             ), outbox AS (

@@ -52,6 +52,37 @@ class FakeWorkspaceEventReceiver:
         await asyncio.Future()
 
 
+class FakeWorkspaceBootstrapper:
+    calls: list[str]
+
+    def __init__(self, pool: object, settings: Settings) -> None:
+        self.calls.append("workspace-bootstrap-init")
+
+    async def ensure(self) -> bool:
+        self.calls.append("workspace-bootstrap-ensure")
+        return True
+
+
+class FakeWorkspaceWorker:
+    calls: list[str]
+    label = "workspace-worker"
+
+    def __init__(self, pool: object, settings: Settings) -> None:
+        self.calls.append(f"{self.label}-init")
+
+    async def run(self) -> None:
+        self.calls.append(f"{self.label}-run")
+        await asyncio.Future()
+
+
+class FakeWorkspaceEventProcessor(FakeWorkspaceWorker):
+    label = "workspace-event-processor"
+
+
+class FakeWorkspaceDiffWorker(FakeWorkspaceWorker):
+    label = "workspace-diff-worker"
+
+
 def test_daemon_prepares_probes_and_closes_database(monkeypatch: object) -> None:
     asyncio.run(_run_daemon_lifecycle_test(monkeypatch))
 
@@ -141,6 +172,9 @@ async def _run_workspace_receiver_test(
     FakeSupervisor.calls = calls
     FakeEventProcessor.calls = calls
     FakeWorkspaceEventReceiver.calls = calls
+    FakeWorkspaceBootstrapper.calls = calls
+    FakeWorkspaceEventProcessor.calls = calls
+    FakeWorkspaceDiffWorker.calls = calls
     monkeypatch.setattr(  # type: ignore[attr-defined]
         service_module, "ZulipThreadSupervisor", FakeSupervisor
     )
@@ -149,6 +183,15 @@ async def _run_workspace_receiver_test(
     )
     monkeypatch.setattr(  # type: ignore[attr-defined]
         service_module, "WorkspaceEventReceiver", FakeWorkspaceEventReceiver
+    )
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        service_module, "WorkspaceBootstrapper", FakeWorkspaceBootstrapper
+    )
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        service_module, "WorkspaceEventProcessor", FakeWorkspaceEventProcessor
+    )
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        service_module, "WorkspaceDiffWorker", FakeWorkspaceDiffWorker
     )
     settings = Settings.from_env(
         {
@@ -163,4 +206,7 @@ async def _run_workspace_receiver_test(
 
     assert "workspace-receiver-init" in calls
     assert "workspace-receiver-run" in calls
+    assert "workspace-bootstrap-ensure" in calls
+    assert "workspace-event-processor-run" in calls
+    assert "workspace-diff-worker-run" in calls
     assert pool.closed

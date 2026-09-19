@@ -53,6 +53,7 @@ def parse_attachment(raw: Mapping[str, Any]) -> ZulipAttachment:
                 "name": name,
                 "size": size_bytes,
                 "created_at": created_at,
+                "message_ids": sorted(set(message_ids)),
             },
             ensure_ascii=False,
             sort_keys=True,

@@ -13,6 +13,9 @@ from workspace_zulip_bridge.database import probe_database
 from workspace_zulip_bridge.event_processor import ZulipEventProcessor
 from workspace_zulip_bridge.event_store import EventStore
 from workspace_zulip_bridge.workspace_events import WorkspaceEventReceiver
+from workspace_zulip_bridge.workspace_sync import WorkspaceBootstrapper
+from workspace_zulip_bridge.workspace_sync import WorkspaceDiffWorker
+from workspace_zulip_bridge.workspace_sync import WorkspaceEventProcessor
 from workspace_zulip_bridge.zulip_worker import ZulipThreadSupervisor
 
 LOG = logging.getLogger(__name__)
@@ -54,11 +57,31 @@ class BridgeService:
                 stop_task,
             ]
             if self._settings.workspace_events_enabled:
+                bootstrapper = WorkspaceBootstrapper(pool, self._settings)
+                await bootstrapper.ensure()
                 receiver = WorkspaceEventReceiver(pool, self._settings)
-                supervised_tasks.append(
-                    asyncio.create_task(
-                        receiver.run(),
-                        name="workspace-event-receiver",
+                workspace_event_processor = WorkspaceEventProcessor(
+                    pool, self._settings
+                )
+                workspace_diff_worker = WorkspaceDiffWorker(pool, self._settings)
+                supervised_tasks.extend(
+                    (
+                        asyncio.create_task(
+                            self._bootstrap_loop(bootstrapper),
+                            name="workspace-bootstrap",
+                        ),
+                        asyncio.create_task(
+                            receiver.run(),
+                            name="workspace-event-receiver",
+                        ),
+                        asyncio.create_task(
+                            workspace_event_processor.run(),
+                            name="workspace-event-processor",
+                        ),
+                        asyncio.create_task(
+                            workspace_diff_worker.run(),
+                            name="workspace-diff-worker",
+                        ),
                     )
                 )
             LOG.info("bridge daemon is ready")
@@ -82,3 +105,8 @@ class BridgeService:
         while True:
             await asyncio.sleep(self._settings.db_probe_seconds)
             await probe_database(pool)
+
+    async def _bootstrap_loop(self, bootstrapper: WorkspaceBootstrapper) -> None:
+        while True:
+            await asyncio.sleep(self._settings.workspace_lease_retry_seconds)
+            await bootstrapper.ensure()

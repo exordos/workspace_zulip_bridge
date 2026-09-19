@@ -50,6 +50,8 @@ def test_schema_normalizes_workspace_like_entities_and_personal_state() -> None:
     assert "reaction_users jsonb NOT NULL DEFAULT '{}'::jsonb" in schema
     assert "flags_hash bytea NOT NULL" in schema
     assert "source_path text NOT NULL" in schema
+    assert "message_ids bigint[] NOT NULL DEFAULT '{}'::bigint[]" in schema
+    assert "zulip_files_message_ids_idx" in schema
     assert "bytea" not in schema[
         schema.index(
             "CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_files"
@@ -58,8 +60,19 @@ def test_schema_normalizes_workspace_like_entities_and_personal_state() -> None:
         )
     ].replace("metadata_hash bytea", "")
     assert "workspace_chats" not in schema
-    assert "workspace_topics" not in schema
-    assert "workspace_messages" not in schema
+    for table in (
+        "workspace_users",
+        "workspace_streams",
+        "workspace_stream_bindings",
+        "workspace_topics",
+        "workspace_topic_bindings",
+        "workspace_messages",
+        "workspace_message_flags",
+        "workspace_message_reactions",
+    ):
+        assert f"workspace_zulip_bridge.{table}" in schema
+    assert "workspace_mirror_state" in schema
+    assert "sync_diffs" in schema
 
 
 def test_schema_contains_event_retention_and_workspace_outbox_state() -> None:

@@ -2,6 +2,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License").
 
 import asyncio
+import hashlib
 import json
 import os
 from dataclasses import replace
@@ -11,6 +12,7 @@ from pathlib import Path
 from uuid import UUID
 
 import asyncpg
+import httpx
 import pytest
 from websockets.asyncio.server import ServerConnection
 from websockets.asyncio.server import serve
@@ -26,7 +28,6 @@ from workspace_zulip_bridge.models import UserDirectoryWrite
 from workspace_zulip_bridge.models import ZulipAttachment
 from workspace_zulip_bridge.models import ZulipDirectoryUser
 from workspace_zulip_bridge.models import ZulipEvent
-from workspace_zulip_bridge.models import ZulipFileMetadata
 from workspace_zulip_bridge.models import ZulipMessage
 from workspace_zulip_bridge.monitor import collect_snapshot
 from workspace_zulip_bridge.stable_ids import stable_chat_uuid
@@ -37,6 +38,8 @@ from workspace_zulip_bridge.stable_ids import stable_user_uuid
 from workspace_zulip_bridge.workspace_events import WorkspaceEvent
 from workspace_zulip_bridge.workspace_events import WorkspaceEventReceiver
 from workspace_zulip_bridge.workspace_events import WorkspaceEventStore
+from workspace_zulip_bridge.workspace_sync import WorkspaceBootstrapper
+from workspace_zulip_bridge.workspace_sync import WorkspaceDiffWorker
 
 ENDPOINT = "https://zulip.example.test"
 
@@ -62,7 +65,17 @@ async def _pool(dsn: str) -> asyncpg.Pool:
     async with pool.acquire() as connection:
         await connection.execute(
             """
-            TRUNCATE workspace_zulip_bridge.workspace_events,
+            TRUNCATE workspace_zulip_bridge.sync_diffs,
+                     workspace_zulip_bridge.workspace_users,
+                     workspace_zulip_bridge.workspace_streams,
+                     workspace_zulip_bridge.workspace_stream_bindings,
+                     workspace_zulip_bridge.workspace_topics,
+                     workspace_zulip_bridge.workspace_topic_bindings,
+                     workspace_zulip_bridge.workspace_messages,
+                     workspace_zulip_bridge.workspace_message_flags,
+                     workspace_zulip_bridge.workspace_message_reactions,
+                     workspace_zulip_bridge.workspace_mirror_state,
+                     workspace_zulip_bridge.workspace_events,
                      workspace_zulip_bridge.workspace_event_cursors,
                      workspace_zulip_bridge.zulip_realms CASCADE
             """
@@ -169,6 +182,240 @@ def test_workspace_websocket_round_trip_uses_one_provider_cursor(
     tmp_path: Path,
 ) -> None:
     asyncio.run(_workspace_websocket_round_trip(_dsn(), tmp_path))
+
+
+def test_workspace_diff_worker_batches_and_converges(
+    tmp_path: Path,
+) -> None:
+    asyncio.run(_workspace_diff_worker_round_trip(_dsn(), tmp_path))
+
+
+def test_workspace_bootstrap_activates_verified_generation(
+    tmp_path: Path,
+) -> None:
+    asyncio.run(_workspace_bootstrap_round_trip(_dsn(), tmp_path))
+
+
+async def _workspace_bootstrap_round_trip(dsn: str, tmp_path: Path) -> None:
+    pool = await _pool(dsn)
+    provider_uuid = UUID("10000000-0000-0000-0000-000000000031")
+    project_uuid = UUID("10000000-0000-0000-0000-000000000032")
+    generation = UUID("10000000-0000-0000-0000-000000000033")
+    epoch_generation = UUID("10000000-0000-0000-0000-000000000034")
+    user_uuid = UUID("10000000-0000-0000-0000-000000000035")
+    token_file = tmp_path / "workspace-bootstrap.token"
+    token_file.write_text("integration-token")
+    settings = Settings.from_env(
+        {
+            "WZB_DATABASE_DSN": dsn,
+            "WZB_DB_POOL_MIN_SIZE": "1",
+            "WZB_DB_POOL_MAX_SIZE": "4",
+            "WZB_ZULIP_HISTORY_CONCURRENCY": "2",
+            "WZB_WORKSPACE_WEBSOCKET_URL": "ws://workspace.test/api/workspace/v1/events/ws",
+            "WZB_WORKSPACE_API_URL": "http://workspace.test/api/workspace/v1",
+            "WZB_WORKSPACE_PROJECT_ID": str(project_uuid),
+            "WZB_WORKSPACE_PROVIDER_UUID": str(provider_uuid),
+            "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+        }
+    )
+    entity = {
+        "record": "entity",
+        "type": "users",
+        "uuid": str(user_uuid),
+        "content_hash": "01" * 32,
+        "source_updated_at": "2026-09-19T08:00:00Z",
+        "data": {"display_name": "Bootstrap User"},
+    }
+    entity_line = json.dumps(entity, sort_keys=True, separators=(",", ":"))
+    counts = {
+        entity_type: 0
+        for entity_type in (
+            "users",
+            "streams",
+            "stream_bindings",
+            "topics",
+            "topic_bindings",
+            "messages",
+            "message_flags",
+            "message_reactions",
+        )
+    }
+    counts["users"] = 1
+    payload = (
+        "\n".join(
+            (
+                json.dumps(
+                    {
+                        "record": "meta",
+                        "schema_version": 1,
+                        "snapshot_uuid": str(generation),
+                        "project_id": str(project_uuid),
+                        "provider_uuid": str(provider_uuid),
+                        "epoch_generation": str(epoch_generation),
+                        "snapshot_epoch_version": 41,
+                        "created_at": "2026-09-19T08:00:00Z",
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                entity_line,
+                json.dumps(
+                    {
+                        "record": "complete",
+                        "snapshot_uuid": str(generation),
+                        "counts": counts,
+                        "sha256": hashlib.sha256(
+                            (entity_line + "\n").encode()
+                        ).hexdigest(),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+        )
+        + "\n"
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/provider/bootstrap")
+        return httpx.Response(200, text=payload)
+
+    try:
+        bootstrapper = WorkspaceBootstrapper(pool, settings)
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            headers={"Authorization": "Bearer integration-token"},
+        ) as client:
+            await bootstrapper.bootstrap(client)
+        state = await pool.fetchrow(
+            """
+            SELECT active_generation, epoch_generation, snapshot_epoch_version,
+                   bootstrap_status
+            FROM workspace_zulip_bridge.workspace_mirror_state
+            WHERE provider_uuid = $1
+            """,
+            provider_uuid,
+        )
+        assert state is not None
+        assert tuple(state) == (generation, epoch_generation, 41, "ready")
+        assert (
+            await pool.fetchval(
+                "SELECT count(*) FROM workspace_zulip_bridge.workspace_users "
+                "WHERE provider_uuid = $1 AND snapshot_generation = $2",
+                provider_uuid,
+                generation,
+            )
+            == 1
+        )
+    finally:
+        await pool.close()
+
+
+async def _workspace_diff_worker_round_trip(dsn: str, tmp_path: Path) -> None:
+    pool = await _pool(dsn)
+    provider_uuid = UUID("10000000-0000-0000-0000-000000000021")
+    project_uuid = UUID("10000000-0000-0000-0000-000000000022")
+    generation = UUID("10000000-0000-0000-0000-000000000023")
+    token_file = tmp_path / "workspace-sync.token"
+    token_file.write_text("integration-token")
+    try:
+        async with pool.acquire() as connection:
+            user_uuid = await _insert_user(connection, 10, 400)
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_users
+                SET profile_hash = decode(repeat('01', 32), 'hex')
+                WHERE uuid = $1
+                """,
+                user_uuid,
+            )
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_realms
+                SET workspace_project_id = $2, workspace_provider_uuid = $3
+                WHERE uuid = $1
+                """,
+                stable_realm_uuid(ENDPOINT),
+                project_uuid,
+                provider_uuid,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.workspace_mirror_state (
+                    provider_uuid, workspace_project_id, active_generation,
+                    bootstrap_status
+                ) VALUES ($1, $2, $3, 'ready')
+                """,
+                provider_uuid,
+                project_uuid,
+                generation,
+            )
+        settings = Settings.from_env(
+            {
+                "WZB_DATABASE_DSN": dsn,
+                "WZB_DB_POOL_MIN_SIZE": "1",
+                "WZB_DB_POOL_MAX_SIZE": "4",
+                "WZB_ZULIP_HISTORY_CONCURRENCY": "2",
+                "WZB_WORKSPACE_WEBSOCKET_URL": "ws://workspace.test/api/workspace/v1/events/ws",
+                "WZB_WORKSPACE_API_URL": "http://workspace.test/api/workspace/v1",
+                "WZB_WORKSPACE_PROJECT_ID": str(project_uuid),
+                "WZB_WORKSPACE_PROVIDER_UUID": str(provider_uuid),
+                "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+            }
+        )
+        worker = WorkspaceDiffWorker(pool, settings)
+        assert await worker.plan() >= 1
+        requests: list[dict[str, object]] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            assert request.headers["authorization"] == "Bearer integration-token"
+            body = json.loads(request.content)
+            requests.append(body)
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "type": item["type"],
+                            "uuid": item["uuid"],
+                            "status": "created",
+                        }
+                        for item in body["operations"]
+                    ]
+                },
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            headers={"Authorization": "Bearer integration-token"},
+        ) as client:
+            assert await worker.process_once(client) == 1
+            await worker.plan()
+            assert await worker.process_once(client) == 0
+        assert len(requests) == 1
+        operation = requests[0]["operations"][0]  # type: ignore[index]
+        assert operation["type"] == "users"  # type: ignore[index]
+        assert operation["data"]["display_name"] == "User 10"  # type: ignore[index]
+        assert (
+            await pool.fetchval(
+                "SELECT count(*) FROM workspace_zulip_bridge.workspace_users"
+            )
+            == 1
+        )
+        assert (
+            await pool.fetchval(
+                """
+                SELECT processing_status FROM workspace_zulip_bridge.sync_diffs
+                WHERE provider_uuid = $1 AND entity_type = 'users'
+                  AND entity_uuid = $2
+                """,
+                provider_uuid,
+                user_uuid,
+            )
+            == "applied"
+        )
+    finally:
+        await pool.close()
 
 
 async def _workspace_websocket_round_trip(dsn: str, tmp_path: Path) -> None:
@@ -648,7 +895,7 @@ async def _file_metadata_round_trip(dsn: str) -> None:
             chat_key="channel:7",
             topic_name="Files",
             sender_user_uuid=owner_uuid,
-            content="[report.csv](/user_uploads/a/report.csv)",
+            content="report attached",
             is_read=True,
             is_starred=False,
             is_collapsed=False,
@@ -660,19 +907,14 @@ async def _file_metadata_round_trip(dsn: str) -> None:
             reactions_json="[]",
             message_hash=b"f" * 32,
             sent_at=1_700_000_000,
-            files=(
-                ZulipFileMetadata(
-                    source_path="/user_uploads/a/report.csv",
-                    name="report.csv",
-                ),
-            ),
+            files=(),
         )
         await _load_one_chat(store, pool, owner_uuid, "queue-owner", message)
         async with pool.acquire() as connection:
             file_row = await connection.fetchrow(
                 """
                 SELECT owner_user_uuid, zulip_attachment_id, source_path, name,
-                       size_bytes, metadata_hash
+                       size_bytes, message_ids, metadata_hash
                 FROM workspace_zulip_bridge.zulip_files
                 """
             )
@@ -696,6 +938,7 @@ async def _file_metadata_round_trip(dsn: str) -> None:
             "source_path": "/user_uploads/a/report.csv",
             "name": "report.csv",
             "size_bytes": 123,
+            "message_ids": [777],
             "metadata_hash": b"m" * 32,
         }
         assert links == 1
@@ -711,7 +954,7 @@ async def _file_metadata_round_trip(dsn: str) -> None:
                 "name": "report.csv",
                 "size": 456,
                 "create_time": 1_699_999_999,
-                "message_ids": [777],
+                "message_ids": [],
             },
         }
         assert await store.store_events(
@@ -738,6 +981,18 @@ async def _file_metadata_round_trip(dsn: str) -> None:
                     "SELECT size_bytes FROM workspace_zulip_bridge.zulip_files"
                 )
                 == 456
+            )
+            assert (
+                await connection.fetchval(
+                    "SELECT message_ids FROM workspace_zulip_bridge.zulip_files"
+                )
+                == []
+            )
+            assert (
+                await connection.fetchval(
+                    "SELECT count(*) FROM workspace_zulip_bridge.zulip_message_files"
+                )
+                == 0
             )
     finally:
         await pool.close()
