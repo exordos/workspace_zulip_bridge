@@ -256,7 +256,7 @@ class WorkspaceEventReceiver:
                             || $1::text, 0)
                     )
                     """,
-                    self._provider_uuid,
+                    str(self._provider_uuid),
                 )
                 if acquired:
                     LOG.info("Workspace event receiver lease acquired")
@@ -273,7 +273,7 @@ class WorkspaceEventReceiver:
                                 )
                             )
                             """,
-                            self._provider_uuid,
+                            str(self._provider_uuid),
                         )
             await asyncio.sleep(self._settings.workspace_lease_retry_seconds)
 

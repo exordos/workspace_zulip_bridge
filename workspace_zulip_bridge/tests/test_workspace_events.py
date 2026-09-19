@@ -61,6 +61,31 @@ class FakeStore:
         self.ready.append((generation, epoch_version))
 
 
+class LeaseProbe(Exception):
+    pass
+
+
+class FakeLease:
+    async def fetchval(self, query: str, provider_uuid: object) -> bool:
+        assert "pg_try_advisory_lock" in query
+        assert provider_uuid == str(PROVIDER_UUID)
+        assert isinstance(provider_uuid, str)
+        raise LeaseProbe
+
+
+class FakeAcquire:
+    async def __aenter__(self) -> FakeLease:
+        return FakeLease()
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+
+class FakePool:
+    def acquire(self) -> FakeAcquire:
+        return FakeAcquire()
+
+
 def _frame(epoch_version: int) -> dict[str, object]:
     return {
         "schema_version": 1,
@@ -124,6 +149,14 @@ def test_provider_frames_are_batched_across_ready_boundary(tmp_path: Path) -> No
 
     assert store.persisted == [(None, [1, 2]), (GENERATION, [5])]
     assert store.ready == [(GENERATION, 2)]
+
+
+def test_advisory_lock_uses_a_text_parameter(tmp_path: Path) -> None:
+    receiver = _receiver(tmp_path)
+    receiver._pool = FakePool()  # type: ignore[assignment]
+
+    with pytest.raises(LeaseProbe):
+        asyncio.run(receiver.run())
 
 
 def test_cursor_gap_is_terminal_and_preserves_prior_events(tmp_path: Path) -> None:
