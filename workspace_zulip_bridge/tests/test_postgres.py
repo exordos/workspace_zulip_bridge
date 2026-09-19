@@ -2,7 +2,6 @@
 # Licensed under the Apache License, Version 2.0 (the "License").
 
 import asyncio
-import hashlib
 import json
 import os
 from dataclasses import replace
@@ -379,66 +378,38 @@ async def _workspace_bootstrap_round_trip(dsn: str, tmp_path: Path) -> None:
         }
     )
     entity = {
-        "record": "entity",
         "type": "users",
         "uuid": str(user_uuid),
         "content_hash": "01" * 32,
         "source_updated_at": "2026-09-19T08:00:00Z",
         "data": {"display_name": "Bootstrap User"},
     }
-    entity_line = json.dumps(entity, sort_keys=True, separators=(",", ":"))
-    counts = {
-        entity_type: 0
-        for entity_type in (
-            "users",
-            "streams",
-            "stream_bindings",
-            "topics",
-            "topic_bindings",
-            "messages",
-            "message_flags",
-            "message_reactions",
-        )
-    }
-    counts["users"] = 1
-    payload = (
-        "\n".join(
-            (
-                json.dumps(
-                    {
-                        "record": "meta",
-                        "schema_version": 1,
-                        "snapshot_uuid": str(generation),
-                        "project_id": str(project_uuid),
-                        "provider_uuid": str(provider_uuid),
-                        "epoch_generation": str(epoch_generation),
-                        "snapshot_epoch_version": 41,
-                        "created_at": "2026-09-19T08:00:00Z",
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-                entity_line,
-                json.dumps(
-                    {
-                        "record": "complete",
-                        "snapshot_uuid": str(generation),
-                        "counts": counts,
-                        "sha256": hashlib.sha256(
-                            (entity_line + "\n").encode()
-                        ).hexdigest(),
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-            )
-        )
-        + "\n"
-    )
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path.endswith("/provider/bootstrap")
-        return httpx.Response(200, text=payload)
+        if request.url.path.endswith("/provider/bootstrap"):
+            assert request.url.params["mode"] == "paged"
+            return httpx.Response(
+                200,
+                json={
+                    "record": "manifest",
+                    "schema_version": 2,
+                    "snapshot_uuid": str(generation),
+                    "project_id": str(project_uuid),
+                    "provider_uuid": str(provider_uuid),
+                    "epoch_generation": str(epoch_generation),
+                    "snapshot_epoch_version": 41,
+                    "created_at": "2026-09-19T08:00:00Z",
+                },
+            )
+        entity_type = request.url.path.rsplit("/", 1)[-1]
+        assert request.url.params["snapshot_after_uuid"] == str(UUID(int=0))
+        return httpx.Response(
+            200,
+            json={
+                "items": [entity] if entity_type == "users" else [],
+                "next_cursor": None,
+            },
+        )
 
     try:
         await pool.execute(

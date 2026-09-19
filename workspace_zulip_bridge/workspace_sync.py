@@ -159,55 +159,71 @@ class WorkspaceBootstrapper:
         buffers: dict[str, list[tuple[Any, ...]]] = defaultdict(list)
         counts = {entity_type: 0 for entity_type in ENTITY_TYPES}
         digest = hashlib.sha256()
-        meta: dict[str, Any] | None = None
-        complete: dict[str, Any] | None = None
-        async with client.stream(
-            "GET", f"{workspace_api_url(self._settings)}/provider/bootstrap"
-        ) as response:
-            response.raise_for_status()
-            async for line in response.aiter_lines():
-                if not line:
-                    continue
-                record = json.loads(line)
-                kind = record.get("record")
-                if kind == "meta":
-                    if meta is not None:
-                        raise ValueError("duplicate Workspace snapshot meta")
-                    meta = record
-                    continue
-                if kind == "complete":
-                    complete = record
-                    continue
-                if kind != "entity" or meta is None or complete is not None:
-                    raise ValueError("invalid Workspace snapshot framing")
-                entity_type = str(record["type"])
-                if entity_type not in ENTITY_TYPES:
-                    raise ValueError("unsupported Workspace snapshot entity")
-                digest.update((line + "\n").encode("utf-8"))
-                counts[entity_type] += 1
-                buffers[entity_type].append(
-                    (
-                        self._provider_uuid,
-                        UUID(str(meta["snapshot_uuid"])),
-                        UUID(str(record["uuid"])),
-                        self._project_uuid,
-                        bytes.fromhex(str(record["content_hash"])),
-                        _timestamp(str(record["source_updated_at"])),
-                        json.dumps(record["data"], separators=(",", ":")),
-                    )
-                )
-                if len(buffers[entity_type]) >= 5000:
-                    await self._copy(entity_type, buffers[entity_type])
-                    buffers[entity_type].clear()
-        if meta is None or complete is None:
-            raise ValueError("incomplete Workspace snapshot")
+        response = await client.get(
+            f"{workspace_api_url(self._settings)}/provider/bootstrap",
+            params={"mode": "paged"},
+        )
+        response.raise_for_status()
+        meta = _json_object(response.json())
+        if meta.get("record") != "manifest" or meta.get("schema_version") != 2:
+            raise ValueError("invalid Workspace bootstrap manifest")
         generation = UUID(str(meta["snapshot_uuid"]))
+        for entity_type in ENTITY_TYPES:
+            after_uuid = UUID(int=0)
+            while True:
+                response = await client.get(
+                    f"{workspace_api_url(self._settings)}/provider/entities/"
+                    f"{entity_type}",
+                    params={
+                        "limit": "500",
+                        "snapshot_after_uuid": str(after_uuid),
+                    },
+                )
+                response.raise_for_status()
+                page = _json_object(response.json())
+                items = page.get("items")
+                if not isinstance(items, list):
+                    raise ValueError("invalid Workspace bootstrap page")
+                for item in items:
+                    record = _json_object(item)
+                    if record.get("type") != entity_type:
+                        raise ValueError("Workspace bootstrap entity type mismatch")
+                    digest.update(
+                        (
+                            json.dumps(
+                                {"record": "entity", **record},
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            )
+                            + "\n"
+                        ).encode("utf-8")
+                    )
+                    counts[entity_type] += 1
+                    buffers[entity_type].append(
+                        (
+                            self._provider_uuid,
+                            generation,
+                            UUID(str(record["uuid"])),
+                            self._project_uuid,
+                            bytes.fromhex(str(record["content_hash"])),
+                            _timestamp(str(record["source_updated_at"])),
+                            json.dumps(record["data"], separators=(",", ":")),
+                        )
+                    )
+                    if len(buffers[entity_type]) >= 5000:
+                        await self._copy(entity_type, buffers[entity_type])
+                        buffers[entity_type].clear()
+                next_cursor = page.get("next_cursor")
+                if next_cursor is None:
+                    break
+                cursor = _json_object(next_cursor)
+                next_after_uuid = UUID(str(cursor["after_uuid"]))
+                if next_after_uuid <= after_uuid:
+                    raise ValueError("Workspace bootstrap cursor did not advance")
+                after_uuid = next_after_uuid
         for entity_type, records in buffers.items():
             await self._copy(entity_type, records)
-        if complete.get("counts") != counts:
-            raise ValueError("Workspace snapshot entity counts do not match")
-        if complete.get("sha256") != digest.hexdigest():
-            raise ValueError("Workspace snapshot checksum does not match")
         epoch_generation = UUID(str(meta["epoch_generation"]))
         epoch_version = int(meta["snapshot_epoch_version"])
         async with self._pool.acquire() as connection, connection.transaction():
