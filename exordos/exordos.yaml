@@ -13,6 +13,7 @@ build:
         - build
         - dist
         - output
+        - workspace_zulip_bridge.egg-info
 
   elements:
     - manifest: manifests/workspace_zulip_bridge.yaml.j2

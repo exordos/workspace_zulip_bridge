@@ -19,7 +19,9 @@ def test_tox_passes_the_postgresql_test_dsn() -> None:
 def test_exordos_configuration_selects_the_bridge_image() -> None:
     config = yaml.safe_load((ROOT / "exordos/exordos.yaml").read_text())
 
+    dependency = config["build"]["deps"][0]
     element = config["build"]["elements"][0]
+    assert "workspace_zulip_bridge.egg-info" in dependency["exclude"]
     assert element["manifest"] == "manifests/workspace_zulip_bridge.yaml.j2"
     assert element["images"][0]["name"] == "workspace-zulip-bridge"
     assert element["images"][0]["profile"] == "exordos_base"
