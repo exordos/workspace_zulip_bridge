@@ -214,6 +214,11 @@ class WorkspaceBootstrapper:
                     if len(buffers[entity_type]) >= 5000:
                         await self._copy(entity_type, buffers[entity_type])
                         buffers[entity_type].clear()
+                        LOG.info(
+                            "Workspace bootstrap progress: entity_type=%s count=%d",
+                            entity_type,
+                            counts[entity_type],
+                        )
                 next_cursor = page.get("next_cursor")
                 if next_cursor is None:
                     break
@@ -222,6 +227,11 @@ class WorkspaceBootstrapper:
                 if next_after_uuid <= after_uuid:
                     raise ValueError("Workspace bootstrap cursor did not advance")
                 after_uuid = next_after_uuid
+            LOG.info(
+                "Workspace bootstrap entity loaded: entity_type=%s count=%d",
+                entity_type,
+                counts[entity_type],
+            )
         for entity_type, records in buffers.items():
             await self._copy(entity_type, records)
         epoch_generation = UUID(str(meta["epoch_generation"]))
