@@ -8,6 +8,7 @@ from dataclasses import replace
 from datetime import UTC
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID
 
 import asyncpg
@@ -170,6 +171,235 @@ async def _prepare_database_requeues_claimed_workspace_work(dsn: str) -> None:
             "FROM workspace_zulip_bridge.sync_diffs WHERE provider_uuid = $1",
             provider_uuid,
         )
+    finally:
+        await pool.close()
+
+
+def test_workspace_event_processor_prioritizes_live_messages() -> None:
+    asyncio.run(_workspace_event_processor_prioritizes_live_messages(_dsn()))
+
+
+async def _workspace_event_processor_prioritizes_live_messages(dsn: str) -> None:
+    pool = await _pool(dsn)
+    provider_uuid = UUID("10000000-0000-0000-0000-000000000091")
+    project_uuid = UUID("10000000-0000-0000-0000-000000000092")
+    try:
+        await pool.executemany(
+            """
+            INSERT INTO workspace_zulip_bridge.workspace_events (
+                uuid, provider_uuid, workspace_project_id, epoch_version,
+                object_type, action, entity_uuid, payload
+            ) VALUES ($1, $2, $3, $4, $5, 'updated', $6, '{}'::jsonb)
+            """,
+            [
+                (
+                    UUID("10000000-0000-0000-0000-000000000093"),
+                    provider_uuid,
+                    project_uuid,
+                    1,
+                    "message_reaction",
+                    UUID("10000000-0000-0000-0000-000000000094"),
+                ),
+                (
+                    UUID("10000000-0000-0000-0000-000000000095"),
+                    provider_uuid,
+                    project_uuid,
+                    2,
+                    "message",
+                    UUID("10000000-0000-0000-0000-000000000096"),
+                ),
+            ],
+        )
+        processor = WorkspaceEventProcessor.__new__(WorkspaceEventProcessor)
+        processor._pool = pool
+        processor._provider_uuid = provider_uuid
+        processor._settings = SimpleNamespace(workspace_event_batch_size=1)
+
+        assert await processor.process_once() == 1
+        rows = await pool.fetch(
+            """
+            SELECT object_type, processing_status
+            FROM workspace_zulip_bridge.workspace_events
+            WHERE provider_uuid = $1
+            ORDER BY epoch_version
+            """,
+            provider_uuid,
+        )
+        assert [tuple(row) for row in rows] == [
+            ("message_reaction", "pending"),
+            ("message", "skipped"),
+        ]
+    finally:
+        await pool.close()
+
+
+def test_live_zulip_message_bypasses_backfill_diff_queue() -> None:
+    asyncio.run(_live_zulip_message_bypasses_backfill_diff_queue(_dsn()))
+
+
+async def _live_zulip_message_bypasses_backfill_diff_queue(dsn: str) -> None:
+    pool = await _pool(dsn)
+    provider_uuid = UUID("10000000-0000-0000-0000-0000000000a1")
+    project_uuid = UUID("10000000-0000-0000-0000-0000000000a2")
+    generation = UUID("10000000-0000-0000-0000-0000000000a3")
+    historical_uuid = UUID("10000000-0000-0000-0000-0000000000a4")
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            owner_uuid = await _insert_user(
+                connection, 10, 100, queue_id="queue-owner", status="filling"
+            )
+        catalog = _catalog(10, [(7, "Shared")], {"channel:7": 1})
+        assert (
+            await store.store_chat_catalog(owner_uuid, "queue-owner", catalog)
+        ).activated
+        assert (await store.reconcile_chat_schedules()).assigned == 1
+        stream_uuid = stable_chat_uuid(ENDPOINT, "channel:7")
+        topic_uuid = stable_topic_uuid(stream_uuid, "Live")
+        async with pool.acquire() as connection:
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_realms
+                SET workspace_project_id = $2, workspace_provider_uuid = $3
+                WHERE uuid = $1
+                """,
+                stable_realm_uuid(ENDPOINT),
+                project_uuid,
+                provider_uuid,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.workspace_mirror_state (
+                    provider_uuid, workspace_project_id, active_generation,
+                    bootstrap_status
+                ) VALUES ($1, $2, $3, 'ready')
+                """,
+                provider_uuid,
+                project_uuid,
+                generation,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.workspace_users (
+                    provider_uuid, snapshot_generation, uuid,
+                    workspace_project_id, content_hash, source_updated_at, data
+                ) VALUES ($1, $2, $3, $4, $5, clock_timestamp(), '{}'::jsonb)
+                """,
+                provider_uuid,
+                generation,
+                owner_uuid,
+                project_uuid,
+                b"p" * 32,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.workspace_streams (
+                    provider_uuid, snapshot_generation, uuid,
+                    workspace_project_id, content_hash, source_updated_at, data
+                ) VALUES ($1, $2, $3, $4, $5, clock_timestamp(), '{}'::jsonb)
+                """,
+                provider_uuid,
+                generation,
+                stream_uuid,
+                project_uuid,
+                b"p" * 32,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.workspace_topics (
+                    provider_uuid, snapshot_generation, uuid,
+                    workspace_project_id, content_hash, source_updated_at, data
+                ) VALUES ($1, $2, $3, $4, $5, clock_timestamp(), '{}'::jsonb)
+                """,
+                provider_uuid,
+                generation,
+                topic_uuid,
+                project_uuid,
+                b"p" * 32,
+            )
+        message = ZulipMessage(
+            message_id=9001,
+            chat_key="channel:7",
+            topic_name="Live",
+            sender_user_uuid=owner_uuid,
+            content="live",
+            is_read=True,
+            is_starred=False,
+            is_collapsed=False,
+            is_mentioned=False,
+            is_stream_wildcard_mentioned=False,
+            is_topic_wildcard_mentioned=False,
+            has_alert_word=False,
+            is_historical=False,
+            reactions_json="[]",
+            message_hash=b"m" * 32,
+            content_hash=b"c" * 32,
+            sent_at=1_800_000_000,
+        )
+        result = await store.apply_live_messages(
+            owner_uuid,
+            "queue-owner",
+            (),
+            (message,),
+            (),
+        )
+        assert result.messages_changed == 1
+        live_uuid = stable_message_uuid(ENDPOINT, 9001)
+        live_diff = await pool.fetchrow(
+            """
+            SELECT direction, delivery_priority, processing_status, source_hash
+            FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1 AND entity_type = 'messages'
+              AND entity_uuid = $2
+            """,
+            provider_uuid,
+            live_uuid,
+        )
+        assert live_diff is not None
+        assert dict(live_diff) == {
+            "direction": "to_workspace",
+            "delivery_priority": 0,
+            "processing_status": "pending",
+            "source_hash": b"c" * 32,
+        }
+
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.sync_diffs
+            SET direction = 'to_zulip'
+            WHERE provider_uuid = $1 AND entity_type = 'messages'
+              AND entity_uuid = $2
+            """,
+            provider_uuid,
+            live_uuid,
+        )
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.sync_diffs (
+                provider_uuid, entity_type, entity_uuid, realm_uuid,
+                direction, source_updated_at
+            ) VALUES ($1, 'messages', $2, $3, 'to_zulip',
+                      clock_timestamp() - interval '1 year')
+            """,
+            provider_uuid,
+            historical_uuid,
+            stable_realm_uuid(ENDPOINT),
+        )
+        claimed: list[UUID] = []
+
+        async def capture(rows: list[asyncpg.Record]) -> None:
+            claimed.extend(row["entity_uuid"] for row in rows)
+
+        worker = WorkspaceDiffWorker.__new__(WorkspaceDiffWorker)
+        worker._pool = pool
+        worker._provider_uuid = provider_uuid
+        worker._settings = SimpleNamespace(workspace_sync_batch_size=1)
+        worker._partition = 0
+        worker._partition_count = 1
+        worker._write_to_zulip = capture  # type: ignore[method-assign]
+        async with httpx.AsyncClient() as client:
+            assert await worker.process_once(client) == 1
+        assert claimed == [live_uuid]
     finally:
         await pool.close()
 
@@ -363,6 +593,60 @@ async def _workspace_event_uses_entity_timestamp(dsn: str) -> None:
         )
         assert diff is not None
         assert tuple(diff) == (entity_time, "to_workspace", "pending")
+
+        message_uuid = UUID("10000000-0000-0000-0000-000000000085")
+        stream_uuid = UUID("10000000-0000-0000-0000-000000000086")
+        message_frame = {
+            "updated_at": event_time.isoformat().replace("+00:00", "Z"),
+            "payload": {
+                "kind": "message.created",
+                "uuid": str(message_uuid),
+                "stream_uuid": str(stream_uuid),
+                "payload": {"kind": "markdown", "content": "Live message"},
+                "created_at": event_time.isoformat().replace("+00:00", "Z"),
+                "updated_at": event_time.isoformat().replace("+00:00", "Z"),
+            },
+        }
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.workspace_events (
+                uuid, provider_uuid, workspace_project_id, epoch_version,
+                object_type, action, entity_uuid, payload
+            ) VALUES ($1, $2, $3, 2, 'message', 'created', $4, $5::jsonb)
+            """,
+            UUID("10000000-0000-0000-0000-000000000087"),
+            provider_uuid,
+            project_uuid,
+            message_uuid,
+            json.dumps(message_frame),
+        )
+        message_event = await pool.fetchrow(
+            "SELECT * FROM workspace_zulip_bridge.workspace_events "
+            "WHERE provider_uuid = $1 AND entity_uuid = $2",
+            provider_uuid,
+            message_uuid,
+        )
+        assert message_event is not None
+        assert await processor._apply(message_event)
+        new_diff = await pool.fetchrow(
+            """
+            SELECT direction, processing_status, partition_key,
+                   source_hash, target_hash IS NOT NULL
+            FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1 AND entity_type = 'messages'
+              AND entity_uuid = $2
+            """,
+            provider_uuid,
+            message_uuid,
+        )
+        assert new_diff is not None
+        assert tuple(new_diff) == (
+            "to_zulip",
+            "pending",
+            stream_uuid,
+            None,
+            True,
+        )
     finally:
         await pool.close()
 
@@ -727,6 +1011,81 @@ async def _workspace_diff_worker_round_trip(dsn: str, tmp_path: Path) -> None:
             assert await worker.plan() == 0
             await pool.execute(
                 """
+                UPDATE workspace_zulip_bridge.sync_diffs
+                SET direction = 'to_workspace', processing_status = 'pending',
+                    delivery_priority = 0,
+                    source_updated_at = clock_timestamp(),
+                    available_at = clock_timestamp()
+                WHERE provider_uuid = $1 AND entity_type = 'users'
+                  AND entity_uuid = $2
+                """,
+                provider_uuid,
+                user_uuid,
+            )
+            assert await worker.process_once(client) == 1
+            assert len(requests) == 1
+            assert (
+                await pool.fetchval(
+                    """
+                SELECT last_error FROM workspace_zulip_bridge.sync_diffs
+                WHERE provider_uuid = $1 AND entity_type = 'users'
+                  AND entity_uuid = $2
+                """,
+                    provider_uuid,
+                    user_uuid,
+                )
+                == "equivalent"
+            )
+            await pool.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.sync_diffs (
+                    provider_uuid, entity_type, entity_uuid, realm_uuid,
+                    direction, source_updated_at
+                ) VALUES ($1, 'users', $2, $3, 'to_workspace',
+                          clock_timestamp() - interval '1 year')
+                """,
+                provider_uuid,
+                UUID("10000000-0000-0000-0000-000000000024"),
+                stable_realm_uuid(ENDPOINT),
+            )
+            await pool.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_users
+                SET full_name = 'Live User 10',
+                    profile_hash = decode(repeat('02', 32), 'hex')
+                WHERE uuid = $1
+                """,
+                user_uuid,
+            )
+            assert await worker.plan() == 1
+            await pool.execute(
+                """
+                UPDATE workspace_zulip_bridge.sync_diffs
+                SET delivery_priority = 0
+                WHERE provider_uuid = $1 AND entity_type = 'users'
+                  AND entity_uuid = $2
+                """,
+                provider_uuid,
+                user_uuid,
+            )
+            assert await worker.process_once(client) == 1
+            assert requests[-1]["delivery_class"] == "live"
+            assert await worker.process_once(client) == 1
+            assert len(requests) == 2
+            assert (
+                await pool.fetchval(
+                    """
+                SELECT last_error FROM workspace_zulip_bridge.sync_diffs
+                WHERE provider_uuid = $1 AND entity_type = 'users'
+                  AND entity_uuid = $2
+                """,
+                    provider_uuid,
+                    UUID("10000000-0000-0000-0000-000000000024"),
+                )
+                == "equivalent"
+            )
+            await pool.execute(
+                """
                 UPDATE workspace_zulip_bridge.zulip_connections
                 SET lifecycle_status = 'active'
                 WHERE uuid = $1
@@ -747,16 +1106,17 @@ async def _workspace_diff_worker_round_trip(dsn: str, tmp_path: Path) -> None:
                 """
                 UPDATE workspace_zulip_bridge.zulip_users
                 SET full_name = 'Updated User 10',
-                    profile_hash = decode(repeat('02', 32), 'hex')
+                    profile_hash = decode(repeat('03', 32), 'hex')
                 WHERE uuid = $1
                 """,
                 user_uuid,
             )
             await worker.plan()
             assert await worker.process_once(client) == 1
-        assert len(requests) == 2
+        assert len(requests) == 3
         assert requests[0]["delivery_class"] == "backfill"
         assert requests[1]["delivery_class"] == "live"
+        assert requests[2]["delivery_class"] == "live"
         operation = requests[0]["operations"][0]  # type: ignore[index]
         assert operation["type"] == "users"  # type: ignore[index]
         assert operation["data"]["display_name"] == "User 10"  # type: ignore[index]
@@ -1770,7 +2130,6 @@ async def _event_processor_round_trip(dsn: str) -> None:
                     "sender_id": 20,
                     "content": "new live message",
                     "timestamp": 1_700_000_001,
-                    "flags": [],
                     "reactions": [],
                 },
             },
@@ -1995,6 +2354,17 @@ async def _event_processor_round_trip(dsn: str) -> None:
                 WHERE zulip_message_id IN (124, 125)
                 """
             )
+            live_flags = await connection.fetchval(
+                """
+                SELECT count(*)
+                FROM workspace_zulip_bridge.zulip_message_flags AS flags
+                JOIN workspace_zulip_bridge.zulip_messages AS message
+                  ON message.uuid = flags.message_uuid
+                WHERE message.zulip_message_id = 124
+                  AND flags.zulip_user_uuid = $1
+                """,
+                owner_uuid,
+            )
             member_read = await connection.fetchval(
                 """
                 SELECT flags.is_read
@@ -2042,6 +2412,7 @@ async def _event_processor_round_trip(dsn: str) -> None:
             }
         ]
         assert live_messages == 2
+        assert live_flags == 0
         assert member_read is True
         assert normalized_reactions == 3
         assert statuses == {"applied": 10, "failed": 1, "skipped": 5}

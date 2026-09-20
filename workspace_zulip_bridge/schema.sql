@@ -481,6 +481,22 @@ CREATE UNIQUE INDEX IF NOT EXISTS workspace_events_epoch_idx
 CREATE INDEX IF NOT EXISTS workspace_events_pending_idx
     ON workspace_zulip_bridge.workspace_events (sequence)
     WHERE processing_status = 'pending';
+CREATE INDEX IF NOT EXISTS workspace_events_priority_pending_idx
+    ON workspace_zulip_bridge.workspace_events (
+        (CASE object_type
+            WHEN 'user' THEN 0
+            WHEN 'stream' THEN 1
+            WHEN 'stream_binding' THEN 2
+            WHEN 'topic' THEN 3
+            WHEN 'topic_binding' THEN 4
+            WHEN 'message' THEN 5
+            WHEN 'message_flag' THEN 6
+            WHEN 'message_reaction' THEN 7
+            ELSE 8
+        END),
+        sequence
+    )
+    WHERE processing_status = 'pending';
 CREATE INDEX IF NOT EXISTS workspace_events_received_at_brin
     ON workspace_zulip_bridge.workspace_events USING brin (received_at)
     WITH (pages_per_range = 32);
@@ -540,6 +556,8 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.sync_diffs (
         REFERENCES workspace_zulip_bridge.zulip_realms (uuid) ON DELETE CASCADE,
     partition_key uuid,
     direction text NOT NULL CHECK (direction IN ('to_workspace', 'to_zulip')),
+    delivery_priority smallint NOT NULL DEFAULT 1
+        CHECK (delivery_priority IN (0, 1)),
     processing_status text NOT NULL DEFAULT 'pending'
         CHECK (processing_status IN (
             'pending', 'processing', 'applied', 'skipped', 'failed', 'blocked'
@@ -559,9 +577,15 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.sync_diffs (
 );
 ALTER TABLE workspace_zulip_bridge.sync_diffs
     ADD COLUMN IF NOT EXISTS partition_key uuid;
+ALTER TABLE workspace_zulip_bridge.sync_diffs
+    ADD COLUMN IF NOT EXISTS delivery_priority smallint NOT NULL DEFAULT 1;
 CREATE INDEX IF NOT EXISTS sync_diffs_pending_idx
     ON workspace_zulip_bridge.sync_diffs
         (available_at, entity_type, source_updated_at, entity_uuid)
+    WHERE processing_status IN ('pending', 'failed');
+CREATE INDEX IF NOT EXISTS sync_diffs_live_pending_idx
+    ON workspace_zulip_bridge.sync_diffs
+        (delivery_priority, available_at, entity_type, source_updated_at, entity_uuid)
     WHERE processing_status IN ('pending', 'failed');
 CREATE INDEX IF NOT EXISTS sync_diffs_processing_idx
     ON workspace_zulip_bridge.sync_diffs (claimed_at, entity_uuid)

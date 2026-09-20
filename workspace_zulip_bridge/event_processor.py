@@ -49,6 +49,15 @@ _FLAG_FIELDS = {
 }
 
 
+def _normalize_live_message(
+    raw_message: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], bool]:
+    """Supply parser defaults without inventing missing per-user state."""
+    if "flags" in raw_message:
+        return raw_message, True
+    return {**raw_message, "flags": []}, False
+
+
 @dataclass(frozen=True, slots=True)
 class EventBatchStats:
     claimed: int = 0
@@ -624,9 +633,10 @@ class ZulipEventProcessor:
         raw_message = item.event.payload.get("message")
         if not isinstance(raw_message, Mapping) or item.event.own_user_id is None:
             return _Outcome(item.event.uuid, "failed", "invalid_message_event")
+        message_payload, write_flags = _normalize_live_message(raw_message)
         user_uuids = await self._load_user_uuids(item.event.endpoint)
         built = build_message_page(
-            [raw_message],
+            [message_payload],
             own_user_id=item.event.own_user_id,
             user_uuids=user_uuids,
             stream_ids_by_name={},
@@ -634,11 +644,18 @@ class ZulipEventProcessor:
         )
         if not built.messages:
             return _Outcome(item.event.uuid, "skipped", "message_filtered")
+        messages = (
+            built.messages
+            if write_flags
+            else tuple(
+                replace(message, write_flags=False) for message in built.messages
+            )
+        )
         result = await self._store.apply_live_messages(
             item.event.user_uuid,
             item.event.queue_id,
             (),
-            built.messages,
+            messages,
             (),
         )
         return _Outcome(
@@ -668,8 +685,9 @@ class ZulipEventProcessor:
                     _Outcome(item.event.uuid, "failed", "invalid_message_event")
                 )
                 continue
+            message_payload, write_flags = _normalize_live_message(raw_message)
             built = build_message_page(
-                [raw_message],
+                [message_payload],
                 own_user_id=first.event.own_user_id,
                 user_uuids=user_uuids,
                 stream_ids_by_name={},
@@ -680,7 +698,11 @@ class ZulipEventProcessor:
                     _Outcome(item.event.uuid, "skipped", "message_filtered")
                 )
                 continue
-            messages.extend(built.messages)
+            messages.extend(
+                built.messages
+                if write_flags
+                else (replace(message, write_flags=False) for message in built.messages)
+            )
             outcomes.append(_Outcome(item.event.uuid, "applied", "message"))
         if not messages:
             return outcomes

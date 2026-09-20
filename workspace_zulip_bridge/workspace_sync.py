@@ -665,7 +665,18 @@ class WorkspaceEventProcessor:
                     SELECT sequence
                     FROM workspace_zulip_bridge.workspace_events
                     WHERE provider_uuid = $1 AND processing_status = 'pending'
-                    ORDER BY sequence
+                    ORDER BY CASE object_type
+                        WHEN 'user' THEN 0
+                        WHEN 'stream' THEN 1
+                        WHEN 'stream_binding' THEN 2
+                        WHEN 'topic' THEN 3
+                        WHEN 'topic_binding' THEN 4
+                        WHEN 'message' THEN 5
+                        WHEN 'message_flag' THEN 6
+                        WHEN 'message_reaction' THEN 7
+                        ELSE 8
+                    END,
+                    sequence
                     FOR UPDATE SKIP LOCKED
                     LIMIT $2
                 )
@@ -730,6 +741,7 @@ class WorkspaceEventProcessor:
             if raw_uuid is None:
                 continue
             entity_uuid = UUID(str(raw_uuid))
+            data = {key: item for key, item in value.items() if key != "kind"}
             if row["action"] == "deleted":
                 await self._pool.execute(
                     f"DELETE FROM workspace_zulip_bridge.workspace_{entity_type} "
@@ -742,7 +754,6 @@ class WorkspaceEventProcessor:
                 target_hash = None
                 source_updated_at = _timestamp(str(frame["updated_at"]))
             else:
-                data = {key: item for key, item in value.items() if key != "kind"}
                 source_updated_at = _timestamp(
                     str(value.get("updated_at") or frame["updated_at"])
                 )
@@ -766,52 +777,78 @@ class WorkspaceEventProcessor:
                     source_updated_at,
                     json.dumps(data, separators=(",", ":")),
                 )
-            await self._refresh_existing_diff(
+            partition_key = None
+            if entity_type in {"messages", "message_flags"}:
+                raw_stream_uuid = data.get("stream_uuid")
+                if raw_stream_uuid is not None:
+                    partition_key = UUID(str(raw_stream_uuid))
+            await self._upsert_diff(
                 entity_type,
                 entity_uuid,
+                partition_key,
                 target_hash,
                 source_updated_at,
             )
             applied = True
         return applied
 
-    async def _refresh_existing_diff(
+    async def _upsert_diff(
         self,
         entity_type: str,
         entity_uuid: UUID,
+        partition_key: UUID | None,
         target_hash: bytes | None,
         target_updated_at: datetime,
     ) -> None:
-        await self._pool.execute(
+        updated = await self._pool.fetchval(
             """
-            UPDATE workspace_zulip_bridge.sync_diffs
-            SET direction = CASE
-                    WHEN $5 > source_updated_at THEN 'to_zulip'
+            INSERT INTO workspace_zulip_bridge.sync_diffs (
+                provider_uuid, entity_type, entity_uuid, realm_uuid,
+                partition_key, direction, source_hash, target_hash,
+                source_updated_at, target_updated_at, delivery_priority
+            )
+            SELECT $1, $2, $3, realm.uuid, $4, 'to_zulip', NULL, $5, $6, $6, 0
+            FROM workspace_zulip_bridge.zulip_realms AS realm
+            WHERE realm.workspace_provider_uuid = $1
+            ON CONFLICT (provider_uuid, entity_type, entity_uuid)
+            DO UPDATE SET direction = CASE
+                    WHEN EXCLUDED.target_updated_at > sync_diffs.source_updated_at
+                    THEN 'to_zulip'
                     ELSE 'to_workspace'
                 END,
+                partition_key = COALESCE(
+                    EXCLUDED.partition_key, sync_diffs.partition_key
+                ),
+                delivery_priority = 0,
                 processing_status = CASE
-                    WHEN target_hash IS DISTINCT FROM $4
-                      OR target_updated_at IS DISTINCT FROM $5
-                    THEN 'pending' ELSE processing_status END,
+                    WHEN sync_diffs.target_hash IS DISTINCT FROM EXCLUDED.target_hash
+                      OR sync_diffs.target_updated_at
+                         IS DISTINCT FROM EXCLUDED.target_updated_at
+                    THEN 'pending' ELSE sync_diffs.processing_status END,
                 available_at = CASE
-                    WHEN target_hash IS DISTINCT FROM $4
-                      OR target_updated_at IS DISTINCT FROM $5
-                    THEN clock_timestamp() ELSE available_at END,
+                    WHEN sync_diffs.target_hash IS DISTINCT FROM EXCLUDED.target_hash
+                      OR sync_diffs.target_updated_at
+                         IS DISTINCT FROM EXCLUDED.target_updated_at
+                    THEN clock_timestamp() ELSE sync_diffs.available_at END,
                 last_error = CASE
-                    WHEN target_hash IS DISTINCT FROM $4
-                      OR target_updated_at IS DISTINCT FROM $5
-                    THEN NULL ELSE last_error END,
-                target_hash = $4, target_updated_at = $5,
+                    WHEN sync_diffs.target_hash IS DISTINCT FROM EXCLUDED.target_hash
+                      OR sync_diffs.target_updated_at
+                         IS DISTINCT FROM EXCLUDED.target_updated_at
+                    THEN NULL ELSE sync_diffs.last_error END,
+                target_hash = EXCLUDED.target_hash,
+                target_updated_at = EXCLUDED.target_updated_at,
                 updated_at = clock_timestamp()
-            WHERE provider_uuid = $1 AND entity_type = $2
-              AND entity_uuid = $3
+            RETURNING true
             """,
             self._provider_uuid,
             entity_type,
             entity_uuid,
+            partition_key,
             target_hash,
             target_updated_at,
         )
+        if not updated:
+            raise RuntimeError("Workspace provider is not linked to a Zulip realm")
 
 
 class WorkspaceDiffWorker:
@@ -1121,20 +1158,41 @@ class WorkspaceDiffWorker:
             return len(rows)
 
     async def process_once(self, client: httpx.AsyncClient) -> int:
-        mirror = await self._pool.fetchrow(
-            """
-            SELECT initial_sync_completed_at
-            FROM workspace_zulip_bridge.workspace_mirror_state
-            WHERE provider_uuid = $1
-            """,
-            self._provider_uuid,
-        )
-        delivery_class = (
-            "live"
-            if mirror is not None and mirror["initial_sync_completed_at"] is not None
-            else "backfill"
-        )
         async with self._pool.acquire() as connection, connection.transaction():
+            delivery_priority = await connection.fetchval(
+                """
+                SELECT delivery_priority
+                FROM workspace_zulip_bridge.sync_diffs
+                WHERE provider_uuid = $1
+                  AND processing_status IN ('pending', 'failed')
+                  AND available_at <= clock_timestamp()
+                  AND (
+                      ($2 = 0 AND entity_type NOT IN (
+                          'messages', 'message_flags', 'message_reactions'
+                      ))
+                      OR (
+                          entity_type IN (
+                              'messages', 'message_flags', 'message_reactions'
+                          )
+                          AND (
+                              (
+                                  hashtextextended(
+                                      COALESCE(partition_key, entity_uuid)::text,
+                                      0
+                                  ) % $3 + $3
+                              ) % $3
+                          ) = $2
+                      )
+                  )
+                ORDER BY delivery_priority
+                LIMIT 1
+                """,
+                self._provider_uuid,
+                self._partition,
+                self._partition_count,
+            )
+            if delivery_priority is None:
+                return 0
             rows = await connection.fetch(
                 """
                 WITH claim AS (
@@ -1143,6 +1201,7 @@ class WorkspaceDiffWorker:
                     WHERE provider_uuid = $1
                       AND processing_status IN ('pending', 'failed')
                       AND available_at <= clock_timestamp()
+                      AND delivery_priority = $5
                       AND (
                           ($3 = 0 AND entity_type NOT IN (
                               'messages', 'message_flags', 'message_reactions'
@@ -1164,7 +1223,8 @@ class WorkspaceDiffWorker:
                               ) = $3
                           )
                       )
-                    ORDER BY CASE entity_type
+                    ORDER BY delivery_priority,
+                        CASE entity_type
                         WHEN 'users' THEN 0 WHEN 'streams' THEN 1
                         WHEN 'stream_bindings' THEN 2 WHEN 'topics' THEN 3
                         WHEN 'topic_bindings' THEN 4 WHEN 'messages' THEN 5
@@ -1184,9 +1244,11 @@ class WorkspaceDiffWorker:
                 self._settings.workspace_sync_batch_size,
                 self._partition,
                 self._partition_count,
+                delivery_priority,
             )
         if not rows:
             return 0
+        delivery_class = "live" if int(delivery_priority) == 0 else "backfill"
         to_workspace = [row for row in rows if row["direction"] == "to_workspace"]
         to_zulip = [row for row in rows if row["direction"] == "to_zulip"]
         if to_zulip:
@@ -1212,8 +1274,16 @@ class WorkspaceDiffWorker:
         ]
         reaction_owners = await self._workspace_reaction_owners(reaction_sources)
         skipped: list[asyncpg.Record] = []
+        equivalent: list[tuple[asyncpg.Record, dict[str, Any], bytes]] = []
         for row in to_workspace:
-            data = loaded.get((row["entity_type"], row["entity_uuid"]))
+            key = (row["entity_type"], row["entity_uuid"])
+            data = loaded.get(key)
+            target = targets.get(key)
+            if _equivalent_entity(row["entity_type"], data, target):
+                equivalent.append(
+                    (row, data or {}, canonical_hash(data) if data else b"")
+                )
+                continue
             if data is None:
                 operations.append(
                     {
@@ -1244,11 +1314,13 @@ class WorkspaceDiffWorker:
             if identity_rebind_required(
                 row["entity_type"],
                 data,
-                targets.get((row["entity_type"], row["entity_uuid"])),
+                target,
             ):
                 operation["rebind_identity"] = True
             operations.append(operation)
             records.append((row, data, content_hash))
+        if equivalent:
+            await self._accept_equivalent(equivalent)
         if skipped:
             await self._mark(
                 skipped,
@@ -1276,7 +1348,11 @@ class WorkspaceDiffWorker:
                 raise RuntimeError("Workspace batch result length mismatch")
             await self._accept(records)
         except Exception as exc:
-            await self._mark(to_workspace, "failed", str(exc)[:2048])
+            await self._mark(
+                [record[0] for record in records],
+                "failed",
+                str(exc)[:2048],
+            )
             raise
         return len(rows)
 
@@ -1477,6 +1553,65 @@ class WorkspaceDiffWorker:
                     last_error = NULL, updated_at = clock_timestamp()
                 FROM unnest($2::text[], $3::uuid[], $4::bytea[])
                     AS input(entity_type, entity_uuid, target_hash)
+                WHERE diff.provider_uuid = $1
+                  AND diff.entity_type = input.entity_type
+                  AND diff.entity_uuid = input.entity_uuid
+                """,
+                self._provider_uuid,
+                [record[0]["entity_type"] for record in records],
+                [record[0]["entity_uuid"] for record in records],
+                [record[2] or None for record in records],
+            )
+
+    async def _accept_equivalent(
+        self, records: list[tuple[asyncpg.Record, dict[str, Any], bytes]]
+    ) -> None:
+        state = await self._pool.fetchrow(
+            "SELECT active_generation FROM "
+            "workspace_zulip_bridge.workspace_mirror_state "
+            "WHERE provider_uuid = $1",
+            self._provider_uuid,
+        )
+        if state is None or state["active_generation"] is None:
+            raise RuntimeError("Workspace mirror generation disappeared")
+        generation = state["active_generation"]
+        async with self._pool.acquire() as connection, connection.transaction():
+            grouped: dict[str, list[tuple[asyncpg.Record, dict[str, Any], bytes]]] = (
+                defaultdict(list)
+            )
+            for record in records:
+                if record[1]:
+                    grouped[record[0]["entity_type"]].append(record)
+            for entity_type, items in grouped.items():
+                await connection.executemany(
+                    f"""
+                    UPDATE workspace_zulip_bridge.workspace_{entity_type}
+                    SET content_hash = $4, source_updated_at = $5,
+                        updated_at = clock_timestamp()
+                    WHERE provider_uuid = $1 AND snapshot_generation = $2
+                      AND uuid = $3
+                    """,
+                    [
+                        (
+                            self._provider_uuid,
+                            generation,
+                            row["entity_uuid"],
+                            content_hash,
+                            row["source_updated_at"],
+                        )
+                        for row, _, content_hash in items
+                    ],
+                )
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.sync_diffs AS diff
+                SET processing_status = 'applied', processed_at = clock_timestamp(),
+                    source_hash = input.content_hash,
+                    target_hash = input.content_hash,
+                    target_updated_at = diff.source_updated_at,
+                    last_error = 'equivalent', updated_at = clock_timestamp()
+                FROM unnest($2::text[], $3::uuid[], $4::bytea[])
+                    AS input(entity_type, entity_uuid, content_hash)
                 WHERE diff.provider_uuid = $1
                   AND diff.entity_type = input.entity_type
                   AND diff.entity_uuid = input.entity_uuid
@@ -1816,6 +1951,23 @@ def _normalized_entity(entity_type: str, data: dict[str, Any]) -> dict[str, Any]
         value.pop("default_topic_uuid", None)
     elif entity_type == "topics":
         value.pop("color", None)
+    elif entity_type == "messages":
+        # Workspace returns the public message representation, which also
+        # contains its UUID, provider metadata and denormalized reactions.
+        # Zulip stores those concerns separately.  Restrict round-trip
+        # comparison to the fields owned by the message itself so the Zulip
+        # echo of a Workspace-created message converges instead of attempting
+        # to create the same native Workspace entity through the provider API.
+        value = {
+            field: value.get(field)
+            for field in (
+                "stream_uuid",
+                "topic_uuid",
+                "author_uuid",
+                "payload",
+                "created_at",
+            )
+        }
     elif entity_type == "message_reactions":
         # Zulip's message/reaction snapshots do not expose when a reaction was
         # originally created.  A reload therefore assigns a new ingestion

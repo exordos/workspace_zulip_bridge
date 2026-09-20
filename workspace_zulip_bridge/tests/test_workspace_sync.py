@@ -59,6 +59,45 @@ def test_reaction_equivalence_still_compares_identity_fields() -> None:
     )
 
 
+def test_message_equivalence_ignores_workspace_projection_metadata() -> None:
+    source = {
+        "stream_uuid": "10000000-0000-0000-0000-000000000001",
+        "topic_uuid": "10000000-0000-0000-0000-000000000002",
+        "author_uuid": "10000000-0000-0000-0000-000000000003",
+        "payload": {"kind": "markdown", "content": "round trip"},
+        "created_at": "2026-09-20T21:08:40.252918+00:00",
+    }
+    target = {
+        **source,
+        "created_at": "2026-09-20T21:08:40.252918Z",
+        "uuid": "10000000-0000-0000-0000-000000000004",
+        "project_id": "10000000-0000-0000-0000-000000000005",
+        "updated_at": "2026-09-20T21:08:41Z",
+        "source": {"kind": "native"},
+        "source_name": "native",
+        "reactions": {},
+        "reaction_users": {},
+    }
+
+    assert _equivalent_entity("messages", source, target)
+
+
+def test_message_equivalence_still_compares_content() -> None:
+    source = {
+        "stream_uuid": "10000000-0000-0000-0000-000000000001",
+        "topic_uuid": "10000000-0000-0000-0000-000000000002",
+        "author_uuid": "10000000-0000-0000-0000-000000000003",
+        "payload": {"kind": "markdown", "content": "before"},
+        "created_at": "2026-09-20T21:08:40Z",
+    }
+
+    assert not _equivalent_entity(
+        "messages",
+        source,
+        {**source, "payload": {"kind": "markdown", "content": "after"}},
+    )
+
+
 def test_reaction_identity_matches_workspace_unique_constraint() -> None:
     assert _reaction_identity(
         {

@@ -94,4 +94,5 @@ def test_schema_contains_event_retention_and_workspace_outbox_state() -> None:
     assert "workspace_event_cursors" in schema
     assert "workspace_events" in schema
     assert "workspace_events_pending_idx" in schema
+    assert "workspace_events_priority_pending_idx" in schema
     assert "recovery_required boolean NOT NULL DEFAULT false" in schema

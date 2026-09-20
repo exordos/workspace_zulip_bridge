@@ -577,6 +577,12 @@ class EventStore:
             page = await history.store_page(messages)
         finally:
             await history.close()
+        if messages:
+            await self._enqueue_live_message_diffs(
+                user_uuid,
+                queue_id,
+                [message.message_id for message in messages],
+            )
         async with self._pool.acquire() as connection:
             deleted = await connection.fetchval(
                 """
@@ -604,6 +610,110 @@ class EventStore:
             reactions_changed=page.reactions_changed,
             files_changed=page.files_changed,
         )
+
+    async def _enqueue_live_message_diffs(
+        self,
+        connection_uuid: UUID,
+        queue_id: str,
+        message_ids: Sequence[int],
+    ) -> int:
+        result = await self._pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.sync_diffs (
+                provider_uuid, entity_type, entity_uuid, realm_uuid,
+                partition_key, direction, delivery_priority,
+                source_hash, target_hash, source_updated_at, target_updated_at
+            )
+            SELECT realm.workspace_provider_uuid, 'messages', source.uuid,
+                   source.realm_uuid, source.zulip_stream_uuid,
+                   CASE WHEN target.source_updated_at > source.source_updated_at
+                        THEN 'to_zulip' ELSE 'to_workspace' END,
+                   0, source.content_hash, target.content_hash,
+                   source.source_updated_at, target.source_updated_at
+            FROM workspace_zulip_bridge.zulip_connections AS owner
+            JOIN workspace_zulip_bridge.zulip_realms AS realm
+              ON realm.uuid = owner.realm_uuid
+             AND realm.workspace_provider_uuid IS NOT NULL
+            JOIN workspace_zulip_bridge.workspace_mirror_state AS mirror
+              ON mirror.provider_uuid = realm.workspace_provider_uuid
+             AND mirror.bootstrap_status = 'ready'
+             AND mirror.active_generation IS NOT NULL
+            JOIN workspace_zulip_bridge.zulip_messages AS source
+              ON source.realm_uuid = owner.realm_uuid
+             AND source.zulip_message_id = ANY($3::bigint[])
+            JOIN workspace_zulip_bridge.zulip_users AS sender
+              ON sender.uuid = source.sender_user_uuid
+            LEFT JOIN workspace_zulip_bridge.workspace_messages AS target
+              ON target.provider_uuid = realm.workspace_provider_uuid
+             AND target.snapshot_generation = mirror.active_generation
+             AND target.uuid = source.uuid
+            WHERE owner.uuid = $1 AND owner.queue_id = $2
+              AND EXISTS (
+                  SELECT 1
+                  FROM workspace_zulip_bridge.workspace_streams AS parent
+                  WHERE parent.provider_uuid = realm.workspace_provider_uuid
+                    AND parent.snapshot_generation = mirror.active_generation
+                    AND parent.uuid = source.zulip_stream_uuid
+              )
+              AND EXISTS (
+                  SELECT 1
+                  FROM workspace_zulip_bridge.workspace_topics AS parent
+                  WHERE parent.provider_uuid = realm.workspace_provider_uuid
+                    AND parent.snapshot_generation = mirror.active_generation
+                    AND parent.uuid = source.topic_uuid
+              )
+              AND EXISTS (
+                  SELECT 1
+                  FROM workspace_zulip_bridge.workspace_users AS parent
+                  WHERE parent.provider_uuid = realm.workspace_provider_uuid
+                    AND parent.snapshot_generation = mirror.active_generation
+                    AND parent.uuid = COALESCE(
+                        sender.workspace_user_uuid, source.sender_user_uuid
+                    )
+              )
+            ON CONFLICT (provider_uuid, entity_type, entity_uuid)
+            DO UPDATE SET
+                direction = EXCLUDED.direction,
+                partition_key = EXCLUDED.partition_key,
+                delivery_priority = 0,
+                source_hash = EXCLUDED.source_hash,
+                target_hash = EXCLUDED.target_hash,
+                source_updated_at = EXCLUDED.source_updated_at,
+                target_updated_at = EXCLUDED.target_updated_at,
+                processing_status = CASE
+                    WHEN sync_diffs.source_hash IS DISTINCT FROM EXCLUDED.source_hash
+                      OR sync_diffs.target_hash IS DISTINCT FROM EXCLUDED.target_hash
+                      OR sync_diffs.source_updated_at
+                         IS DISTINCT FROM EXCLUDED.source_updated_at
+                      OR sync_diffs.target_updated_at
+                         IS DISTINCT FROM EXCLUDED.target_updated_at
+                      OR sync_diffs.direction IS DISTINCT FROM EXCLUDED.direction
+                    THEN 'pending' ELSE sync_diffs.processing_status END,
+                available_at = CASE
+                    WHEN sync_diffs.source_hash IS DISTINCT FROM EXCLUDED.source_hash
+                      OR sync_diffs.target_hash IS DISTINCT FROM EXCLUDED.target_hash
+                      OR sync_diffs.source_updated_at
+                         IS DISTINCT FROM EXCLUDED.source_updated_at
+                      OR sync_diffs.target_updated_at
+                         IS DISTINCT FROM EXCLUDED.target_updated_at
+                      OR sync_diffs.direction IS DISTINCT FROM EXCLUDED.direction
+                    THEN clock_timestamp() ELSE sync_diffs.available_at END,
+                last_error = CASE
+                    WHEN sync_diffs.source_hash IS DISTINCT FROM EXCLUDED.source_hash
+                      OR sync_diffs.target_hash IS DISTINCT FROM EXCLUDED.target_hash
+                      OR sync_diffs.source_updated_at
+                         IS DISTINCT FROM EXCLUDED.source_updated_at
+                      OR sync_diffs.target_updated_at
+                         IS DISTINCT FROM EXCLUDED.target_updated_at
+                      OR sync_diffs.direction IS DISTINCT FROM EXCLUDED.direction
+                    THEN NULL ELSE sync_diffs.last_error END,
+                updated_at = clock_timestamp()
+            """,
+            connection_uuid,
+            queue_id,
+            list(message_ids),
+        )
+        return int(result.rsplit(" ", 1)[-1])
 
     async def apply_message_flags(
         self,
