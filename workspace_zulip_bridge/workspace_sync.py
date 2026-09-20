@@ -178,6 +178,7 @@ class WorkspaceBootstrapper:
             self._provider_uuid,
             self._project_uuid,
         )
+        await self._discard_inactive_generations()
         try:
             await self._load_snapshot(client)
         except BaseException as exc:
@@ -192,6 +193,44 @@ class WorkspaceBootstrapper:
                 str(exc)[:2048],
             )
             raise
+
+    async def _discard_inactive_generations(self) -> None:
+        """Drop partial snapshots left by an interrupted bootstrap."""
+        state = await self._pool.fetchrow(
+            """
+            SELECT active_generation
+            FROM workspace_zulip_bridge.workspace_mirror_state
+            WHERE provider_uuid = $1
+            """,
+            self._provider_uuid,
+        )
+        if state is None:
+            return
+        active_generation = state["active_generation"]
+        deleted: dict[str, int] = {}
+        async with self._pool.acquire() as connection, connection.transaction():
+            for entity_type in ENTITY_TYPES:
+                if active_generation is None:
+                    result = await connection.execute(
+                        f"DELETE FROM workspace_zulip_bridge.workspace_{entity_type} "
+                        "WHERE provider_uuid = $1",
+                        self._provider_uuid,
+                    )
+                else:
+                    result = await connection.execute(
+                        f"DELETE FROM workspace_zulip_bridge.workspace_{entity_type} "
+                        "WHERE provider_uuid = $1 AND snapshot_generation <> $2",
+                        self._provider_uuid,
+                        active_generation,
+                    )
+                count = int(result.rsplit(" ", 1)[-1])
+                if count:
+                    deleted[entity_type] = count
+        if deleted:
+            LOG.info(
+                "Workspace bootstrap discarded incomplete generations: counts=%s",
+                deleted,
+            )
 
     async def _load_snapshot(self, client: httpx.AsyncClient | None) -> None:
         if client is None:

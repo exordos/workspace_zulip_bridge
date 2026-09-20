@@ -257,6 +257,12 @@ def test_workspace_bootstrap_activates_verified_generation(
     asyncio.run(_workspace_bootstrap_round_trip(_dsn(), tmp_path))
 
 
+def test_workspace_bootstrap_discards_interrupted_generation(
+    tmp_path: Path,
+) -> None:
+    asyncio.run(_workspace_bootstrap_discards_interrupted_generation(_dsn(), tmp_path))
+
+
 def test_workspace_event_uses_entity_timestamp_for_diff_direction() -> None:
     asyncio.run(_workspace_event_uses_entity_timestamp(_dsn()))
 
@@ -392,7 +398,7 @@ async def _workspace_bootstrap_round_trip(dsn: str, tmp_path: Path) -> None:
     }
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/users"):
+        if request.url.path.endswith("/users/"):
             return httpx.Response(200, json=[])
         if request.url.path.endswith("/provider/bootstrap"):
             assert request.url.params["mode"] == "paged"
@@ -455,6 +461,96 @@ async def _workspace_bootstrap_round_trip(dsn: str, tmp_path: Path) -> None:
                 generation,
             )
             == 1
+        )
+    finally:
+        await pool.close()
+
+
+async def _workspace_bootstrap_discards_interrupted_generation(
+    dsn: str,
+    tmp_path: Path,
+) -> None:
+    pool = await _pool(dsn)
+    provider_uuid = UUID("10000000-0000-0000-0000-000000000041")
+    project_uuid = UUID("10000000-0000-0000-0000-000000000042")
+    stale_generation = UUID("10000000-0000-0000-0000-000000000043")
+    replacement_generation = UUID("10000000-0000-0000-0000-000000000044")
+    epoch_generation = UUID("10000000-0000-0000-0000-000000000045")
+    user_uuid = UUID("10000000-0000-0000-0000-000000000046")
+    token_file = tmp_path / "workspace-interrupted-bootstrap.token"
+    token_file.write_text("integration-token")
+    settings = Settings.from_env(
+        {
+            "WZB_DATABASE_DSN": dsn,
+            "WZB_DB_POOL_MIN_SIZE": "1",
+            "WZB_DB_POOL_MAX_SIZE": "4",
+            "WZB_ZULIP_HISTORY_CONCURRENCY": "2",
+            "WZB_WORKSPACE_WEBSOCKET_URL": (
+                "ws://workspace.test/api/workspace/v1/events/ws"
+            ),
+            "WZB_WORKSPACE_API_URL": "http://workspace.test/api/workspace/v1",
+            "WZB_WORKSPACE_PROJECT_ID": str(project_uuid),
+            "WZB_WORKSPACE_PROVIDER_UUID": str(provider_uuid),
+            "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+        }
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/provider/bootstrap"):
+            return httpx.Response(
+                200,
+                json={
+                    "record": "manifest",
+                    "schema_version": 2,
+                    "snapshot_uuid": str(replacement_generation),
+                    "project_id": str(project_uuid),
+                    "provider_uuid": str(provider_uuid),
+                    "epoch_generation": str(epoch_generation),
+                    "snapshot_epoch_version": 42,
+                    "created_at": "2026-09-20T15:00:00Z",
+                },
+            )
+        raise httpx.ConnectError("interrupted bootstrap", request=request)
+
+    try:
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.workspace_mirror_state (
+                provider_uuid, workspace_project_id, bootstrap_status
+            ) VALUES ($1, $2, 'failed')
+            """,
+            provider_uuid,
+            project_uuid,
+        )
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.workspace_users (
+                provider_uuid, snapshot_generation, uuid,
+                workspace_project_id, content_hash, source_updated_at, data
+            ) VALUES (
+                $1, $2, $3, $4, decode(repeat('01', 32), 'hex'),
+                '2026-09-20T15:00:00Z', '{}'::jsonb
+            )
+            """,
+            provider_uuid,
+            stale_generation,
+            user_uuid,
+            project_uuid,
+        )
+        bootstrapper = WorkspaceBootstrapper(pool, settings)
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            headers={"Authorization": "Bearer integration-token"},
+        ) as client:
+            with pytest.raises(httpx.ConnectError, match="interrupted bootstrap"):
+                await bootstrapper.bootstrap(client)
+        assert (
+            await pool.fetchval(
+                "SELECT count(*) FROM workspace_zulip_bridge.workspace_users "
+                "WHERE provider_uuid = $1",
+                provider_uuid,
+            )
+            == 0
         )
     finally:
         await pool.close()
