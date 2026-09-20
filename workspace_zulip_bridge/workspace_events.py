@@ -21,6 +21,7 @@ from websockets.exceptions import ConnectionClosed
 from websockets.typing import Subprotocol
 
 from workspace_zulip_bridge.config import Settings
+from workspace_zulip_bridge.workspace_auth import WorkspaceTokenManager
 
 LOG = logging.getLogger(__name__)
 WORKSPACE_EVENTS_PROTOCOL = "workspace.events.v1"
@@ -231,7 +232,12 @@ class WorkspaceEventStore:
 
 
 class WorkspaceEventReceiver:
-    def __init__(self, pool: asyncpg.Pool, settings: Settings) -> None:
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        settings: Settings,
+        tokens: WorkspaceTokenManager | None = None,
+    ) -> None:
         if not settings.workspace_events_enabled:
             raise ValueError("Workspace event receiver is not configured")
         assert settings.workspace_websocket_url is not None
@@ -243,7 +249,7 @@ class WorkspaceEventReceiver:
         self._url = settings.workspace_websocket_url
         self._project_uuid = settings.workspace_project_id
         self._provider_uuid = settings.workspace_provider_uuid
-        self._token_file = settings.workspace_token_file
+        self._tokens = tokens or WorkspaceTokenManager(settings)
         self._store = WorkspaceEventStore(pool)
 
     async def run(self) -> None:
@@ -312,7 +318,7 @@ class WorkspaceEventReceiver:
                 )
 
     async def _receive(self, cursor: WorkspaceEventCursor) -> None:
-        token = await asyncio.to_thread(_read_token, self._token_file)
+        token = await self._tokens.access_token()
         url = _cursor_url(self._url, cursor)
         ssl_context = _ssl_context(self._url, self._settings.workspace_ca_file)
         async with connect(
@@ -408,13 +414,6 @@ class WorkspaceEventReceiver:
             generation,
             batch,
         )
-
-
-def _read_token(path: Path) -> str:
-    token = path.read_text(encoding="utf-8").strip()
-    if not token or any(character.isspace() for character in token):
-        raise ValueError("Workspace token file must contain one bearer token")
-    return token
 
 
 def _cursor_url(url: str, cursor: WorkspaceEventCursor) -> str:

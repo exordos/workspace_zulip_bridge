@@ -355,6 +355,59 @@ def test_first_accessible_channel_message_uses_oldest_narrow() -> None:
     assert message_id == 105
 
 
+def test_message_write_endpoints_preserve_actor_and_provider_ids() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        form = parse_qs(request.content.decode())
+        if request.method == "POST" and request.url.path.endswith("/messages"):
+            assert form == {
+                "type": ["stream"],
+                "to": ["7"],
+                "topic": ["Operations"],
+                "content": ["created"],
+            }
+            return httpx.Response(200, json={"result": "success", "id": 123})
+        if request.method == "PATCH":
+            assert request.url.path.endswith("/messages/123")
+            assert form == {"content": ["updated"]}
+        elif request.url.path.endswith("/messages/flags"):
+            assert json.loads(form["messages"][0]) == [123]
+            assert form["op"] == ["add"]
+            assert form["flag"] == ["read"]
+        elif request.url.path.endswith("/messages/123/reactions"):
+            assert form == {"emoji_name": ["thumbs_up"]}
+        else:
+            assert request.method == "DELETE"
+            assert request.url.path.endswith("/messages/123")
+        return httpx.Response(200, json={"result": "success", "msg": ""})
+
+    client = _client(handler)
+    try:
+        message_id = client.send_message(
+            "channel:7",
+            42,
+            "created",
+            topic="Operations",
+        )
+        client.update_message(message_id, content="updated")
+        client.update_message_flag(message_id, "read", True)
+        client.update_reaction(message_id, "thumbs_up", enabled=True)
+        client.delete_message(message_id)
+    finally:
+        client.close()
+
+    assert message_id == 123
+    assert [request.method for request in requests] == [
+        "POST",
+        "PATCH",
+        "POST",
+        "POST",
+        "DELETE",
+    ]
+
+
 def _client(handler: object) -> ZulipApiClient:
     return ZulipApiClient(
         "https://zulip.example.test",

@@ -432,6 +432,191 @@ class ZulipApiClient:
             raise ZulipApiError("invalid_messages_response", retryable=True)
         return messages
 
+    def send_message(
+        self,
+        chat_key: str,
+        own_user_id: int,
+        content: str,
+        *,
+        topic: str | None,
+    ) -> int:
+        if chat_key.startswith("channel:"):
+            try:
+                recipient: str = str(int(chat_key.removeprefix("channel:")))
+            except ValueError as exc:
+                raise ValueError("invalid channel chat key") from exc
+            data = {
+                "type": "stream",
+                "to": recipient,
+                "topic": topic or "General",
+                "content": content,
+            }
+        elif chat_key.startswith("direct:"):
+            try:
+                participant_ids = {
+                    int(value) for value in chat_key.removeprefix("direct:").split(",")
+                }
+            except ValueError as exc:
+                raise ValueError("invalid direct chat key") from exc
+            if own_user_id not in participant_ids:
+                raise ValueError("direct chat key does not include current user")
+            recipients = sorted(participant_ids - {own_user_id}) or [own_user_id]
+            data = {
+                "type": "private",
+                "to": json.dumps(recipients, separators=(",", ":")),
+                "content": content,
+            }
+        else:
+            raise ValueError("unsupported chat key")
+        payload = self._request("POST", "/api/v1/messages", data=data)
+        message_id = payload.get("id")
+        if not isinstance(message_id, int):
+            raise ZulipApiError("invalid_send_message_response", retryable=True)
+        return message_id
+
+    def update_message(
+        self,
+        message_id: int,
+        *,
+        content: str | None = None,
+        topic: str | None = None,
+        propagate_mode: str = "change_one",
+    ) -> None:
+        data: dict[str, str] = {}
+        if content is not None:
+            data["content"] = content
+        if topic is not None:
+            data["topic"] = topic
+            data["propagate_mode"] = propagate_mode
+        if not data:
+            return
+        self._request("PATCH", f"/api/v1/messages/{message_id}", data=data)
+
+    def delete_message(self, message_id: int) -> None:
+        self._request("DELETE", f"/api/v1/messages/{message_id}")
+
+    def update_message_flag(
+        self,
+        message_id: int,
+        flag: str,
+        enabled: bool,
+    ) -> None:
+        if flag not in {"read", "starred", "collapsed"}:
+            raise ValueError("unsupported writable Zulip message flag")
+        self._request(
+            "POST",
+            "/api/v1/messages/flags",
+            data={
+                "messages": json.dumps([message_id], separators=(",", ":")),
+                "op": "add" if enabled else "remove",
+                "flag": flag,
+            },
+        )
+
+    def update_reaction(
+        self,
+        message_id: int,
+        emoji_name: str,
+        *,
+        enabled: bool,
+    ) -> None:
+        self._request(
+            "POST" if enabled else "DELETE",
+            f"/api/v1/messages/{message_id}/reactions",
+            data={"emoji_name": emoji_name},
+        )
+
+    def update_stream(
+        self,
+        stream_id: int,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        is_archived: bool | None = None,
+    ) -> None:
+        data: dict[str, str] = {}
+        if name is not None:
+            data["new_name"] = name
+        if description is not None:
+            data["description"] = description
+        if is_archived is not None:
+            data["is_archived"] = json.dumps(is_archived)
+        if data:
+            self._request("PATCH", f"/api/v1/streams/{stream_id}", data=data)
+
+    def update_subscription(self, stream_name: str, *, enabled: bool) -> None:
+        subscriptions: object = [{"name": stream_name}] if enabled else [stream_name]
+        self._request(
+            "POST" if enabled else "DELETE",
+            "/api/v1/users/me/subscriptions",
+            data={
+                "subscriptions": json.dumps(
+                    subscriptions,
+                    separators=(",", ":"),
+                )
+            },
+        )
+
+    def create_stream(
+        self,
+        name: str,
+        *,
+        description: str | None,
+        invite_only: bool,
+    ) -> int:
+        self._request(
+            "POST",
+            "/api/v1/users/me/subscriptions",
+            data={
+                "subscriptions": json.dumps(
+                    [{"name": name, "description": description or ""}],
+                    separators=(",", ":"),
+                ),
+                "invite_only": json.dumps(invite_only),
+            },
+        )
+        payload = self._request(
+            "GET",
+            "/api/v1/get_stream_id",
+            params={"stream": name},
+        )
+        stream_id = payload.get("stream_id")
+        if not isinstance(stream_id, int):
+            raise ZulipApiError("invalid_get_stream_id_response", retryable=True)
+        return stream_id
+
+    def update_subscription_property(
+        self,
+        stream_id: int,
+        property_name: str,
+        value: bool | str,
+    ) -> None:
+        self._request(
+            "PATCH",
+            f"/api/v1/users/me/subscriptions/{stream_id}",
+            data={
+                "property": property_name,
+                "value": json.dumps(value) if isinstance(value, bool) else value,
+            },
+        )
+
+    def update_topic_notification(
+        self,
+        stream_id: int,
+        topic: str,
+        *,
+        muted: bool,
+    ) -> None:
+        self._request(
+            "PATCH",
+            "/api/v1/users/me/subscriptions/muted_topics",
+            data={
+                "stream_id": str(stream_id),
+                "topic": topic,
+                "op": "add" if muted else "remove",
+            },
+        )
+
     def _chat_timeout(self) -> httpx.Timeout:
         return httpx.Timeout(
             self._connect_timeout_seconds,

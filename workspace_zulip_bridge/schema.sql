@@ -236,6 +236,39 @@ CREATE INDEX IF NOT EXISTS zulip_messages_sync_plan_idx
     ON workspace_zulip_bridge.zulip_messages
         (realm_uuid, source_updated_at, uuid);
 
+CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_entity_links (
+    realm_uuid uuid NOT NULL
+        REFERENCES workspace_zulip_bridge.zulip_realms (uuid) ON DELETE CASCADE,
+    entity_type text NOT NULL CHECK (entity_type IN ('stream', 'message')),
+    workspace_uuid uuid NOT NULL,
+    zulip_external_key text NOT NULL CHECK (zulip_external_key <> ''),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (realm_uuid, entity_type, workspace_uuid),
+    UNIQUE (realm_uuid, entity_type, zulip_external_key)
+);
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'workspace_zulip_bridge'
+          AND table_name = 'zulip_entity_links'
+          AND column_name = 'zulip_external_id'
+    ) THEN
+        ALTER TABLE workspace_zulip_bridge.zulip_entity_links
+            RENAME COLUMN zulip_external_id TO zulip_external_key;
+        ALTER TABLE workspace_zulip_bridge.zulip_entity_links
+            ALTER COLUMN zulip_external_key TYPE text
+            USING zulip_external_key::text;
+    END IF;
+END;
+$$;
+ALTER TABLE workspace_zulip_bridge.zulip_entity_links
+    DROP CONSTRAINT IF EXISTS zulip_entity_links_entity_type_check;
+ALTER TABLE workspace_zulip_bridge.zulip_entity_links
+    ADD CONSTRAINT zulip_entity_links_entity_type_check
+    CHECK (entity_type IN ('stream', 'message'));
+
 CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_message_flags (
     uuid uuid PRIMARY KEY,
     realm_uuid uuid NOT NULL
@@ -558,7 +591,8 @@ BEGIN
         'zulip_realms', 'zulip_users', 'zulip_connections', 'zulip_streams',
         'zulip_stream_bindings', 'zulip_topics', 'zulip_topic_aliases',
         'zulip_topic_bindings', 'zulip_messages', 'zulip_message_flags',
-        'zulip_message_reactions', 'zulip_files', 'workspace_outbox',
+        'zulip_message_reactions', 'zulip_files', 'zulip_entity_links',
+        'workspace_outbox',
         'workspace_event_cursors', 'workspace_events', 'workspace_mirror_state',
         'workspace_users', 'workspace_streams', 'workspace_stream_bindings',
         'workspace_topics', 'workspace_topic_bindings', 'workspace_messages',

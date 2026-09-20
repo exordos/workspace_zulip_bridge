@@ -32,6 +32,8 @@ from workspace_zulip_bridge.monitor import collect_snapshot
 from workspace_zulip_bridge.stable_ids import stable_chat_uuid
 from workspace_zulip_bridge.stable_ids import stable_message_uuid
 from workspace_zulip_bridge.stable_ids import stable_realm_uuid
+from workspace_zulip_bridge.stable_ids import stable_stream_binding_uuid
+from workspace_zulip_bridge.stable_ids import stable_topic_binding_uuid
 from workspace_zulip_bridge.stable_ids import stable_topic_uuid
 from workspace_zulip_bridge.stable_ids import stable_user_uuid
 from workspace_zulip_bridge.workspace_events import WorkspaceEvent
@@ -245,6 +247,10 @@ def test_workspace_diff_worker_batches_and_converges(
     asyncio.run(_workspace_diff_worker_round_trip(_dsn(), tmp_path))
 
 
+def test_workspace_diff_materializes_topic_bindings(tmp_path: Path) -> None:
+    asyncio.run(_workspace_diff_materializes_topic_bindings(_dsn(), tmp_path))
+
+
 def test_workspace_bootstrap_activates_verified_generation(
     tmp_path: Path,
 ) -> None:
@@ -445,6 +451,94 @@ async def _workspace_bootstrap_round_trip(dsn: str, tmp_path: Path) -> None:
                 "WHERE provider_uuid = $1 AND snapshot_generation = $2",
                 provider_uuid,
                 generation,
+            )
+            == 1
+        )
+    finally:
+        await pool.close()
+
+
+async def _workspace_diff_materializes_topic_bindings(dsn: str, tmp_path: Path) -> None:
+    pool = await _pool(dsn)
+    provider_uuid = UUID("10000000-0000-0000-0000-000000000091")
+    project_uuid = UUID("10000000-0000-0000-0000-000000000092")
+    token_file = tmp_path / "workspace-topic-bindings.token"
+    token_file.write_text("integration-token")
+    try:
+        async with pool.acquire() as connection:
+            user_uuid = await _insert_user(connection, 10, 400)
+            stream_uuid = stable_chat_uuid(ENDPOINT, "channel:7")
+            topic_uuid = stable_topic_uuid(stream_uuid, "General")
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_streams (
+                    uuid, realm_uuid, chat_type, chat_key, name,
+                    content_hash, source_connection_uuid
+                ) VALUES ($1, $2, 'channel', 'channel:7', 'Test', $3, $4)
+                """,
+                stream_uuid,
+                stable_realm_uuid(ENDPOINT),
+                b"s" * 32,
+                user_uuid,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_stream_bindings (
+                    uuid, zulip_stream_uuid, zulip_user_uuid, role,
+                    membership_kind, content_hash
+                ) VALUES ($1, $2, $3, 'member', 'subscriber', $4)
+                """,
+                stable_stream_binding_uuid(stream_uuid, user_uuid),
+                stream_uuid,
+                user_uuid,
+                b"b" * 32,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_topics (
+                    uuid, zulip_stream_uuid, name, content_hash
+                ) VALUES ($1, $2, 'General', $3)
+                """,
+                topic_uuid,
+                stream_uuid,
+                b"t" * 32,
+            )
+        settings = Settings.from_env(
+            {
+                "WZB_DATABASE_DSN": dsn,
+                "WZB_DB_POOL_MIN_SIZE": "1",
+                "WZB_DB_POOL_MAX_SIZE": "4",
+                "WZB_ZULIP_HISTORY_CONCURRENCY": "2",
+                "WZB_WORKSPACE_WEBSOCKET_URL": (
+                    "ws://workspace.test/api/workspace/v1/events/ws"
+                ),
+                "WZB_WORKSPACE_PROJECT_ID": str(project_uuid),
+                "WZB_WORKSPACE_PROVIDER_UUID": str(provider_uuid),
+                "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+            }
+        )
+        worker = WorkspaceDiffWorker(pool, settings)
+        await worker._ensure_topic_bindings(stable_realm_uuid(ENDPOINT))
+        await worker._ensure_topic_bindings(stable_realm_uuid(ENDPOINT))
+
+        row = await pool.fetchrow(
+            """
+            SELECT uuid, zulip_stream_uuid, topic_uuid, zulip_user_uuid,
+                   notification_mode
+            FROM workspace_zulip_bridge.zulip_topic_bindings
+            """
+        )
+        assert row is not None
+        assert dict(row) == {
+            "uuid": stable_topic_binding_uuid(topic_uuid, user_uuid),
+            "zulip_stream_uuid": stream_uuid,
+            "topic_uuid": topic_uuid,
+            "zulip_user_uuid": user_uuid,
+            "notification_mode": "default",
+        }
+        assert (
+            await pool.fetchval(
+                "SELECT count(*) FROM workspace_zulip_bridge.zulip_topic_bindings"
             )
             == 1
         )

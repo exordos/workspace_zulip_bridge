@@ -3,6 +3,7 @@
 
 import asyncio
 import logging
+import typing
 
 import asyncpg
 
@@ -12,6 +13,7 @@ from workspace_zulip_bridge.database import prepare_database
 from workspace_zulip_bridge.database import probe_database
 from workspace_zulip_bridge.event_processor import ZulipEventProcessor
 from workspace_zulip_bridge.event_store import EventStore
+from workspace_zulip_bridge.workspace_auth import WorkspaceTokenManager
 from workspace_zulip_bridge.workspace_events import WorkspaceEventReceiver
 from workspace_zulip_bridge.workspace_sync import WorkspaceBootstrapper
 from workspace_zulip_bridge.workspace_sync import WorkspaceDiffWorker
@@ -19,6 +21,10 @@ from workspace_zulip_bridge.workspace_sync import WorkspaceEventProcessor
 from workspace_zulip_bridge.zulip_worker import ZulipThreadSupervisor
 
 LOG = logging.getLogger(__name__)
+
+
+class _Bootstrapper(typing.Protocol):
+    async def ensure(self) -> bool: ...
 
 
 class BridgeService:
@@ -57,45 +63,47 @@ class BridgeService:
                 stop_task,
             ]
             if self._settings.workspace_events_enabled:
-                bootstrapper = WorkspaceBootstrapper(pool, self._settings)
-                await bootstrapper.ensure()
-                receiver = WorkspaceEventReceiver(pool, self._settings)
-                workspace_event_processor = WorkspaceEventProcessor(
-                    pool, self._settings
-                )
-                workspace_diff_workers = [
-                    WorkspaceDiffWorker(
-                        pool,
-                        self._settings,
-                        plan_enabled=index == 0,
-                        partition=index,
-                        partition_count=self._settings.workspace_sync_workers,
+                tokens = WorkspaceTokenManager(self._settings)
+                bootstrapper = WorkspaceBootstrapper(pool, self._settings, tokens)
+                if await self._ensure_bootstrap(bootstrapper, stop):
+                    receiver = WorkspaceEventReceiver(pool, self._settings, tokens)
+                    workspace_event_processor = WorkspaceEventProcessor(
+                        pool, self._settings
                     )
-                    for index in range(self._settings.workspace_sync_workers)
-                ]
-                supervised_tasks.extend(
-                    (
-                        asyncio.create_task(
-                            self._bootstrap_loop(bootstrapper),
-                            name="workspace-bootstrap",
-                        ),
-                        asyncio.create_task(
-                            receiver.run(),
-                            name="workspace-event-receiver",
-                        ),
-                        asyncio.create_task(
-                            workspace_event_processor.run(),
-                            name="workspace-event-processor",
-                        ),
+                    workspace_diff_workers = [
+                        WorkspaceDiffWorker(
+                            pool,
+                            self._settings,
+                            plan_enabled=index == 0,
+                            partition=index,
+                            partition_count=self._settings.workspace_sync_workers,
+                            tokens=tokens,
+                        )
+                        for index in range(self._settings.workspace_sync_workers)
+                    ]
+                    supervised_tasks.extend(
+                        (
+                            asyncio.create_task(
+                                self._bootstrap_loop(bootstrapper),
+                                name="workspace-bootstrap",
+                            ),
+                            asyncio.create_task(
+                                receiver.run(),
+                                name="workspace-event-receiver",
+                            ),
+                            asyncio.create_task(
+                                workspace_event_processor.run(),
+                                name="workspace-event-processor",
+                            ),
+                        )
                     )
-                )
-                supervised_tasks.extend(
-                    asyncio.create_task(
-                        worker.run(),
-                        name=f"workspace-diff-worker-{index}",
+                    supervised_tasks.extend(
+                        asyncio.create_task(
+                            worker.run(),
+                            name=f"workspace-diff-worker-{index}",
+                        )
+                        for index, worker in enumerate(workspace_diff_workers)
                     )
-                    for index, worker in enumerate(workspace_diff_workers)
-                )
             LOG.info("bridge daemon is ready")
             try:
                 completed, _ = await asyncio.wait(
@@ -118,7 +126,34 @@ class BridgeService:
             await asyncio.sleep(self._settings.db_probe_seconds)
             await probe_database(pool)
 
-    async def _bootstrap_loop(self, bootstrapper: WorkspaceBootstrapper) -> None:
+    async def _bootstrap_loop(self, bootstrapper: _Bootstrapper) -> None:
         while True:
             await asyncio.sleep(self._settings.workspace_lease_retry_seconds)
-            await bootstrapper.ensure()
+            try:
+                await bootstrapper.ensure()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.exception("Workspace bootstrap refresh failed; retrying")
+
+    async def _ensure_bootstrap(
+        self,
+        bootstrapper: _Bootstrapper,
+        stop: asyncio.Event,
+    ) -> bool:
+        while not stop.is_set():
+            try:
+                await bootstrapper.ensure()
+                return True
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.exception("Workspace bootstrap failed; retrying")
+            try:
+                await asyncio.wait_for(
+                    stop.wait(),
+                    timeout=self._settings.workspace_lease_retry_seconds,
+                )
+            except TimeoutError:
+                pass
+        return False

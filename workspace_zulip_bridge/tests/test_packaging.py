@@ -27,6 +27,16 @@ def test_exordos_configuration_selects_the_bridge_image() -> None:
     assert element["images"][0]["profile"] == "exordos_base"
 
 
+def test_runtime_configuration_survives_image_replacement() -> None:
+    service = (ROOT / "etc/systemd/workspace-zulip-bridge.service").read_text()
+    bootstrap = (ROOT / "exordos/images/bootstrap.sh").read_text()
+
+    assert "EnvironmentFile=-/var/lib/workspace_zulip_bridge/runtime.env" in service
+    assert '"/var/lib/workspace_zulip_bridge"' in bootstrap
+    assert '"${PERSISTENT_MOUNT}/var/lib/workspace_zulip_bridge"' in bootstrap
+    assert '"$DATABASE_ROLE"' in bootstrap
+
+
 def test_exordos_manifest_renders_without_implicit_values() -> None:
     source = (ROOT / "exordos/manifests/workspace_zulip_bridge.yaml.j2").read_text()
     rendered = (

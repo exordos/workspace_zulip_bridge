@@ -71,6 +71,8 @@ class Settings:
     workspace_project_id: UUID | None = None
     workspace_provider_uuid: UUID | None = None
     workspace_token_file: Path | None = None
+    workspace_refresh_token_file: Path | None = None
+    workspace_token_url: str | None = None
     workspace_ca_file: Path | None = None
     workspace_event_batch_size: int = 500
     workspace_event_flush_seconds: float = 0.01
@@ -169,6 +171,12 @@ class Settings:
                 if source.get("WZB_WORKSPACE_TOKEN_FILE")
                 else None
             ),
+            workspace_refresh_token_file=(
+                Path(source["WZB_WORKSPACE_REFRESH_TOKEN_FILE"])
+                if source.get("WZB_WORKSPACE_REFRESH_TOKEN_FILE")
+                else None
+            ),
+            workspace_token_url=(source.get("WZB_WORKSPACE_TOKEN_URL") or None),
             workspace_ca_file=(
                 Path(source["WZB_WORKSPACE_CA_FILE"])
                 if source.get("WZB_WORKSPACE_CA_FILE")
@@ -204,9 +212,7 @@ class Settings:
             workspace_sync_batch_size=_read_int(
                 source, "WZB_WORKSPACE_SYNC_BATCH_SIZE", 500
             ),
-            workspace_sync_workers=_read_int(
-                source, "WZB_WORKSPACE_SYNC_WORKERS", 2
-            ),
+            workspace_sync_workers=_read_int(source, "WZB_WORKSPACE_SYNC_WORKERS", 2),
             thread_stop_timeout_seconds=_read_float(
                 source, "WZB_THREAD_STOP_TIMEOUT_SECONDS", 5.0
             ),
@@ -339,6 +345,14 @@ class Settings:
         if self.workspace_api_url is not None:
             if urlsplit(self.workspace_api_url).scheme not in {"http", "https"}:
                 raise ValueError("WZB_WORKSPACE_API_URL must use http or https")
+        if self.workspace_refresh_token_file is not None:
+            if not self.workspace_refresh_token_file.is_file():
+                raise ValueError(
+                    "WZB_WORKSPACE_REFRESH_TOKEN_FILE must name a readable file"
+                )
+        if self.workspace_token_url is not None:
+            if urlsplit(self.workspace_token_url).scheme not in {"http", "https"}:
+                raise ValueError("WZB_WORKSPACE_TOKEN_URL must use http or https")
         if self.workspace_ca_file is not None and not self.workspace_ca_file.is_file():
             raise ValueError("WZB_WORKSPACE_CA_FILE must name a readable file")
 

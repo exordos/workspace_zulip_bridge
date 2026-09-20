@@ -49,7 +49,9 @@ class FakeEventProcessor:
 class FakeWorkspaceEventReceiver:
     calls: list[str]
 
-    def __init__(self, pool: object, settings: Settings) -> None:
+    def __init__(
+        self, pool: object, settings: Settings, tokens: object | None = None
+    ) -> None:
         self.calls.append("workspace-receiver-init")
 
     async def run(self) -> None:
@@ -60,7 +62,9 @@ class FakeWorkspaceEventReceiver:
 class FakeWorkspaceBootstrapper:
     calls: list[str]
 
-    def __init__(self, pool: object, settings: Settings) -> None:
+    def __init__(
+        self, pool: object, settings: Settings, tokens: object | None = None
+    ) -> None:
         self.calls.append("workspace-bootstrap-init")
 
     async def ensure(self) -> bool:
@@ -80,6 +84,7 @@ class FakeWorkspaceWorker:
         plan_enabled: bool = True,
         partition: int = 0,
         partition_count: int = 1,
+        tokens: object | None = None,
     ) -> None:
         self.calls.append(
             f"{self.label}-init-{plan_enabled}-{partition}/{partition_count}"
@@ -96,6 +101,49 @@ class FakeWorkspaceEventProcessor(FakeWorkspaceWorker):
 
 class FakeWorkspaceDiffWorker(FakeWorkspaceWorker):
     label = "workspace-diff-worker"
+
+
+def test_workspace_bootstrap_retries_transient_failure() -> None:
+    asyncio.run(_run_workspace_bootstrap_retry_test())
+
+
+async def _run_workspace_bootstrap_retry_test() -> None:
+    class FlakyBootstrapper:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def ensure(self) -> bool:
+            self.calls += 1
+            if self.calls == 1:
+                raise TimeoutError("temporary Workspace outage")
+            return True
+
+    settings = Settings.from_env({"WZB_WORKSPACE_LEASE_RETRY_SECONDS": "0.01"})
+    bootstrapper = FlakyBootstrapper()
+
+    assert await BridgeService(settings)._ensure_bootstrap(
+        bootstrapper,
+        asyncio.Event(),
+    )
+    assert bootstrapper.calls == 2
+
+
+def test_workspace_bootstrap_retry_stops_cleanly() -> None:
+    asyncio.run(_run_workspace_bootstrap_stop_test())
+
+
+async def _run_workspace_bootstrap_stop_test() -> None:
+    stop = asyncio.Event()
+
+    class StoppingBootstrapper:
+        async def ensure(self) -> bool:
+            stop.set()
+            raise TimeoutError("Workspace is stopping")
+
+    assert not await BridgeService(Settings.from_env({}))._ensure_bootstrap(
+        StoppingBootstrapper(),
+        stop,
+    )
 
 
 def test_workspace_diff_worker_plans_once_before_draining(
@@ -162,6 +210,9 @@ async def _run_workspace_diff_worker_fair_plan_test(
     async def fake_ensure_direct_topics(realm_uuid: UUID) -> None:
         assert realm_uuid == UUID("30000000-0000-0000-0000-000000000001")
 
+    async def fake_ensure_topic_bindings(realm_uuid: UUID) -> None:
+        assert realm_uuid == UUID("30000000-0000-0000-0000-000000000001")
+
     async def fake_plan_entity(
         entity_type: str,
         source: object,
@@ -174,6 +225,7 @@ async def _run_workspace_diff_worker_fair_plan_test(
 
     monkeypatch.setattr(worker, "_link_realm", fake_link_realm)
     monkeypatch.setattr(worker, "_ensure_direct_topics", fake_ensure_direct_topics)
+    monkeypatch.setattr(worker, "_ensure_topic_bindings", fake_ensure_topic_bindings)
     monkeypatch.setattr(worker, "_plan_entity", fake_plan_entity)
 
     assert await worker.plan() == 1

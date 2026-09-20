@@ -1011,11 +1011,28 @@ class HistorySession:
             or self._zulip_user_uuid is None
         ):
             raise RuntimeError("history session is not initialized")
+        linked_rows = await self._connection.fetch(
+            """
+            SELECT workspace_uuid, zulip_external_key
+            FROM workspace_zulip_bridge.zulip_entity_links
+            WHERE realm_uuid = $1 AND entity_type = 'message'
+              AND zulip_external_key = ANY($2::text[])
+            """,
+            self._realm_uuid,
+            [str(message.message_id) for message in messages],
+        )
+        linked_messages = {
+            int(row["zulip_external_key"]): UUID(str(row["workspace_uuid"]))
+            for row in linked_rows
+        }
         records = []
         file_records: list[tuple[UUID, UUID, str, str, int]] = []
         reaction_records: list[tuple[UUID, UUID, UUID, str, str, str]] = []
         for message in messages:
-            message_uuid = stable_message_uuid(self._endpoint, message.message_id)
+            message_uuid = linked_messages.get(
+                message.message_id,
+                stable_message_uuid(self._endpoint, message.message_id),
+            )
             stream_uuid = stable_chat_uuid(self._endpoint, message.chat_key)
             topic_name = message.topic_name or "General"
             topic_uuid = stable_topic_uuid(stream_uuid, topic_name)
@@ -1241,7 +1258,13 @@ class HistorySession:
                     reaction_users = EXCLUDED.reaction_users,
                     content_hash = EXCLUDED.content_hash,
                     message_hash = EXCLUDED.message_hash,
-                    created_at = EXCLUDED.created_at,
+                    created_at = CASE WHEN EXISTS (
+                        SELECT 1
+                        FROM workspace_zulip_bridge.zulip_entity_links AS link
+                        WHERE link.realm_uuid = $2
+                          AND link.entity_type = 'message'
+                          AND link.workspace_uuid = EXCLUDED.uuid
+                    ) THEN zulip_messages.created_at ELSE EXCLUDED.created_at END,
                     source_updated_at = EXCLUDED.source_updated_at,
                     updated_at = clock_timestamp()
                 WHERE zulip_messages.message_hash IS DISTINCT FROM EXCLUDED.message_hash
@@ -1444,7 +1467,24 @@ async def _store_chats(
     *,
     replace_catalog: bool,
 ) -> tuple[int, int]:
-    stream_uuids = [stable_chat_uuid(endpoint, chat.chat_key) for chat in chats]
+    linked_rows = await connection.fetch(
+        """
+        SELECT workspace_uuid, zulip_external_key
+        FROM workspace_zulip_bridge.zulip_entity_links
+        WHERE realm_uuid = $1 AND entity_type = 'stream'
+          AND zulip_external_key = ANY($2::text[])
+        """,
+        realm_uuid,
+        [chat.chat_key for chat in chats],
+    )
+    linked_streams = {
+        str(row["zulip_external_key"]): UUID(str(row["workspace_uuid"]))
+        for row in linked_rows
+    }
+    stream_uuids = [
+        linked_streams.get(chat.chat_key, stable_chat_uuid(endpoint, chat.chat_key))
+        for chat in chats
+    ]
     binding_uuids = [
         stable_stream_binding_uuid(stream_uuid, zulip_user_uuid)
         for stream_uuid in stream_uuids

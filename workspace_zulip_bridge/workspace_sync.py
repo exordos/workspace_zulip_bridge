@@ -20,8 +20,12 @@ import asyncpg
 import httpx
 
 from workspace_zulip_bridge.config import Settings
+from workspace_zulip_bridge.stable_ids import stable_topic_binding_uuid
 from workspace_zulip_bridge.stable_ids import stable_topic_uuid
-from workspace_zulip_bridge.workspace_events import _read_token
+from workspace_zulip_bridge.workspace_auth import WorkspaceTokenManager
+from workspace_zulip_bridge.zulip_api import ZulipApiError
+from workspace_zulip_bridge.zulip_outbound import ZulipOutboundError
+from workspace_zulip_bridge.zulip_outbound import ZulipOutboundWriter
 
 LOG = logging.getLogger(__name__)
 
@@ -66,7 +70,12 @@ def _json_object(value: Any) -> dict[str, Any]:
 
 def workspace_api_url(settings: Settings) -> str:
     if settings.workspace_api_url is not None:
-        return settings.workspace_api_url.rstrip("/")
+        configured = settings.workspace_api_url.rstrip("/")
+        # Keep accepting the original documented value while routing provider
+        # operations to the messenger service that owns this private API.
+        if configured.endswith("/api/workspace/v1"):
+            return f"{configured}/messenger"
+        return configured
     assert settings.workspace_websocket_url is not None
     parsed = urlsplit(settings.workspace_websocket_url)
     scheme = "https" if parsed.scheme == "wss" else "http"
@@ -74,11 +83,19 @@ def workspace_api_url(settings: Settings) -> str:
     path = parsed.path
     if not path.endswith(suffix):
         raise ValueError("Workspace websocket URL must end with /events/ws")
-    return urlunsplit((scheme, parsed.netloc, path[: -len(suffix)], "", "")).rstrip("/")
+    api_root = urlunsplit((scheme, parsed.netloc, path[: -len(suffix)], "", "")).rstrip(
+        "/"
+    )
+    return f"{api_root}/messenger"
 
 
 class WorkspaceBootstrapper:
-    def __init__(self, pool: asyncpg.Pool, settings: Settings) -> None:
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        settings: Settings,
+        tokens: WorkspaceTokenManager | None = None,
+    ) -> None:
         assert settings.workspace_provider_uuid is not None
         assert settings.workspace_project_id is not None
         assert settings.workspace_token_file is not None
@@ -86,7 +103,7 @@ class WorkspaceBootstrapper:
         self._settings = settings
         self._provider_uuid = settings.workspace_provider_uuid
         self._project_uuid = settings.workspace_project_id
-        self._token_file = settings.workspace_token_file
+        self._tokens = tokens or WorkspaceTokenManager(settings)
 
     async def ensure(self) -> bool:
         row = await self._pool.fetchrow(
@@ -141,14 +158,12 @@ class WorkspaceBootstrapper:
 
     async def _load_snapshot(self, client: httpx.AsyncClient | None) -> None:
         if client is None:
-            token = await asyncio.to_thread(_read_token, self._token_file)
             verify: bool | str = (
                 True
                 if self._settings.workspace_ca_file is None
                 else str(self._settings.workspace_ca_file)
             )
             async with httpx.AsyncClient(
-                headers={"Authorization": f"Bearer {token}"},
                 verify=verify,
                 timeout=httpx.Timeout(
                     self._settings.workspace_bootstrap_timeout_seconds
@@ -159,7 +174,8 @@ class WorkspaceBootstrapper:
         buffers: dict[str, list[tuple[Any, ...]]] = defaultdict(list)
         counts = {entity_type: 0 for entity_type in ENTITY_TYPES}
         digest = hashlib.sha256()
-        response = await client.get(
+        response = await self._get(
+            client,
             f"{workspace_api_url(self._settings)}/provider/bootstrap",
             params={"mode": "paged"},
         )
@@ -171,7 +187,8 @@ class WorkspaceBootstrapper:
         for entity_type in ENTITY_TYPES:
             after_uuid = UUID(int=0)
             while True:
-                response = await client.get(
+                response = await self._get(
+                    client,
                     f"{workspace_api_url(self._settings)}/provider/entities/"
                     f"{entity_type}",
                     params={
@@ -290,6 +307,22 @@ class WorkspaceBootstrapper:
                 generation,
             )
         LOG.info("Workspace bootstrap activated: counts=%s", counts)
+
+    async def _get(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        *,
+        params: dict[str, str],
+    ) -> httpx.Response:
+        client.headers["Authorization"] = f"Bearer {await self._tokens.access_token()}"
+        response = await client.get(url, params=params)
+        if response.status_code != 401:
+            return response
+        client.headers["Authorization"] = (
+            f"Bearer {await self._tokens.access_token(force_refresh=True)}"
+        )
+        return await client.get(url, params=params)
 
     async def _copy(self, entity_type: str, records: list[tuple[Any, ...]]) -> None:
         if not records:
@@ -490,6 +523,7 @@ class WorkspaceDiffWorker:
         plan_enabled: bool = True,
         partition: int = 0,
         partition_count: int = 1,
+        tokens: WorkspaceTokenManager | None = None,
     ) -> None:
         assert settings.workspace_provider_uuid is not None
         assert settings.workspace_project_id is not None
@@ -500,39 +534,43 @@ class WorkspaceDiffWorker:
         self._settings = settings
         self._provider_uuid = settings.workspace_provider_uuid
         self._project_uuid = settings.workspace_project_id
-        self._token_file = settings.workspace_token_file
+        self._tokens = tokens or WorkspaceTokenManager(settings)
         self._plan_enabled = plan_enabled
         self._partition = partition
         self._partition_count = partition_count
+        self._zulip_writer = ZulipOutboundWriter(pool, settings)
 
     async def run(self) -> None:
-        token = await asyncio.to_thread(_read_token, self._token_file)
         verify: bool | str = (
             True
             if self._settings.workspace_ca_file is None
             else str(self._settings.workspace_ca_file)
         )
-        async with httpx.AsyncClient(
-            headers={"Authorization": f"Bearer {token}"},
-            verify=verify,
-            timeout=httpx.Timeout(self._settings.workspace_request_timeout_seconds),
-        ) as client:
-            while True:
-                try:
-                    if self._plan_enabled:
-                        await self._plan_and_drain(client)
-                    else:
-                        await self._drain(client)
-                except (
-                    TimeoutError,
-                    asyncpg.PostgresError,
-                    httpx.HTTPError,
-                    RuntimeError,
-                ):
-                    LOG.warning("Workspace diff pass failed; retrying", exc_info=True)
-                    await asyncio.sleep(self._settings.workspace_retry_base_seconds)
-                    continue
-                await asyncio.sleep(self._settings.workspace_sync_poll_seconds)
+        try:
+            async with httpx.AsyncClient(
+                verify=verify,
+                timeout=httpx.Timeout(self._settings.workspace_request_timeout_seconds),
+            ) as client:
+                while True:
+                    try:
+                        if self._plan_enabled:
+                            await self._plan_and_drain(client)
+                        else:
+                            await self._drain(client)
+                    except (
+                        TimeoutError,
+                        asyncpg.PostgresError,
+                        httpx.HTTPError,
+                        RuntimeError,
+                    ):
+                        LOG.warning(
+                            "Workspace diff pass failed; retrying", exc_info=True
+                        )
+                        await asyncio.sleep(self._settings.workspace_retry_base_seconds)
+                        continue
+                    await asyncio.sleep(self._settings.workspace_sync_poll_seconds)
+        finally:
+            await self._zulip_writer.close()
 
     async def _plan_and_drain(self, client: httpx.AsyncClient) -> int:
         planned = await self.plan()
@@ -550,9 +588,10 @@ class WorkspaceDiffWorker:
     async def plan(self) -> int:
         realm_uuid = await self._link_realm()
         await self._ensure_direct_topics(realm_uuid)
+        await self._ensure_topic_bindings(realm_uuid)
         state = await self._pool.fetchrow(
             """
-            SELECT active_generation
+            SELECT active_generation, initial_sync_completed_at
             FROM workspace_zulip_bridge.workspace_mirror_state
             WHERE provider_uuid = $1 AND bootstrap_status = 'ready'
             """,
@@ -570,7 +609,80 @@ class WorkspaceDiffWorker:
                 generation,
             )
             total += planned
+            if state.get("initial_sync_completed_at") is not None:
+                total += await self._plan_target_only(
+                    entity_type,
+                    source,
+                    realm_uuid,
+                    generation,
+                )
         return total
+
+    async def _plan_target_only(
+        self,
+        entity_type: str,
+        source: Mapping[str, str],
+        realm_uuid: UUID,
+        generation: UUID,
+    ) -> int:
+        if entity_type == "message_reactions":
+            partition = "(parent.data ->> 'stream_uuid')::uuid"
+            joins = """
+                JOIN workspace_zulip_bridge.workspace_messages AS parent
+                  ON parent.provider_uuid = target.provider_uuid
+                 AND parent.snapshot_generation = target.snapshot_generation
+                 AND parent.uuid = (target.data ->> 'message_uuid')::uuid
+            """
+        elif entity_type in {"messages", "message_flags"}:
+            partition = "(target.data ->> 'stream_uuid')::uuid"
+            joins = ""
+        else:
+            partition = "NULL::uuid"
+            joins = ""
+        source_table = source["from"].rsplit(".", 1)[-1]
+        result = await self._pool.execute(
+            f"""
+            INSERT INTO workspace_zulip_bridge.sync_diffs (
+                provider_uuid, entity_type, entity_uuid, realm_uuid,
+                partition_key, direction, source_hash, target_hash,
+                source_updated_at, target_updated_at
+            )
+            SELECT $1, $2, target.uuid, $3, {partition}, 'to_zulip',
+                   NULL, target.content_hash,
+                   target.source_updated_at, target.source_updated_at
+            FROM workspace_zulip_bridge.workspace_{entity_type} AS target
+            {joins}
+            WHERE target.provider_uuid = $1
+              AND target.snapshot_generation = $4
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM workspace_zulip_bridge.{source_table} AS source
+                  WHERE source.uuid = target.uuid
+              )
+            ON CONFLICT (provider_uuid, entity_type, entity_uuid)
+            DO UPDATE SET
+                direction = 'to_zulip',
+                partition_key = EXCLUDED.partition_key,
+                target_hash = EXCLUDED.target_hash,
+                target_updated_at = EXCLUDED.target_updated_at,
+                processing_status = CASE
+                    WHEN sync_diffs.target_hash IS DISTINCT FROM EXCLUDED.target_hash
+                      OR sync_diffs.target_updated_at
+                         IS DISTINCT FROM EXCLUDED.target_updated_at
+                    THEN 'pending' ELSE sync_diffs.processing_status END,
+                available_at = CASE
+                    WHEN sync_diffs.target_hash IS DISTINCT FROM EXCLUDED.target_hash
+                      OR sync_diffs.target_updated_at
+                         IS DISTINCT FROM EXCLUDED.target_updated_at
+                    THEN clock_timestamp() ELSE sync_diffs.available_at END,
+                updated_at = clock_timestamp()
+            """,
+            self._provider_uuid,
+            entity_type,
+            realm_uuid,
+            generation,
+        )
+        return int(result.rsplit(" ", 1)[-1])
 
     async def _plan_entity(
         self,
@@ -770,11 +882,7 @@ class WorkspaceDiffWorker:
         to_workspace = [row for row in rows if row["direction"] == "to_workspace"]
         to_zulip = [row for row in rows if row["direction"] == "to_zulip"]
         if to_zulip:
-            await self._mark(
-                to_zulip,
-                "blocked",
-                "Workspace-to-Zulip writer is intentionally not enabled yet",
-            )
+            await self._write_to_zulip(to_zulip)
         if not to_workspace:
             return len(rows)
         operations = []
@@ -812,7 +920,8 @@ class WorkspaceDiffWorker:
             )
             records.append((row, data, content_hash))
         try:
-            response = await client.post(
+            response = await self._post(
+                client,
                 f"{workspace_api_url(self._settings)}/provider/entities/actions/apply/invoke",
                 json={
                     "delivery_class": delivery_class,
@@ -832,6 +941,99 @@ class WorkspaceDiffWorker:
             await self._mark(to_workspace, "failed", str(exc)[:2048])
             raise
         return len(rows)
+
+    async def _write_to_zulip(self, rows: list[asyncpg.Record]) -> None:
+        source_entities: dict[tuple[str, UUID], dict[str, Any]] = {}
+        target_entities: dict[tuple[str, UUID], dict[str, Any]] = {}
+        grouped: dict[str, list[UUID]] = defaultdict(list)
+        for row in rows:
+            grouped[row["entity_type"]].append(row["entity_uuid"])
+        for entity_type, entity_uuids in grouped.items():
+            source_entities.update(
+                await self._load_zulip_entities(entity_type, entity_uuids)
+            )
+            target_entities.update(
+                await self._load_workspace_entities(entity_type, entity_uuids)
+            )
+        for row in rows:
+            key = (row["entity_type"], row["entity_uuid"])
+            source = source_entities.get(key)
+            target = target_entities.get(key)
+            if _equivalent_entity(row["entity_type"], source, target):
+                await self._accept_to_zulip(row, "equivalent")
+                continue
+            try:
+                await self._zulip_writer.apply(
+                    row["entity_type"],
+                    row["entity_uuid"],
+                    source,
+                    target,
+                    row["target_updated_at"],
+                )
+            except ZulipOutboundError as exc:
+                await self._mark([row], "blocked", str(exc)[:2048])
+            except ZulipApiError as exc:
+                if row["entity_type"] == "message_reactions" and (
+                    (target is not None and exc.code == "REACTION_ALREADY_EXISTS")
+                    or (target is None and exc.code == "REACTION_DOES_NOT_EXIST")
+                ):
+                    await self._accept_to_zulip(row, "already_converged")
+                    continue
+                status = "failed" if exc.retryable else "blocked"
+                await self._mark(
+                    [row],
+                    status,
+                    exc.code[:2048],
+                    retry_base_seconds=self._settings.zulip_retry_base_seconds,
+                    retry_cap_seconds=self._settings.zulip_retry_cap_seconds,
+                )
+            except Exception as exc:
+                LOG.exception("Workspace-to-Zulip mutation failed")
+                await self._mark(
+                    [row],
+                    "failed",
+                    str(exc)[:2048],
+                    retry_base_seconds=self._settings.zulip_retry_base_seconds,
+                    retry_cap_seconds=self._settings.zulip_retry_cap_seconds,
+                )
+            else:
+                await self._accept_to_zulip(row, "written")
+
+    async def _accept_to_zulip(
+        self,
+        row: asyncpg.Record,
+        outcome: str,
+    ) -> None:
+        await self._pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.sync_diffs
+            SET processing_status = 'applied', processed_at = clock_timestamp(),
+                source_hash = target_hash,
+                source_updated_at = COALESCE(target_updated_at, source_updated_at),
+                last_error = $4, updated_at = clock_timestamp()
+            WHERE provider_uuid = $1 AND entity_type = $2 AND entity_uuid = $3
+            """,
+            row["provider_uuid"],
+            row["entity_type"],
+            row["entity_uuid"],
+            outcome,
+        )
+
+    async def _post(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        *,
+        json: dict[str, Any],
+    ) -> httpx.Response:
+        client.headers["Authorization"] = f"Bearer {await self._tokens.access_token()}"
+        response = await client.post(url, json=json)
+        if response.status_code != 401:
+            return response
+        client.headers["Authorization"] = (
+            f"Bearer {await self._tokens.access_token(force_refresh=True)}"
+        )
+        return await client.post(url, json=json)
 
     async def _complete_initial_sync(self) -> bool:
         result = await self._pool.execute(
@@ -947,14 +1149,40 @@ class WorkspaceDiffWorker:
                 [record[2] or None for record in records],
             )
 
-    async def _mark(self, rows: list[asyncpg.Record], status: str, error: str) -> None:
+    async def _mark(
+        self,
+        rows: list[asyncpg.Record],
+        status: str,
+        error: str,
+        *,
+        retry_base_seconds: float | None = None,
+        retry_cap_seconds: float | None = None,
+    ) -> None:
+        retry_base_seconds = (
+            self._settings.workspace_retry_base_seconds
+            if retry_base_seconds is None
+            else retry_base_seconds
+        )
+        retry_cap_seconds = (
+            self._settings.workspace_retry_cap_seconds
+            if retry_cap_seconds is None
+            else retry_cap_seconds
+        )
         async with self._pool.acquire() as connection, connection.transaction():
             await connection.executemany(
                 """
                 UPDATE workspace_zulip_bridge.sync_diffs
                 SET processing_status = $4, last_error = $5,
                     available_at = CASE WHEN $4 = 'failed'
-                        THEN clock_timestamp() + interval '1 second'
+                        THEN clock_timestamp() + make_interval(
+                            secs => LEAST(
+                                $7::double precision,
+                                $6::double precision * power(
+                                    2::double precision,
+                                    GREATEST(attempt_count - 1, 0)
+                                )
+                            )
+                        )
                         ELSE available_at END,
                     processed_at = CASE WHEN $4 IN ('blocked', 'skipped')
                         THEN clock_timestamp() ELSE processed_at END,
@@ -968,6 +1196,8 @@ class WorkspaceDiffWorker:
                         row["entity_uuid"],
                         status,
                         error,
+                        retry_base_seconds,
+                        retry_cap_seconds,
                     )
                     for row in rows
                 ],
@@ -1067,10 +1297,112 @@ class WorkspaceDiffWorker:
                 realm_uuid,
             )
 
+    async def _ensure_topic_bindings(self, realm_uuid: UUID) -> None:
+        async with self._pool.acquire() as connection, connection.transaction():
+            rows = await connection.fetch(
+                """
+                SELECT topic.uuid AS topic_uuid,
+                       topic.zulip_stream_uuid AS stream_uuid,
+                       binding.zulip_user_uuid AS user_uuid,
+                       GREATEST(topic.created_at, binding.created_at) AS created_at,
+                       jsonb_build_object(
+                           'stream_uuid', topic.zulip_stream_uuid,
+                           'topic_uuid', topic.uuid,
+                           'user_uuid', binding.zulip_user_uuid,
+                           'notification_mode', 'default',
+                           'created_at',
+                               GREATEST(topic.created_at, binding.created_at)
+                       ) AS data
+                FROM workspace_zulip_bridge.zulip_topics AS topic
+                JOIN workspace_zulip_bridge.zulip_streams AS stream
+                  ON stream.uuid = topic.zulip_stream_uuid
+                JOIN workspace_zulip_bridge.zulip_stream_bindings AS binding
+                  ON binding.zulip_stream_uuid = topic.zulip_stream_uuid
+                WHERE stream.realm_uuid = $1
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM workspace_zulip_bridge.zulip_topic_bindings AS existing
+                      WHERE existing.topic_uuid = topic.uuid
+                        AND existing.zulip_user_uuid = binding.zulip_user_uuid
+                  )
+                """,
+                realm_uuid,
+            )
+            if not rows:
+                return
+            records = [
+                (
+                    stable_topic_binding_uuid(row["topic_uuid"], row["user_uuid"]),
+                    row["stream_uuid"],
+                    row["topic_uuid"],
+                    row["user_uuid"],
+                    canonical_hash(_json_object(row["data"])),
+                    row["created_at"],
+                )
+                for row in rows
+            ]
+            await connection.execute(
+                """
+                CREATE TEMPORARY TABLE pending_topic_bindings (
+                    uuid uuid NOT NULL,
+                    stream_uuid uuid NOT NULL,
+                    topic_uuid uuid NOT NULL,
+                    user_uuid uuid NOT NULL,
+                    content_hash bytea NOT NULL,
+                    created_at timestamptz NOT NULL
+                ) ON COMMIT DROP
+                """
+            )
+            await connection.copy_records_to_table(
+                "pending_topic_bindings",
+                records=records,
+                columns=(
+                    "uuid",
+                    "stream_uuid",
+                    "topic_uuid",
+                    "user_uuid",
+                    "content_hash",
+                    "created_at",
+                ),
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_topic_bindings (
+                    uuid, zulip_stream_uuid, topic_uuid, zulip_user_uuid,
+                    notification_mode, content_hash, created_at, updated_at
+                )
+                SELECT uuid, stream_uuid, topic_uuid, user_uuid,
+                       'default', content_hash, created_at, created_at
+                FROM pending_topic_bindings
+                ON CONFLICT (topic_uuid, zulip_user_uuid) DO NOTHING
+                """
+            )
+
     async def _load_zulip_entities(
         self, entity_type: str, entity_uuids: list[UUID]
     ) -> dict[tuple[str, UUID], dict[str, Any]]:
         rows = await self._pool.fetch(_ENTITY_QUERIES[entity_type], entity_uuids)
+        return {
+            (entity_type, UUID(str(row["entity_uuid"]))): _json_object(row["data"])
+            for row in rows
+        }
+
+    async def _load_workspace_entities(
+        self, entity_type: str, entity_uuids: list[UUID]
+    ) -> dict[tuple[str, UUID], dict[str, Any]]:
+        rows = await self._pool.fetch(
+            f"""
+            SELECT entity.uuid AS entity_uuid, entity.data
+            FROM workspace_zulip_bridge.workspace_{entity_type} AS entity
+            JOIN workspace_zulip_bridge.workspace_mirror_state AS mirror
+              ON mirror.provider_uuid = entity.provider_uuid
+             AND mirror.active_generation = entity.snapshot_generation
+            WHERE entity.provider_uuid = $1
+              AND entity.uuid = ANY($2::uuid[])
+            """,
+            self._provider_uuid,
+            entity_uuids,
+        )
         return {
             (entity_type, UUID(str(row["entity_uuid"]))): _json_object(row["data"])
             for row in rows
@@ -1089,6 +1421,50 @@ def _event_entity_type(object_type: str) -> str | None:
         "message_flag": "message_flags",
         "message_reaction": "message_reactions",
     }.get(object_type)
+
+
+def _equivalent_entity(
+    entity_type: str,
+    source: dict[str, Any] | None,
+    target: dict[str, Any] | None,
+) -> bool:
+    if source is None or target is None:
+        return source is target
+    return _normalized_entity(entity_type, source) == _normalized_entity(
+        entity_type,
+        target,
+    )
+
+
+def _normalized_entity(entity_type: str, data: dict[str, Any]) -> dict[str, Any]:
+    value = dict(_normalize_timestamps(data))
+    if entity_type == "streams":
+        value.pop("default_topic_uuid", None)
+    elif entity_type == "topics":
+        value.pop("color", None)
+    elif entity_type == "message_reactions":
+        # Zulip's message/reaction snapshots do not expose when a reaction was
+        # originally created.  A reload therefore assigns a new ingestion
+        # timestamp to the same stable reaction identity.  Treating that local
+        # timestamp as content causes a false Workspace -> Zulip echo.
+        value.pop("created_at", None)
+    return value
+
+
+def _normalize_timestamps(value: Any, key: str = "") -> Any:
+    if isinstance(value, dict):
+        return {
+            item_key: _normalize_timestamps(item, item_key)
+            for item_key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_normalize_timestamps(item) for item in value]
+    if isinstance(value, str) and key.endswith("_at"):
+        try:
+            return _timestamp(value).isoformat().replace("+00:00", "Z")
+        except ValueError:
+            return value
+    return value
 
 
 _SOURCE_TABLES = {

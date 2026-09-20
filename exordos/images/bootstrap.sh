@@ -24,6 +24,13 @@ migrate_to_persistent_stop_start \
     "/var/lib/postgresql" \
     "${PERSISTENT_MOUNT}/var/lib/postgresql" \
     "postgresql@${PG_VERSION}-main"
+install -d -o "$DATABASE_ROLE" -g "$DATABASE_ROLE" -m 0700 \
+    "/var/lib/workspace_zulip_bridge"
+migrate_to_persistent \
+    "/var/lib/workspace_zulip_bridge" \
+    "${PERSISTENT_MOUNT}/var/lib/workspace_zulip_bridge" \
+    "$DATABASE_ROLE" \
+    "$DATABASE_ROLE"
 persist_migrate_complete
 
 sudo systemctl enable --now postgresql
