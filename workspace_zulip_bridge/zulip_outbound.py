@@ -24,6 +24,14 @@ class ZulipOutboundError(RuntimeError):
     """A Workspace mutation cannot currently be represented in Zulip."""
 
 
+def _json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, str):
+        value = json.loads(value)
+    if not isinstance(value, dict):
+        raise ValueError("expected a JSON object")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class _Actor:
     connection_uuid: UUID
@@ -756,7 +764,7 @@ class ZulipOutboundWriter:
             topic_uuid,
         )
         if row is not None:
-            return dict(row["data"])
+            return _json_object(row["data"])
         row = await self._pool.fetchrow(
             "SELECT name FROM workspace_zulip_bridge.zulip_topics WHERE uuid = $1",
             topic_uuid,
