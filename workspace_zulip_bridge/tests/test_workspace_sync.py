@@ -1,7 +1,9 @@
 # Copyright 2026 Genesis Corporation
 # Licensed under the Apache License, Version 2.0 (the "License").
 
+from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.workspace_sync import _equivalent_entity
+from workspace_zulip_bridge.workspace_sync import workspace_directory_url
 
 
 def test_reaction_equivalence_ignores_reload_timestamp() -> None:
@@ -31,4 +33,16 @@ def test_reaction_equivalence_still_compares_identity_fields() -> None:
         "message_reactions",
         source,
         {**source, "emoji_name": "heart"},
+    )
+
+
+def test_workspace_directory_uses_public_user_route() -> None:
+    settings = Settings.from_env(
+        {
+            "WZB_WORKSPACE_API_URL": "https://workspace.test/api/workspace/v1",
+        }
+    )
+
+    assert workspace_directory_url(settings) == (
+        "https://workspace.test/api/workspace/v1/users/"
     )

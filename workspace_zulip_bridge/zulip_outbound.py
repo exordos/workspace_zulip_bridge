@@ -124,8 +124,9 @@ class ZulipOutboundWriter:
         entity_uuid: UUID,
         target: dict[str, Any],
     ) -> None:
-        owner_uuid = UUID(str(target["owner_uuid"]))
-        actor = await self._actor(owner_uuid)
+        workspace_owner_uuid = UUID(str(target["owner_uuid"]))
+        actor = await self._actor(workspace_owner_uuid)
+        owner_uuid = actor.user_uuid
         if bool(target.get("private")):
             user_rows = await self._pool.fetch(
                 """
@@ -136,6 +137,8 @@ class ZulipOutboundWriter:
                  AND mirror.active_generation = binding.snapshot_generation
                 JOIN workspace_zulip_bridge.zulip_users AS zulip_user
                   ON zulip_user.uuid = (binding.data ->> 'user_uuid')::uuid
+                  OR zulip_user.workspace_user_uuid =
+                     (binding.data ->> 'user_uuid')::uuid
                 WHERE binding.provider_uuid = $1
                   AND (binding.data ->> 'stream_uuid')::uuid = $2
                 ORDER BY zulip_user.zulip_user_id
@@ -160,10 +163,13 @@ class ZulipOutboundWriter:
                     for row in await self._target_rows(
                         "stream_bindings", "stream_uuid", entity_uuid
                     )
-                    if UUID(str(row["data"]["user_uuid"])) != owner_uuid
+                    if UUID(str(row["data"]["user_uuid"]))
+                    != workspace_owner_uuid
                 ),
                 None,
             )
+            if direct_user_uuid is not None:
+                direct_user_uuid = await self._zulip_user_uuid(direct_user_uuid)
         else:
             stream_id = await asyncio.to_thread(
                 self._client(actor).create_stream,
@@ -279,7 +285,7 @@ class ZulipOutboundWriter:
             """,
             entity_uuid,
             UUID(str(target["stream_uuid"])),
-            UUID(str(target["user_uuid"])),
+            actor.user_uuid,
             str(target.get("role", "member")),
             str(target.get("notification_mode", "all_messages")),
             _canonical_hash(target),
@@ -369,7 +375,7 @@ class ZulipOutboundWriter:
             entity_uuid,
             UUID(str(target["stream_uuid"])),
             UUID(str(target["topic_uuid"])),
-            UUID(str(target["user_uuid"])),
+            actor.user_uuid,
             str(target.get("notification_mode", "default")),
             _canonical_hash(target),
             created_at,
@@ -455,14 +461,14 @@ class ZulipOutboundWriter:
         )
         sent_at = int(created_at.timestamp())
         content_hash = message_content_hash(
-            sender_user_uuid=author_uuid,
+            sender_user_uuid=actor.user_uuid,
             chat_key=str(stream["chat_key"]),
             topic_name=str(topic["name"]),
             content=content,
             sent_at=sent_at,
         )
         state_hash = message_state_hash(
-            sender_user_uuid=author_uuid,
+            sender_user_uuid=actor.user_uuid,
             chat_key=str(stream["chat_key"]),
             topic_name=str(topic["name"]),
             content=content,
@@ -500,7 +506,7 @@ class ZulipOutboundWriter:
                 stream["source_connection_uuid"],
                 stream_uuid,
                 topic_uuid,
-                author_uuid,
+                actor.user_uuid,
                 message_id,
                 content,
                 content_hash,
@@ -574,7 +580,7 @@ class ZulipOutboundWriter:
             actor.realm_uuid,
             UUID(str(target["stream_uuid"])),
             UUID(str(target["message_uuid"])),
-            UUID(str(target["user_uuid"])),
+            actor.user_uuid,
             *values.values(),
             message_flags_hash(**values),
         )
@@ -616,8 +622,14 @@ class ZulipOutboundWriter:
               ON zulip_user.uuid = connection.zulip_user_uuid
             JOIN workspace_zulip_bridge.zulip_realms AS realm
               ON realm.uuid = connection.realm_uuid
-            WHERE connection.zulip_user_uuid = $1 AND NOT zulip_user.disabled
-            ORDER BY connection.sync_enabled DESC, connection.uuid LIMIT 1
+            WHERE (
+                    connection.zulip_user_uuid = $1
+                    OR zulip_user.workspace_user_uuid = $1
+                  )
+              AND NOT zulip_user.disabled
+            ORDER BY (connection.zulip_user_uuid = $1) DESC,
+                     connection.sync_enabled DESC, connection.uuid
+            LIMIT 1
             """,
             user_uuid,
         )
@@ -642,6 +654,21 @@ class ZulipOutboundWriter:
         if row is None:
             raise ZulipOutboundError(f"Zulip credential is unavailable for {user_uuid}")
         return _Actor(**dict(row))
+
+    async def _zulip_user_uuid(self, user_uuid: UUID) -> UUID:
+        value = await self._pool.fetchval(
+            """
+            SELECT uuid
+            FROM workspace_zulip_bridge.zulip_users
+            WHERE uuid = $1 OR workspace_user_uuid = $1
+            ORDER BY (uuid = $1) DESC
+            LIMIT 1
+            """,
+            user_uuid,
+        )
+        if value is None:
+            raise ZulipOutboundError(f"Zulip identity is unavailable for {user_uuid}")
+        return UUID(str(value))
 
     async def _stream_actor(self, stream_uuid: UUID) -> _Actor:
         stream = await self._required_stream(stream_uuid)

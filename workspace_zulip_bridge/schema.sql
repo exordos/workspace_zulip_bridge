@@ -34,6 +34,11 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_users (
 );
 ALTER TABLE workspace_zulip_bridge.zulip_users
     ADD COLUMN IF NOT EXISTS is_bot boolean NOT NULL DEFAULT false;
+ALTER TABLE workspace_zulip_bridge.zulip_users
+    ADD COLUMN IF NOT EXISTS workspace_user_uuid uuid;
+CREATE UNIQUE INDEX IF NOT EXISTS zulip_users_workspace_identity_idx
+    ON workspace_zulip_bridge.zulip_users (realm_uuid, workspace_user_uuid)
+    WHERE workspace_user_uuid IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_connections (
     uuid uuid PRIMARY KEY,

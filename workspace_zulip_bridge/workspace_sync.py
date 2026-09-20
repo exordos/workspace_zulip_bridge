@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import time
 from collections import defaultdict
 from collections.abc import Mapping
 from datetime import UTC
@@ -89,6 +90,13 @@ def workspace_api_url(settings: Settings) -> str:
     return f"{api_root}/messenger"
 
 
+def workspace_directory_url(settings: Settings) -> str:
+    root = workspace_api_url(settings).rstrip("/")
+    if root.endswith("/messenger"):
+        root = root[: -len("/messenger")]
+    return f"{root}/users/"
+
+
 class WorkspaceBootstrapper:
     def __init__(
         self,
@@ -104,6 +112,7 @@ class WorkspaceBootstrapper:
         self._provider_uuid = settings.workspace_provider_uuid
         self._project_uuid = settings.workspace_project_id
         self._tokens = tokens or WorkspaceTokenManager(settings)
+        self._next_identity_sync_at = 0.0
 
     async def ensure(self) -> bool:
         row = await self._pool.fetchrow(
@@ -123,6 +132,11 @@ class WorkspaceBootstrapper:
             and row["active_generation"] is not None
             and not row["recovery_required"]
         ):
+            if time.monotonic() >= self._next_identity_sync_at:
+                await self._reconcile_workspace_identities(
+                    UUID(str(row["active_generation"])),
+                    schedule_changes=True,
+                )
             return False
         await self.bootstrap()
         return True
@@ -251,6 +265,12 @@ class WorkspaceBootstrapper:
             )
         for entity_type, records in buffers.items():
             await self._copy(entity_type, records)
+        identity_count = await self._reconcile_workspace_identities(
+            generation,
+            client=client,
+            schedule_changes=False,
+        )
+        counts["users"] += identity_count
         epoch_generation = UUID(str(meta["epoch_generation"]))
         epoch_version = int(meta["snapshot_epoch_version"])
         async with self._pool.acquire() as connection, connection.transaction():
@@ -307,6 +327,220 @@ class WorkspaceBootstrapper:
                 generation,
             )
         LOG.info("Workspace bootstrap activated: counts=%s", counts)
+
+    async def _reconcile_workspace_identities(
+        self,
+        generation: UUID,
+        *,
+        client: httpx.AsyncClient | None = None,
+        schedule_changes: bool,
+    ) -> int:
+        if client is None:
+            verify: bool | str = (
+                True
+                if self._settings.workspace_ca_file is None
+                else str(self._settings.workspace_ca_file)
+            )
+            async with httpx.AsyncClient(
+                verify=verify,
+                timeout=httpx.Timeout(
+                    self._settings.workspace_request_timeout_seconds
+                ),
+            ) as owned_client:
+                return await self._reconcile_workspace_identities(
+                    generation,
+                    client=owned_client,
+                    schedule_changes=schedule_changes,
+                )
+        response = await self._get(
+            client,
+            workspace_directory_url(self._settings),
+            params={},
+        )
+        response.raise_for_status()
+        raw_users = response.json()
+        if not isinstance(raw_users, list):
+            raise ValueError("invalid Workspace user directory")
+        iam_by_email: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for raw_user in raw_users:
+            user = _json_object(raw_user)
+            email = str(user.get("email") or "").strip().casefold()
+            if user.get("source") == "iam" and email:
+                iam_by_email[email].append(user)
+        canonical_users = {
+            email: users[0]
+            for email, users in iam_by_email.items()
+            if len(users) == 1
+        }
+        local_users = await self._pool.fetch(
+            """
+            SELECT zulip_user.uuid, zulip_user.login,
+                   zulip_user.workspace_user_uuid
+            FROM workspace_zulip_bridge.zulip_users AS zulip_user
+            JOIN workspace_zulip_bridge.zulip_realms AS realm
+              ON realm.uuid = zulip_user.realm_uuid
+            WHERE NOT zulip_user.is_bot
+              AND EXISTS (
+                    SELECT 1
+                    FROM workspace_zulip_bridge.zulip_connections AS connection
+                    WHERE connection.zulip_user_uuid = zulip_user.uuid
+                      AND connection.sync_enabled
+                      AND lower(btrim(connection.login)) =
+                          lower(btrim(zulip_user.login))
+              )
+              AND (
+                    realm.workspace_provider_uuid = $1
+                    OR (
+                        realm.workspace_provider_uuid IS NULL
+                        AND realm.workspace_project_id = $2
+                    )
+              )
+            """,
+            self._provider_uuid,
+            self._project_uuid,
+        )
+        desired = {
+            UUID(str(row["uuid"])): UUID(str(canonical_users[email]["uuid"]))
+            for row in local_users
+            if (email := str(row["login"]).strip().casefold()) in canonical_users
+        }
+        current = {
+            UUID(str(row["uuid"])): (
+                None
+                if row["workspace_user_uuid"] is None
+                else UUID(str(row["workspace_user_uuid"]))
+            )
+            for row in local_users
+        }
+        changed = {
+            user_uuid
+            for user_uuid in current.keys() | desired.keys()
+            if current.get(user_uuid) != desired.get(user_uuid)
+        }
+        directory_rows = []
+        for workspace_user_uuid in sorted(set(desired.values()), key=str):
+            user = next(
+                value
+                for value in canonical_users.values()
+                if UUID(str(value["uuid"])) == workspace_user_uuid
+            )
+            data = {
+                "username": user["username"],
+                "display_name": user.get("display_name") or user["username"],
+                "email": user.get("email"),
+                "avatar": user.get("avatar"),
+                "status": user.get("status", "offline"),
+                "last_ping_at": user.get("last_ping_at"),
+                "status_emoji": user.get("status_emoji"),
+                "status_text": user.get("status_text"),
+                "disabled": False,
+                "is_bot": False,
+                "created_at": user["created_at"],
+            }
+            directory_rows.append(
+                (
+                    self._provider_uuid,
+                    generation,
+                    workspace_user_uuid,
+                    self._project_uuid,
+                    canonical_hash(data),
+                    _timestamp(str(user["updated_at"])),
+                    json.dumps(data, separators=(",", ":")),
+                )
+            )
+        async with self._pool.acquire() as connection, connection.transaction():
+            if local_users:
+                await connection.executemany(
+                    """
+                    UPDATE workspace_zulip_bridge.zulip_users
+                    SET workspace_user_uuid = $2
+                    WHERE uuid = $1 AND workspace_user_uuid IS DISTINCT FROM $2
+                    """,
+                    [
+                        (UUID(str(row["uuid"])), desired.get(UUID(str(row["uuid"]))))
+                        for row in local_users
+                    ],
+                )
+            if directory_rows:
+                await connection.executemany(
+                    """
+                    INSERT INTO workspace_zulip_bridge.workspace_users (
+                        provider_uuid, snapshot_generation, uuid,
+                        workspace_project_id, content_hash,
+                        source_updated_at, data
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                    ON CONFLICT (provider_uuid, snapshot_generation, uuid)
+                    DO UPDATE SET content_hash = EXCLUDED.content_hash,
+                        source_updated_at = EXCLUDED.source_updated_at,
+                        data = EXCLUDED.data, updated_at = clock_timestamp()
+                    """,
+                    directory_rows,
+                )
+            if changed and schedule_changes:
+                changed_values = list(changed)
+                await connection.execute(
+                    """
+                    UPDATE workspace_zulip_bridge.zulip_streams AS stream
+                    SET updated_at = clock_timestamp()
+                    WHERE stream.owner_user_uuid = ANY($1::uuid[])
+                       OR stream.direct_user_uuid = ANY($1::uuid[])
+                       OR EXISTS (
+                            SELECT 1
+                            FROM workspace_zulip_bridge.zulip_connections AS source
+                            WHERE source.uuid = stream.source_connection_uuid
+                              AND source.zulip_user_uuid = ANY($1::uuid[])
+                       )
+                    """,
+                    changed_values,
+                )
+                for table in (
+                    "zulip_stream_bindings",
+                    "zulip_topic_bindings",
+                    "zulip_message_flags",
+                    "zulip_message_reactions",
+                ):
+                    await connection.execute(
+                        f"UPDATE workspace_zulip_bridge.{table} "
+                        "SET updated_at = clock_timestamp() "
+                        "WHERE zulip_user_uuid = ANY($1::uuid[])",
+                        changed_values,
+                    )
+                await connection.execute(
+                    """
+                    UPDATE workspace_zulip_bridge.zulip_messages
+                    SET source_updated_at = clock_timestamp()
+                    WHERE sender_user_uuid = ANY($1::uuid[])
+                    """,
+                    changed_values,
+                )
+                await connection.executemany(
+                    """
+                    INSERT INTO workspace_zulip_bridge.sync_diffs (
+                        provider_uuid, entity_type, entity_uuid, realm_uuid,
+                        direction, source_updated_at
+                    )
+                    SELECT $1, 'users', zulip_user.uuid, zulip_user.realm_uuid,
+                           'to_workspace', clock_timestamp()
+                    FROM workspace_zulip_bridge.zulip_users AS zulip_user
+                    WHERE zulip_user.uuid = $2
+                      AND zulip_user.workspace_user_uuid IS NOT NULL
+                    ON CONFLICT (provider_uuid, entity_type, entity_uuid)
+                    DO UPDATE SET direction = 'to_workspace',
+                        processing_status = 'pending', source_hash = NULL,
+                        source_updated_at = EXCLUDED.source_updated_at,
+                        available_at = clock_timestamp(), last_error = NULL,
+                        updated_at = clock_timestamp()
+                    """,
+                    [(self._provider_uuid, user_uuid) for user_uuid in changed],
+                )
+        self._next_identity_sync_at = time.monotonic() + 300.0
+        if changed:
+            LOG.info(
+                "Workspace identity links reconciled: linked=%d changed=%d",
+                len(desired),
+                len(changed),
+            )
+        return len(directory_rows)
 
     async def _get(
         self,
@@ -654,6 +888,14 @@ class WorkspaceDiffWorker:
             {joins}
             WHERE target.provider_uuid = $1
               AND target.snapshot_generation = $4
+              AND (
+                    $2 <> 'users'
+                    OR NOT EXISTS (
+                        SELECT 1
+                        FROM workspace_zulip_bridge.zulip_users AS linked_user
+                        WHERE linked_user.workspace_user_uuid = target.uuid
+                    )
+              )
               AND NOT EXISTS (
                   SELECT 1
                   FROM workspace_zulip_bridge.{source_table} AS source
@@ -1471,7 +1713,7 @@ _SOURCE_TABLES = {
     "users": {
         "from": "workspace_zulip_bridge.zulip_users",
         "joins": "",
-        "where": "source.realm_uuid = $3",
+        "where": "source.realm_uuid = $3 AND source.workspace_user_uuid IS NULL",
         "hash": "source.profile_hash",
         "partition": "NULL::uuid",
     },
@@ -1480,6 +1722,12 @@ _SOURCE_TABLES = {
         "joins": """
             LEFT JOIN workspace_zulip_bridge.zulip_connections AS supplier
               ON supplier.uuid = source.source_connection_uuid
+            LEFT JOIN workspace_zulip_bridge.zulip_users AS supplier_user
+              ON supplier_user.uuid = supplier.zulip_user_uuid
+            LEFT JOIN workspace_zulip_bridge.zulip_users AS owner_user
+              ON owner_user.uuid = source.owner_user_uuid
+            LEFT JOIN workspace_zulip_bridge.zulip_users AS direct_user_source
+              ON direct_user_source.uuid = source.direct_user_uuid
         """,
         "where": """
             source.realm_uuid = $3 AND source.source_connection_uuid IS NOT NULL
@@ -1488,7 +1736,10 @@ _SOURCE_TABLES = {
                 WHERE owner.provider_uuid = $1
                   AND owner.snapshot_generation = $4
                   AND owner.uuid = COALESCE(
-                      source.owner_user_uuid, supplier.zulip_user_uuid
+                      owner_user.workspace_user_uuid,
+                      source.owner_user_uuid,
+                      supplier_user.workspace_user_uuid,
+                      supplier.zulip_user_uuid
                   )
             )
             AND (
@@ -1497,7 +1748,10 @@ _SOURCE_TABLES = {
                     FROM workspace_zulip_bridge.workspace_users AS direct_user
                     WHERE direct_user.provider_uuid = $1
                       AND direct_user.snapshot_generation = $4
-                      AND direct_user.uuid = source.direct_user_uuid
+                      AND direct_user.uuid = COALESCE(
+                          direct_user_source.workspace_user_uuid,
+                          source.direct_user_uuid
+                      )
                 )
             )
         """,
@@ -1506,7 +1760,12 @@ _SOURCE_TABLES = {
     },
     "stream_bindings": {
         "from": "workspace_zulip_bridge.zulip_stream_bindings",
-        "joins": "JOIN workspace_zulip_bridge.zulip_streams AS parent ON parent.uuid = source.zulip_stream_uuid",
+        "joins": """
+            JOIN workspace_zulip_bridge.zulip_streams AS parent
+              ON parent.uuid = source.zulip_stream_uuid
+            JOIN workspace_zulip_bridge.zulip_users AS bound_user
+              ON bound_user.uuid = source.zulip_user_uuid
+        """,
         "where": """
             parent.realm_uuid = $3 AND parent.source_connection_uuid IS NOT NULL
             AND EXISTS (
@@ -1519,7 +1778,9 @@ _SOURCE_TABLES = {
                 SELECT 1 FROM workspace_zulip_bridge.workspace_users AS target_user
                 WHERE target_user.provider_uuid = $1
                   AND target_user.snapshot_generation = $4
-                  AND target_user.uuid = source.zulip_user_uuid
+                  AND target_user.uuid = COALESCE(
+                      bound_user.workspace_user_uuid, source.zulip_user_uuid
+                  )
             )
         """,
         "hash": "source.content_hash",
@@ -1542,7 +1803,12 @@ _SOURCE_TABLES = {
     },
     "topic_bindings": {
         "from": "workspace_zulip_bridge.zulip_topic_bindings",
-        "joins": "JOIN workspace_zulip_bridge.zulip_streams AS parent ON parent.uuid = source.zulip_stream_uuid",
+        "joins": """
+            JOIN workspace_zulip_bridge.zulip_streams AS parent
+              ON parent.uuid = source.zulip_stream_uuid
+            JOIN workspace_zulip_bridge.zulip_users AS bound_user
+              ON bound_user.uuid = source.zulip_user_uuid
+        """,
         "where": """
             parent.realm_uuid = $3 AND parent.source_connection_uuid IS NOT NULL
             AND EXISTS (
@@ -1561,7 +1827,9 @@ _SOURCE_TABLES = {
                 SELECT 1 FROM workspace_zulip_bridge.workspace_users AS target_user
                 WHERE target_user.provider_uuid = $1
                   AND target_user.snapshot_generation = $4
-                  AND target_user.uuid = source.zulip_user_uuid
+                  AND target_user.uuid = COALESCE(
+                      bound_user.workspace_user_uuid, source.zulip_user_uuid
+                  )
             )
         """,
         "hash": "source.content_hash",
@@ -1569,7 +1837,10 @@ _SOURCE_TABLES = {
     },
     "messages": {
         "from": "workspace_zulip_bridge.zulip_messages",
-        "joins": "",
+        "joins": """
+            JOIN workspace_zulip_bridge.zulip_users AS sender_user
+              ON sender_user.uuid = source.sender_user_uuid
+        """,
         "where": """
             source.realm_uuid = $3
             AND EXISTS (
@@ -1588,7 +1859,9 @@ _SOURCE_TABLES = {
                 SELECT 1 FROM workspace_zulip_bridge.workspace_users AS target_user
                 WHERE target_user.provider_uuid = $1
                   AND target_user.snapshot_generation = $4
-                  AND target_user.uuid = source.sender_user_uuid
+                  AND target_user.uuid = COALESCE(
+                      sender_user.workspace_user_uuid, source.sender_user_uuid
+                  )
             )
         """,
         "hash": "source.content_hash",
@@ -1596,7 +1869,10 @@ _SOURCE_TABLES = {
     },
     "message_flags": {
         "from": "workspace_zulip_bridge.zulip_message_flags",
-        "joins": "",
+        "joins": """
+            JOIN workspace_zulip_bridge.zulip_users AS flag_user
+              ON flag_user.uuid = source.zulip_user_uuid
+        """,
         "where": """
             source.realm_uuid = $3
             AND EXISTS (
@@ -1609,7 +1885,9 @@ _SOURCE_TABLES = {
                 SELECT 1 FROM workspace_zulip_bridge.workspace_users AS target_user
                 WHERE target_user.provider_uuid = $1
                   AND target_user.snapshot_generation = $4
-                  AND target_user.uuid = source.zulip_user_uuid
+                  AND target_user.uuid = COALESCE(
+                      flag_user.workspace_user_uuid, source.zulip_user_uuid
+                  )
             )
         """,
         "hash": "source.flags_hash",
@@ -1617,7 +1895,12 @@ _SOURCE_TABLES = {
     },
     "message_reactions": {
         "from": "workspace_zulip_bridge.zulip_message_reactions",
-        "joins": "JOIN workspace_zulip_bridge.zulip_messages AS message ON message.uuid = source.message_uuid",
+        "joins": """
+            JOIN workspace_zulip_bridge.zulip_messages AS message
+              ON message.uuid = source.message_uuid
+            JOIN workspace_zulip_bridge.zulip_users AS reaction_user
+              ON reaction_user.uuid = source.zulip_user_uuid
+        """,
         "where": """
             source.realm_uuid = $3
             AND EXISTS (
@@ -1630,7 +1913,9 @@ _SOURCE_TABLES = {
                 SELECT 1 FROM workspace_zulip_bridge.workspace_users AS target_user
                 WHERE target_user.provider_uuid = $1
                   AND target_user.snapshot_generation = $4
-                  AND target_user.uuid = source.zulip_user_uuid
+                  AND target_user.uuid = COALESCE(
+                      reaction_user.workspace_user_uuid, source.zulip_user_uuid
+                  )
             )
         """,
         "hash": "NULL::bytea",
@@ -1670,13 +1955,19 @@ _ENTITY_QUERIES = {
         JOIN workspace_zulip_bridge.zulip_realms AS realm
           ON realm.uuid = zulip_user.realm_uuid
         WHERE zulip_user.uuid = ANY($1::uuid[])
+          AND zulip_user.workspace_user_uuid IS NULL
     """,
     "streams": """
         SELECT stream.uuid AS entity_uuid, jsonb_build_object(
             'name', stream.name, 'description', stream.description,
-            'owner_uuid', COALESCE(stream.owner_user_uuid, connection.zulip_user_uuid),
+            'owner_uuid', COALESCE(
+                owner_user.workspace_user_uuid, stream.owner_user_uuid,
+                connection_user.workspace_user_uuid, connection.zulip_user_uuid
+            ),
             'invite_only', stream.invite_only, 'announce', stream.announce,
-            'direct_user_uuid', stream.direct_user_uuid,
+            'direct_user_uuid', COALESCE(
+                direct_user.workspace_user_uuid, stream.direct_user_uuid
+            ),
             'private', stream.private, 'is_archived', stream.is_archived,
             'color', COALESCE(stream.color, 0),
             'history_public_to_subscribers',
@@ -1686,13 +1977,24 @@ _ENTITY_QUERIES = {
         FROM workspace_zulip_bridge.zulip_streams AS stream
         LEFT JOIN workspace_zulip_bridge.zulip_connections AS connection
           ON connection.uuid = stream.source_connection_uuid
+        LEFT JOIN workspace_zulip_bridge.zulip_users AS connection_user
+          ON connection_user.uuid = connection.zulip_user_uuid
+        LEFT JOIN workspace_zulip_bridge.zulip_users AS owner_user
+          ON owner_user.uuid = stream.owner_user_uuid
+        LEFT JOIN workspace_zulip_bridge.zulip_users AS direct_user
+          ON direct_user.uuid = stream.direct_user_uuid
         WHERE stream.uuid = ANY($1::uuid[])
     """,
     "stream_bindings": """
         SELECT binding.uuid AS entity_uuid, jsonb_build_object(
             'stream_uuid', binding.zulip_stream_uuid,
-            'user_uuid', binding.zulip_user_uuid,
-            'who_uuid', COALESCE(stream.owner_user_uuid, connection.zulip_user_uuid),
+            'user_uuid', COALESCE(
+                bound_user.workspace_user_uuid, binding.zulip_user_uuid
+            ),
+            'who_uuid', COALESCE(
+                owner_user.workspace_user_uuid, stream.owner_user_uuid,
+                connection_user.workspace_user_uuid, connection.zulip_user_uuid
+            ),
             'role', binding.role,
             'notification_mode', binding.notification_mode,
             'created_at', binding.created_at
@@ -1700,8 +2002,14 @@ _ENTITY_QUERIES = {
         FROM workspace_zulip_bridge.zulip_stream_bindings AS binding
         JOIN workspace_zulip_bridge.zulip_streams AS stream
           ON stream.uuid = binding.zulip_stream_uuid
+        JOIN workspace_zulip_bridge.zulip_users AS bound_user
+          ON bound_user.uuid = binding.zulip_user_uuid
         LEFT JOIN workspace_zulip_bridge.zulip_connections AS connection
           ON connection.uuid = stream.source_connection_uuid
+        LEFT JOIN workspace_zulip_bridge.zulip_users AS connection_user
+          ON connection_user.uuid = connection.zulip_user_uuid
+        LEFT JOIN workspace_zulip_bridge.zulip_users AS owner_user
+          ON owner_user.uuid = stream.owner_user_uuid
         WHERE binding.uuid = ANY($1::uuid[])
     """,
     "topics": """
@@ -1712,35 +2020,63 @@ _ENTITY_QUERIES = {
         WHERE uuid = ANY($1::uuid[])
     """,
     "topic_bindings": """
-        SELECT uuid AS entity_uuid, jsonb_build_object(
-            'stream_uuid', zulip_stream_uuid, 'topic_uuid', topic_uuid,
-            'user_uuid', zulip_user_uuid, 'notification_mode', notification_mode,
-            'created_at', created_at
-        ) AS data FROM workspace_zulip_bridge.zulip_topic_bindings
-        WHERE uuid = ANY($1::uuid[])
+        SELECT binding.uuid AS entity_uuid, jsonb_build_object(
+            'stream_uuid', binding.zulip_stream_uuid,
+            'topic_uuid', binding.topic_uuid,
+            'user_uuid', COALESCE(
+                zulip_user.workspace_user_uuid, binding.zulip_user_uuid
+            ), 'notification_mode', binding.notification_mode,
+            'created_at', binding.created_at
+        ) AS data
+        FROM workspace_zulip_bridge.zulip_topic_bindings AS binding
+        JOIN workspace_zulip_bridge.zulip_users AS zulip_user
+          ON zulip_user.uuid = binding.zulip_user_uuid
+        WHERE binding.uuid = ANY($1::uuid[])
     """,
     "messages": """
-        SELECT uuid AS entity_uuid, jsonb_build_object(
-            'stream_uuid', zulip_stream_uuid, 'topic_uuid', topic_uuid,
-            'author_uuid', sender_user_uuid,
-            'payload', jsonb_build_object('kind', 'markdown', 'content', content),
-            'created_at', created_at
-        ) AS data FROM workspace_zulip_bridge.zulip_messages
-        WHERE uuid = ANY($1::uuid[])
+        SELECT message.uuid AS entity_uuid, jsonb_build_object(
+            'stream_uuid', message.zulip_stream_uuid,
+            'topic_uuid', message.topic_uuid,
+            'author_uuid', COALESCE(
+                sender.workspace_user_uuid, message.sender_user_uuid
+            ),
+            'payload', jsonb_build_object(
+                'kind', 'markdown', 'content', message.content
+            ),
+            'created_at', message.created_at
+        ) AS data
+        FROM workspace_zulip_bridge.zulip_messages AS message
+        JOIN workspace_zulip_bridge.zulip_users AS sender
+          ON sender.uuid = message.sender_user_uuid
+        WHERE message.uuid = ANY($1::uuid[])
     """,
     "message_flags": """
-        SELECT uuid AS entity_uuid, jsonb_build_object(
-            'stream_uuid', zulip_stream_uuid, 'message_uuid', message_uuid,
-            'user_uuid', zulip_user_uuid, 'read', is_read,
-            'pinned', false, 'starred', is_starred, 'mentioned', is_mentioned
-        ) AS data FROM workspace_zulip_bridge.zulip_message_flags
-        WHERE uuid = ANY($1::uuid[])
+        SELECT flag.uuid AS entity_uuid, jsonb_build_object(
+            'stream_uuid', flag.zulip_stream_uuid,
+            'message_uuid', flag.message_uuid,
+            'user_uuid', COALESCE(
+                flag_user.workspace_user_uuid, flag.zulip_user_uuid
+            ), 'read', flag.is_read,
+            'pinned', false, 'starred', flag.is_starred,
+            'mentioned', flag.is_mentioned
+        ) AS data
+        FROM workspace_zulip_bridge.zulip_message_flags AS flag
+        JOIN workspace_zulip_bridge.zulip_users AS flag_user
+          ON flag_user.uuid = flag.zulip_user_uuid
+        WHERE flag.uuid = ANY($1::uuid[])
     """,
     "message_reactions": """
-        SELECT uuid AS entity_uuid, jsonb_build_object(
-            'message_uuid', message_uuid, 'user_uuid', zulip_user_uuid,
-            'emoji_name', emoji_name, 'created_at', created_at
-        ) AS data FROM workspace_zulip_bridge.zulip_message_reactions
-        WHERE uuid = ANY($1::uuid[])
+        SELECT reaction.uuid AS entity_uuid, jsonb_build_object(
+            'message_uuid', reaction.message_uuid,
+            'user_uuid', COALESCE(
+                reaction_user.workspace_user_uuid, reaction.zulip_user_uuid
+            ),
+            'emoji_name', reaction.emoji_name,
+            'created_at', reaction.created_at
+        ) AS data
+        FROM workspace_zulip_bridge.zulip_message_reactions AS reaction
+        JOIN workspace_zulip_bridge.zulip_users AS reaction_user
+          ON reaction_user.uuid = reaction.zulip_user_uuid
+        WHERE reaction.uuid = ANY($1::uuid[])
     """,
 }

@@ -392,6 +392,8 @@ async def _workspace_bootstrap_round_trip(dsn: str, tmp_path: Path) -> None:
     }
 
     async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/users"):
+            return httpx.Response(200, json=[])
         if request.url.path.endswith("/provider/bootstrap"):
             assert request.url.params["mode"] == "paged"
             return httpx.Response(
