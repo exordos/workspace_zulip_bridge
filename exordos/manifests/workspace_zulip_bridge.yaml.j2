@@ -19,11 +19,11 @@ resources:
       disk_spec:
         kind: "disks"
         disks:
-          - label: "root"
-            size: 6
+          - size: 6
             image: "{{ images['workspace_zulip_bridge'] }}"
-          - label: "data"
-            size: 20
+            label: root
+          - size: 20
+            label: data
 
 exports:
   bridge_node:

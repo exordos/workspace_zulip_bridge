@@ -57,10 +57,20 @@ def test_exordos_manifest_renders_without_implicit_values() -> None:
     assert manifest["name"] == "workspace_zulip_bridge"
     assert node["cores"] == 2
     assert node["ram"] == 4096
-    assert node["disk_spec"]["disks"][1] == {"label": "data", "size": 20}
-    assert node["disk_spec"]["disks"][0]["image"] == (
-        "urn:images:00000000-0000-0000-0000-000000000000"
-    )
+    assert node["disk_spec"] == {
+        "kind": "disks",
+        "disks": [
+            {
+                "size": 6,
+                "image": "urn:images:00000000-0000-0000-0000-000000000000",
+                "label": "root",
+            },
+            {"size": 20, "label": "data"},
+        ],
+    }
+    project_id = "12345678-c625-4fee-81d5-f691897b8142"
+    assert node["project_id"] == project_id
+    assert "$core.compute.volumes" not in manifest["resources"]
     assert manifest["exports"]["bridge_node"] == {
         "kind": "resource",
         "link": "$core.compute.nodes.$bridge_node",

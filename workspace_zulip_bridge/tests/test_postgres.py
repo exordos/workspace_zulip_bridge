@@ -876,8 +876,10 @@ async def _insert_user(
     queue_id: str | None = None,
     status: str = "init",
     is_bot: bool = False,
+    connection_uuid: UUID | None = None,
 ) -> UUID:
     user_uuid = stable_user_uuid(ENDPOINT, user_id)
+    connection_uuid = connection_uuid or user_uuid
     await connection.execute(
         """
         INSERT INTO workspace_zulip_bridge.zulip_realms
@@ -908,16 +910,17 @@ async def _insert_user(
             INSERT INTO workspace_zulip_bridge.zulip_connections
                 (uuid, realm_uuid, zulip_user_uuid, login, api_key,
                  queue_id, last_event_id, lifecycle_status)
-            VALUES ($1, $2, $1, $3, $4, $5, 0, $6)
+            VALUES ($1, $2, $3, $4, $5, $6, 0, $7)
             """,
-            user_uuid,
+            connection_uuid,
             stable_realm_uuid(ENDPOINT),
+            user_uuid,
             f"user-{user_id}@example.test",
             api_key,
             queue_id,
             status,
         )
-    return user_uuid
+    return connection_uuid
 
 
 def _catalog(
@@ -937,6 +940,55 @@ def _catalog(
 
 def test_directory_uses_stable_user_ids_and_keeps_bots_without_connections() -> None:
     asyncio.run(_directory_round_trip(_dsn()))
+
+
+def test_user_identity_allows_distinct_connection_uuid() -> None:
+    asyncio.run(_distinct_connection_identity_round_trip(_dsn()))
+
+
+async def _distinct_connection_identity_round_trip(dsn: str) -> None:
+    pool = await _pool(dsn)
+    connection_uuid = UUID("00000000-0000-4000-8000-000000000010")
+    try:
+        async with pool.acquire() as connection:
+            returned_uuid = await _insert_user(
+                connection,
+                10,
+                400,
+                connection_uuid=connection_uuid,
+            )
+        assert returned_uuid == connection_uuid
+
+        store = EventStore(pool)
+        users = await store.list_users()
+        assert [user.uuid for user in users] == [connection_uuid]
+        assert await store.set_user_identity(
+            connection_uuid,
+            ENDPOINT,
+            10,
+            "Current Name",
+            200,
+        )
+        assert not await store.set_user_identity(
+            connection_uuid,
+            ENDPOINT,
+            11,
+            "Wrong User",
+            100,
+        )
+
+        async with pool.acquire() as connection:
+            identity = await connection.fetchrow(
+                "SELECT full_name, role "
+                "FROM workspace_zulip_bridge.zulip_users "
+                "WHERE uuid = $1",
+                stable_user_uuid(ENDPOINT, 10),
+            )
+        assert identity is not None
+        assert identity["full_name"] == "Current Name"
+        assert identity["role"] == 200
+    finally:
+        await pool.close()
 
 
 async def _directory_round_trip(dsn: str) -> None:

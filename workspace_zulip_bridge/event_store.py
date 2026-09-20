@@ -92,14 +92,13 @@ class EventStore:
 
     async def set_user_identity(
         self,
-        user_uuid: UUID,
+        connection_uuid: UUID,
         endpoint: str,
         zulip_user_id: int,
         full_name: str,
         role: int,
     ) -> bool:
-        if user_uuid != stable_user_uuid(endpoint, zulip_user_id):
-            raise ValueError("Zulip user UUID does not match its stable identity")
+        identity_uuid = stable_user_uuid(endpoint, zulip_user_id)
         async with self._pool.acquire() as connection:
             status = await connection.execute(
                 """
@@ -111,15 +110,17 @@ class EventStore:
                 WHERE connection.uuid = $1
                   AND connection.zulip_user_uuid = zulip_user.uuid
                   AND zulip_user.zulip_user_id = $2
+                  AND zulip_user.uuid = $6
                   AND realm.identity_key = $5
                   AND connection.sync_enabled AND NOT zulip_user.disabled
                   AND NOT zulip_user.is_bot
                 """,
-                user_uuid,
+                connection_uuid,
                 zulip_user_id,
                 full_name,
                 role,
                 canonical_endpoint(endpoint),
+                identity_uuid,
             )
         return status == "UPDATE 1"
 

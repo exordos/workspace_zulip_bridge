@@ -13,7 +13,13 @@ SERVICE_NAME="workspace-zulip-bridge"
 DATABASE_NAME="workspace_zulip_bridge"
 DATABASE_ROLE="workspace_zulip_bridge"
 
-PERSISTENT_DISK=$(find_persistent_disk)
+PERSISTENT_DISK=""
+for _ in {1..300}; do
+    if PERSISTENT_DISK=$(find_persistent_disk); then
+        break
+    fi
+    sleep 1
+done
 if [[ -z "$PERSISTENT_DISK" ]]; then
     echo "workspace-zulip-bridge requires a persistent data disk" >&2
     exit 1
