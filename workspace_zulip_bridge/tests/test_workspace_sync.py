@@ -3,6 +3,7 @@
 
 from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.workspace_sync import _equivalent_entity
+from workspace_zulip_bridge.workspace_sync import _reaction_identity
 from workspace_zulip_bridge.workspace_sync import identity_rebind_required
 from workspace_zulip_bridge.workspace_sync import workspace_directory_url
 
@@ -55,6 +56,21 @@ def test_reaction_equivalence_still_compares_identity_fields() -> None:
         "message_reactions",
         source,
         {**source, "emoji_name": "heart"},
+    )
+
+
+def test_reaction_identity_matches_workspace_unique_constraint() -> None:
+    assert _reaction_identity(
+        {
+            "message_uuid": "10000000-0000-0000-0000-000000000001",
+            "user_uuid": "10000000-0000-0000-0000-000000000002",
+            "emoji_name": "smile",
+            "created_at": "2026-09-20T12:00:00Z",
+        }
+    ) == (
+        "10000000-0000-0000-0000-000000000001",
+        "10000000-0000-0000-0000-000000000002",
+        "smile",
     )
 
 

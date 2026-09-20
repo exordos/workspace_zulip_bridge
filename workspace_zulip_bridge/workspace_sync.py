@@ -120,6 +120,14 @@ def identity_rebind_required(
     )
 
 
+def _reaction_identity(data: Mapping[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(data["message_uuid"]),
+        str(data["user_uuid"]),
+        str(data["emoji_name"]),
+    )
+
+
 class WorkspaceBootstrapper:
     def __init__(
         self,
@@ -1197,6 +1205,13 @@ class WorkspaceDiffWorker:
             targets.update(
                 await self._load_workspace_entities(entity_type, entity_uuids)
             )
+        reaction_sources = [
+            data
+            for (entity_type, _), data in loaded.items()
+            if entity_type == "message_reactions"
+        ]
+        reaction_owners = await self._workspace_reaction_owners(reaction_sources)
+        skipped: list[asyncpg.Record] = []
         for row in to_workspace:
             data = loaded.get((row["entity_type"], row["entity_uuid"]))
             if data is None:
@@ -1209,6 +1224,12 @@ class WorkspaceDiffWorker:
                 )
                 records.append((row, {}, b""))
                 continue
+            if row["entity_type"] == "message_reactions":
+                identity = _reaction_identity(data)
+                owner = reaction_owners.setdefault(identity, row["entity_uuid"])
+                if owner != row["entity_uuid"]:
+                    skipped.append(row)
+                    continue
             content_hash = canonical_hash(data)
             operation = {
                 "action": "upsert",
@@ -1228,6 +1249,14 @@ class WorkspaceDiffWorker:
                 operation["rebind_identity"] = True
             operations.append(operation)
             records.append((row, data, content_hash))
+        if skipped:
+            await self._mark(
+                skipped,
+                "skipped",
+                "workspace_reaction_identity_duplicate",
+            )
+        if not operations:
+            return len(rows)
         try:
             response = await self._post(
                 client,
@@ -1714,6 +1743,42 @@ class WorkspaceDiffWorker:
         )
         return {
             (entity_type, UUID(str(row["entity_uuid"]))): _json_object(row["data"])
+            for row in rows
+        }
+
+    async def _workspace_reaction_owners(
+        self,
+        reactions: list[dict[str, Any]],
+    ) -> dict[tuple[str, str, str], UUID]:
+        if not reactions:
+            return {}
+        requested = [
+            {
+                "message_uuid": identity[0],
+                "user_uuid": identity[1],
+                "emoji_name": identity[2],
+            }
+            for identity in sorted({_reaction_identity(data) for data in reactions})
+        ]
+        rows = await self._pool.fetch(
+            """
+            SELECT entity.uuid, entity.data
+            FROM workspace_zulip_bridge.workspace_message_reactions AS entity
+            JOIN workspace_zulip_bridge.workspace_mirror_state AS mirror
+              ON mirror.provider_uuid = entity.provider_uuid
+             AND mirror.active_generation = entity.snapshot_generation
+            JOIN jsonb_to_recordset($2::jsonb) AS requested(
+                message_uuid text, user_uuid text, emoji_name text
+            ) ON requested.message_uuid = entity.data ->> 'message_uuid'
+               AND requested.user_uuid = entity.data ->> 'user_uuid'
+               AND requested.emoji_name = entity.data ->> 'emoji_name'
+            WHERE entity.provider_uuid = $1
+            """,
+            self._provider_uuid,
+            json.dumps(requested, separators=(",", ":")),
+        )
+        return {
+            _reaction_identity(_json_object(row["data"])): UUID(str(row["uuid"]))
             for row in rows
         }
 
