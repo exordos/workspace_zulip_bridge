@@ -142,13 +142,33 @@ class BridgeService:
         stop: asyncio.Event,
     ) -> bool:
         while not stop.is_set():
+            bootstrap_task = asyncio.create_task(bootstrapper.ensure())
+            stop_task = asyncio.create_task(stop.wait())
             try:
-                await bootstrapper.ensure()
-                return True
+                completed, _ = await asyncio.wait(
+                    (bootstrap_task, stop_task),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if bootstrap_task in completed:
+                    bootstrap_task.result()
+                    return True
+                if stop_task in completed:
+                    bootstrap_task.cancel()
+                    await asyncio.gather(bootstrap_task, return_exceptions=True)
+                    return False
             except asyncio.CancelledError:
                 raise
             except Exception:
                 LOG.exception("Workspace bootstrap failed; retrying")
+            finally:
+                for task in (bootstrap_task, stop_task):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(
+                    bootstrap_task,
+                    stop_task,
+                    return_exceptions=True,
+                )
             try:
                 await asyncio.wait_for(
                     stop.wait(),

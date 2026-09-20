@@ -146,6 +146,40 @@ async def _run_workspace_bootstrap_stop_test() -> None:
     )
 
 
+def test_workspace_bootstrap_in_progress_stops_cleanly() -> None:
+    asyncio.run(_run_workspace_bootstrap_in_progress_stop_test())
+
+
+async def _run_workspace_bootstrap_in_progress_stop_test() -> None:
+    stop = asyncio.Event()
+    started = asyncio.Event()
+
+    class BlockingBootstrapper:
+        cancelled = False
+
+        async def ensure(self) -> bool:
+            started.set()
+            try:
+                future: asyncio.Future[bool] = asyncio.Future()
+                return await future
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+
+    bootstrapper = BlockingBootstrapper()
+    task = asyncio.create_task(
+        BridgeService(Settings.from_env({}))._ensure_bootstrap(
+            bootstrapper,
+            stop,
+        )
+    )
+    await started.wait()
+    stop.set()
+
+    assert not await asyncio.wait_for(task, timeout=0.1)
+    assert bootstrapper.cancelled
+
+
 def test_workspace_diff_worker_plans_once_before_draining(
     monkeypatch: Any,
     tmp_path: Path,
