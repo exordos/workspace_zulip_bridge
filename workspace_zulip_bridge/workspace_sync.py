@@ -97,6 +97,29 @@ def workspace_directory_url(settings: Settings) -> str:
     return f"{root}/users/"
 
 
+_IDENTITY_FIELDS = {
+    "stream_bindings": ("stream_uuid", "user_uuid"),
+    "topic_bindings": ("stream_uuid", "topic_uuid", "user_uuid"),
+    "messages": ("author_uuid",),
+    "message_flags": ("stream_uuid", "message_uuid", "user_uuid"),
+    "message_reactions": ("message_uuid", "user_uuid"),
+}
+
+
+def identity_rebind_required(
+    entity_type: str,
+    source: Mapping[str, Any],
+    target: Mapping[str, Any] | None,
+) -> bool:
+    """Request the explicit Provider identity migration only when needed."""
+    if target is None:
+        return False
+    return any(
+        str(source.get(field)) != str(target.get(field))
+        for field in _IDENTITY_FIELDS.get(entity_type, ())
+    )
+
+
 class WorkspaceBootstrapper:
     def __init__(
         self,
@@ -1130,11 +1153,15 @@ class WorkspaceDiffWorker:
         operations = []
         records: list[tuple[asyncpg.Record, dict[str, Any], bytes]] = []
         loaded: dict[tuple[str, UUID], dict[str, Any]] = {}
+        targets: dict[tuple[str, UUID], dict[str, Any]] = {}
         grouped: dict[str, list[UUID]] = defaultdict(list)
         for row in to_workspace:
             grouped[row["entity_type"]].append(row["entity_uuid"])
         for entity_type, entity_uuids in grouped.items():
             loaded.update(await self._load_zulip_entities(entity_type, entity_uuids))
+            targets.update(
+                await self._load_workspace_entities(entity_type, entity_uuids)
+            )
         for row in to_workspace:
             data = loaded.get((row["entity_type"], row["entity_uuid"]))
             if data is None:
@@ -1148,18 +1175,23 @@ class WorkspaceDiffWorker:
                 records.append((row, {}, b""))
                 continue
             content_hash = canonical_hash(data)
-            operations.append(
-                {
-                    "action": "upsert",
-                    "type": row["entity_type"],
-                    "uuid": str(row["entity_uuid"]),
-                    "content_hash": content_hash.hex(),
-                    "source_updated_at": row["source_updated_at"]
-                    .isoformat()
-                    .replace("+00:00", "Z"),
-                    "data": data,
-                }
-            )
+            operation = {
+                "action": "upsert",
+                "type": row["entity_type"],
+                "uuid": str(row["entity_uuid"]),
+                "content_hash": content_hash.hex(),
+                "source_updated_at": row["source_updated_at"]
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "data": data,
+            }
+            if identity_rebind_required(
+                row["entity_type"],
+                data,
+                targets.get((row["entity_type"], row["entity_uuid"])),
+            ):
+                operation["rebind_identity"] = True
+            operations.append(operation)
             records.append((row, data, content_hash))
         try:
             response = await self._post(

@@ -3,6 +3,7 @@
 
 from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.workspace_sync import _equivalent_entity
+from workspace_zulip_bridge.workspace_sync import identity_rebind_required
 from workspace_zulip_bridge.workspace_sync import workspace_directory_url
 
 
@@ -46,3 +47,23 @@ def test_workspace_directory_uses_public_user_route() -> None:
     assert workspace_directory_url(settings) == (
         "https://workspace.test/api/workspace/v1/users/"
     )
+
+
+def test_identity_rebind_is_explicit_and_limited_to_identity_fields() -> None:
+    source = {
+        "stream_uuid": "10000000-0000-0000-0000-000000000001",
+        "user_uuid": "10000000-0000-0000-0000-000000000002",
+        "role": "member",
+    }
+
+    assert identity_rebind_required(
+        "stream_bindings",
+        source,
+        {**source, "user_uuid": "10000000-0000-0000-0000-000000000003"},
+    )
+    assert not identity_rebind_required(
+        "stream_bindings",
+        source,
+        {**source, "role": "admin"},
+    )
+    assert not identity_rebind_required("stream_bindings", source, None)
