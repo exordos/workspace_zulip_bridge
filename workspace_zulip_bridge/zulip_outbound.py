@@ -163,8 +163,7 @@ class ZulipOutboundWriter:
                     for row in await self._target_rows(
                         "stream_bindings", "stream_uuid", entity_uuid
                     )
-                    if UUID(str(row["data"]["user_uuid"]))
-                    != workspace_owner_uuid
+                    if UUID(str(row["data"]["user_uuid"])) != workspace_owner_uuid
                 ),
                 None,
             )

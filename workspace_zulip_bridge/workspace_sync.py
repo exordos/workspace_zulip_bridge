@@ -405,9 +405,7 @@ class WorkspaceBootstrapper:
             )
             async with httpx.AsyncClient(
                 verify=verify,
-                timeout=httpx.Timeout(
-                    self._settings.workspace_request_timeout_seconds
-                ),
+                timeout=httpx.Timeout(self._settings.workspace_request_timeout_seconds),
             ) as owned_client:
                 return await self._reconcile_workspace_identities(
                     generation,
@@ -430,9 +428,7 @@ class WorkspaceBootstrapper:
             if user.get("source") == "iam" and email:
                 iam_by_email[email].append(user)
         canonical_users = {
-            email: users[0]
-            for email, users in iam_by_email.items()
-            if len(users) == 1
+            email: users[0] for email, users in iam_by_email.items() if len(users) == 1
         }
         local_users = await self._pool.fetch(
             """
@@ -1758,9 +1754,15 @@ def _normalized_entity(entity_type: str, data: dict[str, Any]) -> dict[str, Any]
     elif entity_type == "message_reactions":
         # Zulip's message/reaction snapshots do not expose when a reaction was
         # originally created.  A reload therefore assigns a new ingestion
-        # timestamp to the same stable reaction identity.  Treating that local
-        # timestamp as content causes a false Workspace -> Zulip echo.
-        value.pop("created_at", None)
+        # timestamp to the same stable reaction identity.  Workspace also
+        # returns compatibility metadata (source, project_id and old_* fields)
+        # that is not part of the Zulip reaction.  Comparing either category
+        # causes a false Workspace -> Zulip echo and a duplicate-reaction
+        # BAD_REQUEST response.
+        value = {
+            field: value.get(field)
+            for field in ("message_uuid", "user_uuid", "emoji_name")
+        }
     return value
 
 
