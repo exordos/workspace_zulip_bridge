@@ -2090,7 +2090,7 @@ async def _event_processor_round_trip(dsn: str) -> None:
                 "orig_subject": "Performance",
                 "subject": "Renamed",
                 "content": "second",
-                "edit_timestamp": 1,
+                "edit_timestamp": 1_700_000_100,
                 "flags": [],
             },
             {
@@ -2302,6 +2302,7 @@ async def _event_processor_round_trip(dsn: str) -> None:
                        flags.is_starred,
                        message.reactions::text AS reactions,
                        message.created_at,
+                       message.source_updated_at,
                        message.updated_at,
                        topic.name AS topic_name
                 FROM workspace_zulip_bridge.zulip_messages AS message
@@ -2386,6 +2387,9 @@ async def _event_processor_round_trip(dsn: str) -> None:
         assert final_message["topic_name"] == "Renamed"
         assert final_message["created_at"] == datetime.fromtimestamp(
             1_700_000_000, tz=UTC
+        )
+        assert final_message["source_updated_at"] == datetime.fromtimestamp(
+            1_700_000_100, tz=UTC
         )
         assert final_message["updated_at"] >= processing_started_at
         assert json.loads(final_message["reactions"]) == [

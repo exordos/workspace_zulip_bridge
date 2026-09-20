@@ -119,6 +119,7 @@ class _MessageSnapshot:
     is_historical: bool
     reactions: tuple[Mapping[str, str], ...]
     sent_at: int
+    source_updated_at: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -936,6 +937,12 @@ class ZulipEventProcessor:
         messages: list[ZulipMessage] = []
         for snapshot in snapshots:
             changes: dict[str, object] = {}
+            edit_timestamp = payload.get("edit_timestamp")
+            if type(edit_timestamp) is int:
+                changes["source_updated_at"] = max(
+                    snapshot.source_updated_at,
+                    edit_timestamp,
+                )
             new_stream_id = payload.get("new_stream_id")
             if isinstance(new_stream_id, int):
                 changes["chat_key"] = f"channel:{new_stream_id}"
@@ -1106,7 +1113,9 @@ class ZulipEventProcessor:
                        message.sender_user_uuid,
                        message.content,
                        message.reactions::text AS reactions_json,
-                       extract(epoch FROM message.created_at)::bigint AS sent_at
+                       extract(epoch FROM message.created_at)::bigint AS sent_at,
+                       extract(epoch FROM message.source_updated_at)::bigint
+                           AS source_updated_at
                 FROM workspace_zulip_bridge.zulip_messages AS message
                 JOIN workspace_zulip_bridge.zulip_streams AS chat
                   ON chat.uuid = message.zulip_stream_uuid
@@ -1145,6 +1154,7 @@ class ZulipEventProcessor:
                     is_historical=False,
                     reactions=tuple(reactions),
                     sent_at=row["sent_at"],
+                    source_updated_at=row["source_updated_at"],
                 )
             )
         return snapshots
@@ -1370,6 +1380,7 @@ def _snapshot_message(
         files=extract_file_metadata(updated.content),
         write_flags=False,
         sent_at=updated.sent_at,
+        source_updated_at=updated.source_updated_at,
     )
 
 
