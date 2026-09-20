@@ -32,6 +32,14 @@ def _json_object(value: Any) -> dict[str, Any]:
     return value
 
 
+def _stream_owner_uuid(data: dict[str, Any]) -> UUID:
+    for field in ("owner_uuid", "owner", "user_uuid"):
+        value = data.get(field)
+        if value is not None:
+            return UUID(str(value))
+    raise ZulipOutboundError("Workspace stream owner is missing")
+
+
 @dataclass(frozen=True, slots=True)
 class _Actor:
     connection_uuid: UUID
@@ -92,7 +100,7 @@ class ZulipOutboundWriter:
             stream = await self._stream(entity_uuid)
             if stream is None or not str(stream["chat_key"]).startswith("channel:"):
                 raise ZulipOutboundError("direct conversations cannot be deleted")
-            actor = await self._actor(UUID(str(source["owner_uuid"])), entity_uuid)
+            actor = await self._actor(_stream_owner_uuid(source), entity_uuid)
             await asyncio.to_thread(
                 self._client(actor).update_stream,
                 int(str(stream["chat_key"]).removeprefix("channel:")),
@@ -107,7 +115,7 @@ class ZulipOutboundWriter:
         stream = await self._required_stream(entity_uuid)
         if not str(stream["chat_key"]).startswith("channel:"):
             return
-        actor = await self._actor(UUID(str(target["owner_uuid"])), entity_uuid)
+        actor = await self._actor(_stream_owner_uuid(target), entity_uuid)
         stream_id = int(str(stream["chat_key"]).removeprefix("channel:"))
         name = str(target["name"]) if target.get("name") != source.get("name") else None
         description = (
@@ -132,7 +140,7 @@ class ZulipOutboundWriter:
         entity_uuid: UUID,
         target: dict[str, Any],
     ) -> None:
-        workspace_owner_uuid = UUID(str(target["owner_uuid"]))
+        workspace_owner_uuid = _stream_owner_uuid(target)
         actor = await self._actor(workspace_owner_uuid)
         owner_uuid = actor.user_uuid
         if bool(target.get("private")):

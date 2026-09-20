@@ -98,6 +98,66 @@ def test_message_equivalence_still_compares_content() -> None:
     )
 
 
+def test_stream_equivalence_maps_public_workspace_projection() -> None:
+    owner_uuid = "10000000-0000-0000-0000-000000000001"
+    source = {
+        "name": "General",
+        "description": "",
+        "owner_uuid": owner_uuid,
+        "invite_only": False,
+        "announce": False,
+        "direct_user_uuid": None,
+        "private": False,
+        "is_archived": False,
+        "color": 0,
+        "history_public_to_subscribers": False,
+        "created_at": "2026-09-20T21:08:40+00:00",
+    }
+    target = {
+        **source,
+        "owner": owner_uuid,
+        "owner_uuid": None,
+        "description": None,
+        "created_at": "2026-09-19T21:08:40Z",
+        "history_public_to_subscribers": None,
+        "uuid": "10000000-0000-0000-0000-000000000002",
+        "project_id": "10000000-0000-0000-0000-000000000003",
+        "updated_at": "2026-09-20T21:09:00Z",
+        "source": {"kind": "zulip", "stream_id": 0},
+        "source_name": "zulip",
+        "role": "member",
+        "notification_mode": "all_messages",
+        "unread_count": 17,
+        "active_unread_count": 17,
+        "passive_unread_count": 0,
+        "last_message_uuid": "10000000-0000-0000-0000-000000000004",
+    }
+
+    assert _equivalent_entity("streams", source, target)
+
+
+def test_stream_equivalence_still_compares_canonical_fields() -> None:
+    source = {
+        "name": "General",
+        "description": "before",
+        "owner_uuid": "10000000-0000-0000-0000-000000000001",
+        "invite_only": False,
+        "announce": False,
+        "direct_user_uuid": None,
+        "private": False,
+        "is_archived": False,
+        "color": 0,
+        "history_public_to_subscribers": True,
+        "created_at": "2026-09-20T21:08:40Z",
+    }
+
+    assert not _equivalent_entity(
+        "streams",
+        source,
+        {**source, "description": "after"},
+    )
+
+
 def test_reaction_identity_matches_workspace_unique_constraint() -> None:
     assert _reaction_identity(
         {

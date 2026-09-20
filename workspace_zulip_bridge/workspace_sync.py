@@ -1948,7 +1948,24 @@ def _equivalent_entity(
 def _normalized_entity(entity_type: str, data: dict[str, Any]) -> dict[str, Any]:
     value = dict(_normalize_timestamps(data))
     if entity_type == "streams":
-        value.pop("default_topic_uuid", None)
+        # The public Workspace API keeps the historical client field names
+        # (``owner`` plus per-user projection counters), while the provider
+        # contract uses ``owner_uuid`` and only canonical stream attributes.
+        # Compare the shared state, otherwise unread counters make an imported
+        # Zulip stream look like a newer Workspace edit and echo it back.
+        value = {
+            "name": value.get("name"),
+            "description": value.get("description") or "",
+            "owner_uuid": value.get("owner_uuid")
+            or value.get("owner")
+            or value.get("user_uuid"),
+            "invite_only": bool(value.get("invite_only", False)),
+            "announce": bool(value.get("announce", False)),
+            "direct_user_uuid": value.get("direct_user_uuid"),
+            "private": bool(value.get("private", False)),
+            "is_archived": bool(value.get("is_archived", False)),
+            "color": value.get("color") or 0,
+        }
     elif entity_type == "topics":
         value.pop("color", None)
     elif entity_type == "messages":
