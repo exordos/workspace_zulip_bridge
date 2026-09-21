@@ -3,6 +3,7 @@
 
 import asyncio
 import logging
+import random
 import typing
 
 import asyncpg
@@ -127,20 +128,26 @@ class BridgeService:
             await probe_database(pool)
 
     async def _bootstrap_loop(self, bootstrapper: _Bootstrapper) -> None:
+        attempt = 0
         while True:
-            await asyncio.sleep(self._settings.workspace_lease_retry_seconds)
             try:
                 await bootstrapper.ensure()
+                attempt = 0
+                delay = self._settings.workspace_lease_retry_seconds
             except asyncio.CancelledError:
                 raise
             except Exception:
                 LOG.exception("Workspace bootstrap refresh failed; retrying")
+                delay = self._bootstrap_retry_delay(attempt)
+                attempt += 1
+            await asyncio.sleep(delay)
 
     async def _ensure_bootstrap(
         self,
         bootstrapper: _Bootstrapper,
         stop: asyncio.Event,
     ) -> bool:
+        attempt = 0
         while not stop.is_set():
             bootstrap_task = asyncio.create_task(bootstrapper.ensure())
             stop_task = asyncio.create_task(stop.wait())
@@ -172,8 +179,16 @@ class BridgeService:
             try:
                 await asyncio.wait_for(
                     stop.wait(),
-                    timeout=self._settings.workspace_lease_retry_seconds,
+                    timeout=self._bootstrap_retry_delay(attempt),
                 )
             except TimeoutError:
                 pass
+            attempt += 1
         return False
+
+    def _bootstrap_retry_delay(self, attempt: int) -> float:
+        maximum = min(
+            self._settings.workspace_retry_cap_seconds,
+            self._settings.workspace_retry_base_seconds * (2 ** min(attempt, 16)),
+        )
+        return random.uniform(maximum * 0.5, maximum)

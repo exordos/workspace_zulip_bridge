@@ -10,7 +10,6 @@ from uuid import UUID
 from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.models import ChatCatalogWrite
 from workspace_zulip_bridge.models import ChatScheduleReconcile
-from workspace_zulip_bridge.models import DirectMessagePage
 from workspace_zulip_bridge.models import HistoryWrite
 from workspace_zulip_bridge.models import LiveMessageWrite
 from workspace_zulip_bridge.models import MessagePage
@@ -72,6 +71,84 @@ def test_directory_cache_coalesces_concurrent_endpoint_loads() -> None:
     assert sorted(result[1].changed for result in results) == [0] * 7 + [1]
 
 
+def test_directory_cache_force_refresh_bypasses_fresh_entry() -> None:
+    cache = EndpointDirectoryCache(60.0)
+    calls = 0
+
+    def load() -> tuple[list[ZulipDirectoryUser], UserDirectoryWrite]:
+        nonlocal calls
+        calls += 1
+        directory = [
+            ZulipDirectoryUser(
+                10 + calls,
+                f"user-{calls}@example.test",
+                f"User {calls}",
+                400,
+                False,
+                False,
+            )
+        ]
+        return directory, UserDirectoryWrite(users=1, bots=0, changed=1)
+
+    first, _ = cache.get_or_load(USER_ONE.endpoint, load)
+    cached, cached_result = cache.get_or_load(USER_ONE.endpoint, load)
+    refreshed, refreshed_result = cache.get_or_load(
+        USER_ONE.endpoint,
+        load,
+        force_refresh=True,
+    )
+
+    assert calls == 2
+    assert cached == first
+    assert cached_result.changed == 0
+    assert refreshed != first
+    assert refreshed_result.changed == 1
+
+
+def test_directory_cache_coalesces_concurrent_forced_refreshes() -> None:
+    cache = EndpointDirectoryCache(60.0)
+    calls = 0
+    lock = threading.Lock()
+    ready = threading.Barrier(8)
+
+    def load() -> tuple[list[ZulipDirectoryUser], UserDirectoryWrite]:
+        nonlocal calls
+        with lock:
+            calls += 1
+            user_id = 10 + calls
+        time.sleep(0.02)
+        directory = [
+            ZulipDirectoryUser(
+                user_id,
+                f"user-{user_id}@example.test",
+                f"User {user_id}",
+                400,
+                False,
+                False,
+            )
+        ]
+        return directory, UserDirectoryWrite(users=1, bots=0, changed=1)
+
+    initial, _ = cache.get_or_load(USER_ONE.endpoint, load)
+
+    def force_refresh(
+        _: int,
+    ) -> tuple[tuple[ZulipDirectoryUser, ...], UserDirectoryWrite]:
+        ready.wait()
+        return cache.get_or_load(
+            USER_ONE.endpoint,
+            load,
+            force_refresh=True,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        refreshed = list(executor.map(force_refresh, range(8)))
+
+    assert calls == 2
+    assert all(result[0] != initial for result in refreshed)
+    assert sorted(result[1].changed for result in refreshed) == [0] * 7 + [1]
+
+
 class FakeStore:
     def __init__(self) -> None:
         self.users = [USER_ONE, USER_TWO]
@@ -84,6 +161,7 @@ class FakeStore:
         self.live_message_counts: list[int] = []
         self.history_begins = 0
         self.stored = asyncio.Event()
+        self.catalog_stored = asyncio.Event()
 
     async def set_user_identity(
         self,
@@ -172,6 +250,7 @@ class FakeStore:
     ) -> ChatCatalogWrite:
         self.catalogs.append((user_uuid, queue_id, catalog))
         self.statuses.append((user_uuid, "scheduling"))
+        self.catalog_stored.set()
         return ChatCatalogWrite(True, False, len(catalog.chats), 0)
 
     async def store_events(
@@ -242,22 +321,6 @@ class FakeApi:
             ZulipDirectoryUser(99, "bot@example.test", "Build Bot", 400, False, True),
         ]
 
-    def get_direct_messages_page(
-        self, anchor: str | int, *, include_anchor: bool
-    ) -> DirectMessagePage:
-        return DirectMessagePage(
-            messages=[
-                {
-                    "id": 100,
-                    "display_recipient": [
-                        {"id": 10, "full_name": "Current User"},
-                        {"id": 12, "full_name": "Second User"},
-                    ],
-                }
-            ],
-            found_oldest=True,
-        )
-
     def get_messages_page(
         self,
         anchor: str | int,
@@ -283,24 +346,6 @@ class FakeApi:
             ],
             found_oldest=True,
         )
-
-    def get_messages_by_ids(self, message_ids: list[int]) -> list[dict[str, object]]:
-        return [
-            {
-                "id": message_id,
-                "type": "private",
-                "sender_id": 12,
-                "content": "live",
-                "timestamp": 1_700_000_001,
-                "flags": [],
-                "reactions": [],
-                "display_recipient": [
-                    {"id": 10, "full_name": "Current User"},
-                    {"id": 12, "full_name": "Second User"},
-                ],
-            }
-            for message_id in message_ids
-        ]
 
     def get_events(
         self, queue_id: str, last_event_id: int, timeout: float
@@ -336,6 +381,52 @@ class FakeHistory:
         return None
 
 
+class BlockingCatalogApi(FakeApi):
+    def __init__(self) -> None:
+        super().__init__()
+        self.catalog_started = threading.Event()
+        self.release_catalog = threading.Event()
+
+    def get_own_user(self) -> ZulipIdentity:
+        self.catalog_started.set()
+        self.release_catalog.wait(5)
+        return super().get_own_user()
+
+    def close(self) -> None:
+        self.release_catalog.set()
+        super().close()
+
+
+def test_longpoll_persists_events_while_catalog_loading_is_blocked() -> None:
+    asyncio.run(_nonblocking_catalog_test())
+
+
+async def _nonblocking_catalog_test() -> None:
+    store = FakeStore()
+    poll_api = FakeApi()
+    maintenance_api = BlockingCatalogApi()
+    clients = iter((poll_api, maintenance_api))
+    worker = ZulipEventThread(
+        USER_ONE,
+        store,  # type: ignore[arg-type]
+        asyncio.get_running_loop(),
+        Settings(database_dsn="postgresql:///test"),
+        threading.BoundedSemaphore(1),
+        api_factory=lambda user: next(clients),  # type: ignore[arg-type]
+    )
+
+    worker.start()
+    assert await asyncio.to_thread(maintenance_api.catalog_started.wait, 2)
+    await asyncio.wait_for(store.stored.wait(), timeout=2)
+
+    assert not store.catalog_stored.is_set()
+    assert len(store.batches) == 1
+
+    worker.stop()
+    await asyncio.to_thread(worker.join, 2)
+    assert not worker.is_alive()
+
+
 def test_one_thread_persists_a_batch_and_advances_past_heartbeat() -> None:
     asyncio.run(_thread_test())
 
@@ -354,16 +445,15 @@ async def _thread_test() -> None:
 
     worker.start()
     await asyncio.wait_for(store.stored.wait(), timeout=2)
+    await asyncio.wait_for(store.catalog_stored.wait(), timeout=2)
     worker.stop()
     await asyncio.to_thread(worker.join, 2)
 
     assert not worker.is_alive()
     assert store.queues == [(USER_ONE.uuid, "queue-1", -1)]
-    assert [status for _, status in store.statuses] == [
-        "streaming",
-        "filling",
-        "scheduling",
-    ]
+    statuses = [status for _, status in store.statuses]
+    assert statuses[0] == "streaming"
+    assert statuses[-2:] == ["filling", "scheduling"]
     assert len(store.catalogs) == 1
     assert [chat.chat_key for chat in store.catalogs[0][2].chats] == [
         "channel:7",
@@ -518,22 +608,16 @@ async def _expired_queue_test() -> None:
 
     worker.start()
     await asyncio.wait_for(store.stored.wait(), timeout=2)
+    await asyncio.wait_for(store.catalog_stored.wait(), timeout=2)
     worker.stop()
     await asyncio.to_thread(worker.join, 2)
 
     assert store.cleared == [(user.uuid, "expired-queue")]
     assert store.queues == [(user.uuid, "fresh-queue", -1)]
-    assert api.catalog_reads == 2
-    assert [queue_id for _, queue_id, _ in store.catalogs] == [
-        "expired-queue",
-        "fresh-queue",
-    ]
-    assert [status for _, status in store.statuses] == [
-        "streaming",
-        "filling",
-        "scheduling",
-        "init",
-        "streaming",
+    assert api.catalog_reads >= 1
+    assert store.catalogs[-1][1] == "fresh-queue"
+    assert "init" in [status for _, status in store.statuses]
+    assert [status for _, status in store.statuses][-2:] == [
         "filling",
         "scheduling",
     ]

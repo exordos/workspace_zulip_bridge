@@ -93,12 +93,6 @@ class ZulipAttachment:
 
 
 @dataclass(frozen=True, slots=True)
-class DirectMessagePage:
-    messages: list[Mapping[str, Any]]
-    found_oldest: bool
-
-
-@dataclass(frozen=True, slots=True)
 class MessagePage:
     messages: list[Mapping[str, Any]]
     found_oldest: bool

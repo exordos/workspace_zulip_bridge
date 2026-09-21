@@ -188,6 +188,9 @@ deployment.
 | `WZB_EVENT_PROCESSOR_BATCH_SIZE` | `1000` | Maximum events claimed per processor pass |
 | `WZB_EVENT_PROCESSOR_POLL_SECONDS` | `0.05` | Idle inbox polling interval |
 | `WZB_EVENT_PROCESSOR_CLAIM_TIMEOUT_SECONDS` | `60` | Stale processing-claim recovery threshold |
+| `WZB_EVENT_PROCESSOR_MAX_ATTEMPTS` | `8` | Attempts before a transient Zulip event failure becomes terminal |
+| `WZB_EVENT_PROCESSOR_RETRY_BASE_SECONDS` | `0.25` | Initial transient Zulip event retry delay |
+| `WZB_EVENT_PROCESSOR_RETRY_CAP_SECONDS` | `30` | Maximum transient Zulip event retry delay |
 | `WZB_EVENT_RETENTION_SECONDS` | `86400` | Terminal event retention from collection time |
 | `WZB_EVENT_CLEANUP_INTERVAL_SECONDS` | `300` | Interval between caught-up retention passes |
 | `WZB_EVENT_CLEANUP_BATCH_SIZE` | `10000` | Rows deleted per short retention transaction |
@@ -198,6 +201,7 @@ deployment.
 | `WZB_WORKSPACE_CA_FILE` | system trust | Optional Workspace CA bundle |
 | `WZB_WORKSPACE_EVENT_BATCH_SIZE` | `500` | Events written per inbox transaction |
 | `WZB_WORKSPACE_EVENT_FLUSH_SECONDS` | `0.01` | Maximum low-volume persistence delay |
+| `WZB_WORKSPACE_EVENT_MAX_ATTEMPTS` | `8` | Attempts before a transient Workspace event failure becomes terminal |
 | `WZB_WORKSPACE_RETRY_BASE_SECONDS` | `1` | Initial reconnect window |
 | `WZB_WORKSPACE_RETRY_CAP_SECONDS` | `60` | Maximum reconnect window |
 | `WZB_WORKSPACE_LEASE_RETRY_SECONDS` | `5` | Standby receiver lease retry interval |
@@ -272,3 +276,6 @@ exordos elements install output/manifests/workspace_zulip_bridge.yaml
 
 The image bootstrap prepares the persistent disk, starts PostgreSQL, creates a
 peer-authenticated database role, and enables the daemon.
+
+The Workspace-side synchronization dependency and its owning source are
+documented in [docs/workspace_provider_entity_api.md](docs/workspace_provider_entity_api.md).

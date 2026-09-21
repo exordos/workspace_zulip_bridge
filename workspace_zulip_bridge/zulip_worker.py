@@ -72,12 +72,22 @@ class EndpointDirectoryCache:
         self,
         endpoint: str,
         loader: DirectoryLoader,
+        *,
+        force_refresh: bool = False,
     ) -> tuple[tuple[ZulipDirectoryUser, ...], UserDirectoryWrite]:
+        required_loaded_at = time.monotonic() if force_refresh else None
         while True:
             with self._condition:
                 entry = self._entries.get(endpoint)
                 now = time.monotonic()
-                if entry is not None and now - entry.loaded_at < self._ttl_seconds:
+                if (
+                    entry is not None
+                    and now - entry.loaded_at < self._ttl_seconds
+                    and (
+                        required_loaded_at is None
+                        or entry.loaded_at >= required_loaded_at
+                    )
+                ):
                     return entry.users, UserDirectoryWrite(
                         users=len(entry.users),
                         bots=sum(user.is_bot for user in entry.users),
@@ -139,6 +149,10 @@ class ZulipEventThread(threading.Thread):
         self._stop_requested = threading.Event()
         self._client_lock = threading.Lock()
         self._client: ZulipApiClient | None = None
+        self._maintenance_lock = threading.Lock()
+        self._maintenance_clients: set[ZulipApiClient] = set()
+        self._maintenance_thread: threading.Thread | None = None
+        self._maintenance_queue_id: str | None = None
         self._queue_id = user.queue_id
         self._last_event_id = user.last_event_id
         self._catalog_filled = False
@@ -164,6 +178,16 @@ class ZulipEventThread(threading.Thread):
                 target=self._close_client,
                 args=(client,),
                 name=f"zulip-close-{self.user.uuid}",
+                daemon=True,
+            ).start()
+        with self._maintenance_lock:
+            maintenance_clients = tuple(self._maintenance_clients)
+            self._maintenance_clients.clear()
+        for maintenance_client in maintenance_clients:
+            threading.Thread(
+                target=self._close_client,
+                args=(maintenance_client,),
+                name=f"zulip-maintenance-close-{self.user.uuid}",
                 daemon=True,
             ).start()
 
@@ -231,7 +255,6 @@ class ZulipEventThread(threading.Thread):
         longpoll_timeout = self._settings.zulip_default_longpoll_timeout_seconds
         attempt = 0
         while not self._stop_requested.is_set():
-            registered_now = False
             if queue_id is None or last_event_id is None:
                 with self._registration_gate:
                     if self._stop_requested.is_set():
@@ -253,57 +276,11 @@ class ZulipEventThread(threading.Thread):
                     registered.recent_private_conversations
                 )
                 longpoll_timeout = registered.longpoll_timeout_seconds
-                registered_now = True
                 LOG.info(
                     "Zulip queue registered user_uuid=%s",
                     self.user.uuid,
                 )
-
-            if not self._catalog_filled and self._resume_existing_queue:
-                with self._registration_gate:
-                    if self._stop_requested.is_set():
-                        return
-                    if not self._restore_runtime_state(client):
-                        return
-                self._catalog_filled = True
-                self._resume_existing_queue = False
-
-            if not self._catalog_filled:
-                if not registered_now:
-                    if not self._submit(
-                        self._store.set_user_status(
-                            self.user.uuid,
-                            queue_id,
-                            "streaming",
-                        )
-                    ):
-                        return
-                if not self._fill_chat_catalog(client, queue_id):
-                    return
-                self._catalog_filled = True
-
-            user_status = self._submit(
-                self._store.get_user_status(self.user.uuid, queue_id)
-            )
-            if user_status is None:
-                return
-            if user_status == "scheduling":
-                self._stop_requested.wait(self._settings.user_refresh_seconds)
-                continue
-
-            pending_history = self._submit(
-                self._store.list_pending_history_chats(self.user.uuid, queue_id)
-            )
-            if pending_history:
-                with self._history_gate:
-                    if self._stop_requested.is_set():
-                        return
-                    if not self._load_scheduled_history(
-                        client,
-                        queue_id,
-                        pending_history,
-                    ):
-                        return
+            self._ensure_maintenance(queue_id)
 
             try:
                 raw_events = client.get_events(
@@ -356,15 +333,146 @@ class ZulipEventThread(threading.Thread):
             self._last_event_id = next_event_id
             attempt = 0
 
-    def _fill_chat_catalog(self, client: ZulipApiClient, queue_id: str) -> bool:
-        return self._load_chat_catalog(client, queue_id)
+    def _ensure_maintenance(self, queue_id: str) -> None:
+        with self._maintenance_lock:
+            if (
+                self._maintenance_thread is not None
+                and self._maintenance_thread.is_alive()
+                and self._maintenance_queue_id == queue_id
+            ):
+                return
+            self._maintenance_queue_id = queue_id
+            self._maintenance_thread = threading.Thread(
+                target=self._maintain_queue,
+                args=(queue_id,),
+                name=f"zulip-maintenance-{self.user.uuid}",
+                daemon=True,
+            )
+            self._maintenance_thread.start()
 
-    def _load_chat_catalog(self, client: ZulipApiClient, queue_id: str) -> bool:
+    def _maintain_queue(self, queue_id: str) -> None:
+        attempt = 0
+        while not self._stop_requested.is_set() and self._queue_id == queue_id:
+            client = self._api_factory(self.user)
+            with self._maintenance_lock:
+                self._maintenance_clients.add(client)
+            try:
+                self._maintain_queue_session(client, queue_id)
+                attempt = 0
+            except ZulipApiError as exc:
+                if self._stop_requested.is_set() or self._queue_id != queue_id:
+                    return
+                LOG.warning(
+                    "Zulip maintenance retry user_uuid=%s code=%s",
+                    self.user.uuid,
+                    exc.code,
+                )
+            except httpx.TransportError as exc:
+                if self._stop_requested.is_set() or self._queue_id != queue_id:
+                    return
+                LOG.warning(
+                    "Zulip maintenance retry user_uuid=%s code=%s",
+                    self.user.uuid,
+                    type(exc).__name__,
+                )
+            except Exception:
+                if self._stop_requested.is_set() or self._queue_id != queue_id:
+                    return
+                LOG.exception(
+                    "Zulip maintenance failure user_uuid=%s",
+                    self.user.uuid,
+                )
+            finally:
+                with self._maintenance_lock:
+                    self._maintenance_clients.discard(client)
+                client.close()
+            self._wait_before_retry(attempt)
+            attempt += 1
+
+    def _maintain_queue_session(
+        self,
+        client: ZulipApiClient,
+        queue_id: str,
+    ) -> None:
+        while not self._stop_requested.is_set() and self._queue_id == queue_id:
+            user_status = self._submit(
+                self._store.get_user_status(self.user.uuid, queue_id)
+            )
+            if user_status is None:
+                return
+            if not self._catalog_filled and self._resume_existing_queue:
+                with self._registration_gate:
+                    if not self._restore_runtime_state(client):
+                        return
+                self._catalog_filled = True
+                self._resume_existing_queue = False
+                continue
+            if not self._catalog_filled or user_status == "filling":
+                if not self._catalog_filled and not self._submit(
+                    self._store.set_user_status(
+                        self.user.uuid,
+                        queue_id,
+                        "streaming",
+                    )
+                ):
+                    return
+                if not self._fill_chat_catalog(
+                    client,
+                    queue_id,
+                    force_directory_refresh=(
+                        self._catalog_filled and user_status == "filling"
+                    ),
+                ):
+                    return
+                self._catalog_filled = True
+                continue
+            if user_status == "scheduling":
+                self._stop_requested.wait(self._settings.user_refresh_seconds)
+                continue
+            pending_history = self._submit(
+                self._store.list_pending_history_chats(self.user.uuid, queue_id)
+            )
+            if pending_history:
+                with self._history_gate:
+                    if self._stop_requested.is_set():
+                        return
+                    if not self._load_scheduled_history(
+                        client,
+                        queue_id,
+                        pending_history,
+                    ):
+                        return
+                continue
+            self._stop_requested.wait(self._settings.user_refresh_seconds)
+
+    def _fill_chat_catalog(
+        self,
+        client: ZulipApiClient,
+        queue_id: str,
+        *,
+        force_directory_refresh: bool = False,
+    ) -> bool:
+        return self._load_chat_catalog(
+            client,
+            queue_id,
+            force_directory_refresh=force_directory_refresh,
+        )
+
+    def _load_chat_catalog(
+        self,
+        client: ZulipApiClient,
+        queue_id: str,
+        *,
+        force_directory_refresh: bool = False,
+    ) -> bool:
         started_at = time.monotonic()
         if not self._submit(self._store.begin_catalog_fill(self.user.uuid, queue_id)):
             return False
         identity = client.get_own_user()
-        directory, directory_result = self._load_directory(client)
+        directory, directory_result = self._load_directory(
+            client,
+            force_refresh=force_directory_refresh,
+        )
         if not self._submit(
             self._store.set_user_identity(
                 self.user.uuid,
@@ -429,7 +537,7 @@ class ZulipEventThread(threading.Thread):
         allowed_chat_keys = {chat.chat_key for chat in (*channel_chats, *direct_chats)}
         catalog = builder.build()
         with self._catalog_write_gate:
-            if self._stop_requested.is_set():
+            if self._stop_requested.is_set() or self._queue_id != queue_id:
                 return False
             result = self._submit(
                 self._store.store_chat_catalog(
@@ -633,6 +741,8 @@ class ZulipEventThread(threading.Thread):
     def _load_directory(
         self,
         client: ZulipApiClient,
+        *,
+        force_refresh: bool = False,
     ) -> tuple[tuple[ZulipDirectoryUser, ...], UserDirectoryWrite]:
         def load() -> tuple[list[ZulipDirectoryUser], UserDirectoryWrite]:
             users = client.get_users()
@@ -641,7 +751,11 @@ class ZulipEventThread(threading.Thread):
             )
             return users, result
 
-        return self._directory_cache.get_or_load(self.user.endpoint, load)
+        return self._directory_cache.get_or_load(
+            self.user.endpoint,
+            load,
+            force_refresh=force_refresh,
+        )
 
     @staticmethod
     def _next_history_anchor(
@@ -689,7 +803,11 @@ class ZulipEventThread(threading.Thread):
         return events, next_event_id
 
     def _submit(self, coroutine: Coroutine[Any, Any, Any]) -> Any:
-        future = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+        try:
+            future = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+        except Exception:
+            coroutine.close()
+            raise
         try:
             return future.result(timeout=self._settings.zulip_db_ack_timeout_seconds)
         except concurrent.futures.TimeoutError:

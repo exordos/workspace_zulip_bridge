@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_users (
         CHECK (presence_status IN ('active', 'idle', 'offline', 'do_not_disturb')),
     status_text text,
     status_emoji text,
+    workspace_user_uuid uuid,
     last_ping_at timestamptz,
     profile_hash bytea CHECK (profile_hash IS NULL OR octet_length(profile_hash) = 32),
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
@@ -32,10 +33,6 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_users (
     UNIQUE (realm_uuid, zulip_user_id),
     UNIQUE (realm_uuid, login)
 );
-ALTER TABLE workspace_zulip_bridge.zulip_users
-    ADD COLUMN IF NOT EXISTS is_bot boolean NOT NULL DEFAULT false;
-ALTER TABLE workspace_zulip_bridge.zulip_users
-    ADD COLUMN IF NOT EXISTS workspace_user_uuid uuid;
 CREATE UNIQUE INDEX IF NOT EXISTS zulip_users_workspace_identity_idx
     ON workspace_zulip_bridge.zulip_users (realm_uuid, workspace_user_uuid)
     WHERE workspace_user_uuid IS NOT NULL;
@@ -116,32 +113,14 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_stream_bindings (
         CHECK (jsonb_typeof(membership_parameters) = 'object'),
     content_hash bytea NOT NULL CHECK (octet_length(content_hash) = 32),
     available_message_count bigint NOT NULL DEFAULT 0 CHECK (available_message_count >= 0),
-    first_visible_message_id bigint,
+    first_visible_message_id bigint CHECK (
+        first_visible_message_id IS NULL OR first_visible_message_id >= 0
+    ),
     personal_state_loaded_at timestamptz,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     UNIQUE (zulip_stream_uuid, zulip_user_uuid)
 );
-
-ALTER TABLE workspace_zulip_bridge.zulip_stream_bindings
-    ADD COLUMN IF NOT EXISTS first_visible_message_id bigint;
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'zulip_stream_bindings_first_visible_message_id_check'
-          AND conrelid =
-              'workspace_zulip_bridge.zulip_stream_bindings'::regclass
-    ) THEN
-        ALTER TABLE workspace_zulip_bridge.zulip_stream_bindings
-            ADD CONSTRAINT zulip_stream_bindings_first_visible_message_id_check
-            CHECK (
-                first_visible_message_id IS NULL
-                OR first_visible_message_id >= 0
-            );
-    END IF;
-END;
-$$;
 
 CREATE INDEX IF NOT EXISTS zulip_stream_bindings_user_idx
     ON workspace_zulip_bridge.zulip_stream_bindings (zulip_user_uuid, zulip_stream_uuid);
@@ -198,7 +177,7 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_messages (
     realm_uuid uuid NOT NULL
         REFERENCES workspace_zulip_bridge.zulip_realms (uuid) ON DELETE CASCADE,
     source_connection_uuid uuid
-        REFERENCES workspace_zulip_bridge.zulip_connections (uuid) ON DELETE CASCADE,
+        REFERENCES workspace_zulip_bridge.zulip_connections (uuid) ON DELETE SET NULL,
     zulip_stream_uuid uuid NOT NULL
         REFERENCES workspace_zulip_bridge.zulip_streams (uuid) ON DELETE CASCADE,
     topic_uuid uuid,
@@ -218,14 +197,24 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_messages (
         REFERENCES workspace_zulip_bridge.zulip_topics (uuid) ON DELETE CASCADE,
     UNIQUE (realm_uuid, zulip_message_id)
 );
-ALTER TABLE workspace_zulip_bridge.zulip_messages
-    ADD COLUMN IF NOT EXISTS source_updated_at timestamptz;
-UPDATE workspace_zulip_bridge.zulip_messages
-SET source_updated_at = created_at
-WHERE source_updated_at IS NULL;
-ALTER TABLE workspace_zulip_bridge.zulip_messages
-    ALTER COLUMN source_updated_at SET NOT NULL;
-
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conrelid = 'workspace_zulip_bridge.zulip_messages'::regclass
+          AND conname = 'zulip_messages_source_connection_uuid_fkey'
+          AND confdeltype <> 'n'
+    ) THEN
+        ALTER TABLE workspace_zulip_bridge.zulip_messages
+            DROP CONSTRAINT zulip_messages_source_connection_uuid_fkey;
+        ALTER TABLE workspace_zulip_bridge.zulip_messages
+            ADD CONSTRAINT zulip_messages_source_connection_uuid_fkey
+            FOREIGN KEY (source_connection_uuid)
+            REFERENCES workspace_zulip_bridge.zulip_connections (uuid)
+            ON DELETE SET NULL;
+    END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS zulip_messages_stream_timeline_idx
     ON workspace_zulip_bridge.zulip_messages
         (zulip_stream_uuid, created_at DESC, uuid DESC);
@@ -252,28 +241,6 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_entity_links (
     PRIMARY KEY (realm_uuid, entity_type, workspace_uuid),
     UNIQUE (realm_uuid, entity_type, zulip_external_key)
 );
-DO $$
-BEGIN
-    IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema = 'workspace_zulip_bridge'
-          AND table_name = 'zulip_entity_links'
-          AND column_name = 'zulip_external_id'
-    ) THEN
-        ALTER TABLE workspace_zulip_bridge.zulip_entity_links
-            RENAME COLUMN zulip_external_id TO zulip_external_key;
-        ALTER TABLE workspace_zulip_bridge.zulip_entity_links
-            ALTER COLUMN zulip_external_key TYPE text
-            USING zulip_external_key::text;
-    END IF;
-END;
-$$;
-ALTER TABLE workspace_zulip_bridge.zulip_entity_links
-    DROP CONSTRAINT IF EXISTS zulip_entity_links_entity_type_check;
-ALTER TABLE workspace_zulip_bridge.zulip_entity_links
-    ADD CONSTRAINT zulip_entity_links_entity_type_check
-    CHECK (entity_type IN ('stream', 'message'));
-
 CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_message_flags (
     uuid uuid PRIMARY KEY,
     realm_uuid uuid NOT NULL
@@ -348,8 +315,6 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_files (
     UNIQUE (realm_uuid, source_path),
     UNIQUE (realm_uuid, zulip_attachment_id)
 );
-ALTER TABLE workspace_zulip_bridge.zulip_files
-    ADD COLUMN IF NOT EXISTS message_ids bigint[] NOT NULL DEFAULT '{}'::bigint[];
 CREATE INDEX IF NOT EXISTS zulip_files_message_ids_idx
     ON workspace_zulip_bridge.zulip_files USING gin (message_ids);
 
@@ -468,6 +433,7 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_events (
             'pending', 'processing', 'applied', 'skipped', 'failed'
         )),
     attempt_count integer NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    available_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     claimed_at timestamptz,
     processed_at timestamptz,
     last_error text,
@@ -479,7 +445,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS workspace_events_epoch_idx
         (provider_uuid, epoch_generation, epoch_version)
     WHERE epoch_generation IS NOT NULL;
 CREATE INDEX IF NOT EXISTS workspace_events_pending_idx
-    ON workspace_zulip_bridge.workspace_events (sequence)
+    ON workspace_zulip_bridge.workspace_events (available_at, sequence)
     WHERE processing_status = 'pending';
 CREATE INDEX IF NOT EXISTS workspace_events_priority_pending_idx
     ON workspace_zulip_bridge.workspace_events (
@@ -497,6 +463,9 @@ CREATE INDEX IF NOT EXISTS workspace_events_priority_pending_idx
         sequence
     )
     WHERE processing_status = 'pending';
+CREATE INDEX IF NOT EXISTS workspace_events_terminal_retention_idx
+    ON workspace_zulip_bridge.workspace_events (received_at, sequence)
+    WHERE processing_status IN ('applied', 'skipped', 'failed');
 CREATE INDEX IF NOT EXISTS workspace_events_received_at_brin
     ON workspace_zulip_bridge.workspace_events USING brin (received_at)
     WITH (pages_per_range = 32);
@@ -522,17 +491,6 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_mirror_state (
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
-ALTER TABLE workspace_zulip_bridge.workspace_mirror_state
-    ADD COLUMN IF NOT EXISTS initial_sync_completed_at timestamptz;
-ALTER TABLE workspace_zulip_bridge.workspace_mirror_state
-    ADD COLUMN IF NOT EXISTS reconciliation_version smallint NOT NULL DEFAULT 0;
-ALTER TABLE workspace_zulip_bridge.workspace_mirror_state
-    ADD COLUMN IF NOT EXISTS target_scan_generation uuid;
-UPDATE workspace_zulip_bridge.workspace_mirror_state
-SET target_scan_generation = active_generation
-WHERE initial_sync_completed_at IS NOT NULL
-  AND target_scan_generation IS NULL;
-
 CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_users (
     provider_uuid uuid NOT NULL, snapshot_generation uuid NOT NULL, uuid uuid NOT NULL,
     workspace_project_id uuid NOT NULL, content_hash bytea NOT NULL,
@@ -585,10 +543,6 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.sync_diffs (
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (provider_uuid, entity_type, entity_uuid)
 );
-ALTER TABLE workspace_zulip_bridge.sync_diffs
-    ADD COLUMN IF NOT EXISTS partition_key uuid;
-ALTER TABLE workspace_zulip_bridge.sync_diffs
-    ADD COLUMN IF NOT EXISTS delivery_priority smallint NOT NULL DEFAULT 1;
 CREATE INDEX IF NOT EXISTS sync_diffs_pending_idx
     ON workspace_zulip_bridge.sync_diffs
         (available_at, entity_type, source_updated_at, entity_uuid)

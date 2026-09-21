@@ -19,11 +19,15 @@ def test_defaults_use_local_postgresql_socket() -> None:
     assert settings.zulip_db_ack_timeout_seconds == 120.0
     assert settings.event_processor_batch_size == 1000
     assert settings.event_processor_poll_seconds == 0.05
+    assert settings.event_processor_max_attempts == 8
+    assert settings.event_processor_retry_base_seconds == 0.25
+    assert settings.event_processor_retry_cap_seconds == 30.0
     assert settings.event_retention_seconds == 86400.0
     assert settings.event_cleanup_interval_seconds == 300.0
     assert settings.event_cleanup_batch_size == 10000
     assert not settings.workspace_events_enabled
     assert settings.workspace_event_batch_size == 500
+    assert settings.workspace_event_max_attempts == 8
     assert settings.workspace_sync_plan_batch_size == 50000
     assert settings.workspace_sync_batch_size == 500
     assert settings.workspace_sync_workers == 2
@@ -51,6 +55,9 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
             "WZB_EVENT_PROCESSOR_BATCH_SIZE": "750",
             "WZB_EVENT_PROCESSOR_POLL_SECONDS": "0.1",
             "WZB_EVENT_PROCESSOR_CLAIM_TIMEOUT_SECONDS": "30",
+            "WZB_EVENT_PROCESSOR_MAX_ATTEMPTS": "5",
+            "WZB_EVENT_PROCESSOR_RETRY_BASE_SECONDS": "0.5",
+            "WZB_EVENT_PROCESSOR_RETRY_CAP_SECONDS": "12",
             "WZB_EVENT_RETENTION_SECONDS": "3600",
             "WZB_EVENT_CLEANUP_INTERVAL_SECONDS": "10",
             "WZB_EVENT_CLEANUP_BATCH_SIZE": "2500",
@@ -62,6 +69,7 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
             "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
             "WZB_WORKSPACE_EVENT_BATCH_SIZE": "250",
             "WZB_WORKSPACE_EVENT_FLUSH_SECONDS": "0.02",
+            "WZB_WORKSPACE_EVENT_MAX_ATTEMPTS": "6",
             "WZB_WORKSPACE_SYNC_PLAN_BATCH_SIZE": "2500",
             "WZB_WORKSPACE_SYNC_BATCH_SIZE": "250",
             "WZB_WORKSPACE_SYNC_WORKERS": "4",
@@ -83,6 +91,9 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
     assert settings.event_processor_batch_size == 750
     assert settings.event_processor_poll_seconds == 0.1
     assert settings.event_processor_claim_timeout_seconds == 30
+    assert settings.event_processor_max_attempts == 5
+    assert settings.event_processor_retry_base_seconds == 0.5
+    assert settings.event_processor_retry_cap_seconds == 12
     assert settings.event_retention_seconds == 3600
     assert settings.event_cleanup_interval_seconds == 10
     assert settings.event_cleanup_batch_size == 2500
@@ -90,6 +101,7 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
     assert settings.workspace_project_id == UUID("10000000-0000-0000-0000-000000000001")
     assert settings.workspace_event_batch_size == 250
     assert settings.workspace_event_flush_seconds == 0.02
+    assert settings.workspace_event_max_attempts == 6
     assert settings.workspace_sync_plan_batch_size == 2500
     assert settings.workspace_sync_batch_size == 250
     assert settings.workspace_sync_workers == 4
@@ -112,6 +124,9 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
         ("WZB_EVENT_PROCESSOR_BATCH_SIZE", "10001"),
         ("WZB_EVENT_PROCESSOR_POLL_SECONDS", "0"),
         ("WZB_EVENT_PROCESSOR_CLAIM_TIMEOUT_SECONDS", "0"),
+        ("WZB_EVENT_PROCESSOR_MAX_ATTEMPTS", "0"),
+        ("WZB_EVENT_PROCESSOR_RETRY_BASE_SECONDS", "0"),
+        ("WZB_EVENT_PROCESSOR_RETRY_CAP_SECONDS", "0"),
         ("WZB_EVENT_RETENTION_SECONDS", "0"),
         ("WZB_EVENT_CLEANUP_INTERVAL_SECONDS", "0"),
         ("WZB_EVENT_CLEANUP_BATCH_SIZE", "0"),
@@ -119,6 +134,7 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
         ("WZB_WORKSPACE_EVENT_BATCH_SIZE", "0"),
         ("WZB_WORKSPACE_EVENT_BATCH_SIZE", "10001"),
         ("WZB_WORKSPACE_EVENT_FLUSH_SECONDS", "0"),
+        ("WZB_WORKSPACE_EVENT_MAX_ATTEMPTS", "0"),
         ("WZB_WORKSPACE_SYNC_PLAN_BATCH_SIZE", "0"),
         ("WZB_WORKSPACE_SYNC_PLAN_BATCH_SIZE", "100001"),
         ("WZB_WORKSPACE_SYNC_WORKERS", "0"),

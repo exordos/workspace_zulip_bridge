@@ -103,7 +103,7 @@ def test_bad_event_queue_id_is_classified() -> None:
         client.close()
 
 
-def test_chat_catalog_endpoints_and_direct_message_pagination() -> None:
+def test_chat_catalog_endpoints() -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -129,36 +129,39 @@ def test_chat_catalog_endpoints_and_direct_message_pagination() -> None:
                     "role": 400,
                 },
             )
-        assert request.url.path.endswith("/messages")
-        assert request.url.params["anchor"] == "123"
-        assert request.url.params["include_anchor"] == "false"
-        assert request.url.params["num_before"] == "5000"
-        assert request.url.params["num_after"] == "0"
-        assert request.url.params["apply_markdown"] == "false"
-        assert json.loads(request.url.params["narrow"]) == [
-            {"operator": "is", "operand": "dm"}
-        ]
-        return httpx.Response(
-            200,
-            json={
-                "result": "success",
-                "msg": "",
-                "found_oldest": True,
-                "messages": [{"id": 122, "display_recipient": []}],
-            },
-        )
+        raise AssertionError(f"unexpected request: {request.url}")
 
     client = _client(handler)
     try:
         assert client.get_own_user().user_id == 42
         assert client.get_subscriptions() == [{"stream_id": 7, "name": "General"}]
-        page = client.get_direct_messages_page(123, include_anchor=False)
-        assert page.found_oldest
-        assert page.messages == [{"id": 122, "display_recipient": []}]
     finally:
         client.close()
 
-    assert len(requests) == 3
+    assert len(requests) == 2
+
+
+def test_topic_notification_uses_visibility_policy_endpoint() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path.endswith("/user_topics")
+        form = parse_qs(request.content.decode())
+        assert form == {
+            "stream_id": ["7"],
+            "topic": ["General"],
+            "visibility_policy": ["3"],
+        }
+        return httpx.Response(200, json={"result": "success", "msg": ""})
+
+    client = _client(handler)
+    try:
+        client.update_topic_notification(
+            7,
+            "General",
+            visibility_policy=3,
+        )
+    finally:
+        client.close()
 
 
 def test_user_directory_and_full_message_history_endpoints() -> None:
@@ -224,31 +227,6 @@ def test_user_directory_and_full_message_history_endpoints() -> None:
     assert page.messages == [{"id": 123}]
     assert page.found_oldest
     assert len(requests) == 2
-
-
-def test_messages_can_be_refetched_by_id_for_live_updates() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path.endswith("/messages")
-        assert json.loads(request.url.params["message_ids"]) == [4, 8, 15]
-        assert request.url.params["apply_markdown"] == "false"
-        assert request.url.params["allow_empty_topic_name"] == "true"
-        assert "anchor" not in request.url.params
-        return httpx.Response(
-            200,
-            json={
-                "result": "success",
-                "msg": "",
-                "messages": [{"id": 4}, {"id": 15}],
-            },
-        )
-
-    client = _client(handler)
-    try:
-        messages = client.get_messages_by_ids([4, 8, 15])
-    finally:
-        client.close()
-
-    assert messages == [{"id": 4}, {"id": 15}]
 
 
 def test_attachment_directory_contains_metadata_without_file_bytes() -> None:
@@ -367,6 +345,9 @@ def test_message_write_endpoints_preserve_actor_and_provider_ids() -> None:
                 "to": ["7"],
                 "topic": ["Operations"],
                 "content": ["created"],
+                "queue_id": ["queue-42"],
+                "local_id": ["local-42"],
+                "read_by_sender": ["true"],
             }
             return httpx.Response(200, json={"result": "success", "id": 123})
         if request.method == "PATCH":
@@ -390,6 +371,8 @@ def test_message_write_endpoints_preserve_actor_and_provider_ids() -> None:
             42,
             "created",
             topic="Operations",
+            queue_id="queue-42",
+            local_id="local-42",
         )
         client.update_message(message_id, content="updated")
         client.update_message_flag(message_id, "read", True)

@@ -44,6 +44,7 @@ def test_exordos_manifest_renders_without_implicit_values() -> None:
         .from_string(source)
         .render(
             version="0.1.0",
+            project_id="00000000-0000-0000-0000-000000000001",
             images={
                 "workspace_zulip_bridge": (
                     "urn:images:00000000-0000-0000-0000-000000000000"
@@ -68,8 +69,7 @@ def test_exordos_manifest_renders_without_implicit_values() -> None:
             {"size": 20, "label": "data"},
         ],
     }
-    project_id = "12345678-c625-4fee-81d5-f691897b8142"
-    assert node["project_id"] == project_id
+    assert node["project_id"] == "00000000-0000-0000-0000-000000000001"
     assert "$core.compute.volumes" not in manifest["resources"]
     assert manifest["exports"]["bridge_node"] == {
         "kind": "resource",

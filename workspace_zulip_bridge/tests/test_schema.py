@@ -12,6 +12,14 @@ def _schema() -> str:
     )
 
 
+def _schema_upgrades() -> str:
+    return (
+        resources.files("workspace_zulip_bridge")
+        .joinpath("schema_upgrades.sql")
+        .read_text(encoding="utf-8")
+    )
+
+
 def test_schema_separates_realm_identities_and_sync_connections() -> None:
     schema = _schema()
 
@@ -43,6 +51,8 @@ def test_schema_normalizes_workspace_like_entities_and_personal_state() -> None:
     ):
         assert f"workspace_zulip_bridge.{table}" in schema
     assert "source_connection_uuid uuid" in schema
+    assert "zulip_messages_source_connection_uuid_fkey" in schema
+    assert "ON DELETE SET NULL" in schema
     assert "UNIQUE (realm_uuid, chat_key)" in schema
     assert "UNIQUE (zulip_stream_uuid, zulip_user_uuid)" in schema
     assert "first_visible_message_id bigint" in schema
@@ -95,4 +105,25 @@ def test_schema_contains_event_retention_and_workspace_outbox_state() -> None:
     assert "workspace_events" in schema
     assert "workspace_events_pending_idx" in schema
     assert "workspace_events_priority_pending_idx" in schema
+    assert "workspace_events_terminal_retention_idx" in schema
+    assert "available_at timestamptz NOT NULL DEFAULT clock_timestamp()" in schema
     assert "recovery_required boolean NOT NULL DEFAULT false" in schema
+
+
+def test_schema_is_a_clean_install_definition_without_upgrade_rewrites() -> None:
+    schema = _schema()
+
+    assert "ADD COLUMN IF NOT EXISTS" not in schema
+    assert "RENAME COLUMN" not in schema
+
+
+def test_schema_upgrades_preserve_older_persistent_volumes() -> None:
+    upgrades = _schema_upgrades()
+
+    assert "workspace_events" in upgrades
+    assert "ADD COLUMN available_at timestamptz" in upgrades
+    assert "DROP INDEX IF EXISTS" in upgrades
+    assert "workspace_events_pending_idx" in upgrades
+    assert "zulip_users" in upgrades
+    assert "workspace_mirror_state" in upgrades
+    assert "sync_diffs" in upgrades

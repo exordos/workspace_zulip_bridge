@@ -1,11 +1,42 @@
 # Copyright 2026 Genesis Corporation
 # Licensed under the Apache License, Version 2.0 (the "License").
 
+import httpx
+
 from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.workspace_sync import _equivalent_entity
+from workspace_zulip_bridge.workspace_sync import _provider_api_error
 from workspace_zulip_bridge.workspace_sync import _reaction_identity
 from workspace_zulip_bridge.workspace_sync import identity_rebind_required
 from workspace_zulip_bridge.workspace_sync import workspace_directory_url
+
+
+def test_provider_api_error_omits_response_body() -> None:
+    response = httpx.Response(
+        422,
+        json={
+            "error": "invalid_entity",
+            "message": "private message content",
+            "data": {"token": "not-a-real-secret"},
+        },
+    )
+
+    error = str(_provider_api_error(response))
+
+    assert error == "Workspace Provider API returned 422 error=invalid_entity"
+    assert "private message content" not in error
+    assert "not-a-real-secret" not in error
+
+
+def test_provider_api_error_rejects_untrusted_error_code() -> None:
+    response = httpx.Response(
+        500,
+        json={"error": "invalid entity: private message content"},
+    )
+
+    assert str(_provider_api_error(response)) == (
+        "Workspace Provider API returned 500 error=unknown"
+    )
 
 
 def test_reaction_equivalence_ignores_reload_timestamp() -> None:

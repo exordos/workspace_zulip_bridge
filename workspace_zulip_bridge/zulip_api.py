@@ -9,7 +9,6 @@ from typing import Any
 
 import httpx
 
-from workspace_zulip_bridge.models import DirectMessagePage
 from workspace_zulip_bridge.models import MessagePage
 from workspace_zulip_bridge.models import RecentPrivateConversation
 from workspace_zulip_bridge.models import RegisteredQueue
@@ -273,38 +272,6 @@ class ZulipApiClient:
             attachments.append(parse_attachment(raw))
         return attachments
 
-    def get_direct_messages_page(
-        self,
-        anchor: str | int,
-        *,
-        include_anchor: bool,
-    ) -> DirectMessagePage:
-        payload = self._request(
-            "GET",
-            "/api/v1/messages",
-            params={
-                "anchor": str(anchor),
-                "include_anchor": json.dumps(include_anchor),
-                "num_before": str(self._message_page_size),
-                "num_after": "0",
-                "apply_markdown": "false",
-                "narrow": json.dumps(
-                    [{"operator": "is", "operand": "dm"}],
-                    separators=(",", ":"),
-                ),
-            },
-            timeout=self._chat_timeout(),
-        )
-        messages = payload.get("messages")
-        found_oldest = payload.get("found_oldest")
-        if not isinstance(messages, list) or not all(
-            isinstance(message, dict) for message in messages
-        ):
-            raise ZulipApiError("invalid_messages_response", retryable=True)
-        if not isinstance(found_oldest, bool):
-            raise ZulipApiError("invalid_messages_response", retryable=True)
-        return DirectMessagePage(messages=messages, found_oldest=found_oldest)
-
     def get_messages_page(
         self,
         anchor: str | int,
@@ -409,29 +376,6 @@ class ZulipApiClient:
             raise ZulipApiError("invalid_messages_response", retryable=True)
         return message_id
 
-    def get_messages_by_ids(
-        self,
-        message_ids: list[int],
-    ) -> list[Mapping[str, Any]]:
-        if not message_ids:
-            return []
-        payload = self._request(
-            "GET",
-            "/api/v1/messages",
-            params={
-                "message_ids": json.dumps(message_ids, separators=(",", ":")),
-                "apply_markdown": "false",
-                "allow_empty_topic_name": "true",
-            },
-            timeout=self._chat_timeout(),
-        )
-        messages = payload.get("messages")
-        if not isinstance(messages, list) or not all(
-            isinstance(message, dict) for message in messages
-        ):
-            raise ZulipApiError("invalid_messages_response", retryable=True)
-        return messages
-
     def send_message(
         self,
         chat_key: str,
@@ -439,6 +383,8 @@ class ZulipApiClient:
         content: str,
         *,
         topic: str | None,
+        queue_id: str,
+        local_id: str,
     ) -> int:
         if chat_key.startswith("channel:"):
             try:
@@ -468,6 +414,13 @@ class ZulipApiClient:
             }
         else:
             raise ValueError("unsupported chat key")
+        data.update(
+            {
+                "queue_id": queue_id,
+                "local_id": local_id,
+                "read_by_sender": "true",
+            }
+        )
         payload = self._request("POST", "/api/v1/messages", data=data)
         message_id = payload.get("id")
         if not isinstance(message_id, int):
@@ -605,15 +558,15 @@ class ZulipApiClient:
         stream_id: int,
         topic: str,
         *,
-        muted: bool,
+        visibility_policy: int,
     ) -> None:
         self._request(
-            "PATCH",
-            "/api/v1/users/me/subscriptions/muted_topics",
+            "POST",
+            "/api/v1/user_topics",
             data={
                 "stream_id": str(stream_id),
                 "topic": topic,
-                "op": "add" if muted else "remove",
+                "visibility_policy": str(visibility_policy),
             },
         )
 

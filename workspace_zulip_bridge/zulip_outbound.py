@@ -7,21 +7,28 @@ import asyncio
 import hashlib
 import json
 from dataclasses import dataclass
+from datetime import UTC
 from datetime import datetime
 from typing import Any
 from uuid import UUID
 
 import asyncpg
+import httpx
 
 from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.message_history import message_content_hash
 from workspace_zulip_bridge.message_history import message_flags_hash
 from workspace_zulip_bridge.message_history import message_state_hash
 from workspace_zulip_bridge.zulip_api import ZulipApiClient
+from workspace_zulip_bridge.zulip_api import ZulipApiError
 
 
 class ZulipOutboundError(RuntimeError):
     """A Workspace mutation cannot currently be represented in Zulip."""
+
+
+class ZulipOutboundPending(ZulipOutboundError):
+    """A prior message send is waiting for its Zulip local-echo receipt."""
 
 
 def _json_object(value: Any) -> dict[str, Any]:
@@ -49,6 +56,7 @@ class _Actor:
     endpoint: str
     login: str
     api_key: str
+    queue_id: str | None
 
 
 class ZulipOutboundWriter:
@@ -97,25 +105,26 @@ class ZulipOutboundWriter:
         if target is None:
             if source is None:
                 return
-            stream = await self._stream(entity_uuid)
-            if stream is None or not str(stream["chat_key"]).startswith("channel:"):
-                raise ZulipOutboundError("direct conversations cannot be deleted")
-            actor = await self._actor(_stream_owner_uuid(source), entity_uuid)
-            await asyncio.to_thread(
-                self._client(actor).update_stream,
-                int(str(stream["chat_key"]).removeprefix("channel:")),
-                name=None,
-                description=None,
-                is_archived=True,
+            raise ZulipOutboundError(
+                "Workspace stream deletion is not supported by Zulip"
             )
-            return
         if source is None:
             await self._create_stream(entity_uuid, target)
             return
         stream = await self._required_stream(entity_uuid)
         if not str(stream["chat_key"]).startswith("channel:"):
             return
-        actor = await self._actor(_stream_owner_uuid(target), entity_uuid)
+        unsupported_changes = tuple(
+            property_name
+            for property_name in ("invite_only", "announce", "color")
+            if target.get(property_name) != source.get(property_name)
+        )
+        if unsupported_changes:
+            raise ZulipOutboundError(
+                "Zulip stream properties cannot be updated: "
+                + ", ".join(unsupported_changes)
+            )
+        actor = await self._actor(_stream_owner_uuid(target))
         stream_id = int(str(stream["chat_key"]).removeprefix("channel:"))
         name = str(target["name"]) if target.get("name") != source.get("name") else None
         description = (
@@ -261,7 +270,7 @@ class ZulipOutboundWriter:
         if data is None:
             return
         stream = await self._required_stream(UUID(str(data["stream_uuid"])))
-        actor = await self._actor(UUID(str(data["user_uuid"])), stream["uuid"])
+        actor = await self._actor(UUID(str(data["user_uuid"])))
         if str(stream["chat_key"]).startswith("channel:"):
             await asyncio.to_thread(
                 self._client(actor).update_subscription,
@@ -336,6 +345,19 @@ class ZulipOutboundWriter:
         )
         if row is None:
             return
+        conflicting_topic_uuid = await self._pool.fetchval(
+            """
+            SELECT uuid FROM workspace_zulip_bridge.zulip_topics
+            WHERE zulip_stream_uuid = $1 AND name = $2 AND uuid <> $3
+            """,
+            row["stream_uuid"],
+            desired_name,
+            entity_uuid,
+        )
+        if conflicting_topic_uuid is not None:
+            raise ZulipOutboundError(
+                "Workspace topic rename conflicts with an existing Zulip topic"
+            )
         actor = await self._stream_actor(row["stream_uuid"])
         await asyncio.to_thread(
             self._client(actor).update_message,
@@ -343,6 +365,93 @@ class ZulipOutboundWriter:
             topic=desired_name,
             propagate_mode="change_all",
         )
+        await self._record_topic_rename(
+            entity_uuid,
+            row["stream_uuid"],
+            desired_name,
+            target,
+        )
+
+    async def _record_topic_rename(
+        self,
+        entity_uuid: UUID,
+        stream_uuid: UUID,
+        desired_name: str,
+        target: dict[str, Any],
+    ) -> None:
+        async with self._pool.acquire() as connection, connection.transaction():
+            topic = await connection.fetchrow(
+                """
+                SELECT name FROM workspace_zulip_bridge.zulip_topics
+                WHERE uuid = $1 AND zulip_stream_uuid = $2
+                FOR UPDATE
+                """,
+                entity_uuid,
+                stream_uuid,
+            )
+            if topic is None:
+                raise ZulipOutboundError("Zulip topic identity is unavailable")
+            conflict = await connection.fetchval(
+                """
+                SELECT uuid FROM workspace_zulip_bridge.zulip_topics
+                WHERE zulip_stream_uuid = $1 AND name = $2 AND uuid <> $3
+                """,
+                stream_uuid,
+                desired_name,
+                entity_uuid,
+            )
+            if conflict is not None:
+                raise ZulipOutboundError(
+                    "Workspace topic rename conflicts with an existing Zulip topic"
+                )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_topic_aliases (
+                    zulip_stream_uuid, alias, topic_uuid, active
+                ) VALUES ($1, $2, $3, false)
+                ON CONFLICT (zulip_stream_uuid, alias) DO UPDATE
+                SET topic_uuid = EXCLUDED.topic_uuid, active = false,
+                    updated_at = clock_timestamp()
+                """,
+                stream_uuid,
+                topic["name"],
+                entity_uuid,
+            )
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_topic_aliases
+                SET active = false, updated_at = clock_timestamp()
+                WHERE topic_uuid = $1 AND active
+                """,
+                entity_uuid,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_topic_aliases (
+                    zulip_stream_uuid, alias, topic_uuid, active
+                ) VALUES ($1, $2, $3, true)
+                ON CONFLICT (zulip_stream_uuid, alias) DO UPDATE
+                SET topic_uuid = EXCLUDED.topic_uuid, active = true,
+                    updated_at = clock_timestamp()
+                """,
+                stream_uuid,
+                desired_name,
+                entity_uuid,
+            )
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_topics
+                SET name = $3, is_done = $4, version = $5,
+                    content_hash = $6, updated_at = clock_timestamp()
+                WHERE uuid = $1 AND zulip_stream_uuid = $2
+                """,
+                entity_uuid,
+                stream_uuid,
+                desired_name,
+                bool(target.get("is_done")),
+                int(target.get("version", 0)),
+                hashlib.sha256(desired_name.encode("utf-8")).digest(),
+            )
 
     async def _apply_topic_bindings(
         self,
@@ -358,13 +467,21 @@ class ZulipOutboundWriter:
         if not str(stream["chat_key"]).startswith("channel:"):
             return
         topic = await self._target_or_source_topic(UUID(str(data["topic_uuid"])))
-        actor = await self._actor(UUID(str(data["user_uuid"])), stream["uuid"])
+        actor = await self._actor(UUID(str(data["user_uuid"])))
         mode = target.get("notification_mode", "default") if target else "default"
+        visibility_policy = {
+            "default": 0,
+            "mute": 1,
+            "unmute": 2,
+            "follow": 3,
+        }.get(str(mode))
+        if visibility_policy is None:
+            raise ZulipOutboundError("unsupported topic notification mode")
         await asyncio.to_thread(
             self._client(actor).update_topic_notification,
             int(str(stream["chat_key"]).removeprefix("channel:")),
             str(topic["name"]),
-            muted=mode == "mute",
+            visibility_policy=visibility_policy,
         )
         if target is None:
             await self._pool.execute(
@@ -407,9 +524,7 @@ class ZulipOutboundWriter:
             row = await self._message(entity_uuid)
             if row is None or source is None:
                 return
-            actor = await self._actor(
-                UUID(str(source["author_uuid"])), row["stream_uuid"]
-            )
+            actor = await self._actor(UUID(str(source["author_uuid"])))
             await asyncio.to_thread(
                 self._client(actor).delete_message,
                 int(row["zulip_message_id"]),
@@ -421,7 +536,7 @@ class ZulipOutboundWriter:
         row = await self._message(entity_uuid)
         if row is None:
             raise ZulipOutboundError("Zulip message identity is unavailable")
-        actor = await self._actor(UUID(str(target["author_uuid"])), row["stream_uuid"])
+        actor = await self._actor(UUID(str(target["author_uuid"])))
         source_payload = source.get("payload") or {}
         target_payload = target.get("payload") or {}
         content = (
@@ -451,26 +566,95 @@ class ZulipOutboundWriter:
         stream_uuid = UUID(str(target["stream_uuid"]))
         stream = await self._required_stream(stream_uuid)
         author_uuid = UUID(str(target["author_uuid"]))
-        actor = await self._actor(author_uuid, stream_uuid)
+        actor = await self._actor(author_uuid)
         topic_uuid = UUID(str(target["topic_uuid"]))
         topic = await self._ensure_topic(topic_uuid, stream_uuid)
         payload = target.get("payload")
         if not isinstance(payload, dict) or payload.get("kind") != "markdown":
             raise ZulipOutboundError("only markdown messages can be sent to Zulip")
+        if actor.queue_id is None:
+            raise ZulipOutboundError(
+                "Zulip event queue is unavailable for message send"
+            )
         content = str(payload.get("content", ""))
-        message_id = await asyncio.to_thread(
-            self._client(actor).send_message,
-            str(stream["chat_key"]),
-            actor.zulip_user_id,
-            content,
-            topic=str(topic["name"]),
+        message_link = await self._pool.fetchrow(
+            """
+            INSERT INTO workspace_zulip_bridge.zulip_entity_links (
+                realm_uuid, entity_type, workspace_uuid, zulip_external_key
+            ) VALUES ($1, 'message', $2, $3)
+            ON CONFLICT (realm_uuid, entity_type, workspace_uuid) DO NOTHING
+            RETURNING zulip_external_key, updated_at
+            """,
+            actor.realm_uuid,
+            entity_uuid,
+            f"pending:{entity_uuid}",
         )
-        await asyncio.to_thread(
-            self._client(actor).update_message_flag,
-            message_id,
-            "read",
-            True,
-        )
+        owns_send = message_link is not None
+        if message_link is None:
+            message_link = await self._pool.fetchrow(
+                """
+                SELECT zulip_external_key, updated_at
+                FROM workspace_zulip_bridge.zulip_entity_links
+                WHERE realm_uuid = $1 AND entity_type = 'message'
+                  AND workspace_uuid = $2
+                """,
+                actor.realm_uuid,
+                entity_uuid,
+            )
+        if message_link is None:
+            raise ZulipOutboundError("Zulip message identity is unavailable")
+        external_key = str(message_link["zulip_external_key"])
+        if external_key.startswith("pending:") and not owns_send:
+            pending_age = datetime.now(UTC) - message_link["updated_at"]
+            if pending_age.total_seconds() >= self._settings.zulip_retry_cap_seconds:
+                raise ZulipOutboundError(
+                    "Zulip message send confirmation timed out; "
+                    "manual reconciliation is required"
+                )
+            raise ZulipOutboundPending(
+                "Zulip message send is awaiting its local-echo receipt"
+            )
+        if external_key.startswith("pending:"):
+            try:
+                message_id = await asyncio.to_thread(
+                    self._client(actor).send_message,
+                    str(stream["chat_key"]),
+                    actor.zulip_user_id,
+                    content,
+                    topic=str(topic["name"]),
+                    queue_id=actor.queue_id,
+                    local_id=str(entity_uuid),
+                )
+            except (ValueError, ZulipApiError, httpx.ConnectError) as exc:
+                if isinstance(exc, ZulipApiError) and exc.retryable:
+                    raise
+                await self._pool.execute(
+                    """
+                    DELETE FROM workspace_zulip_bridge.zulip_entity_links
+                    WHERE realm_uuid = $1 AND entity_type = 'message'
+                      AND workspace_uuid = $2 AND zulip_external_key = $3
+                    """,
+                    actor.realm_uuid,
+                    entity_uuid,
+                    external_key,
+                )
+                raise
+            await self._pool.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_entity_links
+                SET zulip_external_key = $3, updated_at = clock_timestamp()
+                WHERE realm_uuid = $1 AND entity_type = 'message'
+                  AND workspace_uuid = $2
+                """,
+                actor.realm_uuid,
+                entity_uuid,
+                str(message_id),
+            )
+        else:
+            try:
+                message_id = int(external_key)
+            except ValueError as exc:
+                raise ZulipOutboundError("invalid Zulip message identity") from exc
         created_at = datetime.fromisoformat(
             str(target["created_at"]).replace("Z", "+00:00")
         )
@@ -490,45 +674,85 @@ class ZulipOutboundWriter:
             sent_at=sent_at,
             reactions=(),
         )
-        async with self._pool.acquire() as connection, connection.transaction():
-            await connection.execute(
-                """
-                INSERT INTO workspace_zulip_bridge.zulip_entity_links (
-                    realm_uuid, entity_type, workspace_uuid, zulip_external_key
-                ) VALUES ($1, 'message', $2, $3)
-                ON CONFLICT (realm_uuid, entity_type, workspace_uuid) DO UPDATE
-                SET zulip_external_key = EXCLUDED.zulip_external_key,
-                    updated_at = clock_timestamp()
-                """,
-                actor.realm_uuid,
-                entity_uuid,
-                str(message_id),
-            )
-            await connection.execute(
-                """
-                INSERT INTO workspace_zulip_bridge.zulip_messages (
-                    uuid, realm_uuid, source_connection_uuid, zulip_stream_uuid,
-                    topic_uuid, sender_user_uuid, zulip_message_id, content,
-                    reactions, reaction_users, content_hash, message_hash,
-                    created_at, source_updated_at
-                ) VALUES (
-                    $1, $2, $3, $4, $5, $6, $7, $8,
-                    '[]'::jsonb, '{}'::jsonb, $9, $10, $11, $12
-                ) ON CONFLICT (uuid) DO NOTHING
-                """,
-                entity_uuid,
-                actor.realm_uuid,
-                stream["source_connection_uuid"],
-                stream_uuid,
-                topic_uuid,
-                actor.user_uuid,
-                message_id,
-                content,
-                content_hash,
-                state_hash,
-                created_at,
-                target_updated_at or created_at,
-            )
+        for attempt in range(2):
+            try:
+                async with (
+                    self._pool.acquire() as connection,
+                    connection.transaction(),
+                ):
+                    removed_echoes = await connection.fetch(
+                        """
+                        DELETE FROM workspace_zulip_bridge.zulip_messages
+                        WHERE realm_uuid = $1 AND zulip_message_id = $2
+                          AND uuid <> $3
+                        RETURNING uuid
+                        """,
+                        actor.realm_uuid,
+                        message_id,
+                        entity_uuid,
+                    )
+                    if removed_echoes:
+                        await connection.execute(
+                            """
+                            DELETE FROM workspace_zulip_bridge.sync_diffs
+                            WHERE realm_uuid = $1 AND entity_type = 'messages'
+                              AND entity_uuid = ANY($2::uuid[])
+                            """,
+                            actor.realm_uuid,
+                            [row["uuid"] for row in removed_echoes],
+                        )
+                    await connection.execute(
+                        """
+                        INSERT INTO workspace_zulip_bridge.zulip_messages (
+                            uuid, realm_uuid, source_connection_uuid,
+                            zulip_stream_uuid, topic_uuid, sender_user_uuid,
+                            zulip_message_id, content, reactions, reaction_users,
+                            content_hash, message_hash, created_at, source_updated_at
+                        ) VALUES (
+                            $1, $2, $3, $4, $5, $6, $7, $8,
+                            '[]'::jsonb, '{}'::jsonb, $9, $10, $11, $12
+                        ) ON CONFLICT (uuid) DO UPDATE SET
+                            source_connection_uuid = EXCLUDED.source_connection_uuid,
+                            zulip_stream_uuid = EXCLUDED.zulip_stream_uuid,
+                            topic_uuid = EXCLUDED.topic_uuid,
+                            sender_user_uuid = EXCLUDED.sender_user_uuid,
+                            zulip_message_id = EXCLUDED.zulip_message_id,
+                            content = EXCLUDED.content,
+                            reactions = EXCLUDED.reactions,
+                            reaction_users = EXCLUDED.reaction_users,
+                            content_hash = EXCLUDED.content_hash,
+                            message_hash = EXCLUDED.message_hash,
+                            created_at = EXCLUDED.created_at,
+                            source_updated_at = EXCLUDED.source_updated_at,
+                            updated_at = clock_timestamp()
+                        """,
+                        entity_uuid,
+                        actor.realm_uuid,
+                        stream["source_connection_uuid"],
+                        stream_uuid,
+                        topic_uuid,
+                        actor.user_uuid,
+                        message_id,
+                        content,
+                        content_hash,
+                        state_hash,
+                        created_at,
+                        target_updated_at or created_at,
+                    )
+                break
+            except asyncpg.UniqueViolationError:
+                if attempt:
+                    raise
+                # A pre-link live event can finish between the delete and the
+                # insert. The committed link prevents another non-canonical
+                # echo, so one immediate retry is sufficient.
+                await asyncio.sleep(0)
+        await asyncio.to_thread(
+            self._client(actor).update_message_flag,
+            message_id,
+            "read",
+            True,
+        )
 
     async def _apply_message_flags(
         self,
@@ -540,15 +764,27 @@ class ZulipOutboundWriter:
         data = target or source
         if data is None:
             return
-        message = await self._message(UUID(str(data["message_uuid"])))
-        if message is None:
-            raise ZulipOutboundError("Zulip message identity is unavailable")
-        actor = await self._actor(UUID(str(data["user_uuid"])), message["stream_uuid"])
         desired = target or {
             **data,
             "read": False,
             "starred": False,
+            "pinned": False,
+            "mentioned": False,
         }
+        unsupported_changes = tuple(
+            field
+            for field in ("pinned", "mentioned")
+            if bool((source or {}).get(field)) != bool(desired.get(field))
+        )
+        if unsupported_changes:
+            raise ZulipOutboundError(
+                "Zulip message flags cannot be updated: "
+                + ", ".join(unsupported_changes)
+            )
+        message = await self._message(UUID(str(data["message_uuid"])))
+        if message is None:
+            raise ZulipOutboundError("Zulip message identity is unavailable")
+        actor = await self._actor(UUID(str(data["user_uuid"])))
         for field, zulip_flag in (("read", "read"), ("starred", "starred")):
             if source is None or bool(source.get(field)) != bool(desired.get(field)):
                 await asyncio.to_thread(
@@ -613,7 +849,7 @@ class ZulipOutboundWriter:
         message = await self._message(UUID(str(data["message_uuid"])))
         if message is None:
             raise ZulipOutboundError("Zulip message identity is unavailable")
-        actor = await self._actor(UUID(str(data["user_uuid"])), message["stream_uuid"])
+        actor = await self._actor(UUID(str(data["user_uuid"])))
         await asyncio.to_thread(
             self._client(actor).update_reaction,
             int(message["zulip_message_id"]),
@@ -631,7 +867,7 @@ class ZulipOutboundWriter:
             SELECT connection.uuid AS connection_uuid, connection.realm_uuid,
                    connection.zulip_user_uuid AS user_uuid,
                    zulip_user.zulip_user_id, realm.identity_key AS endpoint,
-                   connection.login, connection.api_key
+                   connection.login, connection.api_key, connection.queue_id
             FROM workspace_zulip_bridge.zulip_connections AS connection
             JOIN workspace_zulip_bridge.zulip_users AS zulip_user
               ON zulip_user.uuid = connection.zulip_user_uuid
@@ -640,10 +876,10 @@ class ZulipOutboundWriter:
             WHERE (
                     connection.zulip_user_uuid = $1
                     OR zulip_user.workspace_user_uuid = $1
-                  )
+              )
               AND NOT zulip_user.disabled
-            ORDER BY (connection.zulip_user_uuid = $1) DESC,
-                     connection.sync_enabled DESC, connection.uuid
+              AND connection.sync_enabled
+            ORDER BY (connection.zulip_user_uuid = $1) DESC, connection.uuid
             LIMIT 1
             """,
             user_uuid,
@@ -654,7 +890,7 @@ class ZulipOutboundWriter:
                 SELECT connection.uuid AS connection_uuid, connection.realm_uuid,
                        connection.zulip_user_uuid AS user_uuid,
                        zulip_user.zulip_user_id, realm.identity_key AS endpoint,
-                       connection.login, connection.api_key
+                       connection.login, connection.api_key, connection.queue_id
                 FROM workspace_zulip_bridge.zulip_streams AS stream
                 JOIN workspace_zulip_bridge.zulip_connections AS connection
                   ON connection.uuid = stream.source_connection_uuid
@@ -663,6 +899,7 @@ class ZulipOutboundWriter:
                 JOIN workspace_zulip_bridge.zulip_realms AS realm
                   ON realm.uuid = connection.realm_uuid
                 WHERE stream.uuid = $1 AND NOT zulip_user.disabled
+                  AND connection.sync_enabled
                 """,
                 stream_uuid,
             )

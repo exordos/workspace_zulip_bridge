@@ -25,6 +25,11 @@ async def open_pool(settings: Settings) -> asyncpg.Pool:
 
 
 async def prepare_database(pool: asyncpg.Pool) -> None:
+    upgrades = (
+        resources.files("workspace_zulip_bridge")
+        .joinpath("schema_upgrades.sql")
+        .read_text(encoding="utf-8")
+    )
     schema = (
         resources.files("workspace_zulip_bridge")
         .joinpath("schema.sql")
@@ -35,6 +40,7 @@ async def prepare_database(pool: asyncpg.Pool) -> None:
             "SELECT pg_advisory_xact_lock("
             "hashtextextended('workspace_zulip_bridge:schema', 0))"
         )
+        await connection.execute(upgrades)
         await connection.execute(schema)
         await connection.execute(
             """

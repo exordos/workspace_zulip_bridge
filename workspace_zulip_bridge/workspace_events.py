@@ -345,11 +345,8 @@ class WorkspaceEventReceiver:
                 await self._consume(websocket, cursor)
             except ConnectionClosed as exc:
                 close_code = None if exc.rcvd is None else exc.rcvd.code
-                close_reason = None if exc.rcvd is None else exc.rcvd.reason
                 if close_code == 4410:
-                    raise WorkspaceCursorGapError(
-                        f"Workspace event cursor expired: {close_reason}"
-                    ) from exc
+                    raise WorkspaceCursorGapError("workspace_cursor_expired") from exc
                 raise
             finally:
                 await self._store.mark_disconnected(self._provider_uuid)
@@ -376,9 +373,13 @@ class WorkspaceEventReceiver:
                 if frame.get("error") == "epoch_pruned" or frame.get("code") == 410:
                     await self._flush(batch, generation)
                     batch.clear()
+                    minimum_epoch_version = _nonnegative_int(
+                        frame.get("minimum_epoch_version"),
+                        "minimum_epoch_version",
+                    )
                     raise WorkspaceCursorGapError(
-                        f"{frame.get('reason', 'epoch_pruned')}: "
-                        f"minimum={frame.get('minimum_epoch_version')}"
+                        "workspace_cursor_expired:"
+                        f"minimum_epoch_version={minimum_epoch_version}"
                     )
                 if frame.get("type") == "ready":
                     await self._flush(batch, generation)

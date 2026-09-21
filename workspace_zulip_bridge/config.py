@@ -63,6 +63,9 @@ class Settings:
     event_processor_batch_size: int = 1000
     event_processor_poll_seconds: float = 0.05
     event_processor_claim_timeout_seconds: float = 60.0
+    event_processor_max_attempts: int = 8
+    event_processor_retry_base_seconds: float = 0.25
+    event_processor_retry_cap_seconds: float = 30.0
     event_retention_seconds: float = 86400.0
     event_cleanup_interval_seconds: float = 300.0
     event_cleanup_batch_size: int = 10000
@@ -76,6 +79,7 @@ class Settings:
     workspace_ca_file: Path | None = None
     workspace_event_batch_size: int = 500
     workspace_event_flush_seconds: float = 0.01
+    workspace_event_max_attempts: int = 8
     workspace_retry_base_seconds: float = 1.0
     workspace_retry_cap_seconds: float = 60.0
     workspace_lease_retry_seconds: float = 5.0
@@ -153,6 +157,15 @@ class Settings:
             event_processor_claim_timeout_seconds=_read_float(
                 source, "WZB_EVENT_PROCESSOR_CLAIM_TIMEOUT_SECONDS", 60.0
             ),
+            event_processor_max_attempts=_read_int(
+                source, "WZB_EVENT_PROCESSOR_MAX_ATTEMPTS", 8
+            ),
+            event_processor_retry_base_seconds=_read_float(
+                source, "WZB_EVENT_PROCESSOR_RETRY_BASE_SECONDS", 0.25
+            ),
+            event_processor_retry_cap_seconds=_read_float(
+                source, "WZB_EVENT_PROCESSOR_RETRY_CAP_SECONDS", 30.0
+            ),
             event_retention_seconds=_read_float(
                 source, "WZB_EVENT_RETENTION_SECONDS", 86400.0
             ),
@@ -187,6 +200,9 @@ class Settings:
             ),
             workspace_event_flush_seconds=_read_float(
                 source, "WZB_WORKSPACE_EVENT_FLUSH_SECONDS", 0.01
+            ),
+            workspace_event_max_attempts=_read_int(
+                source, "WZB_WORKSPACE_EVENT_MAX_ATTEMPTS", 8
             ),
             workspace_retry_base_seconds=_read_float(
                 source, "WZB_WORKSPACE_RETRY_BASE_SECONDS", 1.0
@@ -253,6 +269,12 @@ class Settings:
             "WZB_EVENT_PROCESSOR_CLAIM_TIMEOUT_SECONDS": (
                 self.event_processor_claim_timeout_seconds
             ),
+            "WZB_EVENT_PROCESSOR_RETRY_BASE_SECONDS": (
+                self.event_processor_retry_base_seconds
+            ),
+            "WZB_EVENT_PROCESSOR_RETRY_CAP_SECONDS": (
+                self.event_processor_retry_cap_seconds
+            ),
             "WZB_EVENT_RETENTION_SECONDS": self.event_retention_seconds,
             "WZB_EVENT_CLEANUP_INTERVAL_SECONDS": (self.event_cleanup_interval_seconds),
             "WZB_WORKSPACE_EVENT_FLUSH_SECONDS": self.workspace_event_flush_seconds,
@@ -300,6 +322,16 @@ class Settings:
             raise ValueError(
                 "WZB_EVENT_PROCESSOR_BATCH_SIZE must be between 1 and 10000"
             )
+        if self.event_processor_max_attempts < 1:
+            raise ValueError("WZB_EVENT_PROCESSOR_MAX_ATTEMPTS must be positive")
+        if (
+            self.event_processor_retry_cap_seconds
+            < self.event_processor_retry_base_seconds
+        ):
+            raise ValueError(
+                "WZB_EVENT_PROCESSOR_RETRY_CAP_SECONDS must be at least "
+                "WZB_EVENT_PROCESSOR_RETRY_BASE_SECONDS"
+            )
         if not 1 <= self.event_cleanup_batch_size <= 100000:
             raise ValueError(
                 "WZB_EVENT_CLEANUP_BATCH_SIZE must be between 1 and 100000"
@@ -308,6 +340,8 @@ class Settings:
             raise ValueError(
                 "WZB_WORKSPACE_EVENT_BATCH_SIZE must be between 1 and 10000"
             )
+        if self.workspace_event_max_attempts < 1:
+            raise ValueError("WZB_WORKSPACE_EVENT_MAX_ATTEMPTS must be positive")
         if not 1 <= self.workspace_sync_batch_size <= 500:
             raise ValueError("WZB_WORKSPACE_SYNC_BATCH_SIZE must be between 1 and 500")
         if not 1 <= self.workspace_sync_plan_batch_size <= 100000:

@@ -20,6 +20,7 @@ from workspace_zulip_bridge.message_history import build_message_page
 from workspace_zulip_bridge.message_history import extract_file_metadata
 from workspace_zulip_bridge.message_history import message_content_hash
 from workspace_zulip_bridge.message_history import message_state_hash
+from workspace_zulip_bridge.models import ZulipDirectoryUser
 from workspace_zulip_bridge.models import ZulipMessage
 from workspace_zulip_bridge.stable_ids import stable_chat_uuid
 from workspace_zulip_bridge.zulip_api import ZulipApiError
@@ -64,6 +65,7 @@ class EventBatchStats:
     applied: int = 0
     skipped: int = 0
     failed: int = 0
+    retried: int = 0
     messages_changed: int = 0
     messages_deleted: int = 0
     chats_changed: int = 0
@@ -82,6 +84,7 @@ class _ClaimedEvent:
     user_uuid: UUID
     endpoint: str
     queue_id: str
+    attempt_count: int
     own_user_id: int | None
     event_type: str
     payload: Mapping[str, Any]
@@ -151,12 +154,13 @@ class ZulipEventProcessor:
             if stats.claimed:
                 LOG.info(
                     "Zulip event batch processed claimed=%s applied=%s skipped=%s "
-                    "failed=%s message_changes=%s message_deletes=%s "
+                    "failed=%s retried=%s message_changes=%s message_deletes=%s "
                     "chat_changes=%s elapsed_seconds=%.6f events_per_second=%.3f",
                     stats.claimed,
                     stats.applied,
                     stats.skipped,
                     stats.failed,
+                    stats.retried,
                     stats.messages_changed,
                     stats.messages_deleted,
                     stats.chats_changed,
@@ -223,13 +227,61 @@ class ZulipEventProcessor:
         if not events:
             return EventBatchStats(elapsed_seconds=time.monotonic() - started_at)
 
-        chat_suppliers, message_routes = await self._load_routes(events)
+        try:
+            unresolved_local_links = await self._resolve_local_message_links(events)
+            await self._prepare_catalog_changes(events)
+            (
+                chat_suppliers,
+                message_routes,
+                transitioning_chats,
+            ) = await self._load_routes(events)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            LOG.exception("Zulip event batch preparation failed events=%s", len(events))
+            retry_outcomes = [
+                _Outcome(
+                    event.uuid,
+                    "retry",
+                    f"preparation_error:{type(exc).__name__}",
+                )
+                for event in events
+            ]
+            await self._finish_events(retry_outcomes)
+            return EventBatchStats(
+                claimed=len(events),
+                retried=len(events),
+                elapsed_seconds=time.monotonic() - started_at,
+            )
         routed = [
-            self._route_event(event, chat_suppliers, message_routes) for event in events
+            (
+                _RoutedEvent(event, skip_reason="local_message_link_retry")
+                if event.uuid in unresolved_local_links
+                else self._route_event(
+                    event,
+                    chat_suppliers,
+                    message_routes,
+                    transitioning_chats,
+                )
+            )
+            for event in events
         ]
         outcomes: list[_Outcome] = []
+        blocked_queues: set[tuple[UUID, str]] = set()
+        events_by_uuid = {event.uuid: event for event in events}
         pending_mutation_batch: list[_RoutedEvent] = []
         pending_batch_kind: str | None = None
+
+        def record_outcomes(batch_outcomes: list[_Outcome]) -> None:
+            outcomes.extend(batch_outcomes)
+            for outcome in batch_outcomes:
+                event = events_by_uuid[outcome.event_uuid]
+                if (
+                    outcome.status in {"retry", "defer"}
+                    and event.attempt_count
+                    < self._settings.event_processor_max_attempts
+                ):
+                    blocked_queues.add((event.user_uuid, event.queue_id))
 
         async def flush_mutation_batch() -> None:
             nonlocal pending_batch_kind, pending_mutation_batch
@@ -248,7 +300,7 @@ class ZulipEventProcessor:
                     batch_outcomes = await self._apply_messages_batch(
                         pending_mutation_batch
                     )
-                outcomes.extend(batch_outcomes)
+                record_outcomes(batch_outcomes)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -257,35 +309,59 @@ class ZulipEventProcessor:
                     pending_batch_kind,
                     len(pending_mutation_batch),
                 )
-                outcomes.extend(
-                    _Outcome(
-                        item.event.uuid,
-                        "failed",
-                        f"handler_error:{type(exc).__name__}",
-                    )
-                    for item in pending_mutation_batch
+                record_outcomes(
+                    [
+                        _Outcome(
+                            item.event.uuid,
+                            "retry",
+                            f"handler_error:{type(exc).__name__}",
+                        )
+                        for item in pending_mutation_batch
+                    ]
                 )
             pending_mutation_batch = []
             pending_batch_kind = None
 
         for item in routed:
-            if item.skip_reason is not None:
-                outcomes.append(_Outcome(item.event.uuid, "skipped", item.skip_reason))
-                continue
             batch_kind = _mutation_batch_kind(item)
+            if pending_mutation_batch and (
+                item.skip_reason is not None
+                or batch_kind is None
+                or pending_batch_kind != batch_kind
+                or pending_mutation_batch[0].event.user_uuid != item.event.user_uuid
+                or pending_mutation_batch[0].event.queue_id != item.event.queue_id
+            ):
+                await flush_mutation_batch()
+            queue_key = (item.event.user_uuid, item.event.queue_id)
+            if queue_key in blocked_queues:
+                record_outcomes(
+                    [
+                        _Outcome(
+                            item.event.uuid,
+                            "blocked",
+                            "blocked_by_prior_nonterminal_event",
+                        )
+                    ]
+                )
+                continue
+            if item.skip_reason is not None:
+                status = "skipped"
+                if item.skip_reason in {
+                    "chat_rescheduling",
+                    "chat_unassigned",
+                    "message_not_materialized",
+                }:
+                    status = "defer"
+                elif item.skip_reason == "local_message_link_retry":
+                    status = "retry"
+                record_outcomes([_Outcome(item.event.uuid, status, item.skip_reason)])
+                continue
             if batch_kind is not None:
-                if pending_mutation_batch and (
-                    pending_batch_kind != batch_kind
-                    or pending_mutation_batch[0].event.user_uuid != item.event.user_uuid
-                    or pending_mutation_batch[0].event.queue_id != item.event.queue_id
-                ):
-                    await flush_mutation_batch()
                 pending_batch_kind = batch_kind
                 pending_mutation_batch.append(item)
                 continue
-            await flush_mutation_batch()
             try:
-                outcomes.append(await self._apply_event(item))
+                record_outcomes([await self._apply_event(item)])
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -294,12 +370,14 @@ class ZulipEventProcessor:
                     item.event.uuid,
                     item.event.event_type,
                 )
-                outcomes.append(
-                    _Outcome(
-                        item.event.uuid,
-                        "failed",
-                        f"handler_error:{type(exc).__name__}",
-                    )
+                record_outcomes(
+                    [
+                        _Outcome(
+                            item.event.uuid,
+                            "retry",
+                            f"handler_error:{type(exc).__name__}",
+                        )
+                    ]
                 )
         await flush_mutation_batch()
         await self._finish_events(outcomes)
@@ -309,6 +387,9 @@ class ZulipEventProcessor:
             applied=sum(outcome.status == "applied" for outcome in outcomes),
             skipped=sum(outcome.status == "skipped" for outcome in outcomes),
             failed=sum(outcome.status == "failed" for outcome in outcomes),
+            retried=sum(
+                outcome.status in {"retry", "defer", "blocked"} for outcome in outcomes
+            ),
             messages_changed=sum(outcome.messages_changed for outcome in outcomes),
             messages_deleted=sum(outcome.messages_deleted for outcome in outcomes),
             chats_changed=sum(outcome.chats_changed for outcome in outcomes),
@@ -333,11 +414,54 @@ class ZulipEventProcessor:
             )
             rows = await connection.fetch(
                 """
-                WITH candidates AS MATERIALIZED (
+                WITH queue_heads AS MATERIALIZED (
+                    SELECT DISTINCT ON (
+                        event.zulip_connection_uuid, event.queue_id
+                    )
+                        event.zulip_connection_uuid,
+                        event.queue_id,
+                        event.processing_status,
+                        event.available_at
+                    FROM workspace_zulip_bridge.zulip_events AS event
+                    WHERE event.processing_status IN ('pending', 'processing')
+                    ORDER BY event.zulip_connection_uuid, event.queue_id,
+                             event.event_id
+                ), claimable_queues AS MATERIALIZED (
+                    SELECT head.zulip_connection_uuid, head.queue_id
+                    FROM queue_heads AS head
+                    WHERE head.processing_status = 'pending'
+                      AND head.available_at <= clock_timestamp()
+                      AND pg_try_advisory_xact_lock(
+                          hashtextextended(
+                              head.zulip_connection_uuid::text || ':' ||
+                              head.queue_id,
+                              0
+                          )
+                      )
+                ), candidates AS MATERIALIZED (
                     SELECT event.uuid
                     FROM workspace_zulip_bridge.zulip_events AS event
+                    JOIN claimable_queues AS queue
+                      ON queue.zulip_connection_uuid =
+                         event.zulip_connection_uuid
+                     AND queue.queue_id = event.queue_id
                     WHERE event.processing_status = 'pending'
                       AND event.available_at <= clock_timestamp()
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM workspace_zulip_bridge.zulip_events AS earlier
+                          WHERE earlier.zulip_connection_uuid =
+                                event.zulip_connection_uuid
+                            AND earlier.queue_id = event.queue_id
+                            AND earlier.event_id < event.event_id
+                            AND (
+                                earlier.processing_status = 'processing'
+                                OR (
+                                    earlier.processing_status = 'pending'
+                                    AND earlier.available_at > clock_timestamp()
+                                )
+                            )
+                      )
                     ORDER BY event.created_at,
                              event.zulip_connection_uuid,
                              event.queue_id,
@@ -360,6 +484,7 @@ class ZulipEventProcessor:
                        claimed.zulip_connection_uuid,
                        realm.identity_key AS endpoint,
                        claimed.queue_id,
+                       claimed.attempt_count,
                        zulip_user.zulip_user_id,
                        claimed.event_type,
                        claimed.payload::text AS payload_json,
@@ -393,6 +518,7 @@ class ZulipEventProcessor:
                     user_uuid=row["zulip_connection_uuid"],
                     endpoint=row["endpoint"],
                     queue_id=row["queue_id"],
+                    attempt_count=row["attempt_count"],
                     own_user_id=row["zulip_user_id"],
                     event_type=row["event_type"],
                     payload=payload,
@@ -401,12 +527,74 @@ class ZulipEventProcessor:
             )
         return events
 
+    async def _prepare_catalog_changes(
+        self,
+        events: list[_ClaimedEvent],
+    ) -> None:
+        refreshes = {
+            (event.user_uuid, event.queue_id)
+            for event in events
+            if event.active_queue
+            and event.event_type == "subscription"
+            and event.payload.get("op") in {"add", "remove", "update"}
+        }
+        for connection_uuid, queue_id in refreshes:
+            await self._store.request_catalog_refresh(connection_uuid, queue_id)
+
+        direct_changed = False
+        for event in events:
+            if not event.active_queue or event.event_type != "message":
+                continue
+            raw_message = event.payload.get("message")
+            if not isinstance(raw_message, Mapping):
+                continue
+            if raw_message.get("type") == "stream":
+                continue
+            direct_changed = (
+                await self._store.store_direct_message_chat(
+                    event.user_uuid,
+                    event.queue_id,
+                    raw_message,
+                )
+                or direct_changed
+            )
+        if direct_changed:
+            await self._store.reconcile_chat_schedules()
+
+    async def _resolve_local_message_links(
+        self,
+        events: list[_ClaimedEvent],
+    ) -> set[UUID]:
+        """Resolve Workspace echoes before supplier routing can discard them."""
+        unresolved: set[UUID] = set()
+        for event in events:
+            if not event.active_queue or event.event_type != "message":
+                continue
+            local_message_uuid = _local_message_uuid(event.payload)
+            if local_message_uuid is None:
+                continue
+            raw_message = event.payload.get("message")
+            raw_message_id = (
+                raw_message.get("id") if isinstance(raw_message, Mapping) else None
+            )
+            if not isinstance(
+                raw_message_id, int
+            ) or not await self._store.link_local_message(
+                event.user_uuid,
+                event.queue_id,
+                local_message_uuid,
+                raw_message_id,
+            ):
+                unresolved.add(event.uuid)
+        return unresolved
+
     async def _load_routes(
         self,
         events: list[_ClaimedEvent],
     ) -> tuple[
         dict[tuple[str, str], UUID | None],
         dict[tuple[str, int], _MessageRoute],
+        set[tuple[str, str]],
     ]:
         chat_uuids: set[UUID] = set()
         message_ids_by_endpoint: dict[str, set[int]] = {}
@@ -428,16 +616,21 @@ class ZulipEventProcessor:
                 message_ids_by_endpoint.setdefault(event.endpoint, set()).update(ids)
 
         chat_suppliers: dict[tuple[str, str], UUID | None] = {}
+        transitioning_chats: set[tuple[str, str]] = set()
         message_routes: dict[tuple[str, int], _MessageRoute] = {}
         async with self._pool.acquire() as connection:
             if chat_uuids:
                 rows = await connection.fetch(
                     """
                     SELECT realm.identity_key AS endpoint, stream.chat_key,
-                           stream.source_connection_uuid
+                           stream.source_connection_uuid,
+                           stream.history_loaded_at,
+                           source.lifecycle_status AS source_lifecycle_status
                     FROM workspace_zulip_bridge.zulip_streams AS stream
                     JOIN workspace_zulip_bridge.zulip_realms AS realm
                       ON realm.uuid = stream.realm_uuid
+                    LEFT JOIN workspace_zulip_bridge.zulip_connections AS source
+                      ON source.uuid = stream.source_connection_uuid
                     WHERE stream.uuid = ANY($1::uuid[])
                     """,
                     list(chat_uuids),
@@ -445,6 +638,13 @@ class ZulipEventProcessor:
                 chat_suppliers = {
                     (row["endpoint"], row["chat_key"]): row["source_connection_uuid"]
                     for row in rows
+                }
+                transitioning_chats = {
+                    (row["endpoint"], row["chat_key"])
+                    for row in rows
+                    if row["source_connection_uuid"] is None
+                    or row["history_loaded_at"] is None
+                    or row["source_lifecycle_status"] not in {"active", "backfilling"}
                 }
             for endpoint, message_ids in message_ids_by_endpoint.items():
                 rows = await connection.fetch(
@@ -485,19 +685,31 @@ class ZulipEventProcessor:
             )
             for message_id in announced_message_ids:
                 message_routes.setdefault((event.endpoint, message_id), route)
-        return chat_suppliers, message_routes
+        return chat_suppliers, message_routes, transitioning_chats
 
     def _route_event(
         self,
         event: _ClaimedEvent,
         chat_suppliers: Mapping[tuple[str, str], UUID | None],
         message_routes: Mapping[tuple[str, int], _MessageRoute],
+        transitioning_chats: set[tuple[str, str]],
     ) -> _RoutedEvent:
         if not event.active_queue:
             return _RoutedEvent(event, skip_reason="stale_queue")
-        if event.event_type not in _MESSAGE_EVENT_TYPES | {"attachment", "stream"}:
+        if event.event_type not in _MESSAGE_EVENT_TYPES | {
+            "attachment",
+            "stream",
+            "subscription",
+            "realm_user",
+            "realm_bot",
+        }:
             return _RoutedEvent(event, skip_reason="unsupported_event_type")
-        if event.event_type == "attachment":
+        if event.event_type in {
+            "attachment",
+            "subscription",
+            "realm_user",
+            "realm_bot",
+        }:
             return _RoutedEvent(event)
         if event.event_type == "stream":
             if event.payload.get("op") != "update":
@@ -509,6 +721,12 @@ class ZulipEventProcessor:
             if supplier is None:
                 return _RoutedEvent(
                     event, chat_key=chat_key, skip_reason="chat_unassigned"
+                )
+            if (event.endpoint, chat_key) in transitioning_chats:
+                return _RoutedEvent(
+                    event,
+                    chat_key=chat_key,
+                    skip_reason="chat_rescheduling",
                 )
             if supplier != event.user_uuid:
                 return _RoutedEvent(
@@ -526,6 +744,12 @@ class ZulipEventProcessor:
                 return _RoutedEvent(
                     event, chat_key=chat_key, skip_reason="chat_unassigned"
                 )
+            if (event.endpoint, chat_key) in transitioning_chats:
+                return _RoutedEvent(
+                    event,
+                    chat_key=chat_key,
+                    skip_reason="chat_rescheduling",
+                )
             if supplier != event.user_uuid:
                 return _RoutedEvent(
                     event,
@@ -541,10 +765,20 @@ class ZulipEventProcessor:
             return _RoutedEvent(event, skip_reason="missing_message_target")
 
         if event.event_type == "update_message_flags":
+            flag_routes = [
+                message_routes.get((event.endpoint, message_id))
+                for message_id in message_ids
+            ]
+            if any(
+                route is not None
+                and (event.endpoint, route.chat_key) in transitioning_chats
+                for route in flag_routes
+            ):
+                return _RoutedEvent(event, skip_reason="chat_rescheduling")
             accepted_flags = [
                 message_id
-                for message_id in message_ids
-                if (event.endpoint, message_id) in message_routes
+                for message_id, route in zip(message_ids, flag_routes, strict=True)
+                if route is not None
             ]
             if not accepted_flags:
                 return _RoutedEvent(event, skip_reason="message_not_materialized")
@@ -552,26 +786,34 @@ class ZulipEventProcessor:
 
         destination_stream_id = event.payload.get("new_stream_id")
         accepted: list[int] = []
+        rescheduling = False
         for message_id in message_ids:
             route = message_routes.get((event.endpoint, message_id))
             if isinstance(destination_stream_id, int):
                 destination_key = f"channel:{destination_stream_id}"
                 supplier = chat_suppliers.get((event.endpoint, destination_key))
+                rescheduling = rescheduling or (
+                    (event.endpoint, destination_key) in transitioning_chats
+                )
             elif route is not None:
                 supplier = route.source_connection_uuid
+                rescheduling = rescheduling or (
+                    (event.endpoint, route.chat_key) in transitioning_chats
+                )
             else:
                 supplier = None
-            if supplier == event.user_uuid:
+            if supplier == event.user_uuid and not rescheduling:
                 accepted.append(message_id)
+        if rescheduling:
+            return _RoutedEvent(event, skip_reason="chat_rescheduling")
         if not accepted:
-            reason = (
-                "message_not_materialized"
-                if not any(
-                    (event.endpoint, message_id) in message_routes
-                    for message_id in message_ids
-                )
-                else "not_chat_supplier"
-            )
+            if not any(
+                (event.endpoint, message_id) in message_routes
+                for message_id in message_ids
+            ):
+                reason = "message_not_materialized"
+            else:
+                reason = "not_chat_supplier"
             return _RoutedEvent(event, skip_reason=reason)
         return _RoutedEvent(event, message_ids=tuple(accepted))
 
@@ -591,7 +833,44 @@ class ZulipEventProcessor:
             return await self._apply_stream_update(item)
         if event_type == "attachment":
             return await self._apply_attachment(item)
+        if event_type == "subscription":
+            return _Outcome(item.event.uuid, "applied", "catalog_refresh_requested")
+        if event_type in {"realm_user", "realm_bot"}:
+            return await self._apply_directory_event(item)
         return _Outcome(item.event.uuid, "skipped", "unsupported_event_type")
+
+    async def _apply_directory_event(self, item: _RoutedEvent) -> _Outcome:
+        raw = item.event.payload.get("person")
+        if not isinstance(raw, Mapping):
+            raw = item.event.payload.get("bot")
+        directory_user = _directory_user(
+            raw,
+            is_bot=item.event.event_type == "realm_bot",
+        )
+        if directory_user is None:
+            refreshed = await self._store.request_catalog_refresh(
+                item.event.user_uuid,
+                item.event.queue_id,
+            )
+            return _Outcome(
+                item.event.uuid,
+                "applied" if refreshed else "retry",
+                "directory_refresh_requested",
+            )
+        result = await self._store.store_user_directory(
+            item.event.endpoint,
+            (directory_user,),
+        )
+        schedule = (
+            await self._store.reconcile_chat_schedules() if result.changed else None
+        )
+        return _Outcome(
+            item.event.uuid,
+            "applied",
+            "directory_user",
+            messages_deleted=schedule.messages_deleted if schedule else 0,
+            chats_changed=(schedule.invalidated + schedule.assigned if schedule else 0),
+        )
 
     async def _apply_attachment(self, item: _RoutedEvent) -> _Outcome:
         raw = item.event.payload.get("attachment")
@@ -634,8 +913,28 @@ class ZulipEventProcessor:
         raw_message = item.event.payload.get("message")
         if not isinstance(raw_message, Mapping) or item.event.own_user_id is None:
             return _Outcome(item.event.uuid, "failed", "invalid_message_event")
+        local_message_uuid = _local_message_uuid(item.event.payload)
+        raw_message_id = raw_message.get("id")
+        if local_message_uuid is not None:
+            if not isinstance(raw_message_id, int):
+                return _Outcome(item.event.uuid, "failed", "invalid_message_event")
+            linked = await self._store.link_local_message(
+                item.event.user_uuid,
+                item.event.queue_id,
+                local_message_uuid,
+                raw_message_id,
+            )
+            if not linked:
+                return _Outcome(item.event.uuid, "retry", "local_message_link_retry")
         message_payload, write_flags = _normalize_live_message(raw_message)
         user_uuids = await self._load_user_uuids(item.event.endpoint)
+        sender_id = raw_message.get("sender_id")
+        if isinstance(sender_id, int) and sender_id not in user_uuids:
+            await self._store.request_catalog_refresh(
+                item.event.user_uuid,
+                item.event.queue_id,
+            )
+            return _Outcome(item.event.uuid, "retry", "sender_directory_refresh")
         built = build_message_page(
             [message_payload],
             own_user_id=item.event.own_user_id,
@@ -679,14 +978,67 @@ class ZulipEventProcessor:
         user_uuids = await self._load_user_uuids(first.event.endpoint)
         messages: list[ZulipMessage] = []
         outcomes: list[_Outcome] = []
-        for item in items:
+        for item_index, item in enumerate(items):
             raw_message = item.event.payload.get("message")
             if not isinstance(raw_message, Mapping) or item.chat_key is None:
                 outcomes.append(
                     _Outcome(item.event.uuid, "failed", "invalid_message_event")
                 )
                 continue
+            local_message_uuid = _local_message_uuid(item.event.payload)
+            raw_message_id = raw_message.get("id")
+            if local_message_uuid is not None:
+                if not isinstance(raw_message_id, int):
+                    outcomes.append(
+                        _Outcome(item.event.uuid, "failed", "invalid_message_event")
+                    )
+                    continue
+                linked = await self._store.link_local_message(
+                    item.event.user_uuid,
+                    item.event.queue_id,
+                    local_message_uuid,
+                    raw_message_id,
+                )
+                if not linked:
+                    outcomes.append(
+                        _Outcome(
+                            item.event.uuid,
+                            "retry",
+                            "local_message_link_retry",
+                        )
+                    )
+                    outcomes.extend(
+                        _Outcome(
+                            later.event.uuid,
+                            "blocked",
+                            "blocked_by_prior_nonterminal_event",
+                        )
+                        for later in items[item_index + 1 :]
+                    )
+                    break
             message_payload, write_flags = _normalize_live_message(raw_message)
+            sender_id = raw_message.get("sender_id")
+            if isinstance(sender_id, int) and sender_id not in user_uuids:
+                await self._store.request_catalog_refresh(
+                    item.event.user_uuid,
+                    item.event.queue_id,
+                )
+                outcomes.append(
+                    _Outcome(
+                        item.event.uuid,
+                        "retry",
+                        "sender_directory_refresh",
+                    )
+                )
+                outcomes.extend(
+                    _Outcome(
+                        later.event.uuid,
+                        "blocked",
+                        "blocked_by_prior_nonterminal_event",
+                    )
+                    for later in items[item_index + 1 :]
+                )
+                break
             built = build_message_page(
                 [message_payload],
                 own_user_id=first.event.own_user_id,
@@ -731,44 +1083,9 @@ class ZulipEventProcessor:
         return outcomes
 
     async def _apply_reaction(self, item: _RoutedEvent) -> _Outcome:
-        change = _reaction_change(item.event.payload)
-        if change is None:
+        if _reaction_change(item.event.payload) is None:
             return _Outcome(item.event.uuid, "failed", "invalid_reaction_event")
-        reaction_user_id, emoji_name, emoji_code, reaction_type, operation = change
-        user_uuids = await self._load_user_uuids(item.event.endpoint)
-        reaction_user_uuid = user_uuids.get(reaction_user_id)
-        if reaction_user_uuid is None:
-            return _Outcome(item.event.uuid, "skipped", "reaction_user_filtered")
-        snapshots = await self._load_message_snapshots(
-            item.event.endpoint,
-            item.message_ids,
-        )
-        messages: list[ZulipMessage] = []
-        for snapshot in snapshots:
-            reactions = [dict(reaction) for reaction in snapshot.reactions]
-            identity = (str(reaction_user_uuid), reaction_type, emoji_code)
-            reactions = [
-                reaction
-                for reaction in reactions
-                if (
-                    reaction["user_uuid"],
-                    reaction["reaction_type"],
-                    reaction["emoji_code"],
-                )
-                != identity
-            ]
-            if operation == "add":
-                reactions.append(
-                    {
-                        "user_uuid": str(reaction_user_uuid),
-                        "emoji_name": emoji_name,
-                        "emoji_code": emoji_code,
-                        "reaction_type": reaction_type,
-                    }
-                )
-            reactions.sort(key=_reaction_sort_key)
-            messages.append(_snapshot_message(snapshot, reactions=tuple(reactions)))
-        return await self._store_messages(item, messages, "reaction")
+        return (await self._apply_reactions_batch([item]))[0]
 
     async def _apply_reactions_batch(
         self,
@@ -788,7 +1105,7 @@ class ZulipEventProcessor:
         user_uuids = await self._load_user_uuids(first.event.endpoint)
         touched: set[int] = set()
         outcomes: list[_Outcome] = []
-        for item in items:
+        for item_index, item in enumerate(items):
             change = _reaction_change(item.event.payload)
             if change is None:
                 outcomes.append(
@@ -798,10 +1115,26 @@ class ZulipEventProcessor:
             reaction_user_id, emoji_name, emoji_code, reaction_type, operation = change
             reaction_user_uuid = user_uuids.get(reaction_user_id)
             if reaction_user_uuid is None:
-                outcomes.append(
-                    _Outcome(item.event.uuid, "skipped", "reaction_user_filtered")
+                await self._store.request_catalog_refresh(
+                    item.event.user_uuid,
+                    item.event.queue_id,
                 )
-                continue
+                outcomes.append(
+                    _Outcome(
+                        item.event.uuid,
+                        "retry",
+                        "reaction_directory_refresh",
+                    )
+                )
+                outcomes.extend(
+                    _Outcome(
+                        later.event.uuid,
+                        "blocked",
+                        "blocked_by_prior_nonterminal_event",
+                    )
+                    for later in items[item_index + 1 :]
+                )
+                break
             materialized = False
             for message_id in item.message_ids:
                 snapshot = snapshots.get(message_id)
@@ -983,7 +1316,8 @@ class ZulipEventProcessor:
         async with self._pool.acquire() as connection, connection.transaction():
             row = await connection.fetchrow(
                 """
-                SELECT name, chat_parameters::text AS parameters_json
+                SELECT name, description, invite_only, announce, is_archived, color,
+                       chat_parameters::text AS parameters_json
                 FROM workspace_zulip_bridge.zulip_streams
                 WHERE uuid = $1
                   AND source_connection_uuid = $2
@@ -995,20 +1329,72 @@ class ZulipEventProcessor:
             if row is None:
                 return _Outcome(item.event.uuid, "skipped", "not_chat_supplier")
             name = row["name"]
+            description = row["description"]
+            invite_only = row["invite_only"]
+            announce = row["announce"]
+            is_archived = row["is_archived"]
+            color = row["color"]
             parameters = json.loads(row["parameters_json"])
             if not isinstance(parameters, dict):
                 raise ValueError("invalid stored chat parameters")
+            value = payload.get("value")
             if property_name == "name":
-                value = payload.get("value")
                 if not isinstance(value, str):
                     return _Outcome(item.event.uuid, "failed", "invalid_stream_name")
                 name = value
             else:
-                parameters[property_name] = payload.get("value")
-                if property_name == "description" and isinstance(
-                    payload.get("rendered_description"), str
-                ):
-                    parameters["rendered_description"] = payload["rendered_description"]
+                parameters[property_name] = value
+                if property_name == "description":
+                    if not isinstance(value, str):
+                        return _Outcome(
+                            item.event.uuid,
+                            "failed",
+                            "invalid_stream_description",
+                        )
+                    description = value
+                    if isinstance(payload.get("rendered_description"), str):
+                        parameters["rendered_description"] = payload[
+                            "rendered_description"
+                        ]
+                elif property_name == "invite_only":
+                    if not isinstance(value, bool):
+                        return _Outcome(
+                            item.event.uuid,
+                            "failed",
+                            "invalid_stream_visibility",
+                        )
+                    invite_only = value
+                elif property_name == "is_announcement_only":
+                    if not isinstance(value, bool):
+                        return _Outcome(
+                            item.event.uuid,
+                            "failed",
+                            "invalid_stream_announcement_mode",
+                        )
+                    announce = value
+                elif property_name == "is_archived":
+                    if not isinstance(value, bool):
+                        return _Outcome(
+                            item.event.uuid,
+                            "failed",
+                            "invalid_stream_archive_state",
+                        )
+                    is_archived = value
+                elif property_name == "color":
+                    try:
+                        if not (
+                            isinstance(value, str)
+                            and len(value) == 7
+                            and value.startswith("#")
+                        ):
+                            raise ValueError
+                        color = int(value[1:], 16)
+                    except ValueError:
+                        return _Outcome(
+                            item.event.uuid,
+                            "failed",
+                            "invalid_stream_color",
+                        )
             parameters_json = json.dumps(
                 parameters,
                 ensure_ascii=False,
@@ -1025,15 +1411,26 @@ class ZulipEventProcessor:
                 """
                 UPDATE workspace_zulip_bridge.zulip_streams
                 SET name = $3,
-                    chat_parameters = $4::jsonb,
-                    content_hash = $5
+                    description = $4,
+                    invite_only = $5,
+                    announce = $6,
+                    is_archived = $7,
+                    color = $8,
+                    chat_parameters = $9::jsonb,
+                    content_hash = $10,
+                    updated_at = clock_timestamp()
                 WHERE uuid = $1
                   AND source_connection_uuid = $2
-                  AND content_hash IS DISTINCT FROM $5
+                  AND content_hash IS DISTINCT FROM $10
                 """,
                 chat_uuid,
                 item.event.user_uuid,
                 name,
+                description,
+                invite_only,
+                announce,
+                is_archived,
+                color,
                 parameters_json,
                 content_hash,
             )
@@ -1071,16 +1468,64 @@ class ZulipEventProcessor:
         )
 
     async def _prune_empty_topics(self, user_uuid: UUID) -> None:
-        async with self._pool.acquire() as connection:
+        async with self._pool.acquire() as connection, connection.transaction():
             await connection.execute(
                 """
+                WITH candidates AS MATERIALIZED (
+                    SELECT topic.uuid, topic.zulip_stream_uuid, stream.realm_uuid
+                    FROM workspace_zulip_bridge.zulip_topics AS topic
+                    JOIN workspace_zulip_bridge.zulip_streams AS stream
+                      ON stream.uuid = topic.zulip_stream_uuid
+                    WHERE stream.source_connection_uuid = $1
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM workspace_zulip_bridge.zulip_messages AS message
+                          WHERE message.topic_uuid = topic.uuid
+                      )
+                    FOR UPDATE OF topic
+                ), tombstones AS (
+                    INSERT INTO workspace_zulip_bridge.sync_diffs (
+                        provider_uuid, entity_type, entity_uuid, realm_uuid,
+                        partition_key, direction, delivery_priority,
+                        source_hash, target_hash, source_updated_at,
+                        target_updated_at
+                    )
+                    SELECT realm.workspace_provider_uuid, 'topics',
+                           candidate.uuid, candidate.realm_uuid,
+                           candidate.zulip_stream_uuid, 'to_workspace', 0,
+                           NULL, target.content_hash, clock_timestamp(),
+                           target.source_updated_at
+                    FROM candidates AS candidate
+                    JOIN workspace_zulip_bridge.zulip_realms AS realm
+                      ON realm.uuid = candidate.realm_uuid
+                     AND realm.workspace_provider_uuid IS NOT NULL
+                    JOIN workspace_zulip_bridge.workspace_mirror_state AS mirror
+                      ON mirror.provider_uuid = realm.workspace_provider_uuid
+                     AND mirror.bootstrap_status = 'ready'
+                     AND mirror.active_generation IS NOT NULL
+                    JOIN workspace_zulip_bridge.workspace_topics AS target
+                      ON target.provider_uuid = realm.workspace_provider_uuid
+                     AND target.snapshot_generation = mirror.active_generation
+                     AND target.uuid = candidate.uuid
+                    ON CONFLICT (provider_uuid, entity_type, entity_uuid)
+                    DO UPDATE SET direction = 'to_workspace',
+                        delivery_priority = 0,
+                        partition_key = EXCLUDED.partition_key,
+                        source_hash = NULL,
+                        target_hash = EXCLUDED.target_hash,
+                        source_updated_at = EXCLUDED.source_updated_at,
+                        target_updated_at = EXCLUDED.target_updated_at,
+                        processing_status = 'pending', attempt_count = 0,
+                        available_at = clock_timestamp(), claimed_at = NULL,
+                        processed_at = NULL, last_error = NULL,
+                        updated_at = clock_timestamp()
+                    RETURNING 1
+                )
                 DELETE FROM workspace_zulip_bridge.zulip_topics AS topic
-                WHERE NOT EXISTS (
-                      SELECT 1
-                      FROM workspace_zulip_bridge.zulip_messages AS message
-                      WHERE message.topic_uuid = topic.uuid
-                  )
-                """
+                USING candidates
+                WHERE topic.uuid = candidates.uuid
+                """,
+                user_uuid,
             )
 
     async def _load_user_uuids(self, endpoint: str) -> dict[int, UUID]:
@@ -1188,9 +1633,54 @@ class ZulipEventProcessor:
                         AS outcome(uuid, status, reason)
                 )
                 UPDATE workspace_zulip_bridge.zulip_events AS event
-                SET processing_status = outcomes.status,
-                    processed_at = clock_timestamp(),
-                    outcome_reason = outcomes.reason
+                SET processing_status = CASE
+                        WHEN outcomes.status = 'blocked' THEN 'pending'
+                        WHEN outcomes.status = 'defer'
+                         AND event.attempt_count < $4 THEN 'pending'
+                        WHEN outcomes.status = 'defer' THEN 'skipped'
+                        WHEN outcomes.status = 'retry'
+                         AND event.attempt_count < $4 THEN 'pending'
+                        WHEN outcomes.status = 'retry' THEN 'failed'
+                        ELSE outcomes.status
+                    END,
+                    available_at = CASE
+                        WHEN outcomes.status = 'blocked' THEN clock_timestamp()
+                        WHEN outcomes.status = 'defer'
+                         AND event.attempt_count < $4
+                        THEN clock_timestamp() + make_interval(secs => $6)
+                        WHEN outcomes.status = 'retry'
+                         AND event.attempt_count < $4
+                        THEN clock_timestamp() + make_interval(
+                            secs => LEAST(
+                                $5 * power(2, LEAST(event.attempt_count - 1, 16)),
+                                $6
+                            )
+                        )
+                        ELSE event.available_at
+                    END,
+                    claimed_at = NULL,
+                    processed_at = CASE
+                        WHEN outcomes.status = 'blocked' THEN NULL
+                        WHEN outcomes.status = 'defer'
+                         AND event.attempt_count < $4 THEN NULL
+                        WHEN outcomes.status = 'retry'
+                         AND event.attempt_count < $4 THEN NULL
+                        ELSE clock_timestamp()
+                    END,
+                    attempt_count = CASE
+                        WHEN outcomes.status = 'blocked'
+                        THEN GREATEST(event.attempt_count - 1, 0)
+                        ELSE event.attempt_count
+                    END,
+                    outcome_reason = CASE
+                        WHEN outcomes.status = 'defer'
+                         AND event.attempt_count >= $4
+                        THEN 'defer_exhausted:' || outcomes.reason
+                        WHEN outcomes.status = 'retry'
+                         AND event.attempt_count >= $4
+                        THEN 'retry_exhausted:' || outcomes.reason
+                        ELSE outcomes.reason
+                    END
                 FROM outcomes
                 WHERE event.uuid = outcomes.uuid
                   AND event.processing_status = 'processing'
@@ -1198,6 +1688,9 @@ class ZulipEventProcessor:
                 [outcome.event_uuid for outcome in outcomes],
                 [outcome.status for outcome in outcomes],
                 [outcome.reason for outcome in outcomes],
+                self._settings.event_processor_max_attempts,
+                self._settings.event_processor_retry_base_seconds,
+                self._settings.event_processor_retry_cap_seconds,
             )
 
 
@@ -1220,6 +1713,50 @@ def _event_message_ids(payload: Mapping[str, Any], event_type: str) -> tuple[int
             if isinstance(nested_id, int):
                 values.add(nested_id)
     return tuple(sorted(values))
+
+
+def _local_message_uuid(payload: Mapping[str, Any]) -> UUID | None:
+    value = payload.get("local_message_id")
+    if not isinstance(value, str):
+        return None
+    try:
+        return UUID(value)
+    except ValueError:
+        return None
+
+
+def _directory_user(
+    raw: object,
+    *,
+    is_bot: bool,
+) -> ZulipDirectoryUser | None:
+    if not isinstance(raw, Mapping):
+        return None
+    user_id = raw.get("user_id")
+    login = raw.get("email")
+    full_name = raw.get("full_name")
+    role = raw.get("role")
+    is_active = raw.get("is_active")
+    raw_is_bot = raw.get("is_bot", is_bot)
+    avatar_url = raw.get("avatar_url")
+    if (
+        not isinstance(user_id, int)
+        or not isinstance(login, str)
+        or not isinstance(full_name, str)
+        or role not in {100, 200, 300, 400, 600}
+        or not isinstance(is_active, bool)
+        or not isinstance(raw_is_bot, bool)
+    ):
+        return None
+    return ZulipDirectoryUser(
+        user_id=user_id,
+        login=login,
+        full_name=full_name,
+        role=role,
+        disabled=not is_active,
+        is_bot=raw_is_bot,
+        avatar_url=avatar_url if isinstance(avatar_url, str) else None,
+    )
 
 
 def _flag_change(payload: Mapping[str, Any]) -> tuple[str, bool] | None:
@@ -1382,30 +1919,6 @@ def _snapshot_message(
         sent_at=updated.sent_at,
         source_updated_at=updated.source_updated_at,
     )
-
-
-def _snapshot_with_flag(
-    snapshot: _MessageSnapshot,
-    field: str,
-    value: bool,
-) -> _MessageSnapshot:
-    if field == "is_read":
-        return replace(snapshot, is_read=value)
-    if field == "is_starred":
-        return replace(snapshot, is_starred=value)
-    if field == "is_collapsed":
-        return replace(snapshot, is_collapsed=value)
-    if field == "is_mentioned":
-        return replace(snapshot, is_mentioned=value)
-    if field == "is_stream_wildcard_mentioned":
-        return replace(snapshot, is_stream_wildcard_mentioned=value)
-    if field == "is_topic_wildcard_mentioned":
-        return replace(snapshot, is_topic_wildcard_mentioned=value)
-    if field == "has_alert_word":
-        return replace(snapshot, has_alert_word=value)
-    if field == "is_historical":
-        return replace(snapshot, is_historical=value)
-    raise ValueError(f"unsupported message flag field: {field}")
 
 
 def _reaction_sort_key(reaction: Mapping[str, str]) -> tuple[str, str, str, str]:

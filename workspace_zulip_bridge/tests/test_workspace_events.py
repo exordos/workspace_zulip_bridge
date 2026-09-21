@@ -169,12 +169,15 @@ def test_cursor_gap_is_terminal_and_preserves_prior_events(tmp_path: Path) -> No
             "type": "EventsCursorExpiredError",
             "code": 410,
             "error": "epoch_pruned",
-            "reason": "epoch_pruned",
+            "reason": "https://private.example/internal",
             "minimum_epoch_version": 9,
         },
     ]
 
-    with pytest.raises(WorkspaceCursorGapError, match="minimum=9"):
+    with pytest.raises(
+        WorkspaceCursorGapError,
+        match="workspace_cursor_expired:minimum_epoch_version=9",
+    ) as error:
         asyncio.run(
             receiver._consume(
                 FakeWebsocket(frames),
@@ -182,6 +185,7 @@ def test_cursor_gap_is_terminal_and_preserves_prior_events(tmp_path: Path) -> No
             )
         )
 
+    assert "private.example" not in str(error.value)
     assert store.persisted == [(GENERATION, [7])]
 
 
