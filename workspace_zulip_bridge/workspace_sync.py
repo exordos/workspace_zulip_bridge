@@ -986,7 +986,7 @@ class WorkspaceDiffWorker:
         state = await self._pool.fetchrow(
             """
             SELECT active_generation, initial_sync_completed_at,
-                   reconciliation_version
+                   reconciliation_version, target_scan_generation
             FROM workspace_zulip_bridge.workspace_mirror_state
             WHERE provider_uuid = $1 AND bootstrap_status = 'ready'
             """,
@@ -995,6 +995,10 @@ class WorkspaceDiffWorker:
         if state is None or state["active_generation"] is None:
             return 0
         generation = state["active_generation"]
+        scan_target_only = (
+            state.get("initial_sync_completed_at") is not None
+            and state.get("target_scan_generation", generation) != generation
+        )
         if (
             state.get("initial_sync_completed_at") is not None
             and not self._unmapped_cleanup_done
@@ -1010,13 +1014,25 @@ class WorkspaceDiffWorker:
                 generation,
             )
             total += planned
-            if state.get("initial_sync_completed_at") is not None:
+            if scan_target_only:
                 total += await self._plan_target_only(
                     entity_type,
                     source,
                     realm_uuid,
                     generation,
                 )
+        if scan_target_only:
+            await self._pool.execute(
+                """
+                UPDATE workspace_zulip_bridge.workspace_mirror_state
+                SET target_scan_generation = $2,
+                    updated_at = clock_timestamp()
+                WHERE provider_uuid = $1
+                  AND active_generation = $2
+                """,
+                self._provider_uuid,
+                generation,
+            )
         if (
             int(state.get("reconciliation_version", RECONCILIATION_VERSION))
             < RECONCILIATION_VERSION
