@@ -596,6 +596,18 @@ async def _workspace_event_uses_entity_timestamp(dsn: str) -> None:
 
         message_uuid = UUID("10000000-0000-0000-0000-000000000085")
         stream_uuid = UUID("10000000-0000-0000-0000-000000000086")
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.zulip_streams (
+                uuid, realm_uuid, chat_type, chat_key, name,
+                content_hash, source_connection_uuid
+            ) VALUES ($1, $2, 'channel', 'channel:86', 'Mapped', $3, $4)
+            """,
+            stream_uuid,
+            realm_uuid,
+            b"s" * 32,
+            user_uuid,
+        )
         message_frame = {
             "updated_at": event_time.isoformat().replace("+00:00", "Z"),
             "payload": {
@@ -646,6 +658,60 @@ async def _workspace_event_uses_entity_timestamp(dsn: str) -> None:
             stream_uuid,
             None,
             True,
+        )
+
+        native_message_uuid = UUID("10000000-0000-0000-0000-000000000088")
+        native_stream_uuid = UUID("10000000-0000-0000-0000-000000000089")
+        native_frame = {
+            "updated_at": event_time.isoformat().replace("+00:00", "Z"),
+            "payload": {
+                "kind": "message.created",
+                "uuid": str(native_message_uuid),
+                "stream_uuid": str(native_stream_uuid),
+                "payload": {"kind": "markdown", "content": "Native message"},
+                "created_at": event_time.isoformat().replace("+00:00", "Z"),
+                "updated_at": event_time.isoformat().replace("+00:00", "Z"),
+            },
+        }
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.workspace_events (
+                uuid, provider_uuid, workspace_project_id, epoch_version,
+                object_type, action, entity_uuid, payload
+            ) VALUES ($1, $2, $3, 3, 'message', 'created', $4, $5::jsonb)
+            """,
+            UUID("10000000-0000-0000-0000-000000000090"),
+            provider_uuid,
+            project_uuid,
+            native_message_uuid,
+            json.dumps(native_frame),
+        )
+        native_event = await pool.fetchrow(
+            "SELECT * FROM workspace_zulip_bridge.workspace_events "
+            "WHERE provider_uuid = $1 AND entity_uuid = $2",
+            provider_uuid,
+            native_message_uuid,
+        )
+        assert native_event is not None
+        assert await processor._apply(native_event)
+        assert (
+            await pool.fetchval(
+                "SELECT count(*) FROM workspace_zulip_bridge.workspace_messages "
+                "WHERE provider_uuid = $1 AND uuid = $2",
+                provider_uuid,
+                native_message_uuid,
+            )
+            == 1
+        )
+        assert (
+            await pool.fetchval(
+                "SELECT count(*) FROM workspace_zulip_bridge.sync_diffs "
+                "WHERE provider_uuid = $1 AND entity_type = 'messages' "
+                "AND entity_uuid = $2",
+                provider_uuid,
+                native_message_uuid,
+            )
+            == 0
         )
     finally:
         await pool.close()
@@ -1132,6 +1198,56 @@ async def _workspace_diff_worker_round_trip(dsn: str, tmp_path: Path) -> None:
                 WHERE provider_uuid = $1
                 """,
                 provider_uuid,
+            )
+            native_message_uuid = UUID("10000000-0000-0000-0000-000000000025")
+            native_stream_uuid = UUID("10000000-0000-0000-0000-000000000026")
+            native_data = {
+                "uuid": str(native_message_uuid),
+                "stream_uuid": str(native_stream_uuid),
+                "payload": {"kind": "markdown", "content": "Native only"},
+            }
+            await pool.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.workspace_messages (
+                    provider_uuid, snapshot_generation, uuid,
+                    workspace_project_id, content_hash, source_updated_at, data
+                ) VALUES ($1, $2, $3, $4, $5, clock_timestamp(), $6::jsonb)
+                """,
+                provider_uuid,
+                generation,
+                native_message_uuid,
+                project_uuid,
+                b"n" * 32,
+                json.dumps(native_data),
+            )
+            await pool.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.sync_diffs (
+                    provider_uuid, entity_type, entity_uuid, realm_uuid,
+                    partition_key, direction, processing_status, target_hash,
+                    source_updated_at, target_updated_at
+                ) VALUES ($1, 'messages', $2, $3, $4, 'to_zulip', 'blocked',
+                          $5, clock_timestamp(), clock_timestamp())
+                """,
+                provider_uuid,
+                native_message_uuid,
+                stable_realm_uuid(ENDPOINT),
+                native_stream_uuid,
+                b"n" * 32,
+            )
+            assert await worker.plan() == 0
+            assert (
+                await pool.fetchval(
+                    """
+                SELECT processing_status
+                FROM workspace_zulip_bridge.sync_diffs
+                WHERE provider_uuid = $1 AND entity_type = 'messages'
+                  AND entity_uuid = $2
+                """,
+                    provider_uuid,
+                    native_message_uuid,
+                )
+                == "skipped"
             )
             await pool.execute(
                 """

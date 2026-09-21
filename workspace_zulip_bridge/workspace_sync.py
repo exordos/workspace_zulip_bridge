@@ -777,11 +777,23 @@ class WorkspaceEventProcessor:
                     source_updated_at,
                     json.dumps(data, separators=(",", ":")),
                 )
-            partition_key = None
-            if entity_type in {"messages", "message_flags"}:
+            partition_key = entity_uuid if entity_type == "streams" else None
+            if entity_type in {
+                "stream_bindings",
+                "topics",
+                "topic_bindings",
+                "messages",
+                "message_flags",
+            }:
                 raw_stream_uuid = data.get("stream_uuid")
                 if raw_stream_uuid is not None:
                     partition_key = UUID(str(raw_stream_uuid))
+            if partition_key is None and entity_type != "users":
+                partition_key = await self._source_stream_uuid(
+                    entity_type,
+                    entity_uuid,
+                    data,
+                )
             await self._upsert_diff(
                 entity_type,
                 entity_uuid,
@@ -792,6 +804,41 @@ class WorkspaceEventProcessor:
             applied = True
         return applied
 
+    async def _source_stream_uuid(
+        self,
+        entity_type: str,
+        entity_uuid: UUID,
+        data: Mapping[str, Any],
+    ) -> UUID | None:
+        if entity_type == "message_reactions":
+            raw_message_uuid = data.get("message_uuid")
+            if raw_message_uuid is None:
+                return None
+            value = await self._pool.fetchval(
+                """
+                SELECT message.zulip_stream_uuid
+                FROM workspace_zulip_bridge.zulip_messages AS message
+                WHERE message.uuid = $1
+                """,
+                UUID(str(raw_message_uuid)),
+            )
+            return None if value is None else UUID(str(value))
+        source = {
+            "stream_bindings": ("zulip_stream_bindings", "zulip_stream_uuid"),
+            "topics": ("zulip_topics", "zulip_stream_uuid"),
+            "topic_bindings": ("zulip_topic_bindings", "zulip_stream_uuid"),
+            "messages": ("zulip_messages", "zulip_stream_uuid"),
+            "message_flags": ("zulip_message_flags", "zulip_stream_uuid"),
+        }.get(entity_type)
+        if source is None:
+            return None
+        table, column = source
+        value = await self._pool.fetchval(
+            f"SELECT {column} FROM workspace_zulip_bridge.{table} WHERE uuid = $1",
+            entity_uuid,
+        )
+        return None if value is None else UUID(str(value))
+
     async def _upsert_diff(
         self,
         entity_type: str,
@@ -799,7 +846,7 @@ class WorkspaceEventProcessor:
         partition_key: UUID | None,
         target_hash: bytes | None,
         target_updated_at: datetime,
-    ) -> None:
+    ) -> bool:
         updated = await self._pool.fetchval(
             """
             INSERT INTO workspace_zulip_bridge.sync_diffs (
@@ -810,6 +857,15 @@ class WorkspaceEventProcessor:
             SELECT $1, $2, $3, realm.uuid, $4, 'to_zulip', NULL, $5, $6, $6, 0
             FROM workspace_zulip_bridge.zulip_realms AS realm
             WHERE realm.workspace_provider_uuid = $1
+              AND (
+                  $2 = 'users'
+                  OR EXISTS (
+                      SELECT 1
+                      FROM workspace_zulip_bridge.zulip_streams AS mapped_stream
+                      WHERE mapped_stream.realm_uuid = realm.uuid
+                        AND mapped_stream.uuid = $4
+                  )
+              )
             ON CONFLICT (provider_uuid, entity_type, entity_uuid)
             DO UPDATE SET direction = CASE
                     WHEN EXCLUDED.target_updated_at > sync_diffs.source_updated_at
@@ -847,8 +903,7 @@ class WorkspaceEventProcessor:
             target_hash,
             target_updated_at,
         )
-        if not updated:
-            raise RuntimeError("Workspace provider is not linked to a Zulip realm")
+        return bool(updated)
 
 
 class WorkspaceDiffWorker:
@@ -875,6 +930,7 @@ class WorkspaceDiffWorker:
         self._plan_enabled = plan_enabled
         self._partition = partition
         self._partition_count = partition_count
+        self._unmapped_cleanup_done = False
         self._zulip_writer = ZulipOutboundWriter(pool, settings)
 
     async def run(self) -> None:
@@ -937,6 +993,12 @@ class WorkspaceDiffWorker:
         if state is None or state["active_generation"] is None:
             return 0
         generation = state["active_generation"]
+        if (
+            state.get("initial_sync_completed_at") is not None
+            and not self._unmapped_cleanup_done
+        ):
+            await self._skip_unmapped_target_diffs(realm_uuid, generation)
+            self._unmapped_cleanup_done = True
         total = 0
         for entity_type, source in _SOURCE_TABLES.items():
             planned = await self._plan_entity(
@@ -969,10 +1031,32 @@ class WorkspaceDiffWorker:
                   ON parent.provider_uuid = target.provider_uuid
                  AND parent.snapshot_generation = target.snapshot_generation
                  AND parent.uuid = (target.data ->> 'message_uuid')::uuid
+                JOIN workspace_zulip_bridge.zulip_streams AS mapped_stream
+                  ON mapped_stream.realm_uuid = $3
+                 AND mapped_stream.uuid =
+                     (parent.data ->> 'stream_uuid')::uuid
             """
-        elif entity_type in {"messages", "message_flags"}:
+        elif entity_type in {
+            "stream_bindings",
+            "topics",
+            "topic_bindings",
+            "messages",
+            "message_flags",
+        }:
             partition = "(target.data ->> 'stream_uuid')::uuid"
-            joins = ""
+            joins = """
+                JOIN workspace_zulip_bridge.zulip_streams AS mapped_stream
+                  ON mapped_stream.realm_uuid = $3
+                 AND mapped_stream.uuid =
+                     (target.data ->> 'stream_uuid')::uuid
+            """
+        elif entity_type == "streams":
+            partition = "NULL::uuid"
+            joins = """
+                JOIN workspace_zulip_bridge.zulip_streams AS mapped_stream
+                  ON mapped_stream.realm_uuid = $3
+                 AND mapped_stream.uuid = target.uuid
+            """
         else:
             partition = "NULL::uuid"
             joins = ""
@@ -1034,6 +1118,118 @@ class WorkspaceDiffWorker:
             generation,
         )
         return int(result.rsplit(" ", 1)[-1])
+
+    async def _skip_unmapped_target_diffs(
+        self,
+        realm_uuid: UUID,
+        generation: UUID,
+    ) -> int:
+        """Retire Workspace-only rows that are outside this Zulip realm."""
+        total = 0
+        result = await self._pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.sync_diffs AS diff
+            SET processing_status = 'skipped',
+                processed_at = clock_timestamp(),
+                last_error = 'outside_zulip_provider_scope',
+                updated_at = clock_timestamp()
+            FROM workspace_zulip_bridge.workspace_streams AS target
+            WHERE diff.provider_uuid = $1
+              AND diff.realm_uuid = $2
+              AND diff.entity_type = 'streams'
+              AND diff.entity_uuid = target.uuid
+              AND target.provider_uuid = diff.provider_uuid
+              AND target.snapshot_generation = $3
+              AND diff.direction = 'to_zulip'
+              AND diff.source_hash IS NULL
+              AND diff.processing_status IN ('pending', 'failed', 'blocked')
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM workspace_zulip_bridge.zulip_streams AS mapped_stream
+                  WHERE mapped_stream.realm_uuid = diff.realm_uuid
+                    AND mapped_stream.uuid = target.uuid
+              )
+            """,
+            self._provider_uuid,
+            realm_uuid,
+            generation,
+        )
+        total += int(result.rsplit(" ", 1)[-1])
+        for entity_type in (
+            "stream_bindings",
+            "topics",
+            "topic_bindings",
+            "messages",
+            "message_flags",
+        ):
+            result = await self._pool.execute(
+                f"""
+                UPDATE workspace_zulip_bridge.sync_diffs AS diff
+                SET processing_status = 'skipped',
+                    processed_at = clock_timestamp(),
+                    last_error = 'outside_zulip_provider_scope',
+                    updated_at = clock_timestamp()
+                FROM workspace_zulip_bridge.workspace_{entity_type} AS target
+                WHERE diff.provider_uuid = $1
+                  AND diff.realm_uuid = $2
+                  AND diff.entity_type = $4
+                  AND diff.entity_uuid = target.uuid
+                  AND target.provider_uuid = diff.provider_uuid
+                  AND target.snapshot_generation = $3
+                  AND diff.direction = 'to_zulip'
+                  AND diff.source_hash IS NULL
+                  AND diff.processing_status IN ('pending', 'failed', 'blocked')
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM workspace_zulip_bridge.zulip_streams AS mapped_stream
+                      WHERE mapped_stream.realm_uuid = diff.realm_uuid
+                        AND mapped_stream.uuid =
+                            (target.data ->> 'stream_uuid')::uuid
+                  )
+                """,
+                self._provider_uuid,
+                realm_uuid,
+                generation,
+                entity_type,
+            )
+            total += int(result.rsplit(" ", 1)[-1])
+        result = await self._pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.sync_diffs AS diff
+            SET processing_status = 'skipped',
+                processed_at = clock_timestamp(),
+                last_error = 'outside_zulip_provider_scope',
+                updated_at = clock_timestamp()
+            FROM workspace_zulip_bridge.workspace_message_reactions AS target
+            JOIN workspace_zulip_bridge.workspace_messages AS parent
+              ON parent.provider_uuid = target.provider_uuid
+             AND parent.snapshot_generation = target.snapshot_generation
+             AND parent.uuid = (target.data ->> 'message_uuid')::uuid
+            WHERE diff.provider_uuid = $1
+              AND diff.realm_uuid = $2
+              AND diff.entity_type = 'message_reactions'
+              AND diff.entity_uuid = target.uuid
+              AND target.provider_uuid = diff.provider_uuid
+              AND target.snapshot_generation = $3
+              AND diff.direction = 'to_zulip'
+              AND diff.source_hash IS NULL
+              AND diff.processing_status IN ('pending', 'failed', 'blocked')
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM workspace_zulip_bridge.zulip_streams AS mapped_stream
+                  WHERE mapped_stream.realm_uuid = diff.realm_uuid
+                    AND mapped_stream.uuid =
+                        (parent.data ->> 'stream_uuid')::uuid
+              )
+            """,
+            self._provider_uuid,
+            realm_uuid,
+            generation,
+        )
+        total += int(result.rsplit(" ", 1)[-1])
+        if total:
+            LOG.info("Skipped Workspace rows outside Zulip scope: count=%d", total)
+        return total
 
     async def _plan_entity(
         self,
