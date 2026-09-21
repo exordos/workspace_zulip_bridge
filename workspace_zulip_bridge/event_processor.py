@@ -22,6 +22,9 @@ from workspace_zulip_bridge.message_history import message_content_hash
 from workspace_zulip_bridge.message_history import message_state_hash
 from workspace_zulip_bridge.models import ZulipDirectoryUser
 from workspace_zulip_bridge.models import ZulipMessage
+from workspace_zulip_bridge.models import ZulipUserPresence
+from workspace_zulip_bridge.models import ZulipUserProfileStatus
+from workspace_zulip_bridge.models import ZulipUserTopic
 from workspace_zulip_bridge.stable_ids import stable_chat_uuid
 from workspace_zulip_bridge.zulip_api import ZulipApiError
 from workspace_zulip_bridge.zulip_api import parse_attachment
@@ -146,10 +149,12 @@ class ZulipEventProcessor:
         self._store = store
         self._settings = settings
         self._next_cleanup_at = 0.0
+        self._next_presence_expiry_at = 0.0
 
     async def run(self) -> None:
         while True:
             deleted = await self._maybe_cleanup_expired_events()
+            expired_presences = await self._maybe_expire_user_presences()
             stats = await self.process_once()
             if stats.claimed:
                 LOG.info(
@@ -170,7 +175,25 @@ class ZulipEventProcessor:
                 continue
             if deleted == self._settings.event_cleanup_batch_size:
                 continue
+            if expired_presences == self._settings.event_cleanup_batch_size:
+                continue
             await asyncio.sleep(self._settings.event_processor_poll_seconds)
+
+    async def _maybe_expire_user_presences(self) -> int:
+        if time.monotonic() < self._next_presence_expiry_at:
+            return 0
+        expired = await self._store.expire_user_presences(
+            self._settings.event_cleanup_batch_size
+        )
+        if expired == self._settings.event_cleanup_batch_size:
+            self._next_presence_expiry_at = 0.0
+        else:
+            self._next_presence_expiry_at = (
+                time.monotonic() + self._settings.user_refresh_seconds
+            )
+        if expired:
+            LOG.info("Zulip presences expired users=%s", expired)
+        return expired
 
     async def cleanup_expired_events(self) -> int:
         """Delete one bounded batch of terminal events past their retention."""
@@ -702,6 +725,9 @@ class ZulipEventProcessor:
             "subscription",
             "realm_user",
             "realm_bot",
+            "presence",
+            "user_status",
+            "user_topic",
         }:
             return _RoutedEvent(event, skip_reason="unsupported_event_type")
         if event.event_type in {
@@ -709,6 +735,9 @@ class ZulipEventProcessor:
             "subscription",
             "realm_user",
             "realm_bot",
+            "presence",
+            "user_status",
+            "user_topic",
         }:
             return _RoutedEvent(event)
         if event.event_type == "stream":
@@ -775,6 +804,8 @@ class ZulipEventProcessor:
                 for route in flag_routes
             ):
                 return _RoutedEvent(event, skip_reason="chat_rescheduling")
+            if any(route is None for route in flag_routes):
+                return _RoutedEvent(event, skip_reason="message_not_materialized")
             accepted_flags = [
                 message_id
                 for message_id, route in zip(message_ids, flag_routes, strict=True)
@@ -837,7 +868,41 @@ class ZulipEventProcessor:
             return _Outcome(item.event.uuid, "applied", "catalog_refresh_requested")
         if event_type in {"realm_user", "realm_bot"}:
             return await self._apply_directory_event(item)
+        if event_type == "user_topic":
+            return await self._apply_user_topic(item)
+        if event_type == "presence":
+            return await self._apply_presence(item)
+        if event_type == "user_status":
+            return await self._apply_user_status(item)
         return _Outcome(item.event.uuid, "skipped", "unsupported_event_type")
+
+    async def _apply_user_topic(self, item: _RoutedEvent) -> _Outcome:
+        change = _user_topic_change(item.event.payload)
+        if change is None:
+            return _Outcome(item.event.uuid, "failed", "invalid_user_topic_event")
+        changed = await self._store.store_user_topics(
+            item.event.user_uuid,
+            item.event.queue_id,
+            (change,),
+            replace_all=False,
+        )
+        if changed is None:
+            return _Outcome(item.event.uuid, "defer", "topic_not_materialized")
+        return _Outcome(item.event.uuid, "applied", "user_topic")
+
+    async def _apply_presence(self, item: _RoutedEvent) -> _Outcome:
+        presences = _presence_changes(item.event.payload)
+        if presences is None:
+            return _Outcome(item.event.uuid, "failed", "invalid_presence_event")
+        await self._store.store_user_presences(item.event.endpoint, presences)
+        return _Outcome(item.event.uuid, "applied", "user_presence")
+
+    async def _apply_user_status(self, item: _RoutedEvent) -> _Outcome:
+        status = _user_status_change(item.event.payload)
+        if status is None:
+            return _Outcome(item.event.uuid, "failed", "invalid_user_status_event")
+        await self._store.store_user_statuses(item.event.endpoint, (status,))
+        return _Outcome(item.event.uuid, "applied", "user_status")
 
     async def _apply_directory_event(self, item: _RoutedEvent) -> _Outcome:
         raw = item.event.payload.get("person")
@@ -1756,6 +1821,105 @@ def _directory_user(
         disabled=not is_active,
         is_bot=raw_is_bot,
         avatar_url=avatar_url if isinstance(avatar_url, str) else None,
+    )
+
+
+def _user_topic_change(payload: Mapping[str, Any]) -> ZulipUserTopic | None:
+    stream_id = payload.get("stream_id")
+    topic_name = payload.get("topic_name")
+    visibility_policy = payload.get("visibility_policy")
+    last_updated = payload.get("last_updated")
+    if (
+        not isinstance(stream_id, int)
+        or not isinstance(topic_name, str)
+        or visibility_policy not in {0, 1, 2, 3}
+        or not isinstance(last_updated, int)
+    ):
+        return None
+    return ZulipUserTopic(
+        stream_id=stream_id,
+        topic_name=topic_name,
+        visibility_policy=visibility_policy,
+        last_updated=last_updated,
+    )
+
+
+def _presence_changes(
+    payload: Mapping[str, Any],
+) -> tuple[ZulipUserPresence, ...] | None:
+    modern = payload.get("presences")
+    if isinstance(modern, Mapping):
+        result: list[ZulipUserPresence] = []
+        for raw_user_id, raw_presence in modern.items():
+            try:
+                user_id = int(raw_user_id)
+            except (TypeError, ValueError):
+                return None
+            if not isinstance(raw_presence, Mapping):
+                return None
+            active_timestamp = raw_presence.get("active_timestamp")
+            idle_timestamp = raw_presence.get("idle_timestamp")
+            active = active_timestamp if isinstance(active_timestamp, int) else None
+            idle = idle_timestamp if isinstance(idle_timestamp, int) else None
+            if active is None and idle is None:
+                continue
+            latest = max(value for value in (active, idle) if value is not None)
+            result.append(
+                ZulipUserPresence(
+                    user_id=user_id,
+                    status=(
+                        "active"
+                        if active is not None and active >= (idle or 0)
+                        else "idle"
+                    ),
+                    last_ping_at=latest,
+                )
+            )
+        return tuple(result)
+    legacy_user_id = payload.get("user_id")
+    legacy = payload.get("presence")
+    if not isinstance(legacy_user_id, int) or not isinstance(legacy, Mapping):
+        return None
+    candidates: list[tuple[int, str]] = []
+    for value in legacy.values():
+        if not isinstance(value, Mapping):
+            continue
+        status = value.get("status")
+        timestamp = value.get("timestamp")
+        if status in {"active", "idle"} and isinstance(timestamp, int):
+            candidates.append((timestamp, status))
+    if not candidates:
+        return None
+    timestamp, status = max(candidates)
+    return (
+        ZulipUserPresence(
+            user_id=legacy_user_id,
+            status="active" if status == "active" else "idle",
+            last_ping_at=timestamp,
+        ),
+    )
+
+
+def _user_status_change(
+    payload: Mapping[str, Any],
+) -> ZulipUserProfileStatus | None:
+    user_id = payload.get("user_id")
+    has_status_text = "status_text" in payload
+    has_status_emoji = "emoji_name" in payload
+    status_text = payload.get("status_text") if has_status_text else None
+    status_emoji = payload.get("emoji_name") if has_status_emoji else None
+    if not isinstance(user_id, int) or not (has_status_text or has_status_emoji):
+        return None
+    if has_status_text and not isinstance(status_text, str):
+        return None
+    if has_status_emoji and not isinstance(status_emoji, str):
+        return None
+    return ZulipUserProfileStatus(
+        user_id=user_id,
+        status_text=status_text or None if has_status_text else None,
+        status_emoji=status_emoji or None if has_status_emoji else None,
+        update_status_text=has_status_text,
+        update_status_emoji=has_status_emoji,
     )
 
 

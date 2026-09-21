@@ -113,10 +113,19 @@ class ZulipOutboundWriter:
             return
         stream = await self._required_stream(entity_uuid)
         if not str(stream["chat_key"]).startswith("channel:"):
-            return
+            if source == target:
+                return
+            raise ZulipOutboundError(
+                "direct-message stream updates are not supported by Zulip"
+            )
         unsupported_changes = tuple(
             property_name
-            for property_name in ("invite_only", "announce", "color")
+            for property_name in (
+                "invite_only",
+                "announce",
+                "color",
+                "history_public_to_subscribers",
+            )
             if target.get(property_name) != source.get(property_name)
         )
         if unsupported_changes:
@@ -270,21 +279,39 @@ class ZulipOutboundWriter:
         if data is None:
             return
         stream = await self._required_stream(UUID(str(data["stream_uuid"])))
-        actor = await self._actor(UUID(str(data["user_uuid"])))
-        if str(stream["chat_key"]).startswith("channel:"):
-            await asyncio.to_thread(
-                self._client(actor).update_subscription,
-                str(stream["name"]),
-                enabled=target is not None,
+        if not str(stream["chat_key"]).startswith("channel:"):
+            if source == target:
+                return
+            raise ZulipOutboundError(
+                "direct-message membership updates are not supported by Zulip"
             )
-            if target is not None:
-                muted = target.get("notification_mode") == "muted"
-                await asyncio.to_thread(
-                    self._client(actor).update_subscription_property,
-                    int(str(stream["chat_key"]).removeprefix("channel:")),
-                    "is_muted",
-                    muted,
-                )
+        actor = await self._actor(UUID(str(data["user_uuid"])))
+        if (
+            source is not None
+            and target is not None
+            and source.get("role") != target.get("role")
+        ):
+            raise ZulipOutboundError("Zulip channel membership roles cannot be updated")
+        notification_mode = (
+            target.get("notification_mode") if target is not None else None
+        )
+        if notification_mode == "mentions_only":
+            raise ZulipOutboundError(
+                "mentions-only channel notifications cannot be represented "
+                "without changing independent Zulip notification settings"
+            )
+        await asyncio.to_thread(
+            self._client(actor).update_subscription,
+            str(stream["name"]),
+            enabled=target is not None,
+        )
+        if target is not None:
+            await asyncio.to_thread(
+                self._client(actor).update_subscription_property,
+                int(str(stream["chat_key"]).removeprefix("channel:")),
+                "is_muted",
+                notification_mode == "muted",
+            )
         if target is None:
             await self._pool.execute(
                 "DELETE FROM workspace_zulip_bridge.zulip_stream_bindings "
@@ -465,7 +492,11 @@ class ZulipOutboundWriter:
             return
         stream = await self._required_stream(UUID(str(data["stream_uuid"])))
         if not str(stream["chat_key"]).startswith("channel:"):
-            return
+            if source == target:
+                return
+            raise ZulipOutboundError(
+                "direct-message topic preferences are not supported by Zulip"
+            )
         topic = await self._target_or_source_topic(UUID(str(data["topic_uuid"])))
         actor = await self._actor(UUID(str(data["user_uuid"])))
         mode = target.get("notification_mode", "default") if target else "default"
@@ -533,6 +564,10 @@ class ZulipOutboundWriter:
         if source is None:
             await self._create_message(entity_uuid, target, target_updated_at)
             return
+        if target.get("stream_uuid") != source.get("stream_uuid"):
+            raise ZulipOutboundError(
+                "moving messages between Zulip conversations is not supported"
+            )
         row = await self._message(entity_uuid)
         if row is None:
             raise ZulipOutboundError("Zulip message identity is unavailable")
@@ -626,7 +661,11 @@ class ZulipOutboundWriter:
                     local_id=str(entity_uuid),
                 )
             except (ValueError, ZulipApiError, httpx.ConnectError) as exc:
-                if isinstance(exc, ZulipApiError) and exc.retryable:
+                if (
+                    isinstance(exc, ZulipApiError)
+                    and exc.retryable
+                    and exc.status_code != 429
+                ):
                     raise
                 await self._pool.execute(
                     """
@@ -877,12 +916,14 @@ class ZulipOutboundWriter:
                     connection.zulip_user_uuid = $1
                     OR zulip_user.workspace_user_uuid = $1
               )
+              AND ($2::uuid IS NULL OR realm.workspace_provider_uuid = $2)
               AND NOT zulip_user.disabled
               AND connection.sync_enabled
             ORDER BY (connection.zulip_user_uuid = $1) DESC, connection.uuid
             LIMIT 1
             """,
             user_uuid,
+            self._settings.workspace_provider_uuid,
         )
         if row is None and stream_uuid is not None:
             row = await self._pool.fetchrow(
@@ -898,10 +939,13 @@ class ZulipOutboundWriter:
                   ON zulip_user.uuid = connection.zulip_user_uuid
                 JOIN workspace_zulip_bridge.zulip_realms AS realm
                   ON realm.uuid = connection.realm_uuid
-                WHERE stream.uuid = $1 AND NOT zulip_user.disabled
+                WHERE stream.uuid = $1
+                  AND ($2::uuid IS NULL OR realm.workspace_provider_uuid = $2)
+                  AND NOT zulip_user.disabled
                   AND connection.sync_enabled
                 """,
                 stream_uuid,
+                self._settings.workspace_provider_uuid,
             )
         if row is None:
             raise ZulipOutboundError(f"Zulip credential is unavailable for {user_uuid}")
@@ -910,13 +954,17 @@ class ZulipOutboundWriter:
     async def _zulip_user_uuid(self, user_uuid: UUID) -> UUID:
         value = await self._pool.fetchval(
             """
-            SELECT uuid
-            FROM workspace_zulip_bridge.zulip_users
-            WHERE uuid = $1 OR workspace_user_uuid = $1
-            ORDER BY (uuid = $1) DESC
+            SELECT zulip_user.uuid
+            FROM workspace_zulip_bridge.zulip_users AS zulip_user
+            JOIN workspace_zulip_bridge.zulip_realms AS realm
+              ON realm.uuid = zulip_user.realm_uuid
+            WHERE ($2::uuid IS NULL OR realm.workspace_provider_uuid = $2)
+              AND (zulip_user.uuid = $1 OR zulip_user.workspace_user_uuid = $1)
+            ORDER BY (zulip_user.uuid = $1) DESC
             LIMIT 1
             """,
             user_uuid,
+            self._settings.workspace_provider_uuid,
         )
         if value is None:
             raise ZulipOutboundError(f"Zulip identity is unavailable for {user_uuid}")

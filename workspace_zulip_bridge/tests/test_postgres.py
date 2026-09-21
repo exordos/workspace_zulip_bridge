@@ -26,12 +26,14 @@ from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.database import open_pool
 from workspace_zulip_bridge.database import prepare_database
 from workspace_zulip_bridge.event_processor import ZulipEventProcessor
+from workspace_zulip_bridge.event_processor import _user_status_change
 from workspace_zulip_bridge.event_store import EventStore
 from workspace_zulip_bridge.models import UserDirectoryWrite
 from workspace_zulip_bridge.models import ZulipAttachment
 from workspace_zulip_bridge.models import ZulipDirectoryUser
 from workspace_zulip_bridge.models import ZulipEvent
 from workspace_zulip_bridge.models import ZulipMessage
+from workspace_zulip_bridge.models import ZulipUserProfileStatus
 from workspace_zulip_bridge.monitor import collect_snapshot
 from workspace_zulip_bridge.stable_ids import stable_chat_uuid
 from workspace_zulip_bridge.stable_ids import stable_message_uuid
@@ -53,6 +55,25 @@ from workspace_zulip_bridge.zulip_outbound import ZulipOutboundPending
 from workspace_zulip_bridge.zulip_outbound import ZulipOutboundWriter
 
 ENDPOINT = "https://zulip.example.test"
+
+
+def test_user_status_event_accepts_one_field_updates() -> None:
+    text_only = _user_status_change({"user_id": 7, "status_text": "Focused"})
+    emoji_only = _user_status_change({"user_id": 7, "emoji_name": "target"})
+
+    assert text_only == ZulipUserProfileStatus(
+        7,
+        "Focused",
+        None,
+        update_status_emoji=False,
+    )
+    assert emoji_only == ZulipUserProfileStatus(
+        7,
+        None,
+        "target",
+        update_status_text=False,
+    )
+    assert _user_status_change({"user_id": 7}) is None
 
 
 def _dsn() -> str:
@@ -395,6 +416,31 @@ async def _outbound_message_adopts_a_racing_zulip_echo(dsn: str) -> None:
             f"pending:{retryable_uuid}",
         )
 
+        rate_limited_uuid = UUID("10000000-0000-0000-0000-000000000066")
+
+        def rate_limited_send(*_args, **_kwargs) -> int:
+            calls["send"] += 1
+            raise ZulipApiError(
+                "RATE_LIMIT_HIT",
+                retryable=True,
+                status_code=429,
+            )
+
+        client.send_message = rate_limited_send
+        with pytest.raises(ZulipApiError, match="RATE_LIMIT_HIT"):
+            await writer._create_message(rate_limited_uuid, target, None)
+        assert not await pool.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM workspace_zulip_bridge.zulip_entity_links
+                WHERE realm_uuid = $1 AND entity_type = 'message'
+                  AND workspace_uuid = $2
+            )
+            """,
+            realm_uuid,
+            rate_limited_uuid,
+        )
+
         rejected_uuid = UUID("10000000-0000-0000-0000-000000000063")
 
         def rejected_send(*_args, **_kwargs) -> int:
@@ -504,6 +550,7 @@ async def _outbound_rejects_stream_properties_it_cannot_apply() -> None:
         ("invite_only", True),
         ("announce", True),
         ("color", 2),
+        ("history_public_to_subscribers", False),
     ):
         with pytest.raises(ZulipOutboundError, match=property_name):
             await writer._apply_streams(
@@ -528,6 +575,107 @@ async def _outbound_rejects_workspace_stream_deletion() -> None:
                 "owner_uuid": "10000000-0000-0000-0000-000000000001",
             },
             None,
+            None,
+        )
+
+
+def test_outbound_rejects_direct_chat_and_cross_chat_mutations() -> None:
+    asyncio.run(_outbound_rejects_direct_chat_and_cross_chat_mutations())
+
+
+async def _outbound_rejects_direct_chat_and_cross_chat_mutations() -> None:
+    writer = ZulipOutboundWriter.__new__(ZulipOutboundWriter)
+
+    async def required_stream(_stream_uuid: UUID):
+        return {"chat_key": "direct:1,2"}
+
+    writer._required_stream = required_stream  # type: ignore[method-assign]
+    stream_uuid = UUID("10000000-0000-0000-0000-000000000006")
+    user_uuid = UUID("10000000-0000-0000-0000-000000000007")
+    source_stream = {"name": "Direct", "owner_uuid": str(user_uuid)}
+    with pytest.raises(ZulipOutboundError, match="direct-message stream"):
+        await writer._apply_streams(
+            stream_uuid,
+            source_stream,
+            {**source_stream, "name": "Renamed"},
+            None,
+        )
+
+    binding = {
+        "stream_uuid": str(stream_uuid),
+        "user_uuid": str(user_uuid),
+        "role": "member",
+    }
+    with pytest.raises(ZulipOutboundError, match="direct-message membership"):
+        await writer._apply_stream_bindings(
+            UUID("10000000-0000-0000-0000-000000000008"),
+            binding,
+            {**binding, "notification_mode": "muted"},
+            None,
+        )
+
+    topic_binding = {
+        "stream_uuid": str(stream_uuid),
+        "topic_uuid": "10000000-0000-0000-0000-000000000015",
+        "user_uuid": str(user_uuid),
+        "notification_mode": "default",
+    }
+    with pytest.raises(ZulipOutboundError, match="topic preferences"):
+        await writer._apply_topic_bindings(
+            UUID("10000000-0000-0000-0000-000000000016"),
+            topic_binding,
+            {**topic_binding, "notification_mode": "mute"},
+            None,
+        )
+
+    source_message = {
+        "stream_uuid": str(stream_uuid),
+        "author_uuid": str(user_uuid),
+    }
+    with pytest.raises(ZulipOutboundError, match="between Zulip conversations"):
+        await writer._apply_messages(
+            UUID("10000000-0000-0000-0000-000000000009"),
+            source_message,
+            {
+                **source_message,
+                "stream_uuid": "10000000-0000-0000-0000-000000000010",
+            },
+            None,
+        )
+
+
+def test_outbound_rejects_unrepresentable_channel_binding_changes() -> None:
+    asyncio.run(_outbound_rejects_unrepresentable_channel_binding_changes())
+
+
+async def _outbound_rejects_unrepresentable_channel_binding_changes() -> None:
+    writer = ZulipOutboundWriter.__new__(ZulipOutboundWriter)
+
+    async def required_stream(_stream_uuid: UUID):
+        return {"chat_key": "channel:7", "name": "General"}
+
+    writer._required_stream = required_stream  # type: ignore[method-assign]
+    writer._actor = AsyncMock()  # type: ignore[method-assign]
+    stream_uuid = UUID("10000000-0000-0000-0000-000000000011")
+    user_uuid = UUID("10000000-0000-0000-0000-000000000012")
+    source = {
+        "stream_uuid": str(stream_uuid),
+        "user_uuid": str(user_uuid),
+        "role": "member",
+        "notification_mode": "all_messages",
+    }
+    with pytest.raises(ZulipOutboundError, match="roles cannot be updated"):
+        await writer._apply_stream_bindings(
+            UUID("10000000-0000-0000-0000-000000000013"),
+            source,
+            {**source, "role": "administrator"},
+            None,
+        )
+    with pytest.raises(ZulipOutboundError, match="mentions-only"):
+        await writer._apply_stream_bindings(
+            UUID("10000000-0000-0000-0000-000000000014"),
+            source,
+            {**source, "notification_mode": "mentions_only"},
             None,
         )
 
@@ -661,6 +809,58 @@ async def _outbound_user_scoped_write_requires_exact_actor(dsn: str) -> None:
             await writer._actor(stable_user_uuid(ENDPOINT, 62))
         with pytest.raises(ZulipOutboundError, match="credential is unavailable"):
             await writer._actor(missing_user_uuid, stream_uuid)
+    finally:
+        await pool.close()
+
+
+def test_user_status_partial_updates_and_presence_expiry() -> None:
+    asyncio.run(_user_status_partial_updates_and_presence_expiry(_dsn()))
+
+
+async def _user_status_partial_updates_and_presence_expiry(dsn: str) -> None:
+    pool = await _pool(dsn)
+    try:
+        async with pool.acquire() as connection:
+            user_uuid = await _insert_user(connection, 77, 400)
+        store = EventStore(pool)
+        await store.store_user_statuses(
+            ENDPOINT,
+            (ZulipUserProfileStatus(77, "Working", "hammer"),),
+        )
+        await store.store_user_statuses(
+            ENDPOINT,
+            (
+                ZulipUserProfileStatus(
+                    77,
+                    "Reviewing",
+                    None,
+                    update_status_emoji=False,
+                ),
+            ),
+        )
+        row = await pool.fetchrow(
+            "SELECT status_text, status_emoji FROM "
+            "workspace_zulip_bridge.zulip_users WHERE uuid = $1",
+            user_uuid,
+        )
+        assert tuple(row) == ("Reviewing", "hammer")
+
+        await store.set_presence_offline_threshold(ENDPOINT, 1)
+        previous_hash = await pool.fetchval(
+            "UPDATE workspace_zulip_bridge.zulip_users "
+            "SET presence_status = 'active', "
+            "last_ping_at = clock_timestamp() - interval '2 seconds' "
+            "WHERE uuid = $1 RETURNING profile_hash",
+            user_uuid,
+        )
+        assert await store.expire_user_presences(10) == 1
+        expired = await pool.fetchrow(
+            "SELECT presence_status, profile_hash FROM "
+            "workspace_zulip_bridge.zulip_users WHERE uuid = $1",
+            user_uuid,
+        )
+        assert expired["presence_status"] == "offline"
+        assert expired["profile_hash"] != previous_hash
     finally:
         await pool.close()
 
@@ -1380,7 +1580,7 @@ async def _workspace_event_processor_requeues_transient_failure(dsn: str) -> Non
         assert row["available_at"] is not None
         assert row["claimed_at"] is None
         assert row["processed_at"] is None
-        assert "not bootstrapped" in row["last_error"]
+        assert row["last_error"] == "workspace_event_error:RuntimeError"
     finally:
         await pool.close()
 
@@ -4772,7 +4972,7 @@ async def _event_processor_bounds_deferrals_and_advances_the_queue(dsn: str) -> 
         assert (await processor.process_once()).retried == 1
         await asyncio.sleep(0.01)
         assert (await processor.process_once()).retried == 1
-        assert (await processor.process_once()).skipped == 1
+        assert (await processor.process_once()).failed == 1
 
         rows = await pool.fetch(
             """
@@ -4792,9 +4992,9 @@ async def _event_processor_bounds_deferrals_and_advances_the_queue(dsn: str) -> 
             },
             {
                 "event_id": 2,
-                "processing_status": "skipped",
+                "processing_status": "failed",
                 "attempt_count": 1,
-                "outcome_reason": "unsupported_event_type",
+                "outcome_reason": "invalid_presence_event",
                 "processed": True,
             },
         ]
@@ -5243,7 +5443,16 @@ async def _event_processor_round_trip(dsn: str) -> None:
                 "property": "name",
                 "value": "Renamed channel",
             },
-            {"id": 6, "type": "presence"},
+            {
+                "id": 6,
+                "type": "presence",
+                "presences": {
+                    "20": {
+                        "active_timestamp": 1_700_000_003,
+                        "idle_timestamp": 1_700_000_002,
+                    }
+                },
+            },
             {
                 "id": 7,
                 "type": "message",
@@ -5453,7 +5662,7 @@ async def _event_processor_round_trip(dsn: str) -> None:
             sum(stats.applied for stats in passes),
             sum(stats.skipped for stats in passes),
             sum(stats.failed for stats in passes),
-        ) == (11, 5, 1)
+        ) == (12, 4, 1)
         assert sum(stats.messages_changed for stats in passes) == 9
         assert sum(stats.chats_changed for stats in passes) == 2
 
@@ -5553,6 +5762,14 @@ async def _event_processor_round_trip(dsn: str) -> None:
                 stable_realm_uuid(ENDPOINT),
                 workspace_echo_uuid,
             )
+            member_presence = await connection.fetchrow(
+                """
+                SELECT presence_status, last_ping_at
+                FROM workspace_zulip_bridge.zulip_users
+                WHERE uuid = $1
+                """,
+                member_uuid,
+            )
         assert final_message is not None
         assert final_message["content"] == "second"
         assert final_message["is_read"]
@@ -5596,10 +5813,14 @@ async def _event_processor_round_trip(dsn: str) -> None:
         assert member_read is True
         assert normalized_reactions == 3
         assert echo_external_key == "124"
-        assert statuses == {"applied": 11, "failed": 1, "skipped": 5}
+        assert member_presence is not None
+        assert member_presence["presence_status"] == "active"
+        assert member_presence["last_ping_at"] == datetime.fromtimestamp(
+            1_700_000_003, tz=UTC
+        )
+        assert statuses == {"applied": 12, "failed": 1, "skipped": 4}
         assert skip_reasons == {
             "not_chat_supplier": 4,
-            "unsupported_event_type": 1,
         }
 
         async with pool.acquire() as connection:
@@ -5628,7 +5849,7 @@ async def _event_processor_round_trip(dsn: str) -> None:
                 owner_uuid,
             )
         recovered = await processor.process_once()
-        assert (recovered.claimed, recovered.applied, recovered.skipped) == (1, 0, 1)
+        assert (recovered.claimed, recovered.applied, recovered.failed) == (1, 0, 1)
         async with pool.acquire() as connection:
             recovered_row = await connection.fetchrow(
                 """
@@ -5640,9 +5861,9 @@ async def _event_processor_round_trip(dsn: str) -> None:
             )
         assert recovered_row is not None
         assert dict(recovered_row) == {
-            "processing_status": "skipped",
+            "processing_status": "failed",
             "attempt_count": 1,
-            "outcome_reason": "unsupported_event_type",
+            "outcome_reason": "invalid_presence_event",
         }
         async with pool.acquire() as connection:
             snapshot = await collect_snapshot(
@@ -5651,9 +5872,9 @@ async def _event_processor_round_trip(dsn: str) -> None:
                 exact=True,
             )
         assert snapshot.event_processing_statuses == {
-            "applied": 11,
-            "failed": 1,
-            "skipped": 6,
+            "applied": 12,
+            "failed": 2,
+            "skipped": 4,
         }
         assert snapshot.oldest_pending_event_seconds == 0
     finally:

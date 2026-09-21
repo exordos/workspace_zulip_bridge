@@ -5,6 +5,8 @@ import hashlib
 import json
 from collections.abc import Mapping
 from collections.abc import Sequence
+from datetime import UTC
+from datetime import datetime
 from typing import cast
 from uuid import UUID
 
@@ -28,6 +30,9 @@ from workspace_zulip_bridge.models import ZulipDirectoryUser
 from workspace_zulip_bridge.models import ZulipEvent
 from workspace_zulip_bridge.models import ZulipMessage
 from workspace_zulip_bridge.models import ZulipUser
+from workspace_zulip_bridge.models import ZulipUserPresence
+from workspace_zulip_bridge.models import ZulipUserProfileStatus
+from workspace_zulip_bridge.models import ZulipUserTopic
 from workspace_zulip_bridge.stable_ids import canonical_endpoint
 from workspace_zulip_bridge.stable_ids import stable_chat_uuid
 from workspace_zulip_bridge.stable_ids import stable_file_uuid
@@ -36,6 +41,7 @@ from workspace_zulip_bridge.stable_ids import stable_message_uuid
 from workspace_zulip_bridge.stable_ids import stable_reaction_uuid
 from workspace_zulip_bridge.stable_ids import stable_realm_uuid
 from workspace_zulip_bridge.stable_ids import stable_stream_binding_uuid
+from workspace_zulip_bridge.stable_ids import stable_topic_binding_uuid
 from workspace_zulip_bridge.stable_ids import stable_topic_uuid
 from workspace_zulip_bridge.stable_ids import stable_user_uuid
 
@@ -319,11 +325,7 @@ class EventStore:
                     JOIN workspace_zulip_bridge.zulip_connections AS connection
                       ON connection.zulip_user_uuid = zulip_user.uuid
                      AND connection.sync_enabled
-                    ORDER BY stream.uuid,
-                             CASE binding.role
-                               WHEN 'owner' THEN 1 WHEN 'administrator' THEN 2
-                               WHEN 'moderator' THEN 3 WHEN 'member' THEN 4
-                               ELSE 5 END,
+                    ORDER BY stream.uuid, zulip_user.role,
                              zulip_user.uuid,
                              connection.uuid
                 ), changed AS MATERIALIZED (
@@ -335,6 +337,13 @@ class EventStore:
                     JOIN winners ON winners.stream_uuid = stream.uuid
                     WHERE stream.source_connection_uuid IS DISTINCT FROM
                           winners.connection_uuid
+                       OR EXISTS (
+                           SELECT 1
+                           FROM workspace_zulip_bridge.zulip_messages AS message
+                           WHERE message.zulip_stream_uuid = stream.uuid
+                             AND message.source_connection_uuid IS DISTINCT FROM
+                                 winners.connection_uuid
+                       )
                     ORDER BY stream.uuid
                     FOR UPDATE OF stream SKIP LOCKED
                     LIMIT $1
@@ -490,6 +499,224 @@ class EventStore:
         return UserDirectoryWrite(
             users=len(users), bots=bot_count, changed=row["changed_count"]
         )
+
+    async def store_user_topics(
+        self,
+        connection_uuid: UUID,
+        queue_id: str,
+        topics: Sequence[ZulipUserTopic],
+        *,
+        replace_all: bool,
+    ) -> int | None:
+        async with self._pool.acquire() as connection, connection.transaction():
+            owner = await connection.fetchrow(
+                """
+                SELECT source.realm_uuid, source.zulip_user_uuid
+                FROM workspace_zulip_bridge.zulip_connections AS source
+                WHERE source.uuid = $1 AND source.queue_id = $2
+                  AND source.sync_enabled
+                """,
+                connection_uuid,
+                queue_id,
+            )
+            if owner is None:
+                return None
+            changed = 0
+            if replace_all:
+                rows = await connection.fetch(
+                    """
+                    SELECT topic_binding.uuid, topic_binding.zulip_stream_uuid,
+                           topic_binding.topic_uuid,
+                           topic_binding.zulip_user_uuid,
+                           topic_binding.created_at
+                    FROM workspace_zulip_bridge.zulip_topic_bindings
+                         AS topic_binding
+                    JOIN workspace_zulip_bridge.zulip_streams AS stream
+                      ON stream.uuid = topic_binding.zulip_stream_uuid
+                    WHERE stream.realm_uuid = $1
+                      AND topic_binding.zulip_user_uuid = $2
+                      AND topic_binding.notification_mode <> 'default'
+                    """,
+                    owner["realm_uuid"],
+                    owner["zulip_user_uuid"],
+                )
+                for row in rows:
+                    status = await connection.execute(
+                        """
+                        UPDATE workspace_zulip_bridge.zulip_topic_bindings
+                        SET notification_mode = 'default', content_hash = $2,
+                            updated_at = clock_timestamp()
+                        WHERE uuid = $1 AND notification_mode <> 'default'
+                        """,
+                        row["uuid"],
+                        _topic_binding_hash(
+                            row["zulip_stream_uuid"],
+                            row["topic_uuid"],
+                            row["zulip_user_uuid"],
+                            "default",
+                            row["created_at"],
+                        ),
+                    )
+                    changed += status == "UPDATE 1"
+            for topic in topics:
+                topic_change = await _store_user_topic(
+                    connection,
+                    owner["realm_uuid"],
+                    owner["zulip_user_uuid"],
+                    topic,
+                )
+                if topic_change is None:
+                    if not replace_all:
+                        return None
+                    continue
+                changed += topic_change
+            return changed
+
+    async def store_user_presences(
+        self,
+        endpoint: str,
+        presences: Sequence[ZulipUserPresence],
+    ) -> int:
+        return await self._store_user_live_state(
+            endpoint,
+            presences=presences,
+            statuses=(),
+        )
+
+    async def set_presence_offline_threshold(
+        self,
+        endpoint: str,
+        threshold_seconds: int,
+    ) -> None:
+        await self._pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.zulip_realms
+            SET presence_offline_threshold_seconds = $2,
+                updated_at = clock_timestamp()
+            WHERE uuid = $1
+              AND presence_offline_threshold_seconds IS DISTINCT FROM $2
+            """,
+            stable_realm_uuid(endpoint),
+            threshold_seconds,
+        )
+
+    async def expire_user_presences(self, batch_size: int) -> int:
+        async with self._pool.acquire() as connection, connection.transaction():
+            rows = await connection.fetch(
+                """
+                WITH expired AS MATERIALIZED (
+                    SELECT zulip_user.uuid
+                    FROM workspace_zulip_bridge.zulip_users AS zulip_user
+                    JOIN workspace_zulip_bridge.zulip_realms AS realm
+                      ON realm.uuid = zulip_user.realm_uuid
+                    WHERE zulip_user.presence_status <> 'offline'
+                      AND zulip_user.last_ping_at < (
+                          clock_timestamp() - make_interval(
+                              secs => realm.presence_offline_threshold_seconds
+                          )
+                      )
+                    ORDER BY zulip_user.last_ping_at, zulip_user.uuid
+                    LIMIT $1
+                    FOR UPDATE OF zulip_user SKIP LOCKED
+                )
+                UPDATE workspace_zulip_bridge.zulip_users AS zulip_user
+                SET presence_status = 'offline',
+                    updated_at = clock_timestamp()
+                FROM expired
+                WHERE zulip_user.uuid = expired.uuid
+                RETURNING zulip_user.*
+                """,
+                batch_size,
+            )
+            if rows:
+                await connection.executemany(
+                    """
+                    UPDATE workspace_zulip_bridge.zulip_users
+                    SET profile_hash = $2 WHERE uuid = $1
+                    """,
+                    [(row["uuid"], _user_profile_hash(dict(row))) for row in rows],
+                )
+        return len(rows)
+
+    async def store_user_statuses(
+        self,
+        endpoint: str,
+        statuses: Sequence[ZulipUserProfileStatus],
+    ) -> int:
+        return await self._store_user_live_state(
+            endpoint,
+            presences=(),
+            statuses=statuses,
+        )
+
+    async def _store_user_live_state(
+        self,
+        endpoint: str,
+        *,
+        presences: Sequence[ZulipUserPresence],
+        statuses: Sequence[ZulipUserProfileStatus],
+    ) -> int:
+        realm_uuid = stable_realm_uuid(endpoint)
+        changed_user_ids: set[int] = set()
+        async with self._pool.acquire() as connection, connection.transaction():
+            for presence in presences:
+                status = await connection.execute(
+                    """
+                    UPDATE workspace_zulip_bridge.zulip_users
+                    SET presence_status = $3,
+                        last_ping_at = to_timestamp($4),
+                        updated_at = clock_timestamp()
+                    WHERE realm_uuid = $1 AND zulip_user_id = $2
+                      AND (presence_status, last_ping_at) IS DISTINCT FROM
+                          ($3, to_timestamp($4))
+                    """,
+                    realm_uuid,
+                    presence.user_id,
+                    presence.status,
+                    presence.last_ping_at,
+                )
+                if status == "UPDATE 1":
+                    changed_user_ids.add(presence.user_id)
+            for user_status in statuses:
+                status = await connection.execute(
+                    """
+                    UPDATE workspace_zulip_bridge.zulip_users
+                    SET status_text = CASE WHEN $5 THEN $3 ELSE status_text END,
+                        status_emoji = CASE WHEN $6 THEN $4 ELSE status_emoji END,
+                        updated_at = clock_timestamp()
+                    WHERE realm_uuid = $1 AND zulip_user_id = $2
+                      AND (
+                          ($5 AND status_text IS DISTINCT FROM $3)
+                          OR ($6 AND status_emoji IS DISTINCT FROM $4)
+                      )
+                    """,
+                    realm_uuid,
+                    user_status.user_id,
+                    user_status.status_text,
+                    user_status.status_emoji,
+                    user_status.update_status_text,
+                    user_status.update_status_emoji,
+                )
+                if status == "UPDATE 1":
+                    changed_user_ids.add(user_status.user_id)
+            if changed_user_ids:
+                rows = await connection.fetch(
+                    """
+                    SELECT * FROM workspace_zulip_bridge.zulip_users
+                    WHERE realm_uuid = $1
+                      AND zulip_user_id = ANY($2::bigint[])
+                    """,
+                    realm_uuid,
+                    sorted(changed_user_ids),
+                )
+                await connection.executemany(
+                    """
+                    UPDATE workspace_zulip_bridge.zulip_users
+                    SET profile_hash = $2 WHERE uuid = $1
+                    """,
+                    [(row["uuid"], _user_profile_hash(dict(row))) for row in rows],
+                )
+        return len(changed_user_ids)
 
     async def store_user_attachments(
         self,
@@ -2062,6 +2289,153 @@ def _directory_user_profile_hash(user: ZulipDirectoryUser) -> bytes:
             separators=(",", ":"),
         ).encode("utf-8")
     ).digest()
+
+
+def _user_profile_hash(user: Mapping[str, object]) -> bytes:
+    last_ping_at = user.get("last_ping_at")
+    payload = {
+        "avatar_url": user.get("avatar_url"),
+        "disabled": user.get("disabled"),
+        "full_name": user.get("full_name"),
+        "is_bot": user.get("is_bot"),
+        "last_ping_at": (
+            last_ping_at.isoformat() if isinstance(last_ping_at, datetime) else None
+        ),
+        "login": user.get("login"),
+        "presence_status": user.get("presence_status"),
+        "role": user.get("role"),
+        "status_emoji": user.get("status_emoji"),
+        "status_text": user.get("status_text"),
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).digest()
+
+
+def _topic_binding_hash(
+    stream_uuid: UUID,
+    topic_uuid: UUID,
+    user_uuid: UUID,
+    notification_mode: str,
+    created_at: datetime,
+) -> bytes:
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "stream_uuid": str(stream_uuid),
+                "topic_uuid": str(topic_uuid),
+                "user_uuid": str(user_uuid),
+                "notification_mode": notification_mode,
+                "created_at": created_at.astimezone(UTC).isoformat(),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).digest()
+
+
+async def _store_user_topic(
+    connection: asyncpg.Connection | PoolConnectionProxy,
+    realm_uuid: UUID,
+    user_uuid: UUID,
+    topic: ZulipUserTopic,
+) -> int | None:
+    stream = await connection.fetchrow(
+        """
+        SELECT stream.uuid
+        FROM workspace_zulip_bridge.zulip_streams AS stream
+        JOIN workspace_zulip_bridge.zulip_stream_bindings AS binding
+          ON binding.zulip_stream_uuid = stream.uuid
+         AND binding.zulip_user_uuid = $3
+        WHERE stream.realm_uuid = $1 AND stream.chat_key = $2
+        """,
+        realm_uuid,
+        f"channel:{topic.stream_id}",
+        user_uuid,
+    )
+    if stream is None:
+        return None
+    stream_uuid = UUID(str(stream["uuid"]))
+    topic_uuid = stable_topic_uuid(stream_uuid, topic.topic_name)
+    topic_created_at = datetime.fromtimestamp(topic.last_updated, UTC)
+    await connection.execute(
+        """
+        INSERT INTO workspace_zulip_bridge.zulip_topics (
+            uuid, zulip_stream_uuid, name, content_hash, created_at
+        ) VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (uuid) DO UPDATE
+        SET name = EXCLUDED.name, content_hash = EXCLUDED.content_hash,
+            updated_at = clock_timestamp()
+        WHERE zulip_topics.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+        """,
+        topic_uuid,
+        stream_uuid,
+        topic.topic_name,
+        hashlib.sha256(topic.topic_name.encode("utf-8")).digest(),
+        topic_created_at,
+    )
+    await connection.execute(
+        """
+        INSERT INTO workspace_zulip_bridge.zulip_topic_aliases (
+            zulip_stream_uuid, alias, topic_uuid
+        ) VALUES ($1, $2, $3)
+        ON CONFLICT (zulip_stream_uuid, alias) DO UPDATE
+        SET topic_uuid = EXCLUDED.topic_uuid, active = true,
+            updated_at = clock_timestamp()
+        """,
+        stream_uuid,
+        topic.topic_name,
+        topic_uuid,
+    )
+    mode = {0: "default", 1: "mute", 2: "unmute", 3: "follow"}[topic.visibility_policy]
+    created_at = await connection.fetchval(
+        """
+        SELECT created_at
+        FROM workspace_zulip_bridge.zulip_topic_bindings
+        WHERE topic_uuid = $1 AND zulip_user_uuid = $2
+        """,
+        topic_uuid,
+        user_uuid,
+    )
+    if not isinstance(created_at, datetime):
+        created_at = topic_created_at
+    content_hash = _topic_binding_hash(
+        stream_uuid,
+        topic_uuid,
+        user_uuid,
+        mode,
+        created_at,
+    )
+    status = await connection.execute(
+        """
+        INSERT INTO workspace_zulip_bridge.zulip_topic_bindings (
+            uuid, zulip_stream_uuid, topic_uuid, zulip_user_uuid,
+            notification_mode, content_hash, created_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (uuid) DO UPDATE
+        SET notification_mode = EXCLUDED.notification_mode,
+            content_hash = EXCLUDED.content_hash,
+            updated_at = clock_timestamp()
+        WHERE zulip_topic_bindings.notification_mode
+                  IS DISTINCT FROM EXCLUDED.notification_mode
+           OR zulip_topic_bindings.content_hash
+                  IS DISTINCT FROM EXCLUDED.content_hash
+        """,
+        stable_topic_binding_uuid(topic_uuid, user_uuid),
+        stream_uuid,
+        topic_uuid,
+        user_uuid,
+        mode,
+        content_hash,
+        created_at,
+    )
+    return int(status.rsplit(" ", 1)[-1])
 
 
 async def _store_chats(

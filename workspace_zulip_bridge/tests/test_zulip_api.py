@@ -2,6 +2,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License").
 
 import json
+import time
 from urllib.parse import parse_qs
 
 import httpx
@@ -9,6 +10,20 @@ import pytest
 
 from workspace_zulip_bridge.zulip_api import ZulipApiClient
 from workspace_zulip_bridge.zulip_api import ZulipApiError
+from workspace_zulip_bridge.zulip_api import _parse_user_presences
+
+
+def test_presence_snapshot_expires_old_timestamps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("workspace_zulip_bridge.zulip_api.time.time", lambda: 1_000)
+
+    presences = _parse_user_presences(
+        {"11": {"active_timestamp": 700, "idle_timestamp": 600}},
+        offline_threshold_seconds=200,
+    )
+
+    assert presences[0].status == "offline"
 
 
 def test_register_and_get_events() -> None:
@@ -20,8 +35,15 @@ def test_register_and_get_events() -> None:
             assert request.headers["authorization"].startswith("Basic ")
             form = parse_qs(request.content.decode())
             assert json.loads(form["fetch_event_types"][0]) == [
-                "recent_private_conversations"
+                "recent_private_conversations",
+                "presence",
+                "user_status",
+                "user_topic",
             ]
+            assert form["slim_presence"] == ["true"]
+            assert json.loads(form["client_capabilities"][0]) == {
+                "simplified_presence_events": True
+            }
             assert form["idle_queue_timeout"] == ["3600"]
             return httpx.Response(
                 200,
@@ -31,9 +53,30 @@ def test_register_and_get_events() -> None:
                     "queue_id": "queue-1",
                     "last_event_id": -1,
                     "event_queue_longpoll_timeout_seconds": 90,
+                    "server_presence_offline_threshold_seconds": 200,
                     "recent_private_conversations": [
                         {"user_ids": [12, 11], "max_message_id": 42}
                     ],
+                    "user_topics": [
+                        {
+                            "stream_id": 7,
+                            "topic_name": "Review",
+                            "visibility_policy": 3,
+                            "last_updated": 1_700_000_000,
+                        }
+                    ],
+                    "presences": {
+                        "11": {
+                            "active_timestamp": int(time.time()),
+                            "idle_timestamp": int(time.time()) - 1,
+                        }
+                    },
+                    "user_status": {
+                        "11": {
+                            "status_text": "Reviewing",
+                            "emoji_name": "eyes",
+                        }
+                    },
                 },
             )
         assert request.url.path.endswith("/events")
@@ -55,6 +98,10 @@ def test_register_and_get_events() -> None:
         assert queue.last_event_id == -1
         assert queue.longpoll_timeout_seconds == 90
         assert queue.recent_private_conversations[0].user_ids == (11, 12)
+        assert queue.user_topics[0].topic_name == "Review"
+        assert queue.user_presences[0].status == "active"
+        assert queue.presence_offline_threshold_seconds == 200
+        assert queue.user_statuses[0].status_emoji == "eyes"
         assert client.get_events("queue-1", -1, 90) == [{"id": 1, "type": "heartbeat"}]
     finally:
         client.close()
@@ -99,6 +146,28 @@ def test_bad_event_queue_id_is_classified() -> None:
             client.get_events("expired", 12, 90)
         assert error.value.code == "BAD_EVENT_QUEUE_ID"
         assert error.value.retryable
+        assert error.value.status_code == 400
+    finally:
+        client.close()
+
+
+def test_rate_limit_preserves_http_status() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            json={
+                "result": "error",
+                "msg": "rate limited",
+                "code": "RATE_LIMIT_HIT",
+            },
+        )
+
+    client = _client(handler)
+    try:
+        with pytest.raises(ZulipApiError) as error:
+            client.get_events("queue", 1, 90)
+        assert error.value.retryable
+        assert error.value.status_code == 429
     finally:
         client.close()
 

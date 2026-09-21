@@ -807,9 +807,13 @@ class WorkspaceEventProcessor:
                 status = "applied" if applied else "skipped"
                 error = None
             except Exception as exc:
-                LOG.exception("Workspace mirror event failed")
+                error_type = type(exc).__name__
+                LOG.error(
+                    "Workspace mirror event failed error_type=%s",
+                    error_type,
+                )
                 status = "retry"
-                error = str(exc)[:2048]
+                error = f"workspace_event_error:{error_type}"
             await self._pool.execute(
                 """
                 UPDATE workspace_zulip_bridge.workspace_events

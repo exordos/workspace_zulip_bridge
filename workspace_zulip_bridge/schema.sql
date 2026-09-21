@@ -6,6 +6,8 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_realms (
     endpoint text NOT NULL UNIQUE,
     workspace_project_id uuid,
     workspace_provider_uuid uuid,
+    presence_offline_threshold_seconds integer NOT NULL DEFAULT 200
+        CHECK (presence_offline_threshold_seconds > 0),
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
@@ -36,6 +38,9 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_users (
 CREATE UNIQUE INDEX IF NOT EXISTS zulip_users_workspace_identity_idx
     ON workspace_zulip_bridge.zulip_users (realm_uuid, workspace_user_uuid)
     WHERE workspace_user_uuid IS NOT NULL;
+CREATE INDEX IF NOT EXISTS zulip_users_live_presence_idx
+    ON workspace_zulip_bridge.zulip_users (realm_uuid, last_ping_at, uuid)
+    WHERE presence_status <> 'offline';
 
 CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_connections (
     uuid uuid PRIMARY KEY,
@@ -218,6 +223,9 @@ END $$;
 CREATE INDEX IF NOT EXISTS zulip_messages_stream_timeline_idx
     ON workspace_zulip_bridge.zulip_messages
         (zulip_stream_uuid, created_at DESC, uuid DESC);
+CREATE INDEX IF NOT EXISTS zulip_messages_stream_source_idx
+    ON workspace_zulip_bridge.zulip_messages
+        (zulip_stream_uuid, source_connection_uuid);
 CREATE INDEX IF NOT EXISTS zulip_messages_topic_timeline_idx
     ON workspace_zulip_bridge.zulip_messages
         (topic_uuid, created_at DESC, uuid DESC) WHERE topic_uuid IS NOT NULL;

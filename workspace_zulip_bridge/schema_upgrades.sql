@@ -4,6 +4,23 @@ CREATE SCHEMA IF NOT EXISTS workspace_zulip_bridge;
 -- before it so an element update can safely reuse an older persistent volume.
 DO $upgrade$
 BEGIN
+    IF to_regclass('workspace_zulip_bridge.zulip_realms') IS NOT NULL THEN
+        ALTER TABLE workspace_zulip_bridge.zulip_realms
+            ADD COLUMN IF NOT EXISTS presence_offline_threshold_seconds integer
+            NOT NULL DEFAULT 200;
+        IF NOT EXISTS (
+            SELECT 1
+            FROM pg_constraint
+            WHERE conrelid =
+                    'workspace_zulip_bridge.zulip_realms'::regclass
+              AND conname = 'zulip_realms_presence_offline_threshold_check'
+        ) THEN
+            ALTER TABLE workspace_zulip_bridge.zulip_realms
+                ADD CONSTRAINT zulip_realms_presence_offline_threshold_check
+                CHECK (presence_offline_threshold_seconds > 0);
+        END IF;
+    END IF;
+
     IF to_regclass('workspace_zulip_bridge.zulip_users') IS NOT NULL THEN
         ALTER TABLE workspace_zulip_bridge.zulip_users
             ADD COLUMN IF NOT EXISTS is_bot boolean NOT NULL DEFAULT false;

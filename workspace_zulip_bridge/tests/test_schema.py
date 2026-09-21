@@ -52,6 +52,9 @@ def test_schema_normalizes_workspace_like_entities_and_personal_state() -> None:
         assert f"workspace_zulip_bridge.{table}" in schema
     assert "source_connection_uuid uuid" in schema
     assert "zulip_messages_source_connection_uuid_fkey" in schema
+    assert "zulip_messages_stream_source_idx" in schema
+    assert "presence_offline_threshold_seconds integer" in schema
+    assert "zulip_users_live_presence_idx" in schema
     assert "ON DELETE SET NULL" in schema
     assert "UNIQUE (realm_uuid, chat_key)" in schema
     assert "UNIQUE (zulip_stream_uuid, zulip_user_uuid)" in schema

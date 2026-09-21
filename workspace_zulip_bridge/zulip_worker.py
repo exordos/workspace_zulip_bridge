@@ -30,6 +30,9 @@ from workspace_zulip_bridge.models import ZulipDirectoryUser
 from workspace_zulip_bridge.models import ZulipEvent
 from workspace_zulip_bridge.models import ZulipIdentity
 from workspace_zulip_bridge.models import ZulipUser
+from workspace_zulip_bridge.models import ZulipUserPresence
+from workspace_zulip_bridge.models import ZulipUserProfileStatus
+from workspace_zulip_bridge.models import ZulipUserTopic
 from workspace_zulip_bridge.stable_ids import stable_user_uuid
 from workspace_zulip_bridge.zulip_api import ZulipApiClient
 from workspace_zulip_bridge.zulip_api import ZulipApiError
@@ -167,6 +170,10 @@ class ZulipEventThread(threading.Thread):
         self._allowed_chat_keys: set[str] = set()
         self._catalog_builder: ChatCatalogBuilder | None = None
         self._recent_private_conversations: tuple[RecentPrivateConversation, ...] = ()
+        self._bootstrap_user_topics: tuple[ZulipUserTopic, ...] = ()
+        self._bootstrap_user_presences: tuple[ZulipUserPresence, ...] = ()
+        self._bootstrap_user_statuses: tuple[ZulipUserProfileStatus, ...] = ()
+        self._bootstrap_state_pending = False
 
     def stop(self) -> None:
         self._stop_requested.set()
@@ -268,6 +275,12 @@ class ZulipEventThread(threading.Thread):
                     )
                 ):
                     return
+                self._submit(
+                    self._store.set_presence_offline_threshold(
+                        self.user.endpoint,
+                        registered.presence_offline_threshold_seconds,
+                    )
+                )
                 queue_id = registered.queue_id
                 last_event_id = registered.last_event_id
                 self._queue_id = queue_id
@@ -275,6 +288,10 @@ class ZulipEventThread(threading.Thread):
                 self._recent_private_conversations = (
                     registered.recent_private_conversations
                 )
+                self._bootstrap_user_topics = registered.user_topics
+                self._bootstrap_user_presences = registered.user_presences
+                self._bootstrap_user_statuses = registered.user_statuses
+                self._bootstrap_state_pending = True
                 longpoll_timeout = registered.longpoll_timeout_seconds
                 LOG.info(
                     "Zulip queue registered user_uuid=%s",
@@ -309,6 +326,10 @@ class ZulipEventThread(threading.Thread):
                 self._allowed_chat_keys.clear()
                 self._catalog_builder = None
                 self._recent_private_conversations = ()
+                self._bootstrap_user_topics = ()
+                self._bootstrap_user_presences = ()
+                self._bootstrap_user_statuses = ()
+                self._bootstrap_state_pending = False
                 self._wait_before_retry(attempt)
                 attempt += 1
                 continue
@@ -548,6 +569,32 @@ class ZulipEventThread(threading.Thread):
             )
         if not result.activated:
             return False
+        bootstrap_changes = 0
+        if self._bootstrap_state_pending:
+            bootstrap_changes += self._submit(
+                self._store.store_user_presences(
+                    self.user.endpoint,
+                    self._bootstrap_user_presences,
+                )
+            )
+            bootstrap_changes += self._submit(
+                self._store.store_user_statuses(
+                    self.user.endpoint,
+                    self._bootstrap_user_statuses,
+                )
+            )
+            topic_changes = self._submit(
+                self._store.store_user_topics(
+                    self.user.uuid,
+                    queue_id,
+                    self._bootstrap_user_topics,
+                    replace_all=True,
+                )
+            )
+            if topic_changes is None:
+                return False
+            bootstrap_changes += topic_changes
+            self._bootstrap_state_pending = False
         elapsed = time.monotonic() - started_at
         self._identity = identity
         self._user_uuids = user_uuids
@@ -558,7 +605,7 @@ class ZulipEventThread(threading.Thread):
             "Zulip catalog ready user_uuid=%s users=%s bots=%s user_changes=%s "
             "attachments=%s attachment_changes=%s chats=%s "
             "visibility_probes=%s chat_upserts=%s chat_deletes=%s "
-            "elapsed_seconds=%.3f",
+            "bootstrap_changes=%s elapsed_seconds=%.3f",
             self.user.uuid,
             directory_result.users,
             directory_result.bots,
@@ -569,6 +616,7 @@ class ZulipEventThread(threading.Thread):
             visibility_probes,
             result.upserted,
             result.deleted,
+            bootstrap_changes,
             elapsed,
         )
         return True

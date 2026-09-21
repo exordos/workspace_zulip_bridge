@@ -55,12 +55,40 @@ class RegisteredQueue:
     last_event_id: int
     longpoll_timeout_seconds: float
     recent_private_conversations: tuple["RecentPrivateConversation", ...] = ()
+    user_topics: tuple["ZulipUserTopic", ...] = ()
+    user_presences: tuple["ZulipUserPresence", ...] = ()
+    user_statuses: tuple["ZulipUserProfileStatus", ...] = ()
+    presence_offline_threshold_seconds: int = 200
 
 
 @dataclass(frozen=True, slots=True)
 class RecentPrivateConversation:
     user_ids: tuple[int, ...]
     max_message_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class ZulipUserTopic:
+    stream_id: int
+    topic_name: str
+    visibility_policy: int
+    last_updated: int
+
+
+@dataclass(frozen=True, slots=True)
+class ZulipUserPresence:
+    user_id: int
+    status: Literal["active", "idle", "offline"]
+    last_ping_at: int
+
+
+@dataclass(frozen=True, slots=True)
+class ZulipUserProfileStatus:
+    user_id: int
+    status_text: str | None
+    status_emoji: str | None
+    update_status_text: bool = True
+    update_status_emoji: bool = True
 
 
 @dataclass(frozen=True, slots=True)

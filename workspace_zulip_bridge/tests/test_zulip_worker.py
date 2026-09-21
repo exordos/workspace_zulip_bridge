@@ -162,6 +162,12 @@ class FakeStore:
         self.history_begins = 0
         self.stored = asyncio.Event()
         self.catalog_stored = asyncio.Event()
+        self.presence_thresholds: list[tuple[str, int]] = []
+
+    async def set_presence_offline_threshold(
+        self, endpoint: str, threshold_seconds: int
+    ) -> None:
+        self.presence_thresholds.append((endpoint, threshold_seconds))
 
     async def set_user_identity(
         self,

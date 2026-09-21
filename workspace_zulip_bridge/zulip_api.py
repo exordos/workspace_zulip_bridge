@@ -3,9 +3,11 @@
 
 import hashlib
 import json
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+from typing import Literal
 
 import httpx
 
@@ -15,13 +17,114 @@ from workspace_zulip_bridge.models import RegisteredQueue
 from workspace_zulip_bridge.models import ZulipAttachment
 from workspace_zulip_bridge.models import ZulipDirectoryUser
 from workspace_zulip_bridge.models import ZulipIdentity
+from workspace_zulip_bridge.models import ZulipUserPresence
+from workspace_zulip_bridge.models import ZulipUserProfileStatus
+from workspace_zulip_bridge.models import ZulipUserTopic
 
 
 class ZulipApiError(Exception):
-    def __init__(self, code: str, *, retryable: bool) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        retryable: bool,
+        status_code: int | None = None,
+    ) -> None:
         super().__init__(code)
         self.code = code
         self.retryable = retryable
+        self.status_code = status_code
+
+
+def _parse_user_topics(raw: object) -> tuple[ZulipUserTopic, ...]:
+    if not isinstance(raw, list):
+        raise ZulipApiError("invalid_register_response", retryable=True)
+    result: list[ZulipUserTopic] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            raise ZulipApiError("invalid_register_response", retryable=True)
+        stream_id = item.get("stream_id")
+        topic_name = item.get("topic_name")
+        visibility_policy = item.get("visibility_policy")
+        last_updated = item.get("last_updated")
+        if (
+            not isinstance(stream_id, int)
+            or not isinstance(topic_name, str)
+            or visibility_policy not in {1, 2, 3}
+            or not isinstance(last_updated, int)
+        ):
+            raise ZulipApiError("invalid_register_response", retryable=True)
+        result.append(
+            ZulipUserTopic(
+                stream_id=stream_id,
+                topic_name=topic_name,
+                visibility_policy=visibility_policy,
+                last_updated=last_updated,
+            )
+        )
+    return tuple(result)
+
+
+def _parse_user_presences(
+    raw: object,
+    *,
+    offline_threshold_seconds: int,
+) -> tuple[ZulipUserPresence, ...]:
+    if not isinstance(raw, Mapping):
+        raise ZulipApiError("invalid_register_response", retryable=True)
+    result: list[ZulipUserPresence] = []
+    for raw_user_id, value in raw.items():
+        if not isinstance(raw_user_id, str) or not raw_user_id.isdigit():
+            continue
+        if not isinstance(value, Mapping):
+            raise ZulipApiError("invalid_register_response", retryable=True)
+        active_timestamp = value.get("active_timestamp")
+        idle_timestamp = value.get("idle_timestamp")
+        active = active_timestamp if isinstance(active_timestamp, int) else None
+        idle = idle_timestamp if isinstance(idle_timestamp, int) else None
+        if active is None and idle is None:
+            continue
+        latest = max(value for value in (active, idle) if value is not None)
+        status: Literal["active", "idle", "offline"]
+        if latest < int(time.time()) - offline_threshold_seconds:
+            status = "offline"
+        elif active is not None and active >= (idle or 0):
+            status = "active"
+        else:
+            status = "idle"
+        result.append(
+            ZulipUserPresence(
+                user_id=int(raw_user_id),
+                status=status,
+                last_ping_at=latest,
+            )
+        )
+    return tuple(result)
+
+
+def _parse_user_statuses(raw: object) -> tuple[ZulipUserProfileStatus, ...]:
+    if not isinstance(raw, Mapping):
+        raise ZulipApiError("invalid_register_response", retryable=True)
+    result: list[ZulipUserProfileStatus] = []
+    for raw_user_id, value in raw.items():
+        if not isinstance(raw_user_id, str) or not raw_user_id.isdigit():
+            continue
+        if not isinstance(value, Mapping):
+            raise ZulipApiError("invalid_register_response", retryable=True)
+        status_text = value.get("status_text")
+        status_emoji = value.get("emoji_name")
+        if status_text is not None and not isinstance(status_text, str):
+            raise ZulipApiError("invalid_register_response", retryable=True)
+        if status_emoji is not None and not isinstance(status_emoji, str):
+            raise ZulipApiError("invalid_register_response", retryable=True)
+        result.append(
+            ZulipUserProfileStatus(
+                user_id=int(raw_user_id),
+                status_text=status_text or None,
+                status_emoji=status_emoji or None,
+            )
+        )
+    return tuple(result)
 
 
 def parse_attachment(raw: Mapping[str, Any]) -> ZulipAttachment:
@@ -111,7 +214,17 @@ class ZulipApiClient:
             "/api/v1/register",
             data={
                 "fetch_event_types": json.dumps(
-                    ["recent_private_conversations"],
+                    [
+                        "recent_private_conversations",
+                        "presence",
+                        "user_status",
+                        "user_topic",
+                    ],
+                    separators=(",", ":"),
+                ),
+                "slim_presence": "true",
+                "client_capabilities": json.dumps(
+                    {"simplified_presence_events": True},
                     separators=(",", ":"),
                 ),
                 "idle_queue_timeout": str(self._idle_queue_timeout_seconds),
@@ -149,11 +262,30 @@ class ZulipApiClient:
                     max_message_id=max_message_id,
                 )
             )
+        raw_presence_threshold = payload.get(
+            "server_presence_offline_threshold_seconds",
+            200,
+        )
+        presence_threshold = (
+            raw_presence_threshold
+            if isinstance(raw_presence_threshold, int) and raw_presence_threshold > 0
+            else 200
+        )
+        user_topics = _parse_user_topics(payload.get("user_topics", []))
+        user_presences = _parse_user_presences(
+            payload.get("presences", {}),
+            offline_threshold_seconds=presence_threshold,
+        )
+        user_statuses = _parse_user_statuses(payload.get("user_status", {}))
         return RegisteredQueue(
             queue_id,
             last_event_id,
             longpoll_timeout,
             tuple(conversations),
+            user_topics,
+            user_presences,
+            user_statuses,
+            presence_threshold,
         )
 
     def get_events(
@@ -603,6 +735,7 @@ class ZulipApiClient:
             raise ZulipApiError(
                 f"http_{response.status_code}_invalid_json",
                 retryable=response.status_code >= 500,
+                status_code=response.status_code,
             ) from exc
         if not isinstance(payload, Mapping):
             raise ZulipApiError("invalid_json_shape", retryable=True)
@@ -618,5 +751,9 @@ class ZulipApiClient:
                 or response.status_code >= 500
                 or code == "BAD_EVENT_QUEUE_ID"
             )
-            raise ZulipApiError(code, retryable=retryable)
+            raise ZulipApiError(
+                code,
+                retryable=retryable,
+                status_code=response.status_code,
+            )
         return payload
