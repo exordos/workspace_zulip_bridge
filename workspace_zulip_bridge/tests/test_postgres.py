@@ -477,6 +477,14 @@ def test_workspace_diff_worker_batches_and_converges(
     asyncio.run(_workspace_diff_worker_round_trip(_dsn(), tmp_path))
 
 
+def test_workspace_diff_planner_schedules_unready_entity_graph(
+    tmp_path: Path,
+) -> None:
+    asyncio.run(
+        _workspace_diff_planner_schedules_unready_entity_graph(_dsn(), tmp_path)
+    )
+
+
 def test_workspace_diff_materializes_topic_bindings(tmp_path: Path) -> None:
     asyncio.run(_workspace_diff_materializes_topic_bindings(_dsn(), tmp_path))
 
@@ -987,6 +995,183 @@ async def _workspace_diff_materializes_topic_bindings(dsn: str, tmp_path: Path) 
         assert (
             await pool.fetchval(
                 "SELECT count(*) FROM workspace_zulip_bridge.zulip_topic_bindings"
+            )
+            == 1
+        )
+    finally:
+        await pool.close()
+
+
+async def _workspace_diff_planner_schedules_unready_entity_graph(
+    dsn: str,
+    tmp_path: Path,
+) -> None:
+    pool = await _pool(dsn)
+    provider_uuid = UUID("10000000-0000-0000-0000-000000000081")
+    project_uuid = UUID("10000000-0000-0000-0000-000000000082")
+    generation = UUID("10000000-0000-0000-0000-000000000083")
+    stream_uuid = UUID("10000000-0000-0000-0000-000000000084")
+    stream_binding_uuid = UUID("10000000-0000-0000-0000-000000000085")
+    topic_uuid = UUID("10000000-0000-0000-0000-000000000086")
+    topic_binding_uuid = UUID("10000000-0000-0000-0000-000000000087")
+    message_uuid = UUID("10000000-0000-0000-0000-000000000088")
+    flag_uuid = UUID("10000000-0000-0000-0000-000000000089")
+    reaction_uuid = UUID("10000000-0000-0000-0000-000000000090")
+    token_file = tmp_path / "workspace-unready-graph.token"
+    token_file.write_text("integration-token")
+    try:
+        async with pool.acquire() as connection:
+            user_uuid = await _insert_user(connection, 81, 400)
+            realm_uuid = stable_realm_uuid(ENDPOINT)
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_realms
+                SET workspace_project_id = $2, workspace_provider_uuid = $3
+                WHERE uuid = $1
+                """,
+                realm_uuid,
+                project_uuid,
+                provider_uuid,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.workspace_mirror_state (
+                    provider_uuid, workspace_project_id, active_generation,
+                    bootstrap_status
+                ) VALUES ($1, $2, $3, 'ready')
+                """,
+                provider_uuid,
+                project_uuid,
+                generation,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_streams (
+                    uuid, realm_uuid, chat_type, chat_key, name,
+                    owner_user_uuid, content_hash, source_connection_uuid
+                ) VALUES ($1, $2, 'channel', '81', 'Unready graph',
+                          $3, $4, $3)
+                """,
+                stream_uuid,
+                realm_uuid,
+                user_uuid,
+                b"s" * 32,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_stream_bindings (
+                    uuid, zulip_stream_uuid, zulip_user_uuid, role,
+                    membership_kind, content_hash
+                ) VALUES ($1, $2, $3, 'member', 'subscriber', $4)
+                """,
+                stream_binding_uuid,
+                stream_uuid,
+                user_uuid,
+                b"b" * 32,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_topics (
+                    uuid, zulip_stream_uuid, name, content_hash
+                ) VALUES ($1, $2, 'Unready topic', $3)
+                """,
+                topic_uuid,
+                stream_uuid,
+                b"t" * 32,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_topic_bindings (
+                    uuid, zulip_stream_uuid, topic_uuid, zulip_user_uuid,
+                    content_hash
+                ) VALUES ($1, $2, $3, $4, $5)
+                """,
+                topic_binding_uuid,
+                stream_uuid,
+                topic_uuid,
+                user_uuid,
+                b"q" * 32,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_messages (
+                    uuid, realm_uuid, source_connection_uuid,
+                    zulip_stream_uuid, topic_uuid, sender_user_uuid,
+                    zulip_message_id, content, content_hash, message_hash,
+                    created_at, source_updated_at
+                ) VALUES ($1, $2, $3, $4, $5, $3, 81, 'unready',
+                          $6, $7, clock_timestamp(), clock_timestamp())
+                """,
+                message_uuid,
+                realm_uuid,
+                user_uuid,
+                stream_uuid,
+                topic_uuid,
+                b"m" * 32,
+                b"h" * 32,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_message_flags (
+                    uuid, realm_uuid, zulip_stream_uuid, message_uuid,
+                    zulip_user_uuid, flags_hash
+                ) VALUES ($1, $2, $3, $4, $5, $6)
+                """,
+                flag_uuid,
+                realm_uuid,
+                stream_uuid,
+                message_uuid,
+                user_uuid,
+                b"f" * 32,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_message_reactions (
+                    uuid, realm_uuid, message_uuid, zulip_user_uuid,
+                    emoji_name, emoji_code, reaction_type
+                ) VALUES ($1, $2, $3, $4, 'heart', '2764', 'unicode_emoji')
+                """,
+                reaction_uuid,
+                realm_uuid,
+                message_uuid,
+                user_uuid,
+            )
+        settings = Settings.from_env(
+            {
+                "WZB_DATABASE_DSN": dsn,
+                "WZB_DB_POOL_MIN_SIZE": "1",
+                "WZB_DB_POOL_MAX_SIZE": "4",
+                "WZB_ZULIP_HISTORY_CONCURRENCY": "2",
+                "WZB_WORKSPACE_WEBSOCKET_URL": (
+                    "ws://workspace.test/api/workspace/v1/events/ws"
+                ),
+                "WZB_WORKSPACE_PROJECT_ID": str(project_uuid),
+                "WZB_WORKSPACE_PROVIDER_UUID": str(provider_uuid),
+                "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+            }
+        )
+        worker = WorkspaceDiffWorker(pool, settings)
+
+        assert await worker.plan() == 8
+        assert (
+            await pool.fetchval(
+                """
+                SELECT count(*) FROM workspace_zulip_bridge.sync_diffs
+                WHERE provider_uuid = $1 AND direction = 'to_workspace'
+                  AND processing_status = 'pending'
+                """,
+                provider_uuid,
+            )
+            == 8
+        )
+        assert (
+            await pool.fetchval(
+                """
+                SELECT reconciliation_version
+                FROM workspace_zulip_bridge.workspace_mirror_state
+                WHERE provider_uuid = $1
+                """,
+                provider_uuid,
             )
             == 1
         )

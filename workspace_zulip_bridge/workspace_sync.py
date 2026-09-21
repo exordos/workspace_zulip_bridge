@@ -41,6 +41,7 @@ ENTITY_TYPES = (
     "message_reactions",
 )
 PRIORITY = {entity_type: index for index, entity_type in enumerate(ENTITY_TYPES)}
+RECONCILIATION_VERSION = 1
 
 
 def canonical_hash(data: Mapping[str, Any]) -> bytes:
@@ -984,7 +985,8 @@ class WorkspaceDiffWorker:
         await self._ensure_topic_bindings(realm_uuid)
         state = await self._pool.fetchrow(
             """
-            SELECT active_generation, initial_sync_completed_at
+            SELECT active_generation, initial_sync_completed_at,
+                   reconciliation_version
             FROM workspace_zulip_bridge.workspace_mirror_state
             WHERE provider_uuid = $1 AND bootstrap_status = 'ready'
             """,
@@ -1015,6 +1017,90 @@ class WorkspaceDiffWorker:
                     realm_uuid,
                     generation,
                 )
+        if (
+            int(state.get("reconciliation_version", RECONCILIATION_VERSION))
+            < RECONCILIATION_VERSION
+        ):
+            repaired = await self._repair_missing_source_diffs(
+                realm_uuid,
+                generation,
+            )
+            total += repaired
+            if repaired == 0:
+                await self._pool.execute(
+                    """
+                    UPDATE workspace_zulip_bridge.workspace_mirror_state
+                    SET reconciliation_version = $2,
+                        updated_at = clock_timestamp()
+                    WHERE provider_uuid = $1
+                      AND reconciliation_version < $2
+                    """,
+                    self._provider_uuid,
+                    RECONCILIATION_VERSION,
+                )
+        return total
+
+    async def _repair_missing_source_diffs(
+        self,
+        realm_uuid: UUID,
+        generation: UUID,
+    ) -> int:
+        """Schedule source rows skipped by an older dependency-gated cursor."""
+        total = 0
+        for entity_type, source in _SOURCE_TABLES.items():
+            if entity_type == "users":
+                continue
+            timestamp_column = (
+                "source.source_updated_at"
+                if entity_type == "messages"
+                else "source.updated_at"
+            )
+            result = await self._pool.execute(
+                f"""
+                WITH candidates AS MATERIALIZED (
+                    SELECT source.uuid AS entity_uuid,
+                           {source["partition"]} AS partition_key,
+                           {source["hash"]} AS source_hash,
+                           {timestamp_column} AS source_updated_at
+                    FROM {source["from"]} AS source
+                    {source["joins"]}
+                    LEFT JOIN workspace_zulip_bridge.workspace_{entity_type}
+                        AS target
+                      ON target.provider_uuid = $1
+                     AND target.snapshot_generation = $4
+                     AND target.uuid = source.uuid
+                    LEFT JOIN workspace_zulip_bridge.sync_diffs AS existing
+                      ON existing.provider_uuid = $1
+                     AND existing.entity_type = $2
+                     AND existing.entity_uuid = source.uuid
+                    WHERE {source["where"]}
+                      AND target.uuid IS NULL
+                      AND existing.entity_uuid IS NULL
+                    ORDER BY {timestamp_column}, source.uuid
+                    LIMIT $5
+                )
+                INSERT INTO workspace_zulip_bridge.sync_diffs (
+                    provider_uuid, entity_type, entity_uuid, realm_uuid,
+                    partition_key, direction, source_hash, target_hash,
+                    source_updated_at, target_updated_at
+                )
+                SELECT $1, $2, candidate.entity_uuid, $3,
+                       candidate.partition_key, 'to_workspace',
+                       candidate.source_hash, NULL,
+                       candidate.source_updated_at, NULL
+                FROM candidates AS candidate
+                ON CONFLICT (provider_uuid, entity_type, entity_uuid)
+                DO NOTHING
+                """,
+                self._provider_uuid,
+                entity_type,
+                realm_uuid,
+                generation,
+                self._settings.workspace_sync_plan_batch_size,
+            )
+            total += int(result.rsplit(" ", 1)[-1])
+        if total:
+            LOG.info("Reconciled missing Workspace source rows: count=%d", total)
         return total
 
     async def _plan_target_only(
@@ -2267,29 +2353,6 @@ _SOURCE_TABLES = {
         """,
         "where": """
             source.realm_uuid = $3 AND source.source_connection_uuid IS NOT NULL
-            AND EXISTS (
-                SELECT 1 FROM workspace_zulip_bridge.workspace_users AS owner
-                WHERE owner.provider_uuid = $1
-                  AND owner.snapshot_generation = $4
-                  AND owner.uuid = COALESCE(
-                      owner_user.workspace_user_uuid,
-                      source.owner_user_uuid,
-                      supplier_user.workspace_user_uuid,
-                      supplier.zulip_user_uuid
-                  )
-            )
-            AND (
-                source.direct_user_uuid IS NULL OR EXISTS (
-                    SELECT 1
-                    FROM workspace_zulip_bridge.workspace_users AS direct_user
-                    WHERE direct_user.provider_uuid = $1
-                      AND direct_user.snapshot_generation = $4
-                      AND direct_user.uuid = COALESCE(
-                          direct_user_source.workspace_user_uuid,
-                          source.direct_user_uuid
-                      )
-                )
-            )
         """,
         "hash": "source.content_hash",
         "partition": "NULL::uuid",
@@ -2304,20 +2367,6 @@ _SOURCE_TABLES = {
         """,
         "where": """
             parent.realm_uuid = $3 AND parent.source_connection_uuid IS NOT NULL
-            AND EXISTS (
-                SELECT 1 FROM workspace_zulip_bridge.workspace_streams AS target_parent
-                WHERE target_parent.provider_uuid = $1
-                  AND target_parent.snapshot_generation = $4
-                  AND target_parent.uuid = source.zulip_stream_uuid
-            )
-            AND EXISTS (
-                SELECT 1 FROM workspace_zulip_bridge.workspace_users AS target_user
-                WHERE target_user.provider_uuid = $1
-                  AND target_user.snapshot_generation = $4
-                  AND target_user.uuid = COALESCE(
-                      bound_user.workspace_user_uuid, source.zulip_user_uuid
-                  )
-            )
         """,
         "hash": "source.content_hash",
         "partition": "NULL::uuid",
@@ -2327,12 +2376,6 @@ _SOURCE_TABLES = {
         "joins": "JOIN workspace_zulip_bridge.zulip_streams AS parent ON parent.uuid = source.zulip_stream_uuid",
         "where": """
             parent.realm_uuid = $3 AND parent.source_connection_uuid IS NOT NULL
-            AND EXISTS (
-                SELECT 1 FROM workspace_zulip_bridge.workspace_streams AS target_parent
-                WHERE target_parent.provider_uuid = $1
-                  AND target_parent.snapshot_generation = $4
-                  AND target_parent.uuid = source.zulip_stream_uuid
-            )
         """,
         "hash": "source.content_hash",
         "partition": "NULL::uuid",
@@ -2347,26 +2390,6 @@ _SOURCE_TABLES = {
         """,
         "where": """
             parent.realm_uuid = $3 AND parent.source_connection_uuid IS NOT NULL
-            AND EXISTS (
-                SELECT 1 FROM workspace_zulip_bridge.workspace_streams AS target_stream
-                WHERE target_stream.provider_uuid = $1
-                  AND target_stream.snapshot_generation = $4
-                  AND target_stream.uuid = source.zulip_stream_uuid
-            )
-            AND EXISTS (
-                SELECT 1 FROM workspace_zulip_bridge.workspace_topics AS target_topic
-                WHERE target_topic.provider_uuid = $1
-                  AND target_topic.snapshot_generation = $4
-                  AND target_topic.uuid = source.topic_uuid
-            )
-            AND EXISTS (
-                SELECT 1 FROM workspace_zulip_bridge.workspace_users AS target_user
-                WHERE target_user.provider_uuid = $1
-                  AND target_user.snapshot_generation = $4
-                  AND target_user.uuid = COALESCE(
-                      bound_user.workspace_user_uuid, source.zulip_user_uuid
-                  )
-            )
         """,
         "hash": "source.content_hash",
         "partition": "NULL::uuid",
@@ -2379,26 +2402,6 @@ _SOURCE_TABLES = {
         """,
         "where": """
             source.realm_uuid = $3
-            AND EXISTS (
-                SELECT 1 FROM workspace_zulip_bridge.workspace_streams AS target_stream
-                WHERE target_stream.provider_uuid = $1
-                  AND target_stream.snapshot_generation = $4
-                  AND target_stream.uuid = source.zulip_stream_uuid
-            )
-            AND EXISTS (
-                SELECT 1 FROM workspace_zulip_bridge.workspace_topics AS target_topic
-                WHERE target_topic.provider_uuid = $1
-                  AND target_topic.snapshot_generation = $4
-                  AND target_topic.uuid = source.topic_uuid
-            )
-            AND EXISTS (
-                SELECT 1 FROM workspace_zulip_bridge.workspace_users AS target_user
-                WHERE target_user.provider_uuid = $1
-                  AND target_user.snapshot_generation = $4
-                  AND target_user.uuid = COALESCE(
-                      sender_user.workspace_user_uuid, source.sender_user_uuid
-                  )
-            )
         """,
         "hash": "source.content_hash",
         "partition": "source.zulip_stream_uuid",
@@ -2411,20 +2414,6 @@ _SOURCE_TABLES = {
         """,
         "where": """
             source.realm_uuid = $3
-            AND EXISTS (
-                SELECT 1 FROM workspace_zulip_bridge.workspace_messages AS target_message
-                WHERE target_message.provider_uuid = $1
-                  AND target_message.snapshot_generation = $4
-                  AND target_message.uuid = source.message_uuid
-            )
-            AND EXISTS (
-                SELECT 1 FROM workspace_zulip_bridge.workspace_users AS target_user
-                WHERE target_user.provider_uuid = $1
-                  AND target_user.snapshot_generation = $4
-                  AND target_user.uuid = COALESCE(
-                      flag_user.workspace_user_uuid, source.zulip_user_uuid
-                  )
-            )
         """,
         "hash": "source.flags_hash",
         "partition": "source.zulip_stream_uuid",
@@ -2439,20 +2428,6 @@ _SOURCE_TABLES = {
         """,
         "where": """
             source.realm_uuid = $3
-            AND EXISTS (
-                SELECT 1 FROM workspace_zulip_bridge.workspace_messages AS target_message
-                WHERE target_message.provider_uuid = $1
-                  AND target_message.snapshot_generation = $4
-                  AND target_message.uuid = source.message_uuid
-            )
-            AND EXISTS (
-                SELECT 1 FROM workspace_zulip_bridge.workspace_users AS target_user
-                WHERE target_user.provider_uuid = $1
-                  AND target_user.snapshot_generation = $4
-                  AND target_user.uuid = COALESCE(
-                      reaction_user.workspace_user_uuid, source.zulip_user_uuid
-                  )
-            )
         """,
         "hash": "NULL::bytea",
         "partition": "message.zulip_stream_uuid",
