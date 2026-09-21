@@ -1021,6 +1021,12 @@ class WorkspaceDiffWorker:
                          IS DISTINCT FROM EXCLUDED.target_updated_at
                     THEN clock_timestamp() ELSE sync_diffs.available_at END,
                 updated_at = clock_timestamp()
+            WHERE sync_diffs.target_hash IS DISTINCT FROM EXCLUDED.target_hash
+               OR sync_diffs.target_updated_at
+                  IS DISTINCT FROM EXCLUDED.target_updated_at
+               OR sync_diffs.direction IS DISTINCT FROM 'to_zulip'
+               OR sync_diffs.partition_key
+                  IS DISTINCT FROM EXCLUDED.partition_key
             """,
             self._provider_uuid,
             entity_type,
@@ -1076,30 +1082,45 @@ class WorkspaceDiffWorker:
             assert cursor is not None
             rows = await connection.fetch(
                 f"""
+                WITH candidates AS MATERIALIZED (
+                    SELECT source.uuid AS entity_uuid,
+                           {source["partition"]} AS partition_key,
+                           CASE
+                               WHEN target.source_updated_at > {timestamp_column}
+                               THEN 'to_zulip'
+                               ELSE 'to_workspace'
+                           END AS direction,
+                           {source["hash"]} AS source_hash,
+                           target.content_hash AS target_hash,
+                           {timestamp_column} AS source_updated_at,
+                           target.source_updated_at AS target_updated_at
+                    FROM {source["from"]} AS source
+                    {source["joins"]}
+                    LEFT JOIN workspace_zulip_bridge.workspace_{entity_type}
+                        AS target
+                      ON target.provider_uuid = $1
+                     AND target.snapshot_generation = $4
+                     AND target.uuid = source.uuid
+                    WHERE {source["where"]}
+                      AND (
+                          $5::timestamptz IS NULL
+                          OR ({timestamp_column}, source.uuid) > ($5, $6)
+                      )
+                    ORDER BY {timestamp_column}, source.uuid
+                    LIMIT $7
+                ), upsert AS (
                 INSERT INTO workspace_zulip_bridge.sync_diffs (
                     provider_uuid, entity_type, entity_uuid, realm_uuid,
                     partition_key,
                     direction, source_hash, target_hash,
                     source_updated_at, target_updated_at
                 )
-                SELECT $1, $2, source.uuid, $3, {source["partition"]},
-                       CASE WHEN target.source_updated_at > {timestamp_column}
-                            THEN 'to_zulip' ELSE 'to_workspace' END,
-                       {source["hash"]}, target.content_hash,
-                       {timestamp_column}, target.source_updated_at
-                FROM {source["from"]} AS source
-                {source["joins"]}
-                LEFT JOIN workspace_zulip_bridge.workspace_{entity_type} AS target
-                  ON target.provider_uuid = $1
-                 AND target.snapshot_generation = $4
-                 AND target.uuid = source.uuid
-                WHERE {source["where"]}
-                  AND (
-                      $5::timestamptz IS NULL
-                      OR ({timestamp_column}, source.uuid) > ($5, $6)
-                  )
-                ORDER BY {timestamp_column}, source.uuid
-                LIMIT $7
+                SELECT $1, $2, candidate.entity_uuid, $3,
+                       candidate.partition_key, candidate.direction,
+                       candidate.source_hash, candidate.target_hash,
+                       candidate.source_updated_at,
+                       candidate.target_updated_at
+                FROM candidates AS candidate
                 ON CONFLICT (provider_uuid, entity_type, entity_uuid)
                 DO UPDATE SET
                     direction = EXCLUDED.direction,
@@ -1127,7 +1148,19 @@ class WorkspaceDiffWorker:
                           OR sync_diffs.direction IS DISTINCT FROM EXCLUDED.direction
                         THEN clock_timestamp() ELSE sync_diffs.available_at END,
                     updated_at = clock_timestamp()
-                RETURNING entity_uuid, source_updated_at
+                WHERE sync_diffs.source_hash IS DISTINCT FROM EXCLUDED.source_hash
+                   OR sync_diffs.target_hash IS DISTINCT FROM EXCLUDED.target_hash
+                   OR sync_diffs.source_updated_at
+                      IS DISTINCT FROM EXCLUDED.source_updated_at
+                   OR sync_diffs.target_updated_at
+                      IS DISTINCT FROM EXCLUDED.target_updated_at
+                   OR sync_diffs.direction IS DISTINCT FROM EXCLUDED.direction
+                   OR sync_diffs.partition_key
+                      IS DISTINCT FROM EXCLUDED.partition_key
+                RETURNING 1
+                )
+                SELECT entity_uuid, source_updated_at
+                FROM candidates
                 """,
                 self._provider_uuid,
                 entity_type,

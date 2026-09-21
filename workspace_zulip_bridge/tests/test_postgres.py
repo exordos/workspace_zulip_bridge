@@ -1009,6 +1009,37 @@ async def _workspace_diff_worker_round_trip(dsn: str, tmp_path: Path) -> None:
         ) as client:
             assert await worker.process_once(client) == 1
             assert await worker.plan() == 0
+            unchanged_before = await pool.fetchrow(
+                """
+                SELECT updated_at, processing_status, attempt_count
+                FROM workspace_zulip_bridge.sync_diffs
+                WHERE provider_uuid = $1 AND entity_type = 'users'
+                  AND entity_uuid = $2
+                """,
+                provider_uuid,
+                user_uuid,
+            )
+            await pool.execute(
+                """
+                UPDATE workspace_zulip_bridge.sync_plan_cursors
+                SET source_updated_at = NULL, entity_uuid = NULL
+                WHERE provider_uuid = $1 AND entity_type = 'users'
+                """,
+                provider_uuid,
+            )
+            assert await worker.plan() == 1
+            unchanged_after = await pool.fetchrow(
+                """
+                SELECT updated_at, processing_status, attempt_count
+                FROM workspace_zulip_bridge.sync_diffs
+                WHERE provider_uuid = $1 AND entity_type = 'users'
+                  AND entity_uuid = $2
+                """,
+                provider_uuid,
+                user_uuid,
+            )
+            assert unchanged_after == unchanged_before
+            assert await worker.plan() == 0
             await pool.execute(
                 """
                 UPDATE workspace_zulip_bridge.sync_diffs
