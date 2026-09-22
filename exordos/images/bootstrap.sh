@@ -29,12 +29,37 @@ fi
 
 prepare_persistent_disk "$PERSISTENT_DISK" "$PERSISTENT_MOUNT"
 
-# A hard reset while the first migration is still being flushed can leave the
-# destination directory present without valid contents.  The shared migration
-# helper treats any existing destination as complete, so discard only an
-# uncommitted first-boot migration and rebuild it from the immutable image.
-if [[ ! -f "$PERSIST_MIGRATE_MARKER" ]]; then
-    rm -rf -- "$PERSISTENT_POSTGRESQL_DIR" "$PERSISTENT_RUNTIME_DIR"
+postgres_cluster_valid() {
+    local data_root="$1"
+    local cluster_dir="${data_root}/${PG_VERSION}/main"
+
+    [[ "$(cat "${cluster_dir}/PG_VERSION" 2>/dev/null || true)" == "$PG_VERSION" ]] \
+        && [[ -s "${cluster_dir}/global/pg_control" ]] \
+        && [[ -d "${cluster_dir}/base" ]]
+}
+
+rebuild_image_postgres_cluster() {
+    systemctl stop "postgresql@${PG_VERSION}-main" 2>/dev/null || true
+    pg_dropcluster --stop "$PG_VERSION" main 2>/dev/null || true
+    rm -rf -- "/var/lib/postgresql/${PG_VERSION}/main"
+    pg_createcluster "$PG_VERSION" main --start-conf=auto
+}
+
+# The marker is written after both migrations complete.  A reset in that small
+# window has two valid recovery states: the persistent cluster may already be
+# complete, or it may be partial.  Never delete the only valid cluster merely
+# because the marker is missing.  Rebuild from the image only after validating
+# the destination and, if necessary, detaching an interrupted bind mount.
+if [[ ! -f "$PERSIST_MIGRATE_MARKER" ]] \
+    && ! postgres_cluster_valid "$PERSISTENT_POSTGRESQL_DIR"; then
+    systemctl stop "postgresql@${PG_VERSION}-main" 2>/dev/null || true
+    if mountpoint -q "/var/lib/postgresql"; then
+        umount "/var/lib/postgresql"
+    fi
+    rm -rf -- "$PERSISTENT_POSTGRESQL_DIR"
+    if ! postgres_cluster_valid "/var/lib/postgresql"; then
+        rebuild_image_postgres_cluster
+    fi
 fi
 
 migrate_to_persistent_stop_start \

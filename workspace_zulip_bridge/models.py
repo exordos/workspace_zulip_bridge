@@ -154,6 +154,7 @@ class ChatCatalogWrite:
     reused: bool
     upserted: int
     deleted: int
+    bootstrap_topic_changes: int = 0
 
 
 @dataclass(frozen=True, slots=True)

@@ -102,6 +102,14 @@ class Settings:
     thread_stop_timeout_seconds: float = 5.0
     log_level: str = "INFO"
 
+    @property
+    def effective_zulip_ca_file(self) -> Path | None:
+        if self.zulip_ca_file is not None:
+            return self.zulip_ca_file
+        if self.workspace_control_url is not None:
+            return self.workspace_control_state_dir / "zulip-ca.pem"
+        return None
+
     @classmethod
     def from_env(cls, values: Mapping[str, str] | None = None) -> "Settings":
         source = os.environ if values is None else values

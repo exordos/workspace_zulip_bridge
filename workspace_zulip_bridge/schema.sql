@@ -390,7 +390,6 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_outbox (
     action text NOT NULL CHECK (action IN ('upsert', 'delete')),
     entity_uuid uuid NOT NULL,
     entity_hash bytea CHECK (entity_hash IS NULL OR octet_length(entity_hash) = 32),
-    payload jsonb NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(payload) = 'object'),
     delivery_status text NOT NULL DEFAULT 'pending'
         CHECK (delivery_status IN ('pending', 'delivering', 'delivered', 'failed')),
     attempt_count integer NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
@@ -401,6 +400,8 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_outbox (
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
+ALTER TABLE workspace_zulip_bridge.workspace_outbox
+    DROP COLUMN IF EXISTS payload;
 CREATE UNIQUE INDEX IF NOT EXISTS workspace_outbox_pending_entity_idx
     ON workspace_zulip_bridge.workspace_outbox
         (realm_uuid, entity_type, entity_uuid) WHERE delivery_status = 'pending';

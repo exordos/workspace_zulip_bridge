@@ -37,13 +37,15 @@ def test_runtime_configuration_survives_image_replacement() -> None:
     assert '"$DATABASE_ROLE"' in bootstrap
 
 
-def test_incomplete_first_boot_migration_is_rebuilt() -> None:
+def test_incomplete_first_boot_migration_preserves_valid_postgresql() -> None:
     bootstrap = (ROOT / "exordos/images/bootstrap.sh").read_text()
 
     assert 'if [[ ! -f "$PERSIST_MIGRATE_MARKER" ]]' in bootstrap
-    assert (
-        'rm -rf -- "$PERSISTENT_POSTGRESQL_DIR" "$PERSISTENT_RUNTIME_DIR"' in bootstrap
-    )
+    assert 'postgres_cluster_valid "$PERSISTENT_POSTGRESQL_DIR"' in bootstrap
+    assert 'if mountpoint -q "/var/lib/postgresql"' in bootstrap
+    assert 'umount "/var/lib/postgresql"' in bootstrap
+    assert "rebuild_image_postgres_cluster" in bootstrap
+    assert 'rm -rf -- "$PERSISTENT_RUNTIME_DIR"' not in bootstrap
 
 
 def test_exordos_manifest_renders_without_implicit_values() -> None:

@@ -22,6 +22,20 @@ from workspace_zulip_bridge.models import ZulipUserPresence
 from workspace_zulip_bridge.models import ZulipUserProfileStatus
 from workspace_zulip_bridge.models import ZulipUserTopic
 
+_SAFE_REMOTE_ERROR_CODES = frozenset(
+    {
+        "BAD_EVENT_QUEUE_ID",
+        "BAD_NARROW",
+        "BAD_REQUEST",
+        "INVALID_API_KEY",
+        "RATE_LIMIT_HIT",
+        "REACTION_ALREADY_EXISTS",
+        "REACTION_DOES_NOT_EXIST",
+        "REQUEST_VARIABLE_MISSING",
+        "UNAUTHORIZED",
+    }
+)
+
 
 class ZulipApiError(Exception):
     def __init__(
@@ -752,8 +766,8 @@ class ZulipApiClient:
             raw_code = payload.get("code")
             code = (
                 raw_code
-                if isinstance(raw_code, str)
-                else f"http_{response.status_code}"
+                if isinstance(raw_code, str) and raw_code in _SAFE_REMOTE_ERROR_CODES
+                else f"http_{response.status_code}_zulip_error"
             )
             retryable = (
                 response.status_code == 429

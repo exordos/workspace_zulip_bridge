@@ -33,7 +33,9 @@ from workspace_zulip_bridge.models import ZulipAttachment
 from workspace_zulip_bridge.models import ZulipDirectoryUser
 from workspace_zulip_bridge.models import ZulipEvent
 from workspace_zulip_bridge.models import ZulipMessage
+from workspace_zulip_bridge.models import ZulipUserPresence
 from workspace_zulip_bridge.models import ZulipUserProfileStatus
+from workspace_zulip_bridge.models import ZulipUserTopic
 from workspace_zulip_bridge.monitor import collect_snapshot
 from workspace_zulip_bridge.stable_ids import stable_chat_uuid
 from workspace_zulip_bridge.stable_ids import stable_message_uuid
@@ -858,6 +860,27 @@ async def _user_status_partial_updates_and_presence_expiry(dsn: str) -> None:
         )
         assert tuple(row) == ("Reviewing", "hammer")
 
+        assert (
+            await store.store_user_presences(
+                ENDPOINT,
+                (ZulipUserPresence(77, "active", 1_700_000_100),),
+            )
+            == 1
+        )
+        assert (
+            await store.store_user_presences(
+                ENDPOINT,
+                (ZulipUserPresence(77, "idle", 1_700_000_000),),
+            )
+            == 0
+        )
+        current_presence = await pool.fetchrow(
+            "SELECT presence_status, extract(epoch FROM last_ping_at)::bigint "
+            "FROM workspace_zulip_bridge.zulip_users WHERE uuid = $1",
+            user_uuid,
+        )
+        assert tuple(current_presence) == ("active", 1_700_000_100)
+
         await store.set_presence_offline_threshold(ENDPOINT, 1)
         previous_hash = await pool.fetchval(
             "UPDATE workspace_zulip_bridge.zulip_users "
@@ -880,6 +903,64 @@ async def _user_status_partial_updates_and_presence_expiry(dsn: str) -> None:
 
 def test_catalog_removal_enqueues_workspace_binding_tombstone() -> None:
     asyncio.run(_catalog_removal_enqueues_workspace_binding_tombstone(_dsn()))
+
+
+def test_catalog_applies_registration_topic_snapshot_before_activation() -> None:
+    asyncio.run(_catalog_applies_registration_topic_snapshot_before_activation(_dsn()))
+
+
+async def _catalog_applies_registration_topic_snapshot_before_activation(
+    dsn: str,
+) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            connection_uuid = await _insert_user(
+                connection,
+                78,
+                400,
+                queue_id="queue-topic-snapshot",
+                status="filling",
+            )
+        result = await store.store_chat_catalog(
+            connection_uuid,
+            "queue-topic-snapshot",
+            _catalog(78, [(7, "Shared")], {"channel:7": 1}),
+            bootstrap_user_topics=(ZulipUserTopic(7, "Race", 1, 1_700_000_000),),
+        )
+        assert result.activated
+        assert result.bootstrap_topic_changes == 1
+        snapshot = await pool.fetchrow(
+            """
+            SELECT binding.notification_mode, connection.lifecycle_status
+            FROM workspace_zulip_bridge.zulip_topic_bindings AS binding
+            JOIN workspace_zulip_bridge.zulip_connections AS connection
+              ON connection.uuid = $1
+            WHERE binding.zulip_user_uuid = connection.zulip_user_uuid
+            """,
+            connection_uuid,
+        )
+        assert tuple(snapshot) == ("mute", "scheduling")
+
+        assert (
+            await store.store_user_topics(
+                connection_uuid,
+                "queue-topic-snapshot",
+                (ZulipUserTopic(7, "Race", 3, 1_700_000_001),),
+                replace_all=False,
+            )
+            == 1
+        )
+        assert (
+            await pool.fetchval(
+                "SELECT notification_mode FROM "
+                "workspace_zulip_bridge.zulip_topic_bindings"
+            )
+            == "follow"
+        )
+    finally:
+        await pool.close()
 
 
 async def _catalog_removal_enqueues_workspace_binding_tombstone(dsn: str) -> None:
@@ -2746,6 +2827,17 @@ async def _workspace_identity_reconcile_preserves_external_account_owner(
                 )
                 == 1
             )
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, json=[])),
+        ) as client:
+            assert (
+                await bootstrapper._reconcile_workspace_identities(
+                    UUID("10000000-0000-0000-0000-000000000076"),
+                    client=client,
+                    schedule_changes=True,
+                )
+                == 0
+            )
         assert (
             await pool.fetchval(
                 "SELECT workspace_user_uuid "
@@ -2753,6 +2845,14 @@ async def _workspace_identity_reconcile_preserves_external_account_owner(
                 user_uuid,
             )
             == owner_uuid
+        )
+        assert (
+            await pool.fetchval(
+                "SELECT count(*) FROM workspace_zulip_bridge.workspace_users "
+                "WHERE snapshot_generation = $1",
+                UUID("10000000-0000-0000-0000-000000000076"),
+            )
+            == 0
         )
     finally:
         await pool.close()
@@ -4894,15 +4994,15 @@ async def _event_processor_materializes_live_catalog_changes(dsn: str) -> None:
                 "FROM workspace_zulip_bridge.zulip_events "
                 "WHERE event_id = 3"
             )
-        assert lifecycle == "backfilling"
+        assert lifecycle == "filling"
         assert direct_stream is not None
-        assert direct_stream["source_connection_uuid"] == owner_uuid
+        assert direct_stream["source_connection_uuid"] is None
         assert directory_user is not None
         assert dict(directory_user) == {"full_name": "User 30", "is_bot": False}
         assert statuses == {"applied": 2, "pending": 1}
         assert retry_event is not None
         assert dict(retry_event) == {
-            "outcome_reason": "chat_rescheduling",
+            "outcome_reason": "chat_unassigned",
             "attempt_count": 1,
         }
     finally:
@@ -5052,11 +5152,11 @@ async def _event_processor_defers_stale_supplier(dsn: str) -> None:
         await pool.close()
 
 
-def test_event_processor_bounds_deferrals_and_advances_the_queue() -> None:
-    asyncio.run(_event_processor_bounds_deferrals_and_advances_the_queue(_dsn()))
+def test_event_processor_keeps_dependency_deferrals_pending() -> None:
+    asyncio.run(_event_processor_keeps_dependency_deferrals_pending(_dsn()))
 
 
-async def _event_processor_bounds_deferrals_and_advances_the_queue(dsn: str) -> None:
+async def _event_processor_keeps_dependency_deferrals_pending(dsn: str) -> None:
     pool = await _pool(dsn)
     try:
         store = EventStore(pool)
@@ -5098,7 +5198,8 @@ async def _event_processor_bounds_deferrals_and_advances_the_queue(dsn: str) -> 
         assert (await processor.process_once()).retried == 1
         await asyncio.sleep(0.01)
         assert (await processor.process_once()).retried == 1
-        assert (await processor.process_once()).failed == 1
+        await asyncio.sleep(0.01)
+        assert (await processor.process_once()).retried == 1
 
         rows = await pool.fetch(
             """
@@ -5111,17 +5212,17 @@ async def _event_processor_bounds_deferrals_and_advances_the_queue(dsn: str) -> 
         assert [dict(row) for row in rows] == [
             {
                 "event_id": 1,
-                "processing_status": "skipped",
-                "attempt_count": 2,
-                "outcome_reason": "defer_exhausted:message_not_materialized",
-                "processed": True,
+                "processing_status": "pending",
+                "attempt_count": 3,
+                "outcome_reason": "message_not_materialized",
+                "processed": False,
             },
             {
                 "event_id": 2,
-                "processing_status": "failed",
-                "attempt_count": 1,
-                "outcome_reason": "invalid_presence_event",
-                "processed": True,
+                "processing_status": "pending",
+                "attempt_count": 0,
+                "outcome_reason": None,
+                "processed": False,
             },
         ]
     finally:
@@ -5677,10 +5778,17 @@ async def _event_processor_round_trip(dsn: str) -> None:
                     "display_recipient": "Shared",
                     "subject": "Live",
                     "sender_id": 20,
-                    "content": "new live message",
+                    "content": "wrong non-supplier content",
                     "timestamp": 1_700_000_001,
-                    "flags": [],
-                    "reactions": [],
+                    "flags": ["read", "mentioned"],
+                    "reactions": [
+                        {
+                            "user_id": 20,
+                            "emoji_name": "wrong",
+                            "emoji_code": "274c",
+                            "reaction_type": "unicode_emoji",
+                        }
+                    ],
                 },
             },
             {
@@ -5788,7 +5896,7 @@ async def _event_processor_round_trip(dsn: str) -> None:
             sum(stats.applied for stats in passes),
             sum(stats.skipped for stats in passes),
             sum(stats.failed for stats in passes),
-        ) == (12, 4, 1)
+        ) == (13, 3, 1)
         assert sum(stats.messages_changed for stats in passes) == 9
         assert sum(stats.chats_changed for stats in passes) == 2
 
@@ -5864,6 +5972,17 @@ async def _event_processor_round_trip(dsn: str) -> None:
                 """,
                 owner_uuid,
             )
+            member_live_message = await connection.fetchrow(
+                """
+                SELECT message.content, flags.is_read, flags.is_mentioned
+                FROM workspace_zulip_bridge.zulip_messages AS message
+                JOIN workspace_zulip_bridge.zulip_message_flags AS flags
+                  ON flags.message_uuid = message.uuid
+                WHERE message.zulip_message_id = 124
+                  AND flags.zulip_user_uuid = $1
+                """,
+                member_uuid,
+            )
             member_read = await connection.fetchval(
                 """
                 SELECT flags.is_read
@@ -5936,6 +6055,7 @@ async def _event_processor_round_trip(dsn: str) -> None:
         ]
         assert live_messages == 2
         assert live_flags == 0
+        assert tuple(member_live_message) == ("new live message", True, True)
         assert member_read is True
         assert normalized_reactions == 3
         assert echo_external_key == "124"
@@ -5944,9 +6064,9 @@ async def _event_processor_round_trip(dsn: str) -> None:
         assert member_presence["last_ping_at"] == datetime.fromtimestamp(
             1_700_000_003, tz=UTC
         )
-        assert statuses == {"applied": 12, "failed": 1, "skipped": 4}
+        assert statuses == {"applied": 13, "failed": 1, "skipped": 3}
         assert skip_reasons == {
-            "not_chat_supplier": 4,
+            "not_chat_supplier": 3,
         }
 
         async with pool.acquire() as connection:
@@ -5998,9 +6118,9 @@ async def _event_processor_round_trip(dsn: str) -> None:
                 exact=True,
             )
         assert snapshot.event_processing_statuses == {
-            "applied": 12,
+            "applied": 13,
             "failed": 2,
-            "skipped": 4,
+            "skipped": 3,
         }
         assert snapshot.oldest_pending_event_seconds == 0
     finally:

@@ -98,6 +98,7 @@ class _ClaimedEvent:
 class _MessageRoute:
     chat_key: str
     source_connection_uuid: UUID | None
+    materialized: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,8 +300,8 @@ class ZulipEventProcessor:
             outcomes.extend(batch_outcomes)
             for outcome in batch_outcomes:
                 event = events_by_uuid[outcome.event_uuid]
-                if (
-                    outcome.status in {"retry", "defer"}
+                if outcome.status in {"blocked", "defer"} or (
+                    outcome.status == "retry"
                     and event.attempt_count
                     < self._settings.event_processor_max_attempts
                 ):
@@ -690,6 +691,7 @@ class ZulipEventProcessor:
                     message_routes[(endpoint, row["zulip_message_id"])] = _MessageRoute(
                         chat_key=row["chat_key"],
                         source_connection_uuid=row["source_connection_uuid"],
+                        materialized=True,
                     )
         # A message and its first reaction or flag update may be in the same
         # claimed batch before that message exists in PostgreSQL. Seed routes
@@ -705,6 +707,7 @@ class ZulipEventProcessor:
             route = _MessageRoute(
                 chat_key=chat_key,
                 source_connection_uuid=chat_suppliers.get((event.endpoint, chat_key)),
+                materialized=False,
             )
             for message_id in announced_message_ids:
                 message_routes.setdefault((event.endpoint, message_id), route)
@@ -780,11 +783,28 @@ class ZulipEventProcessor:
                     skip_reason="chat_rescheduling",
                 )
             if supplier != event.user_uuid:
-                return _RoutedEvent(
-                    event,
-                    chat_key=chat_key,
-                    skip_reason="not_chat_supplier",
+                message_ids = _event_message_ids(event.payload, event.event_type)
+                route = (
+                    message_routes.get((event.endpoint, message_ids[0]))
+                    if len(message_ids) == 1
+                    else None
                 )
+                if route is None or not route.materialized:
+                    return _RoutedEvent(
+                        event,
+                        chat_key=chat_key,
+                        skip_reason="message_not_materialized",
+                    )
+                if route.chat_key != chat_key:
+                    return _RoutedEvent(
+                        event,
+                        chat_key=chat_key,
+                        skip_reason="invalid_chat_target",
+                    )
+                # A non-supplier copy of a message carries that queue owner's
+                # personal flags.  The store protects common message fields
+                # and only upserts the per-user state for this route.
+                return _RoutedEvent(event, chat_key=chat_key)
             return _RoutedEvent(event, chat_key=chat_key)
 
         message_ids = _event_message_ids(event.payload, event.event_type)
@@ -1700,9 +1720,7 @@ class ZulipEventProcessor:
                 UPDATE workspace_zulip_bridge.zulip_events AS event
                 SET processing_status = CASE
                         WHEN outcomes.status = 'blocked' THEN 'pending'
-                        WHEN outcomes.status = 'defer'
-                         AND event.attempt_count < $4 THEN 'pending'
-                        WHEN outcomes.status = 'defer' THEN 'skipped'
+                        WHEN outcomes.status = 'defer' THEN 'pending'
                         WHEN outcomes.status = 'retry'
                          AND event.attempt_count < $4 THEN 'pending'
                         WHEN outcomes.status = 'retry' THEN 'failed'
@@ -1711,7 +1729,6 @@ class ZulipEventProcessor:
                     available_at = CASE
                         WHEN outcomes.status = 'blocked' THEN clock_timestamp()
                         WHEN outcomes.status = 'defer'
-                         AND event.attempt_count < $4
                         THEN clock_timestamp() + make_interval(secs => $6)
                         WHEN outcomes.status = 'retry'
                          AND event.attempt_count < $4
@@ -1726,8 +1743,7 @@ class ZulipEventProcessor:
                     claimed_at = NULL,
                     processed_at = CASE
                         WHEN outcomes.status = 'blocked' THEN NULL
-                        WHEN outcomes.status = 'defer'
-                         AND event.attempt_count < $4 THEN NULL
+                        WHEN outcomes.status = 'defer' THEN NULL
                         WHEN outcomes.status = 'retry'
                          AND event.attempt_count < $4 THEN NULL
                         ELSE clock_timestamp()
@@ -1738,9 +1754,6 @@ class ZulipEventProcessor:
                         ELSE event.attempt_count
                     END,
                     outcome_reason = CASE
-                        WHEN outcomes.status = 'defer'
-                         AND event.attempt_count >= $4
-                        THEN 'defer_exhausted:' || outcomes.reason
                         WHEN outcomes.status = 'retry'
                          AND event.attempt_count >= $4
                         THEN 'retry_exhausted:' || outcomes.reason

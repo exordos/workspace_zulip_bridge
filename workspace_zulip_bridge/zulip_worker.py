@@ -565,6 +565,11 @@ class ZulipEventThread(threading.Thread):
                     self.user.uuid,
                     queue_id,
                     catalog,
+                    bootstrap_user_topics=(
+                        self._bootstrap_user_topics
+                        if self._bootstrap_state_pending
+                        else None
+                    ),
                 )
             )
         if not result.activated:
@@ -583,17 +588,7 @@ class ZulipEventThread(threading.Thread):
                     self._bootstrap_user_statuses,
                 )
             )
-            topic_changes = self._submit(
-                self._store.store_user_topics(
-                    self.user.uuid,
-                    queue_id,
-                    self._bootstrap_user_topics,
-                    replace_all=True,
-                )
-            )
-            if topic_changes is None:
-                return False
-            bootstrap_changes += topic_changes
+            bootstrap_changes += result.bootstrap_topic_changes
             self._bootstrap_state_pending = False
         elapsed = time.monotonic() - started_at
         self._identity = identity
@@ -874,7 +869,7 @@ class ZulipEventThread(threading.Thread):
             user.endpoint,
             user.login,
             user.api_key,
-            ca_file=self._settings.zulip_ca_file,
+            ca_file=self._settings.effective_zulip_ca_file,
             connect_timeout_seconds=self._settings.zulip_connect_timeout_seconds,
             default_longpoll_timeout_seconds=(
                 self._settings.zulip_default_longpoll_timeout_seconds

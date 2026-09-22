@@ -78,6 +78,41 @@ def test_control_certificate_is_renewed_before_expiry(
     assert renewed is True
 
 
+def test_control_keeps_syncing_when_valid_certificate_renewal_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    worker = _worker(tmp_path)
+    worker._state.mkdir()
+    worker._ca.write_text("configured trust bundle")
+    worker._load_or_create_request()
+    key = serialization.load_pem_private_key(worker._tls_key.read_bytes(), None)
+    assert isinstance(key, ec.EllipticCurvePrivateKey)
+    now = datetime.datetime.now(datetime.UTC)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([]))
+        .issuer_name(x509.Name([]))
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=1))
+        .not_valid_after(now + datetime.timedelta(days=6))
+        .sign(key, hashes.SHA256())
+    )
+    worker._certificate.write_bytes(
+        certificate.public_bytes(serialization.Encoding.PEM)
+    )
+
+    async def renew() -> None:
+        raise RuntimeError("renewal endpoint unavailable")
+
+    monkeypatch.setattr(worker, "_renew_certificate", renew)
+    asyncio.run(worker._ensure_enrolled())
+
+    assert "certificate renewal deferred: error=RuntimeError" in caplog.text
+
+
 def test_control_credential_envelope_is_recipient_and_resource_bound(
     tmp_path: Path,
 ) -> None:

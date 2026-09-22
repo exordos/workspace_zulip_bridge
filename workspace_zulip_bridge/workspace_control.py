@@ -60,10 +60,7 @@ _CAPABILITIES = {
         "messenger.membership.write",
         "messenger.notification.write",
         "messenger.reaction.write",
-        "messenger.stream.delete",
         "messenger.stream.rename",
-        "messenger.topic.create",
-        "messenger.topic.delete",
         "messenger.topic.rename",
     )
 }
@@ -121,7 +118,18 @@ class WorkspaceControlWorker:
             )
         ):
             if self._validate_certificate():
-                await self._renew_certificate()
+                try:
+                    await self._renew_certificate()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    # Renewal is opportunistic while the current certificate
+                    # is still valid.  Keep desired-state polling and the
+                    # heartbeat alive; the next pass will retry renewal.
+                    LOG.warning(
+                        "Workspace bridge certificate renewal deferred: error=%s",
+                        type(error).__name__,
+                    )
             return
         self._state.mkdir(mode=0o700, parents=True, exist_ok=True)
         if not self._ca.is_file():
@@ -570,13 +578,12 @@ class WorkspaceControlWorker:
             ).value
             if not constraints.ca:
                 raise ValueError("Zulip trust bundle contains a leaf certificate")
-        path = self._settings.zulip_ca_file
-        if path is None:
-            path = self._state / "zulip-ca.pem"
+        path = self._settings.effective_zulip_ca_file
+        assert path is not None
         _atomic_write(path, content, 0o644)
 
     def _remove_zulip_ca(self) -> None:
-        path = self._settings.zulip_ca_file
+        path = self._settings.effective_zulip_ca_file
         if path is not None:
             path.unlink(missing_ok=True)
 
@@ -695,7 +702,7 @@ class WorkspaceControlWorker:
             endpoint,
             email,
             api_key,
-            ca_file=self._settings.zulip_ca_file,
+            ca_file=self._settings.effective_zulip_ca_file,
             connect_timeout_seconds=self._settings.zulip_connect_timeout_seconds,
             default_longpoll_timeout_seconds=(
                 self._settings.zulip_default_longpoll_timeout_seconds

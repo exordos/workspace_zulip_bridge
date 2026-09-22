@@ -47,12 +47,26 @@ def _stream_owner_uuid(data: dict[str, Any]) -> UUID:
     raise ZulipOutboundError("Workspace stream owner is missing")
 
 
+def _binding_role(role: int) -> str:
+    value = {
+        100: "owner",
+        200: "administrator",
+        300: "moderator",
+        400: "member",
+        600: "guest",
+    }.get(role)
+    if value is None:
+        raise ZulipOutboundError("unsupported Zulip user role")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class _Actor:
     connection_uuid: UUID
     realm_uuid: UUID
     user_uuid: UUID
     zulip_user_id: int
+    role: int
     endpoint: str
     login: str
     api_key: str
@@ -63,12 +77,17 @@ class ZulipOutboundWriter:
     def __init__(self, pool: asyncpg.Pool, settings: Settings) -> None:
         self._pool = pool
         self._settings = settings
-        self._clients: dict[UUID, ZulipApiClient] = {}
+        self._clients: dict[
+            UUID, tuple[tuple[str, str, str, str | None], ZulipApiClient]
+        ] = {}
 
     async def close(self) -> None:
         clients, self._clients = self._clients, {}
         await asyncio.gather(
-            *(asyncio.to_thread(client.close) for client in clients.values())
+            *(
+                asyncio.to_thread(client.close)
+                for _signature, client in clients.values()
+            )
         )
 
     async def apply(
@@ -173,15 +192,19 @@ class ZulipOutboundWriter:
                   ON mirror.provider_uuid = binding.provider_uuid
                  AND mirror.active_generation = binding.snapshot_generation
                 JOIN workspace_zulip_bridge.zulip_users AS zulip_user
-                  ON zulip_user.uuid = (binding.data ->> 'user_uuid')::uuid
-                  OR zulip_user.workspace_user_uuid =
-                     (binding.data ->> 'user_uuid')::uuid
+                  ON (
+                      zulip_user.uuid = (binding.data ->> 'user_uuid')::uuid
+                      OR zulip_user.workspace_user_uuid =
+                         (binding.data ->> 'user_uuid')::uuid
+                  )
+                 AND zulip_user.realm_uuid = $3
                 WHERE binding.provider_uuid = $1
                   AND (binding.data ->> 'stream_uuid')::uuid = $2
                 ORDER BY zulip_user.zulip_user_id
                 """,
                 self._settings.workspace_provider_uuid,
                 entity_uuid,
+                actor.realm_uuid,
             )
             participant_ids = [int(row["zulip_user_id"]) for row in user_rows]
             if actor.zulip_user_id not in participant_ids:
@@ -207,6 +230,24 @@ class ZulipOutboundWriter:
             if direct_user_uuid is not None:
                 direct_user_uuid = await self._zulip_user_uuid(direct_user_uuid)
         else:
+            unsupported = [
+                name
+                for name, invalid in (
+                    ("announce", bool(target.get("announce"))),
+                    ("is_archived", bool(target.get("is_archived"))),
+                    ("color", target.get("color") is not None),
+                    (
+                        "history_public_to_subscribers",
+                        target.get("history_public_to_subscribers", True) is not True,
+                    ),
+                )
+                if invalid
+            ]
+            if unsupported:
+                raise ZulipOutboundError(
+                    "Zulip channel properties cannot be set during creation: "
+                    + ", ".join(unsupported)
+                )
             stream_id = await asyncio.to_thread(
                 self._client(actor).create_stream,
                 str(target["name"]),
@@ -288,7 +329,6 @@ class ZulipOutboundWriter:
             raise ZulipOutboundError(
                 "direct-message membership updates are not supported by Zulip"
             )
-        actor = await self._actor(UUID(str(data["user_uuid"])))
         if (
             source is not None
             and target is not None
@@ -302,6 +342,12 @@ class ZulipOutboundWriter:
             raise ZulipOutboundError(
                 "mentions-only channel notifications cannot be represented "
                 "without changing independent Zulip notification settings"
+            )
+        actor = await self._actor(UUID(str(data["user_uuid"])))
+        target_role = str(data.get("role", "member"))
+        if target is not None and target_role != _binding_role(actor.role):
+            raise ZulipOutboundError(
+                "Zulip channel membership role does not match the user role"
             )
         await asyncio.to_thread(
             self._client(actor).update_subscription,
@@ -356,7 +402,9 @@ class ZulipOutboundWriter:
         if target is None:
             raise ZulipOutboundError("Zulip topics cannot be deleted directly")
         if source is None:
-            return
+            raise ZulipOutboundError(
+                "Zulip topics are materialized only when their first message is sent"
+            )
         desired_name = str(target["name"])
         if bool(target.get("is_done")) and not desired_name.startswith("✔"):
             desired_name = f"✔ {desired_name}"
@@ -477,10 +525,10 @@ class ZulipOutboundWriter:
                 """,
                 entity_uuid,
                 stream_uuid,
-                desired_name,
+                str(target["name"]),
                 bool(target.get("is_done")),
                 int(target.get("version", 0)),
-                hashlib.sha256(desired_name.encode("utf-8")).digest(),
+                hashlib.sha256(str(target["name"]).encode("utf-8")).digest(),
             )
 
     async def _apply_topic_bindings(
@@ -579,6 +627,11 @@ class ZulipOutboundWriter:
         actor = await self._actor(UUID(str(target["author_uuid"])))
         source_payload = source.get("payload") or {}
         target_payload = target.get("payload") or {}
+        if (
+            not isinstance(target_payload, dict)
+            or target_payload.get("kind") != "markdown"
+        ):
+            raise ZulipOutboundError("only markdown messages can be sent to Zulip")
         content = (
             str(target_payload.get("content", ""))
             if target_payload != source_payload
@@ -910,7 +963,8 @@ class ZulipOutboundWriter:
             """
             SELECT connection.uuid AS connection_uuid, connection.realm_uuid,
                    connection.zulip_user_uuid AS user_uuid,
-                   zulip_user.zulip_user_id, realm.identity_key AS endpoint,
+                   zulip_user.zulip_user_id, zulip_user.role,
+                   realm.identity_key AS endpoint,
                    connection.login, connection.api_key, connection.queue_id
             FROM workspace_zulip_bridge.zulip_connections AS connection
             JOIN workspace_zulip_bridge.zulip_users AS zulip_user
@@ -935,7 +989,8 @@ class ZulipOutboundWriter:
                 """
                 SELECT connection.uuid AS connection_uuid, connection.realm_uuid,
                        connection.zulip_user_uuid AS user_uuid,
-                       zulip_user.zulip_user_id, realm.identity_key AS endpoint,
+                       zulip_user.zulip_user_id, zulip_user.role,
+                       realm.identity_key AS endpoint,
                        connection.login, connection.api_key, connection.queue_id
                 FROM workspace_zulip_bridge.zulip_streams AS stream
                 JOIN workspace_zulip_bridge.zulip_connections AS connection
@@ -983,13 +1038,23 @@ class ZulipOutboundWriter:
         return await self._actor(UUID(int=0), stream_uuid)
 
     def _client(self, actor: _Actor) -> ZulipApiClient:
-        client = self._clients.get(actor.connection_uuid)
-        if client is None:
+        ca_file = self._settings.effective_zulip_ca_file
+        signature = (
+            actor.endpoint,
+            actor.login,
+            actor.api_key,
+            str(ca_file) if ca_file is not None else None,
+        )
+        cached = self._clients.get(actor.connection_uuid)
+        if cached is not None and cached[0] != signature:
+            cached[1].close()
+            cached = None
+        if cached is None:
             client = ZulipApiClient(
                 actor.endpoint,
                 actor.login,
                 actor.api_key,
-                ca_file=self._settings.zulip_ca_file,
+                ca_file=ca_file,
                 connect_timeout_seconds=self._settings.zulip_connect_timeout_seconds,
                 default_longpoll_timeout_seconds=(
                     self._settings.zulip_default_longpoll_timeout_seconds
@@ -998,8 +1063,9 @@ class ZulipOutboundWriter:
                 chat_fill_timeout_seconds=self._settings.zulip_chat_fill_timeout_seconds,
                 message_page_size=self._settings.zulip_message_page_size,
             )
-            self._clients[actor.connection_uuid] = client
-        return client
+            self._clients[actor.connection_uuid] = (signature, client)
+            return client
+        return cached[1]
 
     async def _message(self, message_uuid: UUID) -> asyncpg.Record | None:
         return await self._pool.fetchrow(

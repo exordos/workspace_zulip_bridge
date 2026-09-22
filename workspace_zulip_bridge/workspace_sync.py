@@ -428,9 +428,14 @@ class WorkspaceBootstrapper:
             await connection.execute(
                 """
                 DELETE FROM workspace_zulip_bridge.workspace_events
-                WHERE provider_uuid = $1 AND epoch_version <= $2
+                WHERE provider_uuid = $1
+                  AND (
+                      epoch_generation IS DISTINCT FROM $2
+                      OR epoch_version <= $3
+                  )
                 """,
                 self._provider_uuid,
+                epoch_generation,
                 epoch_version,
             )
             await connection.execute(
@@ -577,25 +582,31 @@ class WorkspaceBootstrapper:
             for user_uuid in current.keys() | desired.keys()
             if current.get(user_uuid) != desired.get(user_uuid)
         }
+        canonical_users_by_uuid = {
+            UUID(str(value["uuid"])): value for value in canonical_users.values()
+        }
         directory_rows = []
         for workspace_user_uuid in sorted(set(desired.values()), key=str):
-            user = next(
-                value
-                for value in canonical_users.values()
-                if UUID(str(value["uuid"])) == workspace_user_uuid
-            )
+            canonical_user = canonical_users_by_uuid.get(workspace_user_uuid)
+            # The explicit external-account owner remains authoritative even
+            # when the IAM directory no longer returns that user.  Keep the
+            # Zulip-to-Workspace ownership link, but there is no profile row
+            # available to mirror into workspace_users.
+            if canonical_user is None:
+                continue
             data = {
-                "username": user["username"],
-                "display_name": user.get("display_name") or user["username"],
-                "email": user.get("email"),
-                "avatar": user.get("avatar"),
-                "status": user.get("status", "offline"),
-                "last_ping_at": user.get("last_ping_at"),
-                "status_emoji": user.get("status_emoji"),
-                "status_text": user.get("status_text"),
+                "username": canonical_user["username"],
+                "display_name": canonical_user.get("display_name")
+                or canonical_user["username"],
+                "email": canonical_user.get("email"),
+                "avatar": canonical_user.get("avatar"),
+                "status": canonical_user.get("status", "offline"),
+                "last_ping_at": canonical_user.get("last_ping_at"),
+                "status_emoji": canonical_user.get("status_emoji"),
+                "status_text": canonical_user.get("status_text"),
                 "disabled": False,
                 "is_bot": False,
-                "created_at": user["created_at"],
+                "created_at": canonical_user["created_at"],
             }
             directory_rows.append(
                 (
@@ -604,7 +615,7 @@ class WorkspaceBootstrapper:
                     workspace_user_uuid,
                     self._project_uuid,
                     canonical_hash(data),
-                    _timestamp(str(user["updated_at"])),
+                    _timestamp(str(canonical_user["updated_at"])),
                     json.dumps(data, separators=(",", ":")),
                 )
             )

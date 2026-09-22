@@ -253,6 +253,8 @@ class FakeStore:
         user_uuid: UUID,
         queue_id: str,
         catalog: ZulipChatCatalog,
+        *,
+        bootstrap_user_topics: object = None,
     ) -> ChatCatalogWrite:
         self.catalogs.append((user_uuid, queue_id, catalog))
         self.statuses.append((user_uuid, "scheduling"))
