@@ -2105,6 +2105,14 @@ def test_workspace_bootstrap_discards_interrupted_generation(
     asyncio.run(_workspace_bootstrap_discards_interrupted_generation(_dsn(), tmp_path))
 
 
+def test_workspace_identity_reconcile_preserves_external_account_owner(
+    tmp_path: Path,
+) -> None:
+    asyncio.run(
+        _workspace_identity_reconcile_preserves_external_account_owner(_dsn(), tmp_path)
+    )
+
+
 def test_workspace_event_uses_entity_timestamp_for_diff_direction() -> None:
     asyncio.run(_workspace_event_uses_entity_timestamp(_dsn()))
 
@@ -2641,6 +2649,111 @@ async def _workspace_bootstrap_discards_interrupted_generation(
             "Workspace Provider API returned 503 error=snapshot_unavailable",
         )
         assert "workspace.test" not in failed_state["last_error"]
+    finally:
+        await pool.close()
+
+
+async def _workspace_identity_reconcile_preserves_external_account_owner(
+    dsn: str,
+    tmp_path: Path,
+) -> None:
+    pool = await _pool(dsn)
+    provider_uuid = UUID("10000000-0000-0000-0000-000000000071")
+    project_uuid = UUID("10000000-0000-0000-0000-000000000072")
+    generation = UUID("10000000-0000-0000-0000-000000000073")
+    owner_uuid = UUID("10000000-0000-0000-0000-000000000074")
+    account_uuid = UUID("10000000-0000-0000-0000-000000000075")
+    token_file = tmp_path / "workspace-identity-owner.token"
+    token_file.write_text("integration-token")
+    try:
+        async with pool.acquire() as connection:
+            user_uuid = await _insert_user(connection, 71, 400)
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_users
+                SET login = 'external-account@example.test',
+                    workspace_user_uuid = $2
+                WHERE uuid = $1
+                """,
+                user_uuid,
+                owner_uuid,
+            )
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_realms
+                SET workspace_project_id = $2, workspace_provider_uuid = $3
+                WHERE uuid = $1
+                """,
+                stable_realm_uuid(ENDPOINT),
+                project_uuid,
+                provider_uuid,
+            )
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_connections
+                SET external_account_uuid = $2,
+                    owner_workspace_user_uuid = $3,
+                    login = 'external-account@example.test',
+                    lifecycle_status = 'active'
+                WHERE uuid = $1
+                """,
+                user_uuid,
+                account_uuid,
+                owner_uuid,
+            )
+        settings = Settings.from_env(
+            {
+                "WZB_DATABASE_DSN": dsn,
+                "WZB_DB_POOL_MIN_SIZE": "1",
+                "WZB_DB_POOL_MAX_SIZE": "4",
+                "WZB_ZULIP_HISTORY_CONCURRENCY": "2",
+                "WZB_WORKSPACE_WEBSOCKET_URL": (
+                    "ws://workspace.test/api/workspace/v1/events/ws"
+                ),
+                "WZB_WORKSPACE_PROJECT_ID": str(project_uuid),
+                "WZB_WORKSPACE_PROVIDER_UUID": str(provider_uuid),
+                "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+            }
+        )
+        bootstrapper = WorkspaceBootstrapper(pool, settings)
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            assert request.headers["authorization"] == "Bearer integration-token"
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "uuid": str(owner_uuid),
+                        "username": "workspace-owner",
+                        "display_name": "Workspace Owner",
+                        "email": "different-iam-address@example.test",
+                        "source": "iam",
+                        "status": "offline",
+                        "created_at": "2026-09-20T15:00:00Z",
+                        "updated_at": "2026-09-20T15:00:00Z",
+                    }
+                ],
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            assert (
+                await bootstrapper._reconcile_workspace_identities(
+                    generation,
+                    client=client,
+                    schedule_changes=True,
+                )
+                == 1
+            )
+        assert (
+            await pool.fetchval(
+                "SELECT workspace_user_uuid "
+                "FROM workspace_zulip_bridge.zulip_users WHERE uuid = $1",
+                user_uuid,
+            )
+            == owner_uuid
+        )
     finally:
         await pool.close()
 

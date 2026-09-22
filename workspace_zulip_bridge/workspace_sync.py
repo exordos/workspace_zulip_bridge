@@ -523,19 +523,24 @@ class WorkspaceBootstrapper:
         local_users = await self._pool.fetch(
             """
             SELECT zulip_user.uuid, zulip_user.login,
-                   zulip_user.workspace_user_uuid
+                   zulip_user.workspace_user_uuid,
+                   active_connection.owner_workspace_user_uuid
             FROM workspace_zulip_bridge.zulip_users AS zulip_user
             JOIN workspace_zulip_bridge.zulip_realms AS realm
               ON realm.uuid = zulip_user.realm_uuid
+            JOIN LATERAL (
+                SELECT connection.owner_workspace_user_uuid
+                FROM workspace_zulip_bridge.zulip_connections AS connection
+                WHERE connection.zulip_user_uuid = zulip_user.uuid
+                  AND connection.sync_enabled
+                  AND lower(btrim(connection.login)) =
+                      lower(btrim(zulip_user.login))
+                ORDER BY
+                    (connection.owner_workspace_user_uuid IS NOT NULL) DESC,
+                    connection.uuid
+                LIMIT 1
+            ) AS active_connection ON TRUE
             WHERE NOT zulip_user.is_bot
-              AND EXISTS (
-                    SELECT 1
-                    FROM workspace_zulip_bridge.zulip_connections AS connection
-                    WHERE connection.zulip_user_uuid = zulip_user.uuid
-                      AND connection.sync_enabled
-                      AND lower(btrim(connection.login)) =
-                          lower(btrim(zulip_user.login))
-              )
               AND (
                     realm.workspace_provider_uuid = $1
                     OR (
@@ -547,11 +552,18 @@ class WorkspaceBootstrapper:
             self._provider_uuid,
             self._project_uuid,
         )
-        desired = {
-            UUID(str(row["uuid"])): UUID(str(canonical_users[email]["uuid"]))
-            for row in local_users
-            if (email := str(row["login"]).strip().casefold()) in canonical_users
-        }
+        desired: dict[UUID, UUID] = {}
+        for row in local_users:
+            user_uuid = UUID(str(row["uuid"]))
+            if row["owner_workspace_user_uuid"] is not None:
+                # An external account is an explicit ownership link. Its Zulip
+                # login is allowed to differ from the IAM email, so the
+                # directory heuristic must never erase this mapping.
+                desired[user_uuid] = UUID(str(row["owner_workspace_user_uuid"]))
+                continue
+            email = str(row["login"]).strip().casefold()
+            if email in canonical_users:
+                desired[user_uuid] = UUID(str(canonical_users[email]["uuid"]))
         current = {
             UUID(str(row["uuid"])): (
                 None
