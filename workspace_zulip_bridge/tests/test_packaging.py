@@ -37,6 +37,15 @@ def test_runtime_configuration_survives_image_replacement() -> None:
     assert '"$DATABASE_ROLE"' in bootstrap
 
 
+def test_incomplete_first_boot_migration_is_rebuilt() -> None:
+    bootstrap = (ROOT / "exordos/images/bootstrap.sh").read_text()
+
+    assert 'if [[ ! -f "$PERSIST_MIGRATE_MARKER" ]]' in bootstrap
+    assert (
+        'rm -rf -- "$PERSISTENT_POSTGRESQL_DIR" "$PERSISTENT_RUNTIME_DIR"' in bootstrap
+    )
+
+
 def test_exordos_manifest_renders_without_implicit_values() -> None:
     source = (ROOT / "exordos/manifests/workspace_zulip_bridge.yaml.j2").read_text()
     rendered = (

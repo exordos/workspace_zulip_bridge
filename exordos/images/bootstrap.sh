@@ -12,6 +12,8 @@ PG_VERSION="18"
 SERVICE_NAME="workspace-zulip-bridge"
 DATABASE_NAME="workspace_zulip_bridge"
 DATABASE_ROLE="workspace_zulip_bridge"
+PERSISTENT_POSTGRESQL_DIR="${PERSISTENT_MOUNT}/var/lib/postgresql"
+PERSISTENT_RUNTIME_DIR="${PERSISTENT_MOUNT}/var/lib/workspace_zulip_bridge"
 
 PERSISTENT_DISK=""
 for _ in {1..300}; do
@@ -26,15 +28,24 @@ if [[ -z "$PERSISTENT_DISK" ]]; then
 fi
 
 prepare_persistent_disk "$PERSISTENT_DISK" "$PERSISTENT_MOUNT"
+
+# A hard reset while the first migration is still being flushed can leave the
+# destination directory present without valid contents.  The shared migration
+# helper treats any existing destination as complete, so discard only an
+# uncommitted first-boot migration and rebuild it from the immutable image.
+if [[ ! -f "$PERSIST_MIGRATE_MARKER" ]]; then
+    rm -rf -- "$PERSISTENT_POSTGRESQL_DIR" "$PERSISTENT_RUNTIME_DIR"
+fi
+
 migrate_to_persistent_stop_start \
     "/var/lib/postgresql" \
-    "${PERSISTENT_MOUNT}/var/lib/postgresql" \
+    "$PERSISTENT_POSTGRESQL_DIR" \
     "postgresql@${PG_VERSION}-main"
 install -d -o "$DATABASE_ROLE" -g "$DATABASE_ROLE" -m 0700 \
     "/var/lib/workspace_zulip_bridge"
 migrate_to_persistent \
     "/var/lib/workspace_zulip_bridge" \
-    "${PERSISTENT_MOUNT}/var/lib/workspace_zulip_bridge" \
+    "$PERSISTENT_RUNTIME_DIR" \
     "$DATABASE_ROLE" \
     "$DATABASE_ROLE"
 persist_migrate_complete
