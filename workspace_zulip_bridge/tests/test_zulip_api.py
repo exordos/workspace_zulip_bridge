@@ -42,7 +42,8 @@ def test_register_and_get_events() -> None:
             ]
             assert form["slim_presence"] == ["true"]
             assert json.loads(form["client_capabilities"][0]) == {
-                "simplified_presence_events": True
+                "notification_settings_null": False,
+                "simplified_presence_events": True,
             }
             assert form["idle_queue_timeout"] == ["3600"]
             return httpx.Response(

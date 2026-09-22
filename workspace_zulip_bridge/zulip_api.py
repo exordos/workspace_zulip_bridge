@@ -230,7 +230,10 @@ class ZulipApiClient:
                 ),
                 "slim_presence": "true",
                 "client_capabilities": json.dumps(
-                    {"simplified_presence_events": True},
+                    {
+                        "notification_settings_null": False,
+                        "simplified_presence_events": True,
+                    },
                     separators=(",", ":"),
                 ),
                 "idle_queue_timeout": str(self._idle_queue_timeout_seconds),
