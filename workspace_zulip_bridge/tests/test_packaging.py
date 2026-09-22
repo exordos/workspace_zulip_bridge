@@ -80,7 +80,7 @@ def test_exordos_manifest_renders_without_implicit_values() -> None:
         ],
     }
     infrastructure_project_id = "12345678-c625-4fee-81d5-f691897b8142"
-    workspace_project_id = "fe02e55d-4548-4b3e-a175-fcae928f41b2"
+    workspace_project_id = "$workspace_zulip_bridge.imports.$workspace_project_id:value"
     assert node["project_id"] == infrastructure_project_id
     assert "$core.compute.volumes" not in manifest["resources"]
     assert manifest["exports"]["bridge_node"] == {
@@ -91,6 +91,11 @@ def test_exordos_manifest_renders_without_implicit_values() -> None:
     assert manifest["imports"]["workspace_provider_sync_role"]["element"] == (
         "$workspace"
     )
+    assert manifest["imports"]["workspace_project_id"] == {
+        "element": "$workspace",
+        "kind": "resource",
+        "link": "$core.vs.variables.$workspace_project_id",
+    }
     assert (
         manifest["resources"]["$core.iam.rolebinding"][
             "workspace_zulip_bridge_provider_sync"
@@ -101,6 +106,12 @@ def test_exordos_manifest_renders_without_implicit_values() -> None:
         "workspace_zulip_bridge_config"
     ]["body"]["content"]
     assert "WZB_WORKSPACE_CONTROL_URL=" in config
-    assert f"WZB_WORKSPACE_PROJECT_ID={workspace_project_id}" in config
+    assert f"WZB_WORKSPACE_PROJECT_ID={{{workspace_project_id}}}" in config
     assert "WZB_WORKSPACE_USERNAME=" in config
     assert "WZB_WORKSPACE_PASSWORD_FILE=" in config
+    on_change = manifest["resources"]["$core.config.configs"][
+        "workspace_zulip_bridge_config"
+    ]["on_change"]["command"]
+    assert "rm -f /var/lib/workspace_zulip_bridge/workspace.token" in on_change
+    assert "workspace.refresh-token" in on_change
+    assert "control/desired-state-cursor" in on_change

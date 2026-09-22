@@ -66,6 +66,17 @@ _CAPABILITIES = {
 }
 
 
+class _DesiredResourceError(ValueError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(code)
+        self.code = code
+        self.safe_message = message
+
+
+class _RetryableDesiredStateError(RuntimeError):
+    pass
+
+
 class WorkspaceControlWorker:
     def __init__(self, pool: asyncpg.Pool, settings: Settings) -> None:
         assert settings.workspace_control_url is not None
@@ -84,13 +95,51 @@ class WorkspaceControlWorker:
         self._request = self._state / "enrollment-request.json"
         self._cursor = self._state / "desired-state-cursor"
         self._last_heartbeat = 0.0
+        self._enrollment_lock = asyncio.Lock()
 
     async def run(self) -> None:
+        tasks = (
+            asyncio.create_task(self._sync_loop(), name="workspace-control-sync"),
+            asyncio.create_task(
+                self._heartbeat_loop(),
+                name="workspace-control-heartbeat",
+            ),
+        )
+        try:
+            completed, _ = await asyncio.wait(
+                tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            next(iter(completed)).result()
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _sync_loop(self) -> None:
         attempt = 0
         while True:
             try:
                 await self._ensure_enrolled()
                 await self._sync_once()
+                attempt = 0
+                delay = self._settings.workspace_control_poll_seconds
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                LOG.warning(
+                    "Workspace desired-state synchronization failed: error=%s",
+                    type(error).__name__,
+                )
+                delay = _retry_delay(attempt)
+                attempt += 1
+            await asyncio.sleep(delay)
+
+    async def _heartbeat_loop(self) -> None:
+        attempt = 0
+        while True:
+            try:
+                await self._ensure_enrolled()
                 await self._heartbeat()
                 attempt = 0
                 delay = self._settings.workspace_control_poll_seconds
@@ -98,15 +147,18 @@ class WorkspaceControlWorker:
                 raise
             except Exception as error:
                 LOG.warning(
-                    "Workspace control synchronization failed: error=%s",
+                    "Workspace control heartbeat failed: error=%s",
                     type(error).__name__,
                 )
-                maximum = min(60.0, 2 ** min(attempt, 6))
-                delay = maximum * 0.5 + secrets.randbelow(1000) / 1000 * maximum * 0.5
+                delay = _retry_delay(attempt)
                 attempt += 1
             await asyncio.sleep(delay)
 
     async def _ensure_enrolled(self) -> None:
+        async with self._enrollment_lock:
+            await self._ensure_enrolled_locked()
+
+    async def _ensure_enrolled_locked(self) -> None:
         if all(
             path.is_file()
             for path in (
@@ -386,8 +438,11 @@ class WorkspaceControlWorker:
             (_object(change) for change in changes),
             key=lambda item: item.get("resource_type") != "custom_ca_bundle",
         )
+        retry_required = False
         for change in ordered:
-            await self._apply_change(change)
+            retry_required = await self._apply_change(change) or retry_required
+        if retry_required:
+            raise _RetryableDesiredStateError
         next_cursor = batch.get("next_cursor")
         if not isinstance(next_cursor, str) or not next_cursor:
             raise ValueError("invalid desired-state next cursor")
@@ -436,11 +491,14 @@ class WorkspaceControlWorker:
             key=lambda item: item.get("resource_type") != "custom_ca_bundle",
         )
         account_uuids: set[UUID] = set()
+        retry_required = False
         for resource in ordered:
             if resource.get("resource_type") == "external_account":
                 account_uuids.add(UUID(str(resource["uuid"])))
-            await self._apply_resource(resource)
+            retry_required = await self._apply_resource(resource) or retry_required
         await self._disable_absent_accounts(account_uuids)
+        if retry_required:
+            raise _RetryableDesiredStateError
         _atomic_write(self._cursor, anchor.encode("ascii"), 0o600)
         LOG.info(
             "Workspace desired-state snapshot applied: resources=%d accounts=%d",
@@ -448,21 +506,21 @@ class WorkspaceControlWorker:
             len(account_uuids),
         )
 
-    async def _apply_change(self, change: Mapping[str, Any]) -> None:
+    async def _apply_change(self, change: Mapping[str, Any]) -> bool:
         resource_type = change.get("resource_type")
         if resource_type not in _RESOURCE_TYPES:
-            return
+            return False
         if change.get("operation") == "delete":
             if resource_type == "external_account":
                 await self._disable_account(UUID(str(change["resource_uuid"])))
             elif resource_type == "custom_ca_bundle":
                 self._remove_zulip_ca()
-            return
+            return False
         if change.get("operation") != "upsert":
             raise ValueError("invalid desired-state operation")
-        await self._apply_resource(_object(change["resource"]))
+        return await self._apply_resource(_object(change["resource"]))
 
-    async def _apply_resource(self, resource: Mapping[str, Any]) -> None:
+    async def _apply_resource(self, resource: Mapping[str, Any]) -> bool:
         resource_type = resource.get("resource_type")
         try:
             if resource_type == "custom_ca_bundle":
@@ -476,7 +534,7 @@ class WorkspaceControlWorker:
                     else "suspended"
                 )
             else:
-                return
+                return False
         except ZulipApiError as error:
             status = (
                 "auth_required" if error.status_code in {401, 403} else "disconnected"
@@ -494,9 +552,29 @@ class WorkspaceControlWorker:
                     "retryable": error.retryable,
                 },
             )
-            if error.retryable:
-                raise
-            return
+            return error.retryable
+        except httpx.HTTPError:
+            await self._report_observed(
+                resource,
+                "disconnected",
+                safe_error={
+                    "code": "provider_unreachable",
+                    "message": "Zulip is temporarily unavailable.",
+                    "retryable": True,
+                },
+            )
+            return True
+        except _DesiredResourceError as error:
+            await self._report_observed(
+                resource,
+                "failed",
+                safe_error={
+                    "code": error.code,
+                    "message": error.safe_message,
+                    "retryable": False,
+                },
+            )
+            return False
         except ValueError:
             await self._report_observed(
                 resource,
@@ -507,8 +585,9 @@ class WorkspaceControlWorker:
                     "retryable": False,
                 },
             )
-            return
+            return False
         await self._report_observed(resource, status)
+        return False
 
     async def _report_observed(
         self,
@@ -578,12 +657,12 @@ class WorkspaceControlWorker:
             ).value
             if not constraints.ca:
                 raise ValueError("Zulip trust bundle contains a leaf certificate")
-        path = self._settings.effective_zulip_ca_file
+        path = self._settings.zulip_ca_materialization_file
         assert path is not None
         _atomic_write(path, content, 0o644)
 
     def _remove_zulip_ca(self) -> None:
-        path = self._settings.effective_zulip_ca_file
+        path = self._settings.zulip_ca_materialization_file
         if path is not None:
             path.unlink(missing_ok=True)
 
@@ -594,6 +673,17 @@ class WorkspaceControlWorker:
         if resource.get("synchronization_enabled") is not True:
             await self._disable_account(account_uuid)
             return
+        settings = _object(resource["settings"])
+        project_uuid = UUID(str(settings["default_project_id"]))
+        configured_project_uuid = self._settings.workspace_project_id
+        if (
+            configured_project_uuid is not None
+            and project_uuid != configured_project_uuid
+        ):
+            raise _DesiredResourceError(
+                "workspace_project_mismatch",
+                "The external account belongs to another Workspace project.",
+            )
         envelope = resource.get("credential_envelope")
         if not isinstance(envelope, Mapping):
             raise ValueError("enabled external account has no credential")
@@ -603,7 +693,6 @@ class WorkspaceControlWorker:
             generation,
             envelope,
         )
-        settings = _object(resource["settings"])
         endpoint = canonical_endpoint(str(settings["server_url"]))
         if endpoint != canonical_endpoint(credentials["server_url"]):
             raise ValueError("external account endpoint mismatch")
@@ -613,12 +702,26 @@ class WorkspaceControlWorker:
             credentials["email"],
             credentials["api_key"],
         )
-        project_uuid = UUID(str(settings["default_project_id"]))
         provider_uuid = self._settings.workspace_provider_uuid
         assert provider_uuid is not None
         realm_uuid = stable_realm_uuid(endpoint)
         user_uuid = stable_user_uuid(endpoint, identity.user_id)
         async with self._pool.acquire() as connection, connection.transaction():
+            other_realm = await connection.fetchval(
+                """
+                SELECT uuid
+                FROM workspace_zulip_bridge.zulip_realms
+                WHERE workspace_provider_uuid = $1 AND uuid <> $2
+                LIMIT 1
+                """,
+                provider_uuid,
+                realm_uuid,
+            )
+            if other_realm is not None:
+                raise _DesiredResourceError(
+                    "provider_realm_mismatch",
+                    "The bridge is already connected to another Zulip realm.",
+                )
             await connection.execute(
                 """
                 INSERT INTO workspace_zulip_bridge.zulip_realms (
@@ -877,6 +980,11 @@ class WorkspaceControlWorker:
 
 def _utc_now() -> str:
     return datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
+
+
+def _retry_delay(attempt: int) -> float:
+    maximum = min(60.0, float(2 ** min(attempt, 6)))
+    return maximum * 0.5 + secrets.randbelow(1000) / 1000 * maximum * 0.5
 
 
 def _public_key_bytes(key: Any) -> bytes:

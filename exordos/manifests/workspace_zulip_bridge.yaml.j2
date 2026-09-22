@@ -27,6 +27,10 @@ imports:
     element: "$workspace"
     kind: "resource"
     link: "$core.iam.roles.$workspace_provider_sync"
+  workspace_project_id:
+    element: "$workspace"
+    kind: "resource"
+    link: "$core.vs.variables.$workspace_project_id"
 
 resources:
   $core.secret.passwords:
@@ -51,7 +55,7 @@ resources:
     workspace_zulip_bridge_provider_sync:
       role: $workspace_zulip_bridge.imports.$workspace_provider_sync_role:uuid
       user: $core.iam.users.$workspace_zulip_bridge_user:uuid
-      project: "fe02e55d-4548-4b3e-a175-fcae928f41b2"
+      project: $workspace_zulip_bridge.imports.$workspace_project_id:value
 
   $core.compute.nodes:
     bridge_node:
@@ -81,7 +85,11 @@ resources:
         node: $core.compute.nodes.$bridge_node:uuid
       on_change:
         kind: shell
-        command: systemctl restart workspace-zulip-bridge
+        command: >-
+          rm -f /var/lib/workspace_zulip_bridge/workspace.token
+          /var/lib/workspace_zulip_bridge/workspace.refresh-token
+          /var/lib/workspace_zulip_bridge/control/desired-state-cursor &&
+          systemctl restart workspace-zulip-bridge
       body:
         kind: text
         content: |
@@ -92,7 +100,7 @@ resources:
           WZB_ZULIP_CA_FILE=/var/lib/workspace_zulip_bridge/control/zulip-ca.pem
           WZB_WORKSPACE_WEBSOCKET_URL=ws://workspace-backend.{$workspace_zulip_bridge.imports.$core_local_domain:name}/api/workspace/v1/events/ws
           WZB_WORKSPACE_API_URL=http://workspace-backend.{$workspace_zulip_bridge.imports.$core_local_domain:name}/api/workspace/v1/messenger
-          WZB_WORKSPACE_PROJECT_ID=fe02e55d-4548-4b3e-a175-fcae928f41b2
+          WZB_WORKSPACE_PROJECT_ID={$workspace_zulip_bridge.imports.$workspace_project_id:value}
           WZB_WORKSPACE_PROVIDER_UUID={$workspace_zulip_bridge.imports.$workspace_zulip_bridge_enrollment_secret:uuid}
           WZB_WORKSPACE_TOKEN_FILE=/var/lib/workspace_zulip_bridge/workspace.token
           WZB_WORKSPACE_REFRESH_TOKEN_FILE=/var/lib/workspace_zulip_bridge/workspace.refresh-token

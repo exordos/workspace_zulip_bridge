@@ -1231,6 +1231,8 @@ class WorkspaceDiffWorker:
 
     async def _plan_and_drain(self, client: httpx.AsyncClient) -> int:
         planned = await self.plan()
+        if planned is None:
+            return 0
         processed = await self._drain(client)
         if planned == 0 and processed == 0:
             await self._complete_initial_sync()
@@ -1242,8 +1244,10 @@ class WorkspaceDiffWorker:
             processed += changed
         return processed
 
-    async def plan(self) -> int:
+    async def plan(self) -> int | None:
         realm_uuid = await self._link_realm()
+        if realm_uuid is None:
+            return None
         await self._ensure_direct_topics(realm_uuid)
         await self._ensure_topic_bindings(realm_uuid)
         state = await self._pool.fetchrow(
@@ -2361,7 +2365,7 @@ class WorkspaceDiffWorker:
                 ],
             )
 
-    async def _link_realm(self) -> UUID:
+    async def _link_realm(self) -> UUID | None:
         rows = await self._pool.fetch(
             """
             SELECT uuid, workspace_provider_uuid
@@ -2377,8 +2381,10 @@ class WorkspaceDiffWorker:
         exact = [row for row in rows if row["workspace_provider_uuid"] is not None]
         if len(exact) == 1:
             return UUID(str(exact[0]["uuid"]))
+        if not rows:
+            return None
         if len(rows) != 1:
-            raise RuntimeError("Workspace provider must map to exactly one Zulip realm")
+            raise RuntimeError("Workspace provider maps to multiple Zulip realms")
         realm_uuid = UUID(str(rows[0]["uuid"]))
         await self._pool.execute(
             """

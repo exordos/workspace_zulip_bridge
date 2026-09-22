@@ -159,6 +159,39 @@ tox -e py,ruff,mypy
 Optional PostgreSQL integration tests run only when
 `WZB_TEST_DATABASE_DSN` names a disposable database.
 
+## Workspace project selection
+
+The Workspace element owns the mutable `workspace_project_id` Values Store
+variable. Set it before installing the bridge; the selected value is used for
+both the bridge service-account role binding and `WZB_WORKSPACE_PROJECT_ID`.
+List the variable and create its first value with the regular Exordos Values
+Store commands:
+
+```bash
+exordos vs vv list --filters name=workspace_project_id --output yaml
+exordos vs values add \
+  --project-id INFRASTRUCTURE_PROJECT_UUID \
+  --name workspace_project_id \
+  --var WORKSPACE_PROJECT_VARIABLE_UUID \
+  --value WORKSPACE_PROJECT_UUID
+```
+
+To select another Workspace project, update the existing value and let Element
+Manager reconcile the bridge resources:
+
+```bash
+exordos vs values list --output yaml
+exordos vs values update WORKSPACE_PROJECT_VALUE_UUID \
+  --value WORKSPACE_PROJECT_UUID
+```
+
+The config reconciliation removes persisted Workspace access and refresh tokens
+and the desired-state cursor before restarting the daemon. The next login
+requests a token scoped to the new project, and the bridge takes a fresh
+desired-state snapshot instead of continuing an old project's cursor. External
+accounts whose `default_project_id` does not match the selected project are
+reported as failed instead of remaining in `connecting`.
+
 ## Runtime configuration
 
 All settings are environment variables. Defaults favor a local Exordos Core

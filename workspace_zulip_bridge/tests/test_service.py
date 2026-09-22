@@ -357,6 +357,74 @@ async def _run_workspace_diff_worker_completion_test(
     assert calls == ["plan", "process", "complete"]
 
 
+def test_workspace_diff_worker_waits_for_control_realm(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    asyncio.run(_run_workspace_diff_worker_realm_wait_test(monkeypatch, tmp_path))
+
+
+def test_workspace_diff_worker_accepts_missing_control_realm(tmp_path: Path) -> None:
+    asyncio.run(_run_workspace_diff_worker_missing_realm_test(tmp_path))
+
+
+async def _run_workspace_diff_worker_missing_realm_test(tmp_path: Path) -> None:
+    token_file = tmp_path / "workspace.token"
+    token_file.write_text("token")
+    settings = Settings.from_env(
+        {
+            "WZB_WORKSPACE_WEBSOCKET_URL": "wss://workspace.example/events/ws",
+            "WZB_WORKSPACE_PROJECT_ID": "10000000-0000-0000-0000-000000000001",
+            "WZB_WORKSPACE_PROVIDER_UUID": "10000000-0000-0000-0000-000000000002",
+            "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+        }
+    )
+
+    class EmptyRealmPool:
+        async def fetch(self, query: str, *args: object) -> list[object]:
+            assert "zulip_realms" in query
+            return []
+
+    worker = WorkspaceDiffWorker(EmptyRealmPool(), settings)  # type: ignore[arg-type]
+
+    assert await worker._link_realm() is None
+
+
+async def _run_workspace_diff_worker_realm_wait_test(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    token_file = tmp_path / "workspace.token"
+    token_file.write_text("token")
+    settings = Settings.from_env(
+        {
+            "WZB_WORKSPACE_WEBSOCKET_URL": "wss://workspace.example/events/ws",
+            "WZB_WORKSPACE_PROJECT_ID": "10000000-0000-0000-0000-000000000001",
+            "WZB_WORKSPACE_PROVIDER_UUID": "10000000-0000-0000-0000-000000000002",
+            "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+        }
+    )
+    worker = WorkspaceDiffWorker(object(), settings)  # type: ignore[arg-type]
+    calls: list[str] = []
+
+    async def fake_plan() -> None:
+        calls.append("plan")
+        return None
+
+    async def fail_process_once(client: object) -> int:
+        raise AssertionError("diff processing started before realm readiness")
+
+    async def fail_complete() -> bool:
+        raise AssertionError("initial sync completed before realm readiness")
+
+    monkeypatch.setattr(worker, "plan", fake_plan)
+    monkeypatch.setattr(worker, "process_once", fail_process_once)
+    monkeypatch.setattr(worker, "_complete_initial_sync", fail_complete)
+
+    assert await worker._plan_and_drain(object()) == 0  # type: ignore[arg-type]
+    assert calls == ["plan"]
+
+
 def test_daemon_prepares_probes_and_closes_database(monkeypatch: object) -> None:
     asyncio.run(_run_daemon_lifecycle_test(monkeypatch))
 

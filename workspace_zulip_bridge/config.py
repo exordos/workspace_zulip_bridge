@@ -103,12 +103,17 @@ class Settings:
     log_level: str = "INFO"
 
     @property
-    def effective_zulip_ca_file(self) -> Path | None:
+    def zulip_ca_materialization_file(self) -> Path | None:
         if self.zulip_ca_file is not None:
             return self.zulip_ca_file
         if self.workspace_control_url is not None:
             return self.workspace_control_state_dir / "zulip-ca.pem"
         return None
+
+    @property
+    def effective_zulip_ca_file(self) -> Path | None:
+        path = self.zulip_ca_materialization_file
+        return path if path is not None and path.is_file() else None
 
     @classmethod
     def from_env(cls, values: Mapping[str, str] | None = None) -> "Settings":
