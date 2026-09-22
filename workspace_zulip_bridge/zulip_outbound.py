@@ -868,70 +868,159 @@ class ZulipOutboundWriter:
             "pinned": False,
             "mentioned": False,
         }
+        if source is not None:
+            unsupported_changes = tuple(
+                field
+                for field in ("pinned", "mentioned")
+                if bool(source.get(field)) != bool(desired.get(field))
+            )
+            if unsupported_changes:
+                raise ZulipOutboundError(
+                    "Zulip message flags cannot be updated: "
+                    + ", ".join(unsupported_changes)
+                )
+        message = await self._message(UUID(str(data["message_uuid"])))
+        if message is None:
+            raise ZulipOutboundError("Zulip message identity is unavailable")
+        actor = await self._actor(UUID(str(data["user_uuid"])))
+        existing = await self._pool.fetchrow(
+            """
+            SELECT is_read, is_starred, is_collapsed, is_mentioned,
+                   is_stream_wildcard_mentioned, is_topic_wildcard_mentioned,
+                   has_alert_word, is_historical
+            FROM workspace_zulip_bridge.zulip_message_flags
+            WHERE message_uuid = $1 AND zulip_user_uuid = $2
+            """,
+            UUID(str(data["message_uuid"])),
+            actor.user_uuid,
+        )
+        effective_source = source
+        if effective_source is None and existing is not None:
+            effective_source = {
+                "read": bool(existing["is_read"]),
+                "starred": bool(existing["is_starred"]),
+                "pinned": False,
+                "mentioned": bool(existing["is_mentioned"]),
+            }
         unsupported_changes = tuple(
             field
             for field in ("pinned", "mentioned")
-            if bool((source or {}).get(field)) != bool(desired.get(field))
+            if bool((effective_source or {}).get(field)) != bool(desired.get(field))
         )
         if unsupported_changes:
             raise ZulipOutboundError(
                 "Zulip message flags cannot be updated: "
                 + ", ".join(unsupported_changes)
             )
-        message = await self._message(UUID(str(data["message_uuid"])))
-        if message is None:
-            raise ZulipOutboundError("Zulip message identity is unavailable")
-        actor = await self._actor(UUID(str(data["user_uuid"])))
+        if target is not None:
+            values = {
+                "is_read": bool((effective_source or {}).get("read")),
+                "is_starred": bool((effective_source or {}).get("starred")),
+                "is_collapsed": bool(existing["is_collapsed"]) if existing else False,
+                "is_mentioned": bool((effective_source or {}).get("mentioned")),
+                "is_stream_wildcard_mentioned": (
+                    bool(existing["is_stream_wildcard_mentioned"])
+                    if existing
+                    else False
+                ),
+                "is_topic_wildcard_mentioned": (
+                    bool(existing["is_topic_wildcard_mentioned"]) if existing else False
+                ),
+                "has_alert_word": bool(existing["has_alert_word"])
+                if existing
+                else False,
+                "is_historical": bool(existing["is_historical"]) if existing else False,
+            }
+            await self._pool.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_message_flags (
+                    uuid, realm_uuid, zulip_stream_uuid, message_uuid,
+                    zulip_user_uuid, is_read, is_starred, is_collapsed,
+                    is_mentioned, is_stream_wildcard_mentioned,
+                    is_topic_wildcard_mentioned, has_alert_word, is_historical,
+                    flags_hash
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                    $13, $14
+                ) ON CONFLICT (message_uuid, zulip_user_uuid) DO UPDATE SET
+                    uuid = EXCLUDED.uuid,
+                    updated_at = clock_timestamp()
+                """,
+                entity_uuid,
+                actor.realm_uuid,
+                UUID(str(target["stream_uuid"])),
+                UUID(str(target["message_uuid"])),
+                actor.user_uuid,
+                *values.values(),
+                message_flags_hash(**values),
+            )
         for field, zulip_flag in (("read", "read"), ("starred", "starred")):
-            if source is None or bool(source.get(field)) != bool(desired.get(field)):
+            if effective_source is None or bool(effective_source.get(field)) != bool(
+                desired.get(field)
+            ):
                 await asyncio.to_thread(
                     self._client(actor).update_message_flag,
                     int(message["zulip_message_id"]),
                     zulip_flag,
                     bool(desired.get(field)),
                 )
+                database_field = {
+                    "read": "is_read",
+                    "starred": "is_starred",
+                }[field]
+                async with (
+                    self._pool.acquire() as connection,
+                    connection.transaction(),
+                ):
+                    row = await connection.fetchrow(
+                        f"""
+                        UPDATE workspace_zulip_bridge.zulip_message_flags
+                        SET {database_field} = $3,
+                            updated_at = clock_timestamp()
+                        WHERE message_uuid = $1 AND zulip_user_uuid = $2
+                        RETURNING uuid, is_read, is_starred, is_collapsed,
+                                  is_mentioned, is_stream_wildcard_mentioned,
+                                  is_topic_wildcard_mentioned, has_alert_word,
+                                  is_historical
+                        """,
+                        UUID(str(data["message_uuid"])),
+                        actor.user_uuid,
+                        bool(desired.get(field)),
+                    )
+                    if row is not None:
+                        actual = {
+                            name: bool(row[name])
+                            for name in (
+                                "is_read",
+                                "is_starred",
+                                "is_collapsed",
+                                "is_mentioned",
+                                "is_stream_wildcard_mentioned",
+                                "is_topic_wildcard_mentioned",
+                                "has_alert_word",
+                                "is_historical",
+                            )
+                        }
+                        await connection.execute(
+                            """
+                            UPDATE workspace_zulip_bridge.zulip_message_flags
+                            SET flags_hash = $2
+                            WHERE uuid = $1
+                            """,
+                            row["uuid"],
+                            message_flags_hash(**actual),
+                        )
+                if effective_source is None:
+                    effective_source = {}
+                effective_source[field] = bool(desired.get(field))
         if target is None:
             await self._pool.execute(
                 "DELETE FROM workspace_zulip_bridge.zulip_message_flags "
-                "WHERE uuid = $1",
+                "WHERE uuid = $1 OR (message_uuid = $2 AND zulip_user_uuid = $3)",
                 entity_uuid,
+                UUID(str(data["message_uuid"])),
+                actor.user_uuid,
             )
-            return
-        values = {
-            "is_read": bool(target.get("read")),
-            "is_starred": bool(target.get("starred")),
-            "is_collapsed": False,
-            "is_mentioned": bool(target.get("mentioned")),
-            "is_stream_wildcard_mentioned": False,
-            "is_topic_wildcard_mentioned": False,
-            "has_alert_word": False,
-            "is_historical": False,
-        }
-        await self._pool.execute(
-            """
-            INSERT INTO workspace_zulip_bridge.zulip_message_flags (
-                uuid, realm_uuid, zulip_stream_uuid, message_uuid,
-                zulip_user_uuid, is_read, is_starred, is_collapsed,
-                is_mentioned, is_stream_wildcard_mentioned,
-                is_topic_wildcard_mentioned, has_alert_word, is_historical,
-                flags_hash
-            ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
-            ) ON CONFLICT (uuid) DO UPDATE SET
-                is_read = EXCLUDED.is_read,
-                is_starred = EXCLUDED.is_starred,
-                is_mentioned = EXCLUDED.is_mentioned,
-                flags_hash = EXCLUDED.flags_hash,
-                updated_at = clock_timestamp()
-            """,
-            entity_uuid,
-            actor.realm_uuid,
-            UUID(str(target["stream_uuid"])),
-            UUID(str(target["message_uuid"])),
-            actor.user_uuid,
-            *values.values(),
-            message_flags_hash(**values),
-        )
 
     async def _apply_message_reactions(
         self,

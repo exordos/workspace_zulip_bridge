@@ -28,6 +28,7 @@ from workspace_zulip_bridge.database import prepare_database
 from workspace_zulip_bridge.event_processor import ZulipEventProcessor
 from workspace_zulip_bridge.event_processor import _user_status_change
 from workspace_zulip_bridge.event_store import EventStore
+from workspace_zulip_bridge.message_history import message_flags_hash
 from workspace_zulip_bridge.models import UserDirectoryWrite
 from workspace_zulip_bridge.models import ZulipAttachment
 from workspace_zulip_bridge.models import ZulipDirectoryUser
@@ -38,6 +39,7 @@ from workspace_zulip_bridge.models import ZulipUserProfileStatus
 from workspace_zulip_bridge.models import ZulipUserTopic
 from workspace_zulip_bridge.monitor import collect_snapshot
 from workspace_zulip_bridge.stable_ids import stable_chat_uuid
+from workspace_zulip_bridge.stable_ids import stable_message_flag_uuid
 from workspace_zulip_bridge.stable_ids import stable_message_uuid
 from workspace_zulip_bridge.stable_ids import stable_reaction_uuid
 from workspace_zulip_bridge.stable_ids import stable_realm_uuid
@@ -531,6 +533,201 @@ async def _outbound_message_adopts_a_racing_zulip_echo(dsn: str) -> None:
 
 def test_outbound_user_scoped_write_requires_exact_actor() -> None:
     asyncio.run(_outbound_user_scoped_write_requires_exact_actor(_dsn()))
+
+
+def test_outbound_message_flags_adopt_workspace_identity() -> None:
+    asyncio.run(_outbound_message_flags_adopt_workspace_identity(_dsn()))
+
+
+async def _outbound_message_flags_adopt_workspace_identity(dsn: str) -> None:
+    pool = await _pool(dsn)
+    realm_uuid = stable_realm_uuid(ENDPOINT)
+    stream_uuid = stable_chat_uuid(ENDPOINT, "channel:64")
+    message_uuid = stable_message_uuid(ENDPOINT, 6400)
+    workspace_flag_uuid = UUID("10000000-0000-0000-0000-000000000064")
+    try:
+        async with pool.acquire() as connection:
+            user_uuid = await _insert_user(connection, 64, 400)
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_streams (
+                    uuid, realm_uuid, chat_type, chat_key, name,
+                    content_hash, source_connection_uuid
+                ) VALUES ($1, $2, 'channel', 'channel:64', 'Flags', $3, $4)
+                """,
+                stream_uuid,
+                realm_uuid,
+                b"s" * 32,
+                user_uuid,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_stream_bindings (
+                    uuid, zulip_stream_uuid, zulip_user_uuid, role,
+                    membership_kind, content_hash
+                ) VALUES ($1, $2, $3, 'member', 'subscriber', $4)
+                """,
+                stable_stream_binding_uuid(stream_uuid, user_uuid),
+                stream_uuid,
+                user_uuid,
+                b"b" * 32,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_messages (
+                    uuid, realm_uuid, source_connection_uuid, zulip_stream_uuid,
+                    sender_user_uuid, zulip_message_id, content, content_hash,
+                    message_hash, created_at, source_updated_at
+                ) VALUES ($1, $2, $3, $4, $3, 6400, 'flags', $5, $6,
+                          clock_timestamp(), clock_timestamp())
+                """,
+                message_uuid,
+                realm_uuid,
+                user_uuid,
+                stream_uuid,
+                b"c" * 32,
+                b"m" * 32,
+            )
+            existing = {
+                "is_read": False,
+                "is_starred": False,
+                "is_collapsed": True,
+                "is_mentioned": True,
+                "is_stream_wildcard_mentioned": True,
+                "is_topic_wildcard_mentioned": False,
+                "has_alert_word": True,
+                "is_historical": True,
+            }
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_message_flags (
+                    uuid, realm_uuid, zulip_stream_uuid, message_uuid,
+                    zulip_user_uuid, is_read, is_starred, is_collapsed,
+                    is_mentioned, is_stream_wildcard_mentioned,
+                    is_topic_wildcard_mentioned, has_alert_word, is_historical,
+                    flags_hash
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                          $11, $12, $13, $14)
+                """,
+                stable_message_flag_uuid(message_uuid, user_uuid),
+                realm_uuid,
+                stream_uuid,
+                message_uuid,
+                user_uuid,
+                *existing.values(),
+                message_flags_hash(**existing),
+            )
+
+        calls: list[tuple[int, str, bool]] = []
+        fail_starred_once = True
+
+        def update_message_flag(message_id: int, flag: str, enabled: bool) -> None:
+            nonlocal fail_starred_once
+            calls.append((message_id, flag, enabled))
+            if flag == "starred" and fail_starred_once:
+                fail_starred_once = False
+                raise RuntimeError("simulated rate limit between flag updates")
+
+        actor = SimpleNamespace(realm_uuid=realm_uuid, user_uuid=user_uuid)
+        writer = ZulipOutboundWriter(pool, Settings(database_dsn=dsn))
+        writer._message = AsyncMock(return_value={"zulip_message_id": 6400})  # type: ignore[method-assign]
+        writer._actor = AsyncMock(return_value=actor)  # type: ignore[method-assign]
+        writer._client = lambda _actor: SimpleNamespace(  # type: ignore[method-assign]
+            update_message_flag=update_message_flag
+        )
+        target = {
+            "stream_uuid": str(stream_uuid),
+            "message_uuid": str(message_uuid),
+            "user_uuid": str(user_uuid),
+            "read": True,
+            "starred": True,
+            "pinned": False,
+            "mentioned": True,
+        }
+
+        with pytest.raises(RuntimeError, match="simulated rate limit"):
+            await writer._apply_message_flags(
+                workspace_flag_uuid,
+                None,
+                target,
+                None,
+            )
+
+        partial = await pool.fetchrow(
+            """
+            SELECT uuid, is_read, is_starred
+            FROM workspace_zulip_bridge.zulip_message_flags
+            WHERE message_uuid = $1 AND zulip_user_uuid = $2
+            """,
+            message_uuid,
+            user_uuid,
+        )
+        assert partial is not None
+        assert partial["uuid"] == workspace_flag_uuid
+        assert partial["is_read"]
+        assert not partial["is_starred"]
+
+        await writer._apply_message_flags(
+            workspace_flag_uuid,
+            None,
+            target,
+            None,
+        )
+
+        row = await pool.fetchrow(
+            """
+            SELECT uuid, is_read, is_starred, is_collapsed, is_mentioned,
+                   is_stream_wildcard_mentioned, is_topic_wildcard_mentioned,
+                   has_alert_word, is_historical, flags_hash
+            FROM workspace_zulip_bridge.zulip_message_flags
+            WHERE message_uuid = $1 AND zulip_user_uuid = $2
+            """,
+            message_uuid,
+            user_uuid,
+        )
+        assert row is not None
+        assert row["uuid"] == workspace_flag_uuid
+        assert row["is_read"]
+        assert row["is_starred"]
+        assert row["is_collapsed"]
+        assert row["is_mentioned"]
+        assert row["is_stream_wildcard_mentioned"]
+        assert not row["is_topic_wildcard_mentioned"]
+        assert row["has_alert_word"]
+        assert row["is_historical"]
+        actual = {
+            name: bool(row[name])
+            for name in (
+                "is_read",
+                "is_starred",
+                "is_collapsed",
+                "is_mentioned",
+                "is_stream_wildcard_mentioned",
+                "is_topic_wildcard_mentioned",
+                "has_alert_word",
+                "is_historical",
+            )
+        }
+        assert row["flags_hash"] == message_flags_hash(**actual)
+        assert calls == [
+            (6400, "read", True),
+            (6400, "starred", True),
+            (6400, "starred", True),
+        ]
+
+        await writer._apply_message_flags(
+            workspace_flag_uuid,
+            None,
+            target,
+            None,
+        )
+        assert calls == [
+            (6400, "read", True),
+            (6400, "starred", True),
+            (6400, "starred", True),
+        ]
+    finally:
+        await pool.close()
 
 
 def test_outbound_rejects_stream_properties_it_cannot_apply() -> None:
