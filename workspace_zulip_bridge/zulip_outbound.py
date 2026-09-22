@@ -871,7 +871,7 @@ class ZulipOutboundWriter:
         if source is not None:
             unsupported_changes = tuple(
                 field
-                for field in ("pinned", "mentioned")
+                for field in ("pinned",)
                 if bool(source.get(field)) != bool(desired.get(field))
             )
             if unsupported_changes:
@@ -904,7 +904,7 @@ class ZulipOutboundWriter:
             }
         unsupported_changes = tuple(
             field
-            for field in ("pinned", "mentioned")
+            for field in ("pinned",)
             if bool((effective_source or {}).get(field)) != bool(desired.get(field))
         )
         if unsupported_changes:
@@ -1013,7 +1013,22 @@ class ZulipOutboundWriter:
                 if effective_source is None:
                     effective_source = {}
                 effective_source[field] = bool(desired.get(field))
-        if target is None:
+        if target is None and bool((effective_source or {}).get("mentioned")):
+            # Zulip computes ``mentioned`` from message content and recipients;
+            # it is not a mutable personal flag.  Keep the provider value so a
+            # subsequent source scan restores the Workspace projection instead
+            # of losing a true mention when Workspace removes its flag row.
+            await self._pool.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_message_flags
+                SET updated_at = clock_timestamp()
+                WHERE uuid = $1 OR (message_uuid = $2 AND zulip_user_uuid = $3)
+                """,
+                entity_uuid,
+                UUID(str(data["message_uuid"])),
+                actor.user_uuid,
+            )
+        elif target is None:
             await self._pool.execute(
                 "DELETE FROM workspace_zulip_bridge.zulip_message_flags "
                 "WHERE uuid = $1 OR (message_uuid = $2 AND zulip_user_uuid = $3)",

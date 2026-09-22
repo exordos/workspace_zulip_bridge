@@ -44,7 +44,7 @@ ENTITY_TYPES = (
     "message_reactions",
 )
 PRIORITY = {entity_type: index for index, entity_type in enumerate(ENTITY_TYPES)}
-RECONCILIATION_VERSION = 2
+RECONCILIATION_VERSION = 3
 
 
 class ProviderApiError(RuntimeError):
@@ -1376,6 +1376,7 @@ class WorkspaceDiffWorker:
             generation,
         )
         if int(state.get("reconciliation_version", 0)) < RECONCILIATION_VERSION:
+            total += await self._requeue_provider_owned_mentions()
             await self._pool.execute(
                 """
                 UPDATE workspace_zulip_bridge.workspace_mirror_state
@@ -1388,6 +1389,27 @@ class WorkspaceDiffWorker:
                 RECONCILIATION_VERSION,
             )
         return total
+
+    async def _requeue_provider_owned_mentions(self) -> int:
+        """Retry rows blocked before ``mentioned`` became provider-owned."""
+        result = await self._pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.sync_diffs
+            SET processing_status = 'pending', attempt_count = 0,
+                available_at = clock_timestamp(), claimed_at = NULL,
+                processed_at = NULL,
+                last_error = 'requeued_provider_owned_mentioned',
+                updated_at = clock_timestamp()
+            WHERE provider_uuid = $1
+              AND entity_type = 'message_flags'
+              AND direction = 'to_zulip'
+              AND processing_status = 'blocked'
+              AND last_error =
+                  'Zulip message flags cannot be updated: mentioned'
+            """,
+            self._provider_uuid,
+        )
+        return int(result.rsplit(" ", 1)[-1])
 
     async def _repair_missing_source_diffs(
         self,

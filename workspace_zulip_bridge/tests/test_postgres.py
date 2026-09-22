@@ -642,7 +642,10 @@ async def _outbound_message_flags_adopt_workspace_identity(dsn: str) -> None:
             "read": True,
             "starred": True,
             "pinned": False,
-            "mentioned": True,
+            # Workspace may have a newer user-owned flag while its projection
+            # still lacks Zulip's computed mention.  The writer must apply only
+            # read/starred and preserve the provider-owned mention.
+            "mentioned": False,
         }
 
         with pytest.raises(RuntimeError, match="simulated rate limit"):
@@ -725,6 +728,37 @@ async def _outbound_message_flags_adopt_workspace_identity(dsn: str) -> None:
             (6400, "read", True),
             (6400, "starred", True),
             (6400, "starred", True),
+        ]
+
+        await writer._apply_message_flags(
+            workspace_flag_uuid,
+            {**target, "mentioned": True},
+            None,
+            None,
+        )
+        preserved = await pool.fetchrow(
+            """
+            SELECT is_read, is_starred, is_mentioned
+            FROM workspace_zulip_bridge.zulip_message_flags
+            WHERE message_uuid = $1 AND zulip_user_uuid = $2
+            """,
+            message_uuid,
+            user_uuid,
+        )
+        assert preserved is not None
+        assert not preserved["is_read"]
+        assert not preserved["is_starred"]
+        assert preserved["is_mentioned"]
+        assert calls[-2:] == [
+            (6400, "read", False),
+            (6400, "starred", False),
+        ]
+        assert calls == [
+            (6400, "read", True),
+            (6400, "starred", True),
+            (6400, "starred", True),
+            (6400, "read", False),
+            (6400, "starred", False),
         ]
     finally:
         await pool.close()
@@ -911,19 +945,11 @@ async def _outbound_rejects_unsupported_message_flag_changes() -> None:
         "pinned": False,
         "mentioned": False,
     }
-    for field in ("pinned", "mentioned"):
-        with pytest.raises(ZulipOutboundError, match=field):
-            await writer._apply_message_flags(
-                UUID("10000000-0000-0000-0000-000000000004"),
-                base,
-                {**base, field: True},
-                None,
-            )
-    with pytest.raises(ZulipOutboundError, match="mentioned"):
+    with pytest.raises(ZulipOutboundError, match="pinned"):
         await writer._apply_message_flags(
             UUID("10000000-0000-0000-0000-000000000004"),
-            {**base, "mentioned": True},
-            None,
+            base,
+            {**base, "pinned": True},
             None,
         )
     writer._message.assert_not_awaited()
@@ -2313,6 +2339,41 @@ async def _workspace_reconciliation_revisits_completed_sweeps(
         )
         worker = WorkspaceDiffWorker(pool, settings)
 
+        blocked_flag_uuid = UUID("10000000-0000-0000-0000-0000000000a6")
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.sync_diffs (
+                provider_uuid, entity_type, entity_uuid, realm_uuid,
+                partition_key, direction, source_hash, source_updated_at,
+                processing_status, attempt_count, last_error
+            ) VALUES (
+                $1, 'message_flags', $2, $3, $4, 'to_zulip', $5,
+                clock_timestamp(), 'blocked', 41,
+                'Zulip message flags cannot be updated: mentioned'
+            )
+            """,
+            provider_uuid,
+            blocked_flag_uuid,
+            realm_uuid,
+            stream_uuid,
+            b"f" * 32,
+        )
+        assert await worker._requeue_provider_owned_mentions() == 1
+        recovered = await pool.fetchrow(
+            """
+            SELECT processing_status, attempt_count, last_error
+            FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1 AND entity_type = 'message_flags'
+              AND entity_uuid = $2
+            """,
+            provider_uuid,
+            blocked_flag_uuid,
+        )
+        assert recovered is not None
+        assert recovered["processing_status"] == "pending"
+        assert recovered["attempt_count"] == 0
+        assert recovered["last_error"] == "requeued_provider_owned_mentioned"
+
         assert (
             await worker._repair_entity(
                 "topics", _SOURCE_TABLES["topics"], realm_uuid, generation
@@ -3597,7 +3658,7 @@ async def _workspace_diff_planner_schedules_unready_entity_graph(
                 """,
                 provider_uuid,
             )
-            == 2
+            == 3
         )
     finally:
         await pool.close()
