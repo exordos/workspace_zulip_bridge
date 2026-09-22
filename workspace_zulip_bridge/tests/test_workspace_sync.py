@@ -187,6 +187,11 @@ def test_stream_equivalence_still_compares_canonical_fields() -> None:
         source,
         {**source, "description": "after"},
     )
+    assert not _equivalent_entity(
+        "streams",
+        source,
+        {**source, "history_public_to_subscribers": False},
+    )
 
 
 def test_reaction_identity_matches_workspace_unique_constraint() -> None:

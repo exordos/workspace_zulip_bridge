@@ -29,6 +29,9 @@ def test_schema_separates_realm_identities_and_sync_connections() -> None:
     assert "zulip_user_id bigint NOT NULL" in schema
     assert "is_bot boolean NOT NULL DEFAULT false" in schema
     assert "api_key text NOT NULL" in schema
+    assert "external_account_uuid uuid UNIQUE" in schema
+    assert "owner_workspace_user_uuid uuid" in schema
+    assert "desired_generation bigint" in schema
     assert "lifecycle_status text NOT NULL DEFAULT 'init'" in schema
     assert "streams_hash bytea" in schema
     assert "password" not in schema

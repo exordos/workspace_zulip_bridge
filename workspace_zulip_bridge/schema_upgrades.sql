@@ -28,6 +28,37 @@ BEGIN
             ADD COLUMN IF NOT EXISTS workspace_user_uuid uuid;
     END IF;
 
+    IF to_regclass('workspace_zulip_bridge.zulip_connections') IS NOT NULL THEN
+        ALTER TABLE workspace_zulip_bridge.zulip_connections
+            ADD COLUMN IF NOT EXISTS external_account_uuid uuid;
+        ALTER TABLE workspace_zulip_bridge.zulip_connections
+            ADD COLUMN IF NOT EXISTS owner_workspace_user_uuid uuid;
+        ALTER TABLE workspace_zulip_bridge.zulip_connections
+            ADD COLUMN IF NOT EXISTS desired_generation bigint;
+        IF NOT EXISTS (
+            SELECT 1
+            FROM pg_constraint
+            WHERE conrelid =
+                    'workspace_zulip_bridge.zulip_connections'::regclass
+              AND conname = 'zulip_connections_external_account_uuid_key'
+        ) THEN
+            ALTER TABLE workspace_zulip_bridge.zulip_connections
+                ADD CONSTRAINT zulip_connections_external_account_uuid_key
+                UNIQUE (external_account_uuid);
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1
+            FROM pg_constraint
+            WHERE conrelid =
+                    'workspace_zulip_bridge.zulip_connections'::regclass
+              AND conname = 'zulip_connections_desired_generation_check'
+        ) THEN
+            ALTER TABLE workspace_zulip_bridge.zulip_connections
+                ADD CONSTRAINT zulip_connections_desired_generation_check
+                CHECK (desired_generation IS NULL OR desired_generation > 0);
+        END IF;
+    END IF;
+
     IF to_regclass('workspace_zulip_bridge.zulip_stream_bindings') IS NOT NULL THEN
         ALTER TABLE workspace_zulip_bridge.zulip_stream_bindings
             ADD COLUMN IF NOT EXISTS first_visible_message_id bigint;

@@ -121,8 +121,11 @@ class ZulipOutboundWriter:
         unsupported_changes = tuple(
             property_name
             for property_name in (
+                "owner_uuid",
                 "invite_only",
                 "announce",
+                "direct_user_uuid",
+                "private",
                 "color",
                 "history_public_to_subscribers",
             )
@@ -568,6 +571,8 @@ class ZulipOutboundWriter:
             raise ZulipOutboundError(
                 "moving messages between Zulip conversations is not supported"
             )
+        if target.get("author_uuid") != source.get("author_uuid"):
+            raise ZulipOutboundError("changing Zulip message authors is not supported")
         row = await self._message(entity_uuid)
         if row is None:
             raise ZulipOutboundError("Zulip message identity is unavailable")

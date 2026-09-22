@@ -75,6 +75,8 @@ class Settings:
     workspace_provider_uuid: UUID | None = None
     workspace_token_file: Path | None = None
     workspace_refresh_token_file: Path | None = None
+    workspace_username: str | None = None
+    workspace_password_file: Path | None = None
     workspace_token_url: str | None = None
     workspace_ca_file: Path | None = None
     workspace_event_batch_size: int = 500
@@ -89,6 +91,14 @@ class Settings:
     workspace_sync_plan_batch_size: int = 50000
     workspace_sync_batch_size: int = 500
     workspace_sync_workers: int = 2
+    workspace_control_url: str | None = None
+    workspace_control_bootstrap_url: str | None = None
+    workspace_control_hostname: str | None = None
+    workspace_realm_uuid: UUID | None = None
+    workspace_bridge_instance_uuid: UUID | None = None
+    workspace_enrollment_secret_file: Path | None = None
+    workspace_control_state_dir: Path = Path("/var/lib/workspace_zulip_bridge/control")
+    workspace_control_poll_seconds: float = 2.0
     thread_stop_timeout_seconds: float = 5.0
     log_level: str = "INFO"
 
@@ -189,6 +199,12 @@ class Settings:
                 if source.get("WZB_WORKSPACE_REFRESH_TOKEN_FILE")
                 else None
             ),
+            workspace_username=(source.get("WZB_WORKSPACE_USERNAME") or None),
+            workspace_password_file=(
+                Path(source["WZB_WORKSPACE_PASSWORD_FILE"])
+                if source.get("WZB_WORKSPACE_PASSWORD_FILE")
+                else None
+            ),
             workspace_token_url=(source.get("WZB_WORKSPACE_TOKEN_URL") or None),
             workspace_ca_file=(
                 Path(source["WZB_WORKSPACE_CA_FILE"])
@@ -229,6 +245,31 @@ class Settings:
                 source, "WZB_WORKSPACE_SYNC_BATCH_SIZE", 500
             ),
             workspace_sync_workers=_read_int(source, "WZB_WORKSPACE_SYNC_WORKERS", 2),
+            workspace_control_url=(source.get("WZB_WORKSPACE_CONTROL_URL") or None),
+            workspace_control_bootstrap_url=(
+                source.get("WZB_WORKSPACE_CONTROL_BOOTSTRAP_URL") or None
+            ),
+            workspace_control_hostname=(
+                source.get("WZB_WORKSPACE_CONTROL_HOSTNAME") or None
+            ),
+            workspace_realm_uuid=_read_uuid(source, "WZB_WORKSPACE_REALM_UUID"),
+            workspace_bridge_instance_uuid=_read_uuid(
+                source, "WZB_WORKSPACE_BRIDGE_INSTANCE_UUID"
+            ),
+            workspace_enrollment_secret_file=(
+                Path(source["WZB_WORKSPACE_ENROLLMENT_SECRET_FILE"])
+                if source.get("WZB_WORKSPACE_ENROLLMENT_SECRET_FILE")
+                else None
+            ),
+            workspace_control_state_dir=Path(
+                source.get(
+                    "WZB_WORKSPACE_CONTROL_STATE_DIR",
+                    "/var/lib/workspace_zulip_bridge/control",
+                )
+            ),
+            workspace_control_poll_seconds=_read_float(
+                source, "WZB_WORKSPACE_CONTROL_POLL_SECONDS", 2.0
+            ),
             thread_stop_timeout_seconds=_read_float(
                 source, "WZB_THREAD_STOP_TIMEOUT_SECONDS", 5.0
             ),
@@ -288,6 +329,7 @@ class Settings:
                 self.workspace_request_timeout_seconds
             ),
             "WZB_WORKSPACE_SYNC_POLL_SECONDS": self.workspace_sync_poll_seconds,
+            "WZB_WORKSPACE_CONTROL_POLL_SECONDS": (self.workspace_control_poll_seconds),
             "WZB_THREAD_STOP_TIMEOUT_SECONDS": self.thread_stop_timeout_seconds,
         }
         for name, value in positive_float_values.items():
@@ -355,7 +397,11 @@ class Settings:
                 "WZB_WORKSPACE_RETRY_CAP_SECONDS must be at least "
                 "WZB_WORKSPACE_RETRY_BASE_SECONDS"
             )
-        if self.zulip_ca_file is not None and not self.zulip_ca_file.is_file():
+        if (
+            self.zulip_ca_file is not None
+            and not self.zulip_ca_file.is_file()
+            and self.workspace_control_url is None
+        ):
             raise ValueError("WZB_ZULIP_CA_FILE must name a readable file")
         workspace_required = (
             self.workspace_websocket_url,
@@ -374,22 +420,67 @@ class Settings:
             if urlsplit(self.workspace_websocket_url).scheme not in {"ws", "wss"}:
                 raise ValueError("WZB_WORKSPACE_WEBSOCKET_URL must use ws or wss")
             assert self.workspace_token_file is not None
-            if not self.workspace_token_file.is_file():
-                raise ValueError("WZB_WORKSPACE_TOKEN_FILE must name a readable file")
+            password_login = (
+                self.workspace_username is not None
+                and self.workspace_password_file is not None
+            )
+            if not self.workspace_token_file.is_file() and not password_login:
+                raise ValueError(
+                    "WZB_WORKSPACE_TOKEN_FILE must exist unless Workspace "
+                    "username and password file are configured"
+                )
         if self.workspace_api_url is not None:
             if urlsplit(self.workspace_api_url).scheme not in {"http", "https"}:
                 raise ValueError("WZB_WORKSPACE_API_URL must use http or https")
         if self.workspace_refresh_token_file is not None:
-            if not self.workspace_refresh_token_file.is_file():
-                raise ValueError(
-                    "WZB_WORKSPACE_REFRESH_TOKEN_FILE must name a readable file"
-                )
+            if (
+                self.workspace_refresh_token_file.exists()
+                and not self.workspace_refresh_token_file.is_file()
+            ):
+                raise ValueError("WZB_WORKSPACE_REFRESH_TOKEN_FILE must be a file")
+        if (self.workspace_username is None) != (self.workspace_password_file is None):
+            raise ValueError(
+                "WZB_WORKSPACE_USERNAME and WZB_WORKSPACE_PASSWORD_FILE "
+                "must be configured together"
+            )
+        if (
+            self.workspace_password_file is not None
+            and not self.workspace_password_file.is_file()
+        ):
+            raise ValueError("WZB_WORKSPACE_PASSWORD_FILE must name a readable file")
         if self.workspace_token_url is not None:
             if urlsplit(self.workspace_token_url).scheme not in {"http", "https"}:
                 raise ValueError("WZB_WORKSPACE_TOKEN_URL must use http or https")
         if self.workspace_ca_file is not None and not self.workspace_ca_file.is_file():
             raise ValueError("WZB_WORKSPACE_CA_FILE must name a readable file")
+        control_required = (
+            self.workspace_control_url,
+            self.workspace_control_bootstrap_url,
+            self.workspace_control_hostname,
+            self.workspace_realm_uuid,
+            self.workspace_bridge_instance_uuid,
+            self.workspace_enrollment_secret_file,
+        )
+        if any(value is not None for value in control_required) and not all(
+            value is not None for value in control_required
+        ):
+            raise ValueError("Workspace control settings must be configured together")
+        if self.workspace_control_url is not None:
+            if urlsplit(self.workspace_control_url).scheme != "https":
+                raise ValueError("WZB_WORKSPACE_CONTROL_URL must use https")
+            assert self.workspace_control_bootstrap_url is not None
+            if urlsplit(self.workspace_control_bootstrap_url).scheme != "http":
+                raise ValueError("WZB_WORKSPACE_CONTROL_BOOTSTRAP_URL must use http")
+            assert self.workspace_enrollment_secret_file is not None
+            if not self.workspace_enrollment_secret_file.is_file():
+                raise ValueError(
+                    "WZB_WORKSPACE_ENROLLMENT_SECRET_FILE must name a readable file"
+                )
 
     @property
     def workspace_events_enabled(self) -> bool:
         return self.workspace_websocket_url is not None
+
+    @property
+    def workspace_control_enabled(self) -> bool:
+        return self.workspace_control_url is not None

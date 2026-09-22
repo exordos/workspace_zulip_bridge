@@ -547,8 +547,11 @@ async def _outbound_rejects_stream_properties_it_cannot_apply() -> None:
         "color": 1,
     }
     for property_name, value in (
+        ("owner_uuid", "10000000-0000-0000-0000-000000000003"),
         ("invite_only", True),
         ("announce", True),
+        ("direct_user_uuid", "10000000-0000-0000-0000-000000000004"),
+        ("private", True),
         ("color", 2),
         ("history_public_to_subscribers", False),
     ):
@@ -639,6 +642,16 @@ async def _outbound_rejects_direct_chat_and_cross_chat_mutations() -> None:
             {
                 **source_message,
                 "stream_uuid": "10000000-0000-0000-0000-000000000010",
+            },
+            None,
+        )
+    with pytest.raises(ZulipOutboundError, match="message authors"):
+        await writer._apply_messages(
+            UUID("10000000-0000-0000-0000-000000000009"),
+            source_message,
+            {
+                **source_message,
+                "author_uuid": "10000000-0000-0000-0000-000000000011",
             },
             None,
         )

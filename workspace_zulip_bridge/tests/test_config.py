@@ -208,3 +208,42 @@ def test_workspace_websocket_configuration_is_atomic(tmp_path: Path) -> None:
     }
     with pytest.raises(ValueError, match="ws or wss"):
         Settings.from_env(values)
+
+
+def test_workspace_password_and_control_configuration_is_atomic(
+    tmp_path: Path,
+) -> None:
+    password_file = tmp_path / "workspace.password"
+    password_file.write_text("secret\n")
+    enrollment_file = tmp_path / "enrollment.secret"
+    enrollment_file.write_text("enrollment-secret\n")
+    settings = Settings.from_env(
+        {
+            "WZB_ZULIP_CA_FILE": str(tmp_path / "zulip-ca.pem"),
+            "WZB_WORKSPACE_WEBSOCKET_URL": "wss://workspace.example/events/ws",
+            "WZB_WORKSPACE_PROJECT_ID": "10000000-0000-0000-0000-000000000001",
+            "WZB_WORKSPACE_PROVIDER_UUID": "10000000-0000-0000-0000-000000000002",
+            "WZB_WORKSPACE_TOKEN_FILE": str(tmp_path / "workspace.token"),
+            "WZB_WORKSPACE_USERNAME": "workspace-zulip-bridge",
+            "WZB_WORKSPACE_PASSWORD_FILE": str(password_file),
+            "WZB_WORKSPACE_CONTROL_URL": "https://control.example:21443",
+            "WZB_WORKSPACE_CONTROL_BOOTSTRAP_URL": "http://control.example:21085",
+            "WZB_WORKSPACE_CONTROL_HOSTNAME": "control.example",
+            "WZB_WORKSPACE_REALM_UUID": "10000000-0000-0000-0000-000000000003",
+            "WZB_WORKSPACE_BRIDGE_INSTANCE_UUID": (
+                "10000000-0000-0000-0000-000000000004"
+            ),
+            "WZB_WORKSPACE_ENROLLMENT_SECRET_FILE": str(enrollment_file),
+            "WZB_WORKSPACE_CONTROL_STATE_DIR": str(tmp_path / "control"),
+        }
+    )
+
+    assert settings.workspace_events_enabled
+    assert settings.workspace_control_enabled
+    assert settings.workspace_username == "workspace-zulip-bridge"
+    assert settings.workspace_control_state_dir == tmp_path / "control"
+
+    with pytest.raises(ValueError, match="configured together"):
+        Settings.from_env(
+            {"WZB_WORKSPACE_CONTROL_URL": "https://control.example:21443"}
+        )

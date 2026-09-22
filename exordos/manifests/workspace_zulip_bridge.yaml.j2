@@ -7,8 +7,52 @@ api_version: "v1"
 requirements:
   core:
     from_version: "0.0.0"
+  workspace:
+    from_version: "1.2.5-dev"
+
+imports:
+  core_local_domain:
+    element: "$core"
+    kind: "resource"
+    link: "$core.dns.domains.$local_domain"
+  workspace_backend_node:
+    element: "$workspace"
+    kind: "resource"
+    link: "$core.compute.nodes.$workspace_backend"
+  workspace_zulip_bridge_enrollment_secret:
+    element: "$workspace"
+    kind: "resource"
+    link: "$core.secret.passwords.$workspace_zulip_bridge_enrollment_secret"
+  workspace_provider_sync_role:
+    element: "$workspace"
+    kind: "resource"
+    link: "$core.iam.roles.$workspace_provider_sync"
 
 resources:
+  $core.secret.passwords:
+    workspace_zulip_bridge_user_password:
+      name: workspace_zulip_bridge_user_password
+      description: "Workspace Zulip bridge IAM service password"
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      constructor:
+        kind: plain
+      method: AUTO_HEX
+
+  $core.iam.users:
+    workspace_zulip_bridge_user:
+      uuid: e4fb8a07-a393-5dd5-843f-0a473e0c4dd5
+      username: workspace-zulip-bridge
+      first_name: "Workspace Zulip bridge"
+      last_name: "service account"
+      email: "noreply+workspace-zulip-bridge@exordos.com"
+      password: $core.secret.passwords.$workspace_zulip_bridge_user_password:value
+
+  $core.iam.rolebinding:
+    workspace_zulip_bridge_provider_sync:
+      role: $workspace_zulip_bridge.imports.$workspace_provider_sync_role:uuid
+      user: $core.iam.users.$workspace_zulip_bridge_user:uuid
+      project: "fe02e55d-4548-4b3e-a175-fcae928f41b2"
+
   $core.compute.nodes:
     bridge_node:
       name: "workspace-zulip-bridge"
@@ -24,6 +68,96 @@ resources:
             label: root
           - size: 20
             label: data
+
+  $core.config.configs:
+    workspace_zulip_bridge_config:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/workspace_zulip_bridge/bridge.env
+      mode: "0640"
+      owner: root
+      group: workspace_zulip_bridge
+      target:
+        kind: node
+        node: $core.compute.nodes.$bridge_node:uuid
+      on_change:
+        kind: shell
+        command: systemctl restart workspace-zulip-bridge
+      body:
+        kind: text
+        content: |
+          f"
+          WZB_DATABASE_DSN=postgresql:///workspace_zulip_bridge?host=/var/run/postgresql
+          WZB_DB_POOL_MIN_SIZE=2
+          WZB_DB_POOL_MAX_SIZE=16
+          WZB_ZULIP_CA_FILE=/var/lib/workspace_zulip_bridge/control/zulip-ca.pem
+          WZB_WORKSPACE_WEBSOCKET_URL=ws://workspace-backend.{$workspace_zulip_bridge.imports.$core_local_domain:name}/api/workspace/v1/events/ws
+          WZB_WORKSPACE_API_URL=http://workspace-backend.{$workspace_zulip_bridge.imports.$core_local_domain:name}/api/workspace/v1/messenger
+          WZB_WORKSPACE_PROJECT_ID=fe02e55d-4548-4b3e-a175-fcae928f41b2
+          WZB_WORKSPACE_PROVIDER_UUID={$workspace_zulip_bridge.imports.$workspace_zulip_bridge_enrollment_secret:uuid}
+          WZB_WORKSPACE_TOKEN_FILE=/var/lib/workspace_zulip_bridge/workspace.token
+          WZB_WORKSPACE_REFRESH_TOKEN_FILE=/var/lib/workspace_zulip_bridge/workspace.refresh-token
+          WZB_WORKSPACE_TOKEN_URL=http://workspace-backend.{$workspace_zulip_bridge.imports.$core_local_domain:name}/api/core/v1/iam/clients/default/actions/get_token/invoke
+          WZB_WORKSPACE_USERNAME={$core.iam.users.$workspace_zulip_bridge_user:username}
+          WZB_WORKSPACE_PASSWORD_FILE=/etc/workspace_zulip_bridge/workspace.password
+          WZB_WORKSPACE_CONTROL_URL=https://workspace-bridge-control.{$workspace_zulip_bridge.imports.$core_local_domain:name}:21443
+          WZB_WORKSPACE_CONTROL_BOOTSTRAP_URL=http://workspace-bridge-control.{$workspace_zulip_bridge.imports.$core_local_domain:name}:21085
+          WZB_WORKSPACE_CONTROL_HOSTNAME=workspace-bridge-control.{$workspace_zulip_bridge.imports.$core_local_domain:name}
+          WZB_WORKSPACE_REALM_UUID={$workspace_zulip_bridge.imports.$core_local_domain:uuid}
+          WZB_WORKSPACE_BRIDGE_INSTANCE_UUID={$workspace_zulip_bridge.imports.$workspace_zulip_bridge_enrollment_secret:uuid}
+          WZB_WORKSPACE_ENROLLMENT_SECRET_FILE=/etc/workspace_zulip_bridge/enrollment.secret
+          WZB_WORKSPACE_CONTROL_STATE_DIR=/var/lib/workspace_zulip_bridge/control
+          WZB_LOG_LEVEL=INFO
+          "
+    workspace_zulip_bridge_user_password:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/workspace_zulip_bridge/workspace.password
+      mode: "0640"
+      owner: root
+      group: workspace_zulip_bridge
+      target:
+        kind: node
+        node: $core.compute.nodes.$bridge_node:uuid
+      body:
+        kind: text
+        content: 'f"{$core.secret.passwords.$workspace_zulip_bridge_user_password:value}"'
+    workspace_zulip_bridge_enrollment_secret:
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      path: /etc/workspace_zulip_bridge/enrollment.secret
+      mode: "0640"
+      owner: root
+      group: workspace_zulip_bridge
+      target:
+        kind: node
+        node: $core.compute.nodes.$bridge_node:uuid
+      body:
+        kind: text
+        content: 'f"{$workspace_zulip_bridge.imports.$workspace_zulip_bridge_enrollment_secret:value}"'
+
+  $workspace_zulip_bridge.imports.$core_local_domain.records:
+    workspace_zulip_bridge:
+      domain: $workspace_zulip_bridge.imports.$core_local_domain:uuid
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      type: A
+      record:
+        kind: A
+        name: workspace-zulip-bridge
+        address: $core.compute.nodes.$bridge_node:default_network:ipv4
+    workspace_backend:
+      domain: $workspace_zulip_bridge.imports.$core_local_domain:uuid
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      type: A
+      record:
+        kind: A
+        name: workspace-backend
+        address: $workspace_zulip_bridge.imports.$workspace_backend_node:default_network:ipv4
+    workspace_bridge_control:
+      domain: $workspace_zulip_bridge.imports.$core_local_domain:uuid
+      project_id: "12345678-c625-4fee-81d5-f691897b8142"
+      type: A
+      record:
+        kind: A
+        name: workspace-bridge-control
+        address: $workspace_zulip_bridge.imports.$workspace_backend_node:default_network:ipv4
 
 exports:
   bridge_node:

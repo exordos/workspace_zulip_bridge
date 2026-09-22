@@ -45,20 +45,35 @@ class WorkspaceTokenManager:
     async def access_token(self, *, force_refresh: bool = False) -> str:
         async with self._lock:
             if self._access_token is None:
-                self._access_token = await asyncio.to_thread(
-                    _read_token, self._access_path
-                )
+                if self._access_path.is_file():
+                    self._access_token = await asyncio.to_thread(
+                        _read_token, self._access_path
+                    )
+                else:
+                    return await self._password_login()
             access_token = self._access_token
             if not force_refresh and not _expires_soon(access_token):
                 return access_token
-            if self._refresh_path is None:
-                return access_token
-            if self._refresh_token is None:
+            if self._refresh_path is not None and self._refresh_token is None:
+                if not self._refresh_path.is_file():
+                    return await self._password_login()
                 self._refresh_token = await asyncio.to_thread(
                     _read_token, self._refresh_path
                 )
+            if self._refresh_token is None:
+                if self._settings.workspace_username is not None:
+                    return await self._password_login()
+                return access_token
             refresh_token = self._refresh_token
-            response = await self._refresh(refresh_token)
+            try:
+                response = await self._refresh(refresh_token)
+            except RuntimeError:
+                if self._settings.workspace_username is None:
+                    raise
+                self._refresh_token = None
+                if self._refresh_path is not None:
+                    await asyncio.to_thread(self._refresh_path.unlink, True)
+                return await self._password_login()
             refreshed_access_token = _response_token(response, "access_token")
             assert refreshed_access_token is not None
             access_token = refreshed_access_token
@@ -68,6 +83,7 @@ class WorkspaceTokenManager:
             self._access_token = access_token
             await asyncio.to_thread(_write_token, self._access_path, access_token)
             if next_refresh_token is not None:
+                assert self._refresh_path is not None
                 self._refresh_token = next_refresh_token
                 await asyncio.to_thread(
                     _write_token,
@@ -75,6 +91,52 @@ class WorkspaceTokenManager:
                     next_refresh_token,
                 )
             return access_token
+
+    async def _password_login(self) -> str:
+        if (
+            self._token_url is None
+            or self._settings.workspace_username is None
+            or self._settings.workspace_password_file is None
+        ):
+            raise RuntimeError("Workspace password login is not configured")
+        password = await asyncio.to_thread(
+            _read_secret,
+            self._settings.workspace_password_file,
+        )
+        async with httpx.AsyncClient(
+            verify=self._verify,
+            timeout=httpx.Timeout(self._timeout),
+            transport=self._transport,
+        ) as client:
+            response = await client.post(
+                self._token_url,
+                data={
+                    "grant_type": "login+password",
+                    "login": self._settings.workspace_username,
+                    "password": password,
+                    "scope": (
+                        "openid email profile "
+                        f"project:{self._settings.workspace_project_id}"
+                    ),
+                    "ttl": "3600",
+                    "refresh_ttl": "31536000",
+                },
+                headers={"Accept": "application/json"},
+            )
+        value = _token_response(response, "login")
+        access_token = _response_token(value, "access_token")
+        assert access_token is not None
+        refresh_token = _response_token(value, "refresh_token", required=False)
+        self._access_token = access_token
+        await asyncio.to_thread(_write_token, self._access_path, access_token)
+        if refresh_token is not None and self._refresh_path is not None:
+            self._refresh_token = refresh_token
+            await asyncio.to_thread(
+                _write_token,
+                self._refresh_path,
+                refresh_token,
+            )
+        return access_token
 
     async def _refresh(self, refresh_token: str) -> dict[str, Any]:
         if self._token_url is None:
@@ -96,26 +158,7 @@ class WorkspaceTokenManager:
                 },
                 headers={"Accept": "application/json"},
             )
-        if response.is_error:
-            error_code = "unknown"
-            try:
-                payload = response.json()
-            except ValueError:
-                payload = None
-            if isinstance(payload, dict):
-                value = payload.get("error")
-                if isinstance(value, str) and re.fullmatch(
-                    r"[A-Za-z0-9._-]{1,128}", value
-                ):
-                    error_code = value
-            raise RuntimeError(
-                "Workspace token refresh returned "
-                f"{response.status_code} error={error_code}"
-            )
-        value = response.json()
-        if not isinstance(value, dict):
-            raise RuntimeError("Workspace token refresh returned invalid JSON")
-        return value
+        return _token_response(response, "refresh")
 
 
 def _token_url(settings: Settings) -> str | None:
@@ -142,6 +185,13 @@ def _read_token(path: Path) -> str:
     if not token or any(character.isspace() for character in token):
         raise ValueError(f"{path.name} must contain one token")
     return token
+
+
+def _read_secret(path: Path) -> str:
+    value = path.read_text(encoding="utf-8").strip()
+    if not value or "\0" in value or "\n" in value or "\r" in value:
+        raise ValueError(f"{path.name} must contain one secret")
+    return value
 
 
 def _write_token(path: Path, token: str) -> None:
@@ -180,3 +230,24 @@ def _response_token(
     if any(character.isspace() for character in token):
         raise RuntimeError(f"Workspace token refresh returned invalid {name}")
     return token
+
+
+def _token_response(response: httpx.Response, operation: str) -> dict[str, Any]:
+    if response.is_error:
+        error_code = "unknown"
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict):
+            value = payload.get("error")
+            if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,128}", value):
+                error_code = value
+        raise RuntimeError(
+            f"Workspace token {operation} returned "
+            f"{response.status_code} error={error_code}"
+        )
+    value = response.json()
+    if not isinstance(value, dict):
+        raise RuntimeError(f"Workspace token {operation} returned invalid JSON")
+    return value

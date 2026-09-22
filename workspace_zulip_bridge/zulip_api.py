@@ -3,6 +3,7 @@
 
 import hashlib
 import json
+import ssl
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -195,8 +196,13 @@ class ZulipApiClient:
         self._chat_fill_timeout_seconds = chat_fill_timeout_seconds
         self._message_page_size = message_page_size
         self._auth = httpx.BasicAuth(login, api_key)
+        verify: bool | ssl.SSLContext = True
+        if ca_file is not None:
+            context = ssl.create_default_context()
+            context.load_verify_locations(cafile=ca_file)
+            verify = context
         self._client = httpx.Client(
-            verify=str(ca_file) if ca_file is not None else True,
+            verify=verify,
             follow_redirects=False,
             trust_env=False,
             limits=httpx.Limits(max_connections=1, max_keepalive_connections=1),

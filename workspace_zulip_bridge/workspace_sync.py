@@ -177,8 +177,12 @@ class WorkspaceBootstrapper:
         self._project_uuid = settings.workspace_project_id
         self._tokens = tokens or WorkspaceTokenManager(settings)
         self._next_identity_sync_at = 0.0
+        self._registered = False
 
     async def ensure(self) -> bool:
+        if not self._registered:
+            await self._register_provider()
+            self._registered = True
         row = await self._pool.fetchrow(
             """
             SELECT mirror.bootstrap_status, mirror.active_generation,
@@ -204,6 +208,45 @@ class WorkspaceBootstrapper:
             return False
         await self.bootstrap()
         return True
+
+    async def _register_provider(self) -> None:
+        verify: bool | str = (
+            True
+            if self._settings.workspace_ca_file is None
+            else str(self._settings.workspace_ca_file)
+        )
+        async with httpx.AsyncClient(
+            verify=verify,
+            timeout=httpx.Timeout(self._settings.workspace_request_timeout_seconds),
+        ) as client:
+            client.headers["Authorization"] = (
+                f"Bearer {await self._tokens.access_token()}"
+            )
+            response = await client.put(
+                f"{workspace_api_url(self._settings)}/provider/registration",
+                json={"provider_uuid": str(self._provider_uuid), "name": "zulip"},
+            )
+            if response.status_code == 401:
+                client.headers["Authorization"] = (
+                    f"Bearer {await self._tokens.access_token(force_refresh=True)}"
+                )
+                response = await client.put(
+                    f"{workspace_api_url(self._settings)}/provider/registration",
+                    json={
+                        "provider_uuid": str(self._provider_uuid),
+                        "name": "zulip",
+                    },
+                )
+        if response.is_error:
+            raise _provider_api_error(response)
+        registration = _json_object(response.json())
+        if (
+            UUID(str(registration["provider_uuid"])) != self._provider_uuid
+            or UUID(str(registration["project_id"])) != self._project_uuid
+            or registration.get("name") != "zulip"
+            or registration.get("enabled") is not True
+        ):
+            raise ValueError("invalid Workspace provider registration")
 
     async def bootstrap(self, client: httpx.AsyncClient | None = None) -> None:
         await self._pool.execute(
@@ -1953,11 +1996,15 @@ class WorkspaceDiffWorker:
                     retry_cap_seconds=self._settings.zulip_retry_cap_seconds,
                 )
             except Exception as exc:
-                LOG.exception("Workspace-to-Zulip mutation failed")
+                error_category = f"unexpected_error:{type(exc).__name__}"
+                LOG.error(
+                    "Workspace-to-Zulip mutation failed error=%s",
+                    error_category,
+                )
                 await self._mark(
                     [row],
                     "failed",
-                    str(exc)[:2048],
+                    error_category,
                     retry_base_seconds=self._settings.zulip_retry_base_seconds,
                     retry_cap_seconds=self._settings.zulip_retry_cap_seconds,
                 )
@@ -2554,10 +2601,19 @@ def _equivalent_entity(
 ) -> bool:
     if source is None or target is None:
         return source is target
-    return _normalized_entity(entity_type, source) == _normalized_entity(
-        entity_type,
-        target,
-    )
+    normalized_source = _normalized_entity(entity_type, source)
+    normalized_target = _normalized_entity(entity_type, target)
+    if (
+        entity_type == "streams"
+        and target.get("history_public_to_subscribers") is not None
+    ):
+        normalized_source["history_public_to_subscribers"] = bool(
+            source.get("history_public_to_subscribers", False)
+        )
+        normalized_target["history_public_to_subscribers"] = bool(
+            target["history_public_to_subscribers"]
+        )
+    return normalized_source == normalized_target
 
 
 def _normalized_entity(entity_type: str, data: dict[str, Any]) -> dict[str, Any]:

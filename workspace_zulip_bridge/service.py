@@ -15,6 +15,7 @@ from workspace_zulip_bridge.database import probe_database
 from workspace_zulip_bridge.event_processor import ZulipEventProcessor
 from workspace_zulip_bridge.event_store import EventStore
 from workspace_zulip_bridge.workspace_auth import WorkspaceTokenManager
+from workspace_zulip_bridge.workspace_control import WorkspaceControlWorker
 from workspace_zulip_bridge.workspace_events import WorkspaceEventReceiver
 from workspace_zulip_bridge.workspace_sync import WorkspaceBootstrapper
 from workspace_zulip_bridge.workspace_sync import WorkspaceDiffWorker
@@ -63,6 +64,14 @@ class BridgeService:
                 event_processor_task,
                 stop_task,
             ]
+            if self._settings.workspace_control_enabled:
+                control_worker = WorkspaceControlWorker(pool, self._settings)
+                supervised_tasks.append(
+                    asyncio.create_task(
+                        control_worker.run(),
+                        name="workspace-control",
+                    )
+                )
             if self._settings.workspace_events_enabled:
                 tokens = WorkspaceTokenManager(self._settings)
                 bootstrapper = WorkspaceBootstrapper(pool, self._settings, tokens)

@@ -17,7 +17,9 @@ classifiers = [
 ]
 dependencies = [
     "asyncpg>=0.31.0,<1.0.0",  # Apache-2.0
+    "cryptography>=45.0.0,<47.0.0",  # Apache-2.0 OR BSD-3-Clause
     "httpx>=0.28.1,<1.0.0",  # BSD-3-Clause
+    "pyhpke>=0.6.4,<0.7.0",  # MIT
     "websockets>=15.0.1,<17.0.0",  # BSD-3-Clause
     "uvloop>=0.22.1,<1.0.0; python_version < '3.14'",  # MIT OR Apache-2.0
 ]

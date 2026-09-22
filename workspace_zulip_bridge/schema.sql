@@ -44,6 +44,11 @@ CREATE INDEX IF NOT EXISTS zulip_users_live_presence_idx
 
 CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_connections (
     uuid uuid PRIMARY KEY,
+    external_account_uuid uuid UNIQUE,
+    owner_workspace_user_uuid uuid,
+    desired_generation bigint CHECK (
+        desired_generation IS NULL OR desired_generation > 0
+    ),
     realm_uuid uuid NOT NULL
         REFERENCES workspace_zulip_bridge.zulip_realms (uuid) ON DELETE CASCADE,
     zulip_user_uuid uuid NOT NULL UNIQUE
