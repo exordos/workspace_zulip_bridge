@@ -31,6 +31,7 @@ def test_defaults_use_local_postgresql_socket() -> None:
     assert settings.workspace_sync_plan_batch_size == 50000
     assert settings.workspace_sync_batch_size == 500
     assert settings.workspace_sync_workers == 2
+    assert settings.workspace_reconciliation_interval_seconds == 300.0
 
 
 def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
@@ -73,6 +74,7 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
             "WZB_WORKSPACE_SYNC_PLAN_BATCH_SIZE": "2500",
             "WZB_WORKSPACE_SYNC_BATCH_SIZE": "250",
             "WZB_WORKSPACE_SYNC_WORKERS": "4",
+            "WZB_WORKSPACE_RECONCILIATION_INTERVAL_SECONDS": "45",
         }
     )
 
@@ -105,6 +107,7 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
     assert settings.workspace_sync_plan_batch_size == 2500
     assert settings.workspace_sync_batch_size == 250
     assert settings.workspace_sync_workers == 4
+    assert settings.workspace_reconciliation_interval_seconds == 45.0
 
 
 @pytest.mark.parametrize(
@@ -123,6 +126,7 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
         ("WZB_EVENT_PROCESSOR_BATCH_SIZE", "0"),
         ("WZB_EVENT_PROCESSOR_BATCH_SIZE", "10001"),
         ("WZB_EVENT_PROCESSOR_POLL_SECONDS", "0"),
+        ("WZB_WORKSPACE_RECONCILIATION_INTERVAL_SECONDS", "0"),
         ("WZB_EVENT_PROCESSOR_CLAIM_TIMEOUT_SECONDS", "0"),
         ("WZB_EVENT_PROCESSOR_MAX_ATTEMPTS", "0"),
         ("WZB_EVENT_PROCESSOR_RETRY_BASE_SECONDS", "0"),

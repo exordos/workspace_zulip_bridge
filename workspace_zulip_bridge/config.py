@@ -91,6 +91,7 @@ class Settings:
     workspace_sync_plan_batch_size: int = 50000
     workspace_sync_batch_size: int = 500
     workspace_sync_workers: int = 2
+    workspace_reconciliation_interval_seconds: float = 300.0
     workspace_control_url: str | None = None
     workspace_control_bootstrap_url: str | None = None
     workspace_control_hostname: str | None = None
@@ -258,6 +259,9 @@ class Settings:
                 source, "WZB_WORKSPACE_SYNC_BATCH_SIZE", 500
             ),
             workspace_sync_workers=_read_int(source, "WZB_WORKSPACE_SYNC_WORKERS", 2),
+            workspace_reconciliation_interval_seconds=_read_float(
+                source, "WZB_WORKSPACE_RECONCILIATION_INTERVAL_SECONDS", 300.0
+            ),
             workspace_control_url=(source.get("WZB_WORKSPACE_CONTROL_URL") or None),
             workspace_control_bootstrap_url=(
                 source.get("WZB_WORKSPACE_CONTROL_BOOTSTRAP_URL") or None
@@ -342,6 +346,9 @@ class Settings:
                 self.workspace_request_timeout_seconds
             ),
             "WZB_WORKSPACE_SYNC_POLL_SECONDS": self.workspace_sync_poll_seconds,
+            "WZB_WORKSPACE_RECONCILIATION_INTERVAL_SECONDS": (
+                self.workspace_reconciliation_interval_seconds
+            ),
             "WZB_WORKSPACE_CONTROL_POLL_SECONDS": (self.workspace_control_poll_seconds),
             "WZB_THREAD_STOP_TIMEOUT_SECONDS": self.thread_stop_timeout_seconds,
         }

@@ -26,6 +26,7 @@ from workspace_zulip_bridge.models import ZulipUserPresence
 from workspace_zulip_bridge.models import ZulipUserProfileStatus
 from workspace_zulip_bridge.models import ZulipUserTopic
 from workspace_zulip_bridge.stable_ids import stable_chat_uuid
+from workspace_zulip_bridge.workspace_entities import validate_description
 from workspace_zulip_bridge.zulip_api import ZulipApiError
 from workspace_zulip_bridge.zulip_api import parse_attachment
 
@@ -1430,13 +1431,14 @@ class ZulipEventProcessor:
             else:
                 parameters[property_name] = value
                 if property_name == "description":
-                    if not isinstance(value, str):
+                    try:
+                        description = validate_description(value)
+                    except ValueError:
                         return _Outcome(
                             item.event.uuid,
                             "failed",
                             "invalid_stream_description",
                         )
-                    description = value
                     if isinstance(payload.get("rendered_description"), str):
                         parameters["rendered_description"] = payload[
                             "rendered_description"

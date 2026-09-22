@@ -3,8 +3,11 @@
 
 import json
 
+import pytest
+
 from workspace_zulip_bridge.chat_catalog import ChatCatalogBuilder
 from workspace_zulip_bridge.models import RecentPrivateConversation
+from workspace_zulip_bridge.workspace_entities import WORKSPACE_DESCRIPTION_MAX_LENGTH
 
 
 def test_channel_parameters_and_membership_parameters_are_separated() -> None:
@@ -65,6 +68,35 @@ def test_channel_parameters_and_membership_parameters_are_separated() -> None:
         first_visible_message_ids={7: 105},
     )
     assert reordered.build().content_hash == catalog.content_hash
+
+
+def test_channel_description_accepts_ten_thousand_characters() -> None:
+    description = "x" * WORKSPACE_DESCRIPTION_MAX_LENGTH
+    builder = ChatCatalogBuilder(10, "Current User")
+
+    builder.add_subscriptions(
+        [{"stream_id": 7, "name": "Engineering", "description": description}]
+    )
+
+    assert (
+        json.loads(builder.build().chats[0].chat_parameters_json)["description"]
+        == description
+    )
+
+
+def test_channel_description_rejects_more_than_ten_thousand_characters() -> None:
+    builder = ChatCatalogBuilder(10, "Current User")
+
+    with pytest.raises(ValueError, match="must not exceed 10000 characters"):
+        builder.add_subscriptions(
+            [
+                {
+                    "stream_id": 7,
+                    "name": "Engineering",
+                    "description": "x" * (WORKSPACE_DESCRIPTION_MAX_LENGTH + 1),
+                }
+            ]
+        )
 
 
 def test_direct_conversations_are_deduplicated_by_sorted_participants() -> None:

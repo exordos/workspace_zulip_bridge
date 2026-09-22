@@ -48,6 +48,8 @@ from workspace_zulip_bridge.stable_ids import stable_user_uuid
 from workspace_zulip_bridge.workspace_events import WorkspaceEvent
 from workspace_zulip_bridge.workspace_events import WorkspaceEventReceiver
 from workspace_zulip_bridge.workspace_events import WorkspaceEventStore
+from workspace_zulip_bridge.workspace_sync import _SOURCE_TABLES
+from workspace_zulip_bridge.workspace_sync import ProviderApiError
 from workspace_zulip_bridge.workspace_sync import WorkspaceBootstrapper
 from workspace_zulip_bridge.workspace_sync import WorkspaceDiffWorker
 from workspace_zulip_bridge.workspace_sync import WorkspaceEventProcessor
@@ -101,6 +103,7 @@ async def _pool(dsn: str) -> asyncpg.Pool:
             """
             TRUNCATE workspace_zulip_bridge.sync_diffs,
                      workspace_zulip_bridge.sync_plan_cursors,
+                     workspace_zulip_bridge.sync_repair_cursors,
                      workspace_zulip_bridge.workspace_users,
                      workspace_zulip_bridge.workspace_streams,
                      workspace_zulip_bridge.workspace_stream_bindings,
@@ -2032,6 +2035,286 @@ def test_workspace_diff_worker_batches_and_converges(
     asyncio.run(_workspace_diff_worker_round_trip(_dsn(), tmp_path))
 
 
+def test_workspace_reconciliation_revisits_completed_sweeps(tmp_path: Path) -> None:
+    asyncio.run(_workspace_reconciliation_revisits_completed_sweeps(_dsn(), tmp_path))
+
+
+async def _workspace_reconciliation_revisits_completed_sweeps(
+    dsn: str,
+    tmp_path: Path,
+) -> None:
+    pool = await _pool(dsn)
+    provider_uuid = UUID("10000000-0000-0000-0000-0000000000a1")
+    project_uuid = UUID("10000000-0000-0000-0000-0000000000a2")
+    generation = UUID("10000000-0000-0000-0000-0000000000a3")
+    stream_uuid = UUID("10000000-0000-0000-0000-0000000000a4")
+    topic_uuid = UUID("10000000-0000-0000-0000-0000000000a5")
+    token_file = tmp_path / "workspace-reconciliation.token"
+    token_file.write_text("integration-token")
+    try:
+        async with pool.acquire() as connection:
+            owner_uuid = await _insert_user(connection, 101, 400)
+            realm_uuid = stable_realm_uuid(ENDPOINT)
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_realms
+                SET workspace_project_id = $2, workspace_provider_uuid = $3
+                WHERE uuid = $1
+                """,
+                realm_uuid,
+                project_uuid,
+                provider_uuid,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.workspace_mirror_state (
+                    provider_uuid, workspace_project_id, active_generation,
+                    bootstrap_status, reconciliation_version
+                ) VALUES ($1, $2, $3, 'ready', 2)
+                """,
+                provider_uuid,
+                project_uuid,
+                generation,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_streams (
+                    uuid, realm_uuid, chat_type, chat_key, name,
+                    owner_user_uuid, content_hash, source_connection_uuid
+                ) VALUES ($1, $2, 'channel', 'repair', 'Repair',
+                          $3, $4, $3)
+                """,
+                stream_uuid,
+                realm_uuid,
+                owner_uuid,
+                b"s" * 32,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_topics (
+                    uuid, zulip_stream_uuid, name, content_hash
+                ) VALUES ($1, $2, 'Recovered', $3)
+                """,
+                topic_uuid,
+                stream_uuid,
+                b"t" * 32,
+            )
+        settings = Settings.from_env(
+            {
+                "WZB_DATABASE_DSN": dsn,
+                "WZB_DB_POOL_MIN_SIZE": "1",
+                "WZB_DB_POOL_MAX_SIZE": "4",
+                "WZB_ZULIP_HISTORY_CONCURRENCY": "2",
+                "WZB_WORKSPACE_WEBSOCKET_URL": (
+                    "ws://workspace.test/api/workspace/v1/events/ws"
+                ),
+                "WZB_WORKSPACE_PROJECT_ID": str(project_uuid),
+                "WZB_WORKSPACE_PROVIDER_UUID": str(provider_uuid),
+                "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+                "WZB_WORKSPACE_RECONCILIATION_INTERVAL_SECONDS": "1",
+            }
+        )
+        worker = WorkspaceDiffWorker(pool, settings)
+
+        assert (
+            await worker._repair_entity(
+                "topics", _SOURCE_TABLES["topics"], realm_uuid, generation
+            )
+            == 1
+        )
+        assert (
+            await worker._repair_entity(
+                "topics", _SOURCE_TABLES["topics"], realm_uuid, generation
+            )
+            == 0
+        )
+        await pool.execute(
+            """
+            DELETE FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1 AND entity_type = 'topics'
+              AND entity_uuid = $2
+            """,
+            provider_uuid,
+            topic_uuid,
+        )
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.sync_repair_cursors
+            SET source_updated_at = NULL, entity_uuid = NULL,
+                next_run_at = clock_timestamp() - interval '1 second'
+            WHERE provider_uuid = $1 AND entity_type = 'topics'
+            """,
+            provider_uuid,
+        )
+
+        assert (
+            await worker._repair_entity(
+                "topics", _SOURCE_TABLES["topics"], realm_uuid, generation
+            )
+            == 1
+        )
+    finally:
+        await pool.close()
+
+
+def test_workspace_diff_dependencies_gate_children_and_batch_errors_isolate(
+    tmp_path: Path,
+) -> None:
+    asyncio.run(
+        _workspace_diff_dependencies_gate_children_and_batch_errors_isolate(
+            _dsn(), tmp_path
+        )
+    )
+
+
+async def _workspace_diff_dependencies_gate_children_and_batch_errors_isolate(
+    dsn: str,
+    tmp_path: Path,
+) -> None:
+    pool = await _pool(dsn)
+    provider_uuid = UUID("10000000-0000-0000-0000-0000000000b1")
+    project_uuid = UUID("10000000-0000-0000-0000-0000000000b2")
+    generation = UUID("10000000-0000-0000-0000-0000000000b3")
+    stream_uuid = UUID("10000000-0000-0000-0000-0000000000b4")
+    topic_uuid = UUID("10000000-0000-0000-0000-0000000000b5")
+    message_uuid = UUID("10000000-0000-0000-0000-0000000000b6")
+    second_uuid = UUID("10000000-0000-0000-0000-0000000000b7")
+    claimed_at = datetime(2026, 9, 22, tzinfo=UTC)
+    token_file = tmp_path / "workspace-dependencies.token"
+    token_file.write_text("integration-token")
+    try:
+        async with pool.acquire() as connection:
+            user_uuid = await _insert_user(connection, 111, 400)
+            realm_uuid = stable_realm_uuid(ENDPOINT)
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_realms
+                SET workspace_project_id = $2, workspace_provider_uuid = $3
+                WHERE uuid = $1
+                """,
+                realm_uuid,
+                project_uuid,
+                provider_uuid,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.workspace_mirror_state (
+                    provider_uuid, workspace_project_id, active_generation,
+                    bootstrap_status
+                ) VALUES ($1, $2, $3, 'ready')
+                """,
+                provider_uuid,
+                project_uuid,
+                generation,
+            )
+            for table, entity_uuid in (
+                ("users", user_uuid),
+                ("streams", stream_uuid),
+            ):
+                await connection.execute(
+                    f"""
+                    INSERT INTO workspace_zulip_bridge.workspace_{table} (
+                        provider_uuid, snapshot_generation, uuid,
+                        workspace_project_id, content_hash, source_updated_at, data
+                    ) VALUES ($1, $2, $3, $4, $5, clock_timestamp(), '{{}}'::jsonb)
+                    """,
+                    provider_uuid,
+                    generation,
+                    entity_uuid,
+                    project_uuid,
+                    b"x" * 32,
+                )
+            await connection.executemany(
+                """
+                INSERT INTO workspace_zulip_bridge.sync_diffs (
+                    provider_uuid, entity_type, entity_uuid, realm_uuid,
+                    partition_key, direction, processing_status,
+                    source_updated_at, attempt_count, claimed_at
+                ) VALUES ($1, 'messages', $2, $3, $4, 'to_workspace',
+                          'processing', clock_timestamp(), 1, $5)
+                """,
+                [
+                    (provider_uuid, message_uuid, realm_uuid, stream_uuid, claimed_at),
+                    (provider_uuid, second_uuid, realm_uuid, stream_uuid, claimed_at),
+                ],
+            )
+        settings = Settings.from_env(
+            {
+                "WZB_DATABASE_DSN": dsn,
+                "WZB_DB_POOL_MIN_SIZE": "1",
+                "WZB_DB_POOL_MAX_SIZE": "4",
+                "WZB_ZULIP_HISTORY_CONCURRENCY": "2",
+                "WZB_WORKSPACE_WEBSOCKET_URL": (
+                    "ws://workspace.test/api/workspace/v1/events/ws"
+                ),
+                "WZB_WORKSPACE_PROJECT_ID": str(project_uuid),
+                "WZB_WORKSPACE_PROVIDER_UUID": str(provider_uuid),
+                "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+            }
+        )
+        worker = WorkspaceDiffWorker(pool, settings)
+        rows = await pool.fetch(
+            """
+            SELECT * FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1 ORDER BY entity_uuid
+            """,
+            provider_uuid,
+        )
+        message_data = {
+            "stream_uuid": str(stream_uuid),
+            "topic_uuid": str(topic_uuid),
+            "author_uuid": str(user_uuid),
+        }
+        candidate = (
+            rows[0],
+            message_data,
+            b"m" * 32,
+            {"action": "upsert", "type": "messages", "uuid": str(message_uuid)},
+        )
+
+        ready, deferred = await worker._partition_dependency_ready([candidate])
+        assert ready == []
+        assert deferred == [rows[0]]
+
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.workspace_topics (
+                provider_uuid, snapshot_generation, uuid,
+                workspace_project_id, content_hash, source_updated_at, data
+            ) VALUES ($1, $2, $3, $4, $5, clock_timestamp(), '{}'::jsonb)
+            """,
+            provider_uuid,
+            generation,
+            topic_uuid,
+            project_uuid,
+            b"t" * 32,
+        )
+        ready, deferred = await worker._partition_dependency_ready([candidate])
+        assert ready == [candidate]
+        assert deferred == []
+
+        await worker._isolate_provider_failure(
+            [(rows[0], message_data, b"m" * 32), (rows[1], message_data, b"n" * 32)],
+            ProviderApiError(422, "invalid_entity", 0),
+        )
+        states = await pool.fetch(
+            """
+            SELECT entity_uuid, processing_status, attempt_count, last_error
+            FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1 ORDER BY entity_uuid
+            """,
+            provider_uuid,
+        )
+        assert states[0]["processing_status"] == "failed"
+        assert states[0]["attempt_count"] == 1
+        assert states[0]["last_error"].endswith("item_index=0")
+        assert states[1]["processing_status"] == "pending"
+        assert states[1]["attempt_count"] == 0
+        assert states[1]["last_error"] == "workspace_batch_rolled_back item_index=0"
+    finally:
+        await pool.close()
+
+
 def test_workspace_diff_completion_requires_current_claim() -> None:
     asyncio.run(_workspace_diff_completion_requires_current_claim(_dsn()))
 
@@ -3117,7 +3400,7 @@ async def _workspace_diff_planner_schedules_unready_entity_graph(
                 """,
                 provider_uuid,
             )
-            == 1
+            == 2
         )
     finally:
         await pool.close()

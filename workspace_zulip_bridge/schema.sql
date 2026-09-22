@@ -583,6 +583,24 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.sync_plan_cursors (
     PRIMARY KEY (provider_uuid, entity_type)
 );
 
+CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.sync_repair_cursors (
+    provider_uuid uuid NOT NULL,
+    entity_type text NOT NULL CHECK (entity_type IN (
+        'users', 'streams', 'stream_bindings', 'topics', 'topic_bindings',
+        'messages', 'message_flags', 'message_reactions'
+    )),
+    snapshot_generation uuid NOT NULL,
+    source_updated_at timestamptz,
+    entity_uuid uuid,
+    next_run_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (provider_uuid, entity_type)
+);
+CREATE INDEX IF NOT EXISTS sync_repair_cursors_due_idx
+    ON workspace_zulip_bridge.sync_repair_cursors
+        (next_run_at, provider_uuid, entity_type);
+
 CREATE OR REPLACE FUNCTION workspace_zulip_bridge.touch_updated_at()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -604,7 +622,7 @@ BEGIN
         'workspace_users', 'workspace_streams', 'workspace_stream_bindings',
         'workspace_topics', 'workspace_topic_bindings', 'workspace_messages',
         'workspace_message_flags', 'workspace_message_reactions', 'sync_diffs',
-        'sync_plan_cursors'
+        'sync_plan_cursors', 'sync_repair_cursors'
     ] LOOP
         EXECUTE format(
             'DROP TRIGGER IF EXISTS %I ON workspace_zulip_bridge.%I',

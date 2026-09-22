@@ -1,9 +1,12 @@
 # Copyright 2026 Genesis Corporation
 # Licensed under the Apache License, Version 2.0 (the "License").
 
+from uuid import UUID
+
 import httpx
 
 from workspace_zulip_bridge.config import Settings
+from workspace_zulip_bridge.workspace_sync import _entity_dependencies
 from workspace_zulip_bridge.workspace_sync import _equivalent_entity
 from workspace_zulip_bridge.workspace_sync import _provider_api_error
 from workspace_zulip_bridge.workspace_sync import _reaction_identity
@@ -36,6 +39,44 @@ def test_provider_api_error_rejects_untrusted_error_code() -> None:
 
     assert str(_provider_api_error(response)) == (
         "Workspace Provider API returned 500 error=unknown"
+    )
+
+
+def test_provider_api_error_preserves_safe_item_index() -> None:
+    response = httpx.Response(
+        422,
+        json={
+            "error": "invalid_entity",
+            "item_index": 17,
+            "message": "private message content",
+        },
+    )
+
+    error = _provider_api_error(response)
+
+    assert error.item_index == 17
+    assert str(error) == (
+        "Workspace Provider API returned 422 error=invalid_entity item_index=17"
+    )
+    assert "private message content" not in str(error)
+
+
+def test_message_dependencies_include_container_and_author() -> None:
+    stream_uuid = UUID("10000000-0000-0000-0000-000000000001")
+    topic_uuid = UUID("10000000-0000-0000-0000-000000000002")
+    author_uuid = UUID("10000000-0000-0000-0000-000000000003")
+
+    assert _entity_dependencies(
+        "messages",
+        {
+            "stream_uuid": str(stream_uuid),
+            "topic_uuid": str(topic_uuid),
+            "author_uuid": str(author_uuid),
+        },
+    ) == (
+        ("streams", stream_uuid),
+        ("topics", topic_uuid),
+        ("users", author_uuid),
     )
 
 

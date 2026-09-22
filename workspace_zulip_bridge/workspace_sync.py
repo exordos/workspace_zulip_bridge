@@ -25,6 +25,7 @@ from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.stable_ids import stable_topic_binding_uuid
 from workspace_zulip_bridge.stable_ids import stable_topic_uuid
 from workspace_zulip_bridge.workspace_auth import WorkspaceTokenManager
+from workspace_zulip_bridge.workspace_entities import validate_entity
 from workspace_zulip_bridge.zulip_api import ZulipApiError
 from workspace_zulip_bridge.zulip_outbound import ZulipOutboundError
 from workspace_zulip_bridge.zulip_outbound import ZulipOutboundPending
@@ -43,7 +44,25 @@ ENTITY_TYPES = (
     "message_reactions",
 )
 PRIORITY = {entity_type: index for index, entity_type in enumerate(ENTITY_TYPES)}
-RECONCILIATION_VERSION = 1
+RECONCILIATION_VERSION = 2
+
+
+class ProviderApiError(RuntimeError):
+    """Safe, structured Provider API failure details."""
+
+    def __init__(
+        self,
+        status_code: int,
+        error_code: str,
+        item_index: int | None,
+    ) -> None:
+        self.status_code = status_code
+        self.error_code = error_code
+        self.item_index = item_index
+        suffix = "" if item_index is None else f" item_index={item_index}"
+        super().__init__(
+            f"Workspace Provider API returned {status_code} error={error_code}{suffix}"
+        )
 
 
 def canonical_hash(data: Mapping[str, Any]) -> bytes:
@@ -72,8 +91,49 @@ def _json_object(value: Any) -> dict[str, Any]:
     return value
 
 
-def _provider_api_error(response: httpx.Response) -> RuntimeError:
+def _entity_dependencies(
+    entity_type: str,
+    data: Mapping[str, Any],
+) -> tuple[tuple[str, UUID], ...]:
+    fields = {
+        "streams": (("users", "owner_uuid"), ("users", "direct_user_uuid")),
+        "stream_bindings": (
+            ("streams", "stream_uuid"),
+            ("users", "user_uuid"),
+            ("users", "who_uuid"),
+        ),
+        "topics": (("streams", "stream_uuid"),),
+        "topic_bindings": (
+            ("streams", "stream_uuid"),
+            ("topics", "topic_uuid"),
+            ("users", "user_uuid"),
+        ),
+        "messages": (
+            ("streams", "stream_uuid"),
+            ("topics", "topic_uuid"),
+            ("users", "author_uuid"),
+        ),
+        "message_flags": (
+            ("streams", "stream_uuid"),
+            ("messages", "message_uuid"),
+            ("users", "user_uuid"),
+        ),
+        "message_reactions": (
+            ("messages", "message_uuid"),
+            ("users", "user_uuid"),
+        ),
+    }.get(entity_type, ())
+    dependencies = []
+    for dependency_type, field in fields:
+        value = data.get(field)
+        if value is not None:
+            dependencies.append((dependency_type, UUID(str(value))))
+    return tuple(dependencies)
+
+
+def _provider_api_error(response: httpx.Response) -> ProviderApiError:
     error_code = "unknown"
+    item_index = None
     try:
         payload = response.json()
     except ValueError:
@@ -89,9 +149,14 @@ def _provider_api_error(response: httpx.Response) -> RuntimeError:
             )
         ):
             error_code = candidate
-    return RuntimeError(
-        f"Workspace Provider API returned {response.status_code} error={error_code}"
-    )
+        candidate_index = payload.get("item_index")
+        if (
+            isinstance(candidate_index, int)
+            and not isinstance(candidate_index, bool)
+            and 0 <= candidate_index <= 1_000_000
+        ):
+            item_index = candidate_index
+    return ProviderApiError(response.status_code, error_code, item_index)
 
 
 def _bootstrap_error(error: BaseException) -> RuntimeError:
@@ -370,6 +435,8 @@ class WorkspaceBootstrapper:
                     record = _json_object(item)
                     if record.get("type") != entity_type:
                         raise ValueError("Workspace bootstrap entity type mismatch")
+                    data = _json_object(record["data"])
+                    validate_entity(entity_type, data)
                     digest.update(
                         (
                             json.dumps(
@@ -390,7 +457,7 @@ class WorkspaceBootstrapper:
                             self._project_uuid,
                             bytes.fromhex(str(record["content_hash"])),
                             _timestamp(str(record["source_updated_at"])),
-                            json.dumps(record["data"], separators=(",", ":")),
+                            json.dumps(data, separators=(",", ":")),
                         )
                     )
                     if len(buffers[entity_type]) >= 5000:
@@ -952,6 +1019,7 @@ class WorkspaceEventProcessor:
             if await self._newer_entity_event_applied(row, entity_uuid):
                 continue
             data = {key: item for key, item in value.items() if key != "kind"}
+            validate_entity(entity_type, data)
             if row["action"] == "deleted":
                 await self._pool.execute(
                     f"DELETE FROM workspace_zulip_bridge.workspace_{entity_type} "
@@ -1233,7 +1301,10 @@ class WorkspaceDiffWorker:
         planned = await self.plan()
         if planned is None:
             return 0
-        processed = await self._drain(client)
+        # Keep planning live while a large history queue is draining. Exhausting
+        # one partition here can otherwise postpone cursor-independent repair for
+        # hours or days.
+        processed = await self.process_once(client)
         if planned == 0 and processed == 0:
             await self._complete_initial_sync()
         return processed
@@ -1300,27 +1371,22 @@ class WorkspaceDiffWorker:
                 self._provider_uuid,
                 generation,
             )
-        if (
-            int(state.get("reconciliation_version", RECONCILIATION_VERSION))
-            < RECONCILIATION_VERSION
-        ):
-            repaired = await self._repair_missing_source_diffs(
-                realm_uuid,
-                generation,
+        total += await self._repair_missing_source_diffs(
+            realm_uuid,
+            generation,
+        )
+        if int(state.get("reconciliation_version", 0)) < RECONCILIATION_VERSION:
+            await self._pool.execute(
+                """
+                UPDATE workspace_zulip_bridge.workspace_mirror_state
+                SET reconciliation_version = $2,
+                    updated_at = clock_timestamp()
+                WHERE provider_uuid = $1
+                  AND reconciliation_version < $2
+                """,
+                self._provider_uuid,
+                RECONCILIATION_VERSION,
             )
-            total += repaired
-            if repaired == 0:
-                await self._pool.execute(
-                    """
-                    UPDATE workspace_zulip_bridge.workspace_mirror_state
-                    SET reconciliation_version = $2,
-                        updated_at = clock_timestamp()
-                    WHERE provider_uuid = $1
-                      AND reconciliation_version < $2
-                    """,
-                    self._provider_uuid,
-                    RECONCILIATION_VERSION,
-                )
         return total
 
     async def _repair_missing_source_diffs(
@@ -1328,23 +1394,98 @@ class WorkspaceDiffWorker:
         realm_uuid: UUID,
         generation: UUID,
     ) -> int:
-        """Schedule source rows skipped by an older dependency-gated cursor."""
+        """Continuously sweep for source rows skipped by the main cursor."""
+        cursor_rows = await self._pool.fetch(
+            """
+            SELECT entity_type, snapshot_generation, next_run_at
+            FROM workspace_zulip_bridge.sync_repair_cursors
+            WHERE provider_uuid = $1
+            """,
+            self._provider_uuid,
+        )
+        cursors = {row["entity_type"]: row for row in cursor_rows}
+        now = datetime.now(UTC)
         total = 0
         for entity_type, source in _SOURCE_TABLES.items():
-            if entity_type == "users":
+            cursor = cursors.get(entity_type)
+            if (
+                cursor is not None
+                and cursor["snapshot_generation"] == generation
+                and cursor["next_run_at"] > now
+            ):
                 continue
-            timestamp_column = (
-                "source.source_updated_at"
-                if entity_type == "messages"
-                else "source.updated_at"
+            total += await self._repair_entity(
+                entity_type,
+                source,
+                realm_uuid,
+                generation,
             )
-            result = await self._pool.execute(
+        if total:
+            LOG.info("Reconciled missing Workspace source rows: count=%d", total)
+        return total
+
+    async def _repair_entity(
+        self,
+        entity_type: str,
+        source: Mapping[str, str],
+        realm_uuid: UUID,
+        generation: UUID,
+    ) -> int:
+        source_timestamp_column = (
+            "source.source_updated_at"
+            if entity_type == "messages"
+            else "source.updated_at"
+        )
+        cursor_timestamp_column = source_timestamp_column
+        async with self._pool.acquire() as connection, connection.transaction():
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.sync_repair_cursors (
+                    provider_uuid, entity_type, snapshot_generation
+                ) VALUES ($1, $2, $3)
+                ON CONFLICT (provider_uuid, entity_type) DO UPDATE
+                SET snapshot_generation = EXCLUDED.snapshot_generation,
+                    source_updated_at = CASE
+                        WHEN sync_repair_cursors.snapshot_generation
+                             IS DISTINCT FROM EXCLUDED.snapshot_generation
+                        THEN NULL ELSE sync_repair_cursors.source_updated_at END,
+                    entity_uuid = CASE
+                        WHEN sync_repair_cursors.snapshot_generation
+                             IS DISTINCT FROM EXCLUDED.snapshot_generation
+                        THEN NULL ELSE sync_repair_cursors.entity_uuid END,
+                    next_run_at = CASE
+                        WHEN sync_repair_cursors.snapshot_generation
+                             IS DISTINCT FROM EXCLUDED.snapshot_generation
+                        THEN clock_timestamp()
+                        ELSE sync_repair_cursors.next_run_at END,
+                    updated_at = clock_timestamp()
+                """,
+                self._provider_uuid,
+                entity_type,
+                generation,
+            )
+            cursor = await connection.fetchrow(
+                """
+                SELECT source_updated_at, entity_uuid, next_run_at
+                FROM workspace_zulip_bridge.sync_repair_cursors
+                WHERE provider_uuid = $1 AND entity_type = $2
+                FOR UPDATE
+                """,
+                self._provider_uuid,
+                entity_type,
+            )
+            assert cursor is not None
+            if cursor["next_run_at"] > datetime.now(UTC):
+                return 0
+            rows = await connection.fetch(
                 f"""
-                WITH candidates AS MATERIALIZED (
+                WITH scanned AS MATERIALIZED (
                     SELECT source.uuid AS entity_uuid,
                            {source["partition"]} AS partition_key,
                            {source["hash"]} AS source_hash,
-                           {timestamp_column} AS source_updated_at
+                           {source_timestamp_column} AS source_updated_at,
+                           {cursor_timestamp_column} AS cursor_updated_at,
+                           target.uuid AS target_uuid
                     FROM {source["from"]} AS source
                     {source["joins"]}
                     LEFT JOIN workspace_zulip_bridge.workspace_{entity_type}
@@ -1352,39 +1493,90 @@ class WorkspaceDiffWorker:
                       ON target.provider_uuid = $1
                      AND target.snapshot_generation = $4
                      AND target.uuid = source.uuid
-                    LEFT JOIN workspace_zulip_bridge.sync_diffs AS existing
-                      ON existing.provider_uuid = $1
-                     AND existing.entity_type = $2
-                     AND existing.entity_uuid = source.uuid
                     WHERE {source["where"]}
-                      AND target.uuid IS NULL
-                      AND existing.entity_uuid IS NULL
-                    ORDER BY {timestamp_column}, source.uuid
-                    LIMIT $5
+                      AND (
+                          $5::timestamptz IS NULL
+                          OR ({cursor_timestamp_column}, source.uuid) > ($5, $6)
+                      )
+                    ORDER BY {cursor_timestamp_column}, source.uuid
+                    LIMIT $7
+                ), repaired AS (
+                    INSERT INTO workspace_zulip_bridge.sync_diffs (
+                        provider_uuid, entity_type, entity_uuid, realm_uuid,
+                        partition_key, direction, source_hash, target_hash,
+                        source_updated_at, target_updated_at
+                    )
+                    SELECT $1, $2, scanned.entity_uuid, $3,
+                           scanned.partition_key, 'to_workspace',
+                           scanned.source_hash, NULL,
+                           scanned.source_updated_at, NULL
+                    FROM scanned
+                    WHERE scanned.target_uuid IS NULL
+                    ON CONFLICT (provider_uuid, entity_type, entity_uuid)
+                    DO UPDATE SET
+                        realm_uuid = EXCLUDED.realm_uuid,
+                        partition_key = EXCLUDED.partition_key,
+                        direction = 'to_workspace',
+                        source_hash = EXCLUDED.source_hash,
+                        target_hash = NULL,
+                        source_updated_at = EXCLUDED.source_updated_at,
+                        target_updated_at = NULL,
+                        processing_status = 'pending',
+                        available_at = clock_timestamp(),
+                        claimed_at = NULL,
+                        processed_at = NULL,
+                        last_error = 'reconciled_missing_workspace_entity',
+                        updated_at = clock_timestamp()
+                    WHERE sync_diffs.processing_status IN (
+                        'applied', 'skipped', 'blocked'
+                    )
+                       OR sync_diffs.direction <> 'to_workspace'
+                    RETURNING 1
                 )
-                INSERT INTO workspace_zulip_bridge.sync_diffs (
-                    provider_uuid, entity_type, entity_uuid, realm_uuid,
-                    partition_key, direction, source_hash, target_hash,
-                    source_updated_at, target_updated_at
-                )
-                SELECT $1, $2, candidate.entity_uuid, $3,
-                       candidate.partition_key, 'to_workspace',
-                       candidate.source_hash, NULL,
-                       candidate.source_updated_at, NULL
-                FROM candidates AS candidate
-                ON CONFLICT (provider_uuid, entity_type, entity_uuid)
-                DO NOTHING
+                SELECT entity_uuid, cursor_updated_at,
+                       (SELECT count(*) FROM repaired) AS repaired_count
+                FROM scanned
                 """,
                 self._provider_uuid,
                 entity_type,
                 realm_uuid,
                 generation,
+                cursor["source_updated_at"],
+                cursor["entity_uuid"],
                 self._settings.workspace_sync_plan_batch_size,
             )
-            total += int(result.rsplit(" ", 1)[-1])
-        if total:
-            LOG.info("Reconciled missing Workspace source rows: count=%d", total)
-        return total
+            if not rows:
+                await connection.execute(
+                    """
+                    UPDATE workspace_zulip_bridge.sync_repair_cursors
+                    SET source_updated_at = NULL, entity_uuid = NULL,
+                        next_run_at = clock_timestamp()
+                            + make_interval(secs => $3::double precision),
+                        updated_at = clock_timestamp()
+                    WHERE provider_uuid = $1 AND entity_type = $2
+                    """,
+                    self._provider_uuid,
+                    entity_type,
+                    self._settings.workspace_reconciliation_interval_seconds,
+                )
+                return 0
+            last = max(
+                rows,
+                key=lambda row: (row["cursor_updated_at"], row["entity_uuid"]),
+            )
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.sync_repair_cursors
+                SET source_updated_at = $3, entity_uuid = $4,
+                    updated_at = clock_timestamp()
+                WHERE provider_uuid = $1 AND entity_type = $2
+                """,
+                self._provider_uuid,
+                entity_type,
+                last["cursor_updated_at"],
+                last["entity_uuid"],
+            )
+            return int(rows[0]["repaired_count"])
 
     async def _plan_target_only(
         self,
@@ -1871,8 +2063,9 @@ class WorkspaceDiffWorker:
             await self._write_to_zulip(to_zulip)
         if not to_workspace:
             return len(rows)
-        operations = []
-        records: list[tuple[asyncpg.Record, dict[str, Any], bytes]] = []
+        candidates: list[
+            tuple[asyncpg.Record, dict[str, Any], bytes, dict[str, Any]]
+        ] = []
         loaded: dict[tuple[str, UUID], dict[str, Any]] = {}
         targets: dict[tuple[str, UUID], dict[str, Any]] = {}
         grouped: dict[str, list[UUID]] = defaultdict(list)
@@ -1901,14 +2094,18 @@ class WorkspaceDiffWorker:
                 )
                 continue
             if data is None:
-                operations.append(
-                    {
-                        "action": "delete",
-                        "type": row["entity_type"],
-                        "uuid": str(row["entity_uuid"]),
-                    }
+                candidates.append(
+                    (
+                        row,
+                        {},
+                        b"",
+                        {
+                            "action": "delete",
+                            "type": row["entity_type"],
+                            "uuid": str(row["entity_uuid"]),
+                        },
+                    )
                 )
-                records.append((row, {}, b""))
                 continue
             if row["entity_type"] == "message_reactions":
                 identity = _reaction_identity(data)
@@ -1933,8 +2130,7 @@ class WorkspaceDiffWorker:
                 target,
             ):
                 operation["rebind_identity"] = True
-            operations.append(operation)
-            records.append((row, data, content_hash))
+            candidates.append((row, data, content_hash, operation))
         if equivalent:
             await self._accept_equivalent(equivalent)
         if skipped:
@@ -1943,8 +2139,16 @@ class WorkspaceDiffWorker:
                 "skipped",
                 "workspace_reaction_identity_duplicate",
             )
-        if not operations:
+        if not candidates:
             return len(rows)
+        ready, deferred = await self._partition_dependency_ready(candidates)
+        if deferred:
+            await self._defer_for_dependencies(deferred)
+        if not ready:
+            return len(rows)
+        ready.sort(key=lambda item: PRIORITY[item[0]["entity_type"]])
+        operations = [item[3] for item in ready]
+        records = [item[:3] for item in ready]
         try:
             response = await self._post(
                 client,
@@ -1955,11 +2159,15 @@ class WorkspaceDiffWorker:
                 },
             )
             if response.is_error:
-                raise _provider_api_error(response)
+                error = _provider_api_error(response)
+                await self._isolate_provider_failure(records, error)
+                raise error
             results = response.json()["results"]
             if len(results) != len(records):
                 raise RuntimeError("Workspace batch result length mismatch")
             await self._accept(records)
+        except ProviderApiError:
+            raise
         except Exception as exc:
             await self._mark(
                 [record[0] for record in records],
@@ -1968,6 +2176,156 @@ class WorkspaceDiffWorker:
             )
             raise
         return len(rows)
+
+    async def _partition_dependency_ready(
+        self,
+        candidates: list[tuple[asyncpg.Record, dict[str, Any], bytes, dict[str, Any]]],
+    ) -> tuple[
+        list[tuple[asyncpg.Record, dict[str, Any], bytes, dict[str, Any]]],
+        list[asyncpg.Record],
+    ]:
+        dependencies: dict[str, set[UUID]] = defaultdict(set)
+        for row, data, _, _ in candidates:
+            if not data:
+                continue
+            for dependency_type, dependency_uuid in _entity_dependencies(
+                row["entity_type"], data
+            ):
+                dependencies[dependency_type].add(dependency_uuid)
+        ready_ids = await self._load_ready_dependency_ids(dependencies)
+        ready = []
+        deferred = []
+        for candidate in sorted(
+            candidates,
+            key=lambda item: PRIORITY[item[0]["entity_type"]],
+        ):
+            row, data, _, _ = candidate
+            required = _entity_dependencies(row["entity_type"], data) if data else ()
+            if all(
+                dependency_uuid in ready_ids[dependency_type]
+                for dependency_type, dependency_uuid in required
+            ):
+                ready.append(candidate)
+                if data:
+                    ready_ids[row["entity_type"]].add(row["entity_uuid"])
+            else:
+                deferred.append(row)
+        return ready, deferred
+
+    async def _load_ready_dependency_ids(
+        self,
+        dependencies: Mapping[str, set[UUID]],
+    ) -> dict[str, set[UUID]]:
+        ready: dict[str, set[UUID]] = defaultdict(set)
+        if not any(dependencies.values()):
+            return ready
+        rows = await self._pool.fetch(
+            """
+            WITH active AS (
+                SELECT active_generation
+                FROM workspace_zulip_bridge.workspace_mirror_state
+                WHERE provider_uuid = $1
+            )
+            SELECT 'users' AS entity_type, entity.uuid
+            FROM workspace_zulip_bridge.workspace_users AS entity
+            JOIN active ON active.active_generation = entity.snapshot_generation
+            WHERE entity.provider_uuid = $1 AND entity.uuid = ANY($2::uuid[])
+            UNION ALL
+            SELECT 'users', source.workspace_user_uuid
+            FROM workspace_zulip_bridge.zulip_users AS source
+            WHERE source.workspace_user_uuid = ANY($2::uuid[])
+            UNION ALL
+            SELECT 'streams', entity.uuid
+            FROM workspace_zulip_bridge.workspace_streams AS entity
+            JOIN active ON active.active_generation = entity.snapshot_generation
+            WHERE entity.provider_uuid = $1 AND entity.uuid = ANY($3::uuid[])
+            UNION ALL
+            SELECT 'topics', entity.uuid
+            FROM workspace_zulip_bridge.workspace_topics AS entity
+            JOIN active ON active.active_generation = entity.snapshot_generation
+            WHERE entity.provider_uuid = $1 AND entity.uuid = ANY($4::uuid[])
+            UNION ALL
+            SELECT 'messages', entity.uuid
+            FROM workspace_zulip_bridge.workspace_messages AS entity
+            JOIN active ON active.active_generation = entity.snapshot_generation
+            WHERE entity.provider_uuid = $1 AND entity.uuid = ANY($5::uuid[])
+            """,
+            self._provider_uuid,
+            list(dependencies.get("users", ())),
+            list(dependencies.get("streams", ())),
+            list(dependencies.get("topics", ())),
+            list(dependencies.get("messages", ())),
+        )
+        for row in rows:
+            ready[row["entity_type"]].add(UUID(str(row["uuid"])))
+        return ready
+
+    async def _defer_for_dependencies(self, rows: list[asyncpg.Record]) -> None:
+        await self._release_claims(
+            rows,
+            "waiting_for_workspace_dependencies",
+            delay_seconds=max(1.0, self._settings.workspace_sync_poll_seconds * 10),
+        )
+
+    async def _isolate_provider_failure(
+        self,
+        records: list[tuple[asyncpg.Record, dict[str, Any], bytes]],
+        error: ProviderApiError,
+    ) -> None:
+        item_index = error.item_index
+        if item_index is None or item_index >= len(records):
+            await self._mark(
+                [record[0] for record in records],
+                "failed",
+                str(error)[:2048],
+            )
+            return
+        failed = records[item_index][0]
+        rolled_back = [
+            record[0] for index, record in enumerate(records) if index != item_index
+        ]
+        await self._mark([failed], "failed", str(error)[:2048])
+        if rolled_back:
+            await self._release_claims(
+                rolled_back,
+                f"workspace_batch_rolled_back item_index={item_index}",
+                delay_seconds=0.0,
+            )
+
+    async def _release_claims(
+        self,
+        rows: list[asyncpg.Record],
+        reason: str,
+        *,
+        delay_seconds: float,
+    ) -> None:
+        if not rows:
+            return
+        async with self._pool.acquire() as connection, connection.transaction():
+            await connection.executemany(
+                """
+                UPDATE workspace_zulip_bridge.sync_diffs
+                SET processing_status = 'pending', claimed_at = NULL,
+                    attempt_count = GREATEST(attempt_count - 1, 0),
+                    available_at = clock_timestamp()
+                        + make_interval(secs => $6::double precision),
+                    processed_at = NULL, last_error = $5,
+                    updated_at = clock_timestamp()
+                WHERE provider_uuid = $1 AND entity_type = $2 AND entity_uuid = $3
+                  AND processing_status = 'processing' AND claimed_at = $4
+                """,
+                [
+                    (
+                        row["provider_uuid"],
+                        row["entity_type"],
+                        row["entity_uuid"],
+                        row["claimed_at"],
+                        reason,
+                        delay_seconds,
+                    )
+                    for row in rows
+                ],
+            )
 
     async def _write_to_zulip(self, rows: list[asyncpg.Record]) -> None:
         source_entities: dict[tuple[str, UUID], dict[str, Any]] = {}

@@ -14,6 +14,7 @@ from workspace_zulip_bridge.models import MembershipKind
 from workspace_zulip_bridge.models import RecentPrivateConversation
 from workspace_zulip_bridge.models import ZulipChat
 from workspace_zulip_bridge.models import ZulipChatCatalog
+from workspace_zulip_bridge.workspace_entities import validate_description
 
 _CHANNEL_MEMBERSHIP_FIELDS = frozenset(
     {
@@ -63,6 +64,7 @@ class ChatCatalogBuilder:
             name = subscription.get("name")
             if not isinstance(stream_id, int) or not isinstance(name, str):
                 raise ValueError("invalid Zulip subscription")
+            validate_description(subscription.get("description", ""))
             chat_key = f"channel:{stream_id}"
             membership_parameters = {
                 key: value

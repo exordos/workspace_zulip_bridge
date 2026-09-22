@@ -231,9 +231,12 @@ async def _run_workspace_diff_worker_fair_plan_test(
     )
 
     class PlanningPool:
-        async def fetchrow(self, query: str, *args: object) -> dict[str, UUID]:
+        async def fetchrow(self, query: str, *args: object) -> dict[str, object]:
             assert "active_generation" in query
-            return {"active_generation": UUID("20000000-0000-0000-0000-000000000001")}
+            return {
+                "active_generation": UUID("20000000-0000-0000-0000-000000000001"),
+                "reconciliation_version": 2,
+            }
 
     worker = WorkspaceDiffWorker(PlanningPool(), settings)  # type: ignore[arg-type]
     calls: list[str] = []
@@ -257,10 +260,15 @@ async def _run_workspace_diff_worker_fair_plan_test(
         calls.append(entity_type)
         return 1 if entity_type == "users" else 0
 
+    async def fake_repair(realm_uuid: UUID, generation: UUID) -> int:
+        del realm_uuid, generation
+        return 0
+
     monkeypatch.setattr(worker, "_link_realm", fake_link_realm)
     monkeypatch.setattr(worker, "_ensure_direct_topics", fake_ensure_direct_topics)
     monkeypatch.setattr(worker, "_ensure_topic_bindings", fake_ensure_topic_bindings)
     monkeypatch.setattr(worker, "_plan_entity", fake_plan_entity)
+    monkeypatch.setattr(worker, "_repair_missing_source_diffs", fake_repair)
 
     assert await worker.plan() == 1
     assert calls == [
@@ -291,7 +299,6 @@ async def _run_workspace_diff_worker_drain_test(
     )
     worker = WorkspaceDiffWorker(object(), settings)  # type: ignore[arg-type]
     calls: list[str] = []
-    batches = iter((100, 100, 0))
 
     async def fake_plan() -> int:
         calls.append("plan")
@@ -299,7 +306,7 @@ async def _run_workspace_diff_worker_drain_test(
 
     async def fake_process_once(client: object) -> int:
         calls.append("process")
-        return next(batches)
+        return 100
 
     async def fake_complete() -> bool:
         calls.append("complete")
@@ -309,8 +316,8 @@ async def _run_workspace_diff_worker_drain_test(
     monkeypatch.setattr(worker, "process_once", fake_process_once)
     monkeypatch.setattr(worker, "_complete_initial_sync", fake_complete)
 
-    assert await worker._plan_and_drain(object()) == 200  # type: ignore[arg-type]
-    assert calls == ["plan", "process", "process", "process"]
+    assert await worker._plan_and_drain(object()) == 100  # type: ignore[arg-type]
+    assert calls == ["plan", "process"]
 
 
 def test_workspace_diff_worker_completes_only_after_empty_plan(
