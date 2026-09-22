@@ -16,6 +16,7 @@ from workspace_zulip_bridge.models import MessagePage
 from workspace_zulip_bridge.models import MessagePageWrite
 from workspace_zulip_bridge.models import RecentPrivateConversation
 from workspace_zulip_bridge.models import RegisteredQueue
+from workspace_zulip_bridge.models import ScheduledChat
 from workspace_zulip_bridge.models import UserDirectoryWrite
 from workspace_zulip_bridge.models import UserStatus
 from workspace_zulip_bridge.models import ZulipChatCatalog
@@ -389,6 +390,88 @@ class FakeHistory:
         return None
 
 
+class TrackingGate:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.active = 0
+        self.entries = 0
+
+    def __enter__(self) -> "TrackingGate":
+        self._lock.acquire()
+        self.active += 1
+        self.entries += 1
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.active -= 1
+        self._lock.release()
+
+
+class GateAwareHistory(FakeHistory):
+    def __init__(self, gate: TrackingGate) -> None:
+        self._gate = gate
+
+    async def finish(self, chat_keys: object) -> HistoryWrite:
+        assert self._gate.active == 1
+        return await super().finish(chat_keys)
+
+
+class GateAwareStore(FakeStore):
+    def __init__(self, gate: TrackingGate) -> None:
+        super().__init__()
+        self._gate = gate
+
+    async def begin_history(self, user_uuid: UUID, queue_id: str) -> GateAwareHistory:
+        self.history_begins += 1
+        return GateAwareHistory(self._gate)
+
+
+class DirectHistoryApi(FakeApi):
+    def get_chat_messages_page(
+        self,
+        chat_key: str,
+        own_user_id: int,
+        anchor: str | int,
+        *,
+        include_anchor: bool,
+    ) -> MessagePage:
+        assert chat_key == "direct:10,12"
+        assert own_user_id == 10
+        return self.get_messages_page(anchor, include_anchor=include_anchor)
+
+
+def test_history_finalization_uses_catalog_write_gate() -> None:
+    asyncio.run(_history_finalization_gate_test())
+
+
+async def _history_finalization_gate_test() -> None:
+    gate = TrackingGate()
+    store = GateAwareStore(gate)
+    api = DirectHistoryApi()
+    worker = ZulipEventThread(
+        USER_ONE,
+        store,  # type: ignore[arg-type]
+        asyncio.get_running_loop(),
+        Settings(database_dsn="postgresql:///test"),
+        threading.BoundedSemaphore(1),
+        catalog_write_gate=gate,  # type: ignore[arg-type]
+        api_factory=lambda user: api,  # type: ignore[arg-type]
+    )
+    worker._identity = ZulipIdentity(10, "Current User", 400)
+    worker._queue_id = "queue-1"
+    worker._user_uuids = {10: USER_ONE.uuid, 12: USER_TWO.uuid}
+
+    loaded = await asyncio.to_thread(
+        worker._load_scheduled_history,
+        api,
+        "queue-1",
+        [ScheduledChat("direct:10,12", 1)],
+    )
+
+    assert loaded
+    assert gate.entries == 1
+
+
 class BlockingCatalogApi(FakeApi):
     def __init__(self) -> None:
         super().__init__()
@@ -689,6 +772,39 @@ class FakeWorker:
 
     def is_alive(self) -> bool:
         return self.alive
+
+
+class ScheduleTrackingStore(FakeStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.schedule_reconciliations = 0
+
+    async def reconcile_chat_schedules(self) -> ChatScheduleReconcile:
+        self.schedule_reconciliations += 1
+        return ChatScheduleReconcile(0, 0, 0)
+
+
+def test_schedule_reconciliation_waits_for_catalog_write_gate() -> None:
+    asyncio.run(_schedule_reconciliation_gate_test())
+
+
+async def _schedule_reconciliation_gate_test() -> None:
+    store = ScheduleTrackingStore()
+    supervisor = ZulipThreadSupervisor(
+        store,  # type: ignore[arg-type]
+        asyncio.get_running_loop(),
+        Settings(database_dsn="postgresql:///test"),
+        worker_factory=lambda user, gate: FakeWorker(user),  # type: ignore[arg-type]
+    )
+    supervisor._catalog_write_gate.acquire()
+    task = asyncio.create_task(supervisor.reconcile())
+
+    await asyncio.sleep(0.05)
+    assert store.schedule_reconciliations == 0
+
+    supervisor._catalog_write_gate.release()
+    await asyncio.wait_for(task, timeout=1)
+    assert store.schedule_reconciliations == 1
 
 
 def test_supervisor_owns_exactly_one_thread_per_user() -> None:

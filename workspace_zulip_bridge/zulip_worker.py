@@ -685,7 +685,14 @@ class ZulipEventThread(threading.Thread):
                         break
                     anchor = next_anchor
                     include_anchor = False
-                chat_write = self._submit(history.finish([scheduled_chat.chat_key]))
+                # Finalizing history updates shared stream, binding, connection,
+                # topic, and diff rows.  Serialize it with catalog publication so
+                # concurrent account bootstraps cannot acquire those rows in
+                # conflicting orders and deadlock the daemon.
+                with self._catalog_write_gate:
+                    if self._stop_requested.is_set() or self._queue_id != queue_id:
+                        return False
+                    chat_write = self._submit(history.finish([scheduled_chat.chat_key]))
                 if not chat_write.activated:
                     return False
                 schedules_loaded += chat_write.schedules_loaded
@@ -926,7 +933,11 @@ class ZulipThreadSupervisor:
             self._workers.clear()
 
     async def reconcile(self) -> None:
-        schedule = await self._store.reconcile_chat_schedules()
+        await asyncio.to_thread(self._catalog_write_gate.acquire)
+        try:
+            schedule = await self._store.reconcile_chat_schedules()
+        finally:
+            self._catalog_write_gate.release()
         if schedule.invalidated or schedule.assigned or schedule.messages_deleted:
             LOG.info(
                 "Zulip chat schedules reconciled invalidated=%s assigned=%s "
