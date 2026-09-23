@@ -41,6 +41,13 @@ _MESSAGE_EVENT_TYPES = frozenset(
         "delete_message",
     }
 )
+_DEPENDENCY_DEFERRAL_REASONS = frozenset(
+    {
+        "chat_rescheduling",
+        "chat_unassigned",
+        "message_not_materialized",
+    }
+)
 _FLAG_FIELDS = {
     "read": "is_read",
     "starred": "is_starred",
@@ -154,6 +161,12 @@ class ZulipEventProcessor:
         self._next_presence_expiry_at = 0.0
 
     async def run(self) -> None:
+        recovered = await self._requeue_preparation_deadlocks()
+        if recovered:
+            LOG.info(
+                "Recoverable Zulip event preparation failures requeued count=%s",
+                recovered,
+            )
         while True:
             deleted = await self._maybe_cleanup_expired_events()
             expired_presences = await self._maybe_expire_user_presences()
@@ -180,6 +193,28 @@ class ZulipEventProcessor:
             if expired_presences == self._settings.event_cleanup_batch_size:
                 continue
             await asyncio.sleep(self._settings.event_processor_poll_seconds)
+
+    async def _requeue_preparation_deadlocks(self) -> int:
+        result = await self._pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.zulip_events
+            SET processing_status = 'pending', attempt_count = 0,
+                available_at = clock_timestamp(), claimed_at = NULL,
+                processed_at = NULL,
+                outcome_reason = 'requeued_preparation_deadlock'
+            WHERE (
+                    processing_status = 'failed'
+                    AND outcome_reason =
+                      'retry_exhausted:preparation_error:DeadlockDetectedError'
+                  )
+               OR (
+                    processing_status = 'pending'
+                    AND outcome_reason =
+                      'preparation_error:DeadlockDetectedError'
+                  )
+            """
+        )
+        return int(result.rsplit(" ", 1)[-1])
 
     async def _maybe_expire_user_presences(self) -> int:
         if time.monotonic() < self._next_presence_expiry_at:
@@ -301,7 +336,7 @@ class ZulipEventProcessor:
             outcomes.extend(batch_outcomes)
             for outcome in batch_outcomes:
                 event = events_by_uuid[outcome.event_uuid]
-                if outcome.status in {"blocked", "defer"} or (
+                if outcome.status == "blocked" or (
                     outcome.status == "retry"
                     and event.attempt_count
                     < self._settings.event_processor_max_attempts
@@ -371,11 +406,7 @@ class ZulipEventProcessor:
                 continue
             if item.skip_reason is not None:
                 status = "skipped"
-                if item.skip_reason in {
-                    "chat_rescheduling",
-                    "chat_unassigned",
-                    "message_not_materialized",
-                }:
+                if item.skip_reason in _DEPENDENCY_DEFERRAL_REASONS:
                     status = "defer"
                 elif item.skip_reason == "local_message_link_retry":
                     status = "retry"
@@ -450,10 +481,35 @@ class ZulipEventProcessor:
                     FROM workspace_zulip_bridge.zulip_events AS event
                     WHERE event.processing_status IN ('pending', 'processing')
                     ORDER BY event.zulip_connection_uuid, event.queue_id,
+                             COALESCE(
+                                 event.outcome_reason = ANY($2::text[]),
+                                 false
+                             ),
                              event.event_id
+                ), queue_blockers AS MATERIALIZED (
+                    SELECT event.zulip_connection_uuid,
+                           event.queue_id,
+                           min(event.event_id) AS first_blocking_event_id
+                    FROM workspace_zulip_bridge.zulip_events AS event
+                    WHERE event.processing_status IN ('pending', 'processing')
+                      AND NOT COALESCE(
+                          event.outcome_reason = ANY($2::text[]),
+                          false
+                      )
+                      AND (
+                          event.processing_status = 'processing'
+                          OR event.available_at > clock_timestamp()
+                      )
+                    GROUP BY event.zulip_connection_uuid, event.queue_id
                 ), claimable_queues AS MATERIALIZED (
-                    SELECT head.zulip_connection_uuid, head.queue_id
+                    SELECT head.zulip_connection_uuid,
+                           head.queue_id,
+                           blocker.first_blocking_event_id
                     FROM queue_heads AS head
+                    LEFT JOIN queue_blockers AS blocker
+                      ON blocker.zulip_connection_uuid =
+                         head.zulip_connection_uuid
+                     AND blocker.queue_id = head.queue_id
                     WHERE head.processing_status = 'pending'
                       AND head.available_at <= clock_timestamp()
                       AND pg_try_advisory_xact_lock(
@@ -472,22 +528,15 @@ class ZulipEventProcessor:
                      AND queue.queue_id = event.queue_id
                     WHERE event.processing_status = 'pending'
                       AND event.available_at <= clock_timestamp()
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM workspace_zulip_bridge.zulip_events AS earlier
-                          WHERE earlier.zulip_connection_uuid =
-                                event.zulip_connection_uuid
-                            AND earlier.queue_id = event.queue_id
-                            AND earlier.event_id < event.event_id
-                            AND (
-                                earlier.processing_status = 'processing'
-                                OR (
-                                    earlier.processing_status = 'pending'
-                                    AND earlier.available_at > clock_timestamp()
-                                )
-                            )
+                      AND (
+                          queue.first_blocking_event_id IS NULL
+                          OR event.event_id < queue.first_blocking_event_id
                       )
-                    ORDER BY event.created_at,
+                    ORDER BY COALESCE(
+                                 event.outcome_reason = ANY($2::text[]),
+                                 false
+                             ),
+                             event.created_at,
                              event.zulip_connection_uuid,
                              event.queue_id,
                              event.event_id
@@ -531,6 +580,7 @@ class ZulipEventProcessor:
                          claimed.event_id
                 """,
                 self._settings.event_processor_batch_size,
+                list(_DEPENDENCY_DEFERRAL_REASONS),
             )
         events: list[_ClaimedEvent] = []
         for row in rows:
@@ -566,7 +616,9 @@ class ZulipEventProcessor:
         for connection_uuid, queue_id in refreshes:
             await self._store.request_catalog_refresh(connection_uuid, queue_id)
 
-        direct_changed = False
+        direct_messages: dict[
+            tuple[UUID, str, str], tuple[_ClaimedEvent, Mapping[str, Any]]
+        ] = {}
         for event in events:
             if not event.active_queue or event.event_type != "message":
                 continue
@@ -575,6 +627,18 @@ class ZulipEventProcessor:
                 continue
             if raw_message.get("type") == "stream":
                 continue
+            if event.own_user_id is None:
+                continue
+            chat_key = _event_chat_key(event.payload, event.own_user_id)
+            if chat_key is None:
+                continue
+            direct_messages.setdefault(
+                (event.user_uuid, event.queue_id, chat_key),
+                (event, raw_message),
+            )
+
+        direct_changed = False
+        for event, raw_message in direct_messages.values():
             direct_changed = (
                 await self._store.store_direct_message_chat(
                     event.user_uuid,
@@ -649,7 +713,6 @@ class ZulipEventProcessor:
                     """
                     SELECT realm.identity_key AS endpoint, stream.chat_key,
                            stream.source_connection_uuid,
-                           stream.history_loaded_at,
                            source.lifecycle_status AS source_lifecycle_status
                     FROM workspace_zulip_bridge.zulip_streams AS stream
                     JOIN workspace_zulip_bridge.zulip_realms AS realm
@@ -668,7 +731,6 @@ class ZulipEventProcessor:
                     (row["endpoint"], row["chat_key"])
                     for row in rows
                     if row["source_connection_uuid"] is None
-                    or row["history_loaded_at"] is None
                     or row["source_lifecycle_status"] not in {"active", "backfilling"}
                 }
             for endpoint, message_ids in message_ids_by_endpoint.items():
@@ -755,7 +817,10 @@ class ZulipEventProcessor:
                 return _RoutedEvent(
                     event, chat_key=chat_key, skip_reason="chat_unassigned"
                 )
-            if (event.endpoint, chat_key) in transitioning_chats:
+            if (
+                event.endpoint,
+                chat_key,
+            ) in transitioning_chats and supplier != event.user_uuid:
                 return _RoutedEvent(
                     event,
                     chat_key=chat_key,
@@ -777,7 +842,10 @@ class ZulipEventProcessor:
                 return _RoutedEvent(
                     event, chat_key=chat_key, skip_reason="chat_unassigned"
                 )
-            if (event.endpoint, chat_key) in transitioning_chats:
+            if (
+                event.endpoint,
+                chat_key,
+            ) in transitioning_chats and supplier != event.user_uuid:
                 return _RoutedEvent(
                     event,
                     chat_key=chat_key,
@@ -819,12 +887,6 @@ class ZulipEventProcessor:
                 message_routes.get((event.endpoint, message_id))
                 for message_id in message_ids
             ]
-            if any(
-                route is not None
-                and (event.endpoint, route.chat_key) in transitioning_chats
-                for route in flag_routes
-            ):
-                return _RoutedEvent(event, skip_reason="chat_rescheduling")
             if any(route is None for route in flag_routes):
                 return _RoutedEvent(event, skip_reason="message_not_materialized")
             accepted_flags = [
@@ -846,11 +908,13 @@ class ZulipEventProcessor:
                 supplier = chat_suppliers.get((event.endpoint, destination_key))
                 rescheduling = rescheduling or (
                     (event.endpoint, destination_key) in transitioning_chats
+                    and supplier != event.user_uuid
                 )
             elif route is not None:
                 supplier = route.source_connection_uuid
                 rescheduling = rescheduling or (
                     (event.endpoint, route.chat_key) in transitioning_chats
+                    and supplier != event.user_uuid
                 )
             else:
                 supplier = None

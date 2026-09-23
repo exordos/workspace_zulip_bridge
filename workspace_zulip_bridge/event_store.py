@@ -184,6 +184,18 @@ class EventStore:
         queue_id: str,
         message: Mapping[str, object],
     ) -> bool:
+        return await self._store_direct_message_chat(
+            connection_uuid,
+            queue_id,
+            message,
+        )
+
+    async def _store_direct_message_chat(
+        self,
+        connection_uuid: UUID,
+        queue_id: str,
+        message: Mapping[str, object],
+    ) -> bool:
         async with self._pool.acquire() as connection, connection.transaction():
             owner = await connection.fetchrow(
                 """
@@ -305,8 +317,8 @@ class EventStore:
                       ON zulip_user.uuid = connection.zulip_user_uuid
                     WHERE connection.sync_enabled AND NOT zulip_user.disabled
                       AND NOT zulip_user.is_bot
+                      AND connection.catalog_completed_at IS NOT NULL
                     GROUP BY connection.realm_uuid
-                    HAVING bool_and(connection.catalog_completed_at IS NOT NULL)
                 ), winners AS MATERIALIZED (
                     SELECT DISTINCT ON (stream.uuid)
                            stream.uuid AS stream_uuid,
@@ -329,6 +341,7 @@ class EventStore:
                     JOIN workspace_zulip_bridge.zulip_connections AS connection
                       ON connection.zulip_user_uuid = zulip_user.uuid
                      AND connection.sync_enabled
+                     AND connection.catalog_completed_at IS NOT NULL
                     ORDER BY stream.uuid, zulip_user.role,
                              zulip_user.uuid,
                              connection.uuid
@@ -890,7 +903,12 @@ class EventStore:
 
     async def begin_history(self, user_uuid: UUID, queue_id: str) -> "HistorySession":
         connection = await self._pool.acquire()
-        session = HistorySession(self._pool, connection, user_uuid, queue_id)
+        session = HistorySession(
+            self._pool,
+            connection,
+            user_uuid,
+            queue_id,
+        )
         try:
             await session.initialize()
         except BaseException:
@@ -1365,6 +1383,21 @@ class EventStore:
         *,
         bootstrap_user_topics: Sequence[ZulipUserTopic] | None = None,
     ) -> ChatCatalogWrite:
+        return await self._store_chat_catalog(
+            user_uuid,
+            queue_id,
+            catalog,
+            bootstrap_user_topics=bootstrap_user_topics,
+        )
+
+    async def _store_chat_catalog(
+        self,
+        user_uuid: UUID,
+        queue_id: str,
+        catalog: ZulipChatCatalog,
+        *,
+        bootstrap_user_topics: Sequence[ZulipUserTopic] | None = None,
+    ) -> ChatCatalogWrite:
         async with self._pool.acquire() as connection, connection.transaction():
             owner = await connection.fetchrow(
                 """
@@ -1494,6 +1527,7 @@ class HistorySession:
         self._realm_uuid: UUID | None = None
         self._zulip_user_uuid: UUID | None = None
         self._endpoint: str | None = None
+        self._started_at: datetime | None = None
         self._closed = False
 
     async def initialize(self) -> None:
@@ -1514,6 +1548,7 @@ class HistorySession:
         self._realm_uuid = owner["realm_uuid"]
         self._zulip_user_uuid = owner["zulip_user_uuid"]
         self._endpoint = owner["endpoint"]
+        self._started_at = await self._connection.fetchval("SELECT clock_timestamp()")
         await self._connection.execute(
             """
             CREATE TEMP TABLE IF NOT EXISTS wzb_seen_messages (
@@ -1998,20 +2033,25 @@ class HistorySession:
             or self._zulip_user_uuid is None
         ):
             raise RuntimeError("history session is not initialized")
-        changed, _ = await _store_chats(
-            self._connection,
-            self._endpoint,
-            self._realm_uuid,
-            self._zulip_user_uuid,
-            chats,
-            replace_catalog=False,
-        )
+        async with self._connection.transaction():
+            changed, _ = await _store_chats(
+                self._connection,
+                self._endpoint,
+                self._realm_uuid,
+                self._zulip_user_uuid,
+                chats,
+                replace_catalog=False,
+            )
         return changed
 
     async def finish(self, chat_keys: Sequence[str]) -> HistoryWrite:
         if self._closed:
             raise RuntimeError("history session is closed")
-        if self._endpoint is None or self._zulip_user_uuid is None:
+        if (
+            self._endpoint is None
+            or self._zulip_user_uuid is None
+            or self._started_at is None
+        ):
             raise RuntimeError("history session is not initialized")
         stream_uuids = [stable_chat_uuid(self._endpoint, key) for key in chat_keys]
         async with self._connection.transaction():
@@ -2032,6 +2072,7 @@ class HistorySession:
                     FROM workspace_zulip_bridge.zulip_messages AS message
                     WHERE message.source_connection_uuid = $1
                       AND message.zulip_stream_uuid = ANY($2::uuid[])
+                      AND message.updated_at <= $3
                       AND NOT EXISTS (
                           SELECT 1 FROM wzb_seen_messages AS seen
                           WHERE seen.zulip_message_id = message.zulip_message_id
@@ -2083,6 +2124,7 @@ class HistorySession:
                 """,
                     self._connection_uuid,
                     stream_uuids,
+                    self._started_at,
                 )
             )
             await self._connection.execute(
@@ -2095,6 +2137,7 @@ class HistorySession:
                       ON message.uuid = flag.message_uuid
                     WHERE flag.zulip_user_uuid = $1
                       AND flag.zulip_stream_uuid = ANY($2::uuid[])
+                      AND flag.updated_at <= $3
                       AND NOT EXISTS (
                           SELECT 1 FROM wzb_seen_messages AS seen
                           WHERE seen.zulip_message_id = message.zulip_message_id
@@ -2146,6 +2189,7 @@ class HistorySession:
                 """,
                 self._zulip_user_uuid,
                 stream_uuids,
+                self._started_at,
             )
             deleted_topics = int(
                 await self._connection.fetchval(
@@ -2234,19 +2278,6 @@ class HistorySession:
                   AND stream.history_loaded_at IS NOT NULL
                 """,
                 self._zulip_user_uuid,
-                stream_uuids,
-            )
-            await self._connection.execute(
-                """
-                UPDATE workspace_zulip_bridge.zulip_connections AS connection
-                SET lifecycle_status = 'backfilling'
-                FROM workspace_zulip_bridge.zulip_stream_bindings AS binding
-                WHERE binding.zulip_stream_uuid = ANY($1::uuid[])
-                  AND binding.personal_state_loaded_at IS NULL
-                  AND connection.zulip_user_uuid = binding.zulip_user_uuid
-                  AND connection.sync_enabled
-                  AND connection.catalog_completed_at IS NOT NULL
-                """,
                 stream_uuids,
             )
             await self._connection.execute(
@@ -2535,6 +2566,29 @@ async def _store_chats(
         stable_stream_binding_uuid(stream_uuid, zulip_user_uuid)
         for stream_uuid in stream_uuids
     ]
+    # Catalogs from many accounts share most stream rows.  Lock the existing
+    # rows in one deterministic order before the bulk upsert so concurrent
+    # bootstrap and realtime writes cannot form a row-lock cycle.  Unlike a
+    # process-wide mutex, this only makes transactions with overlapping chats
+    # wait and lets unrelated realtime work continue during history imports.
+    await connection.fetch(
+        """
+        SELECT uuid FROM workspace_zulip_bridge.zulip_streams
+        WHERE uuid = ANY($1::uuid[])
+        ORDER BY uuid
+        FOR UPDATE
+        """,
+        stream_uuids,
+    )
+    await connection.fetch(
+        """
+        SELECT uuid FROM workspace_zulip_bridge.zulip_stream_bindings
+        WHERE uuid = ANY($1::uuid[])
+        ORDER BY uuid
+        FOR UPDATE
+        """,
+        binding_uuids,
+    )
     row = await connection.fetchrow(
         """
         WITH incoming AS MATERIALIZED (
@@ -2575,6 +2629,7 @@ async def _store_chats(
                        ELSE NULL
                    END,
                    chat_parameters, content_hash FROM incoming
+            ORDER BY stream_uuid
             ON CONFLICT (uuid) DO UPDATE SET chat_type = EXCLUDED.chat_type,
                 name = EXCLUDED.name, description = EXCLUDED.description,
                 invite_only = EXCLUDED.invite_only,
@@ -2608,6 +2663,7 @@ async def _store_chats(
             SELECT binding_uuid, stream_uuid, $16, role, membership_kind,
                    notification_mode, membership_parameters, membership_hash,
                    available_message_count, first_visible_message_id FROM incoming
+            ORDER BY stream_uuid
             ON CONFLICT (zulip_stream_uuid, zulip_user_uuid) DO UPDATE SET
                 role = EXCLUDED.role, membership_kind = EXCLUDED.membership_kind,
                 notification_mode = EXCLUDED.notification_mode,

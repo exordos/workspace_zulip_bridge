@@ -1533,11 +1533,44 @@ async def _history_rescan_enqueues_tombstones(dsn: str) -> None:
 
         rescan = await store.begin_history(connection_uuid, "queue-66-rescan")
         try:
+            concurrent_message_uuid = stable_message_uuid(ENDPOINT, 661)
+            concurrent_topic_uuid = stable_topic_uuid(stream_uuid, "Realtime")
+            await pool.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_topics (
+                    uuid, zulip_stream_uuid, name, content_hash
+                ) VALUES ($1, $2, 'Realtime', $3)
+                """,
+                concurrent_topic_uuid,
+                stream_uuid,
+                b"r" * 32,
+            )
+            await pool.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_messages (
+                    uuid, realm_uuid, source_connection_uuid, zulip_stream_uuid,
+                    topic_uuid, sender_user_uuid, zulip_message_id, content,
+                    content_hash, message_hash, created_at, source_updated_at
+                ) VALUES ($1, $2, $3, $4, $5, $3, 661, 'live during rescan',
+                          $6, $6, clock_timestamp(), clock_timestamp())
+                """,
+                concurrent_message_uuid,
+                stable_realm_uuid(ENDPOINT),
+                connection_uuid,
+                stream_uuid,
+                concurrent_topic_uuid,
+                b"n" * 32,
+            )
             finished = await rescan.finish(["channel:66"])
         finally:
             await rescan.close()
 
         assert (finished.messages_deleted, finished.topics_deleted) == (1, 1)
+        assert await pool.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM "
+            "workspace_zulip_bridge.zulip_messages WHERE uuid = $1)",
+            concurrent_message_uuid,
+        )
         diffs = await pool.fetch(
             """
             SELECT entity_type, entity_uuid, direction, source_hash,
@@ -4910,6 +4943,41 @@ def test_scheduler_reassigns_large_histories_in_bounded_batches() -> None:
     asyncio.run(_scheduler_batched_reassignment_round_trip(_dsn()))
 
 
+def test_scheduler_uses_completed_catalogs_while_another_account_is_filling() -> None:
+    asyncio.run(_scheduler_incomplete_catalog_round_trip(_dsn()))
+
+
+async def _scheduler_incomplete_catalog_round_trip(dsn: str) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            ready_uuid = await _insert_user(
+                connection, 10, 100, queue_id="queue-ready", status="filling"
+            )
+            await _insert_user(
+                connection, 20, 200, queue_id="queue-filling", status="filling"
+            )
+        assert (
+            await store.store_chat_catalog(
+                ready_uuid, "queue-ready", _catalog(10, [(7, "Shared")], {})
+            )
+        ).activated
+
+        reconciled = await store.reconcile_chat_schedules()
+        assert reconciled.assigned == 1
+        assert (
+            await pool.fetchval(
+                "SELECT source_connection_uuid "
+                "FROM workspace_zulip_bridge.zulip_streams "
+                "WHERE chat_key = 'channel:7'"
+            )
+            == ready_uuid
+        )
+    finally:
+        await pool.close()
+
+
 async def _scheduler_batched_reassignment_round_trip(dsn: str) -> None:
     pool = await _pool(dsn)
     try:
@@ -6034,6 +6102,113 @@ def test_event_processor_defers_stale_supplier_during_catalog_refresh() -> None:
     asyncio.run(_event_processor_defers_stale_supplier(_dsn()))
 
 
+def test_event_processor_applies_supplier_message_during_history_backfill() -> None:
+    asyncio.run(_event_processor_applies_during_history_backfill(_dsn()))
+
+
+async def _event_processor_applies_during_history_backfill(dsn: str) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            owner_uuid = await _insert_user(
+                connection, 10, 100, queue_id="queue-owner", status="filling"
+            )
+        assert (
+            await store.store_chat_catalog(
+                owner_uuid,
+                "queue-owner",
+                _catalog(10, [(7, "Shared")], {"channel:7": 1}),
+            )
+        ).activated
+        assert (await store.reconcile_chat_schedules()).assigned == 1
+        assert not await pool.fetchval(
+            "SELECT history_loaded_at IS NOT NULL "
+            "FROM workspace_zulip_bridge.zulip_streams "
+            "WHERE chat_key = 'channel:7'"
+        )
+        await pool.execute(
+            "UPDATE workspace_zulip_bridge.zulip_connections "
+            "SET lifecycle_status = 'filling', catalog_completed_at = NULL "
+            "WHERE uuid = $1",
+            owner_uuid,
+        )
+        event = {
+            "id": 1,
+            "type": "message",
+            "message": {
+                "id": 701,
+                "type": "stream",
+                "stream_id": 7,
+                "display_recipient": "Shared",
+                "subject": "General",
+                "sender_id": 10,
+                "content": "live during history",
+                "timestamp": 1_700_000_000,
+                "flags": [],
+                "reactions": [],
+            },
+        }
+        assert await store.store_events(
+            owner_uuid,
+            "queue-owner",
+            (
+                ZulipEvent(
+                    event_id=1,
+                    event_type="message",
+                    payload_json=json.dumps(event),
+                ),
+            ),
+            1,
+        ) == (1, True)
+
+        processor = ZulipEventProcessor(
+            pool,
+            store,
+            Settings.from_env({"WZB_DATABASE_DSN": dsn}),
+        )
+        processed = await processor.process_once()
+        assert (processed.claimed, processed.applied, processed.retried) == (1, 1, 0)
+        assert await pool.fetchval(
+            "SELECT EXISTS (SELECT 1 "
+            "FROM workspace_zulip_bridge.zulip_messages "
+            "WHERE zulip_message_id = 701)"
+        )
+
+        flag_event = {
+            "id": 2,
+            "type": "update_message_flags",
+            "op": "add",
+            "flag": "read",
+            "messages": [701],
+        }
+        assert await store.store_events(
+            owner_uuid,
+            "queue-owner",
+            (
+                ZulipEvent(
+                    event_id=2,
+                    event_type="update_message_flags",
+                    payload_json=json.dumps(flag_event),
+                ),
+            ),
+            2,
+        ) == (1, True)
+        processed = await processor.process_once()
+        assert (processed.claimed, processed.applied, processed.retried) == (1, 1, 0)
+        assert await pool.fetchval(
+            "SELECT flag.is_read "
+            "FROM workspace_zulip_bridge.zulip_message_flags AS flag "
+            "JOIN workspace_zulip_bridge.zulip_messages AS message "
+            "ON message.uuid = flag.message_uuid "
+            "WHERE flag.zulip_user_uuid = $1 "
+            "AND message.zulip_message_id = 701",
+            owner_uuid,
+        )
+    finally:
+        await pool.close()
+
+
 async def _event_processor_defers_stale_supplier(dsn: str) -> None:
     pool = await _pool(dsn)
     try:
@@ -6173,11 +6348,13 @@ async def _event_processor_defers_stale_supplier(dsn: str) -> None:
         await pool.close()
 
 
-def test_event_processor_keeps_dependency_deferrals_pending() -> None:
-    asyncio.run(_event_processor_keeps_dependency_deferrals_pending(_dsn()))
+def test_event_processor_dependency_deferrals_do_not_block_later_events() -> None:
+    asyncio.run(_event_processor_dependency_deferrals_do_not_block_later_events(_dsn()))
 
 
-async def _event_processor_keeps_dependency_deferrals_pending(dsn: str) -> None:
+async def _event_processor_dependency_deferrals_do_not_block_later_events(
+    dsn: str,
+) -> None:
     pool = await _pool(dsn)
     try:
         store = EventStore(pool)
@@ -6187,7 +6364,7 @@ async def _event_processor_keeps_dependency_deferrals_pending(dsn: str) -> None:
             )
         events = (
             {"id": 1, "type": "update_message", "message_id": 999999},
-            {"id": 2, "type": "presence"},
+            {"id": 2, "type": "heartbeat"},
         )
         assert await store.store_events(
             owner_uuid,
@@ -6217,8 +6394,8 @@ async def _event_processor_keeps_dependency_deferrals_pending(dsn: str) -> None:
             ),
         )
         assert (await processor.process_once()).retried == 1
-        await asyncio.sleep(0.01)
-        assert (await processor.process_once()).retried == 1
+        second = await processor.process_once()
+        assert (second.claimed, second.skipped) == (1, 1)
         await asyncio.sleep(0.01)
         assert (await processor.process_once()).retried == 1
 
@@ -6234,18 +6411,70 @@ async def _event_processor_keeps_dependency_deferrals_pending(dsn: str) -> None:
             {
                 "event_id": 1,
                 "processing_status": "pending",
-                "attempt_count": 3,
+                "attempt_count": 2,
                 "outcome_reason": "message_not_materialized",
                 "processed": False,
             },
             {
                 "event_id": 2,
-                "processing_status": "pending",
-                "attempt_count": 0,
-                "outcome_reason": None,
-                "processed": False,
+                "processing_status": "skipped",
+                "attempt_count": 1,
+                "outcome_reason": "unsupported_event_type",
+                "processed": True,
             },
         ]
+    finally:
+        await pool.close()
+
+
+def test_event_processor_retry_delay_blocks_later_queue_events() -> None:
+    asyncio.run(_event_processor_retry_delay_blocks_later_queue_events(_dsn()))
+
+
+async def _event_processor_retry_delay_blocks_later_queue_events(
+    dsn: str,
+) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            owner_uuid = await _insert_user(
+                connection, 10, 100, queue_id="queue-owner", status="active"
+            )
+        assert await store.store_events(
+            owner_uuid,
+            "queue-owner",
+            (
+                ZulipEvent(
+                    event_id=1,
+                    event_type="heartbeat",
+                    payload_json=json.dumps({"id": 1, "type": "heartbeat"}),
+                ),
+                ZulipEvent(
+                    event_id=2,
+                    event_type="heartbeat",
+                    payload_json=json.dumps({"id": 2, "type": "heartbeat"}),
+                ),
+            ),
+            2,
+        ) == (2, True)
+        await pool.execute(
+            "UPDATE workspace_zulip_bridge.zulip_events "
+            "SET available_at = clock_timestamp() + interval '1 hour', "
+            "outcome_reason = 'handler_error:RuntimeError' "
+            "WHERE event_id = 1"
+        )
+
+        processor = ZulipEventProcessor(
+            pool,
+            store,
+            Settings.from_env({"WZB_DATABASE_DSN": dsn}),
+        )
+        assert (await processor.process_once()).claimed == 0
+        assert await pool.fetchval(
+            "SELECT processing_status = 'pending' "
+            "FROM workspace_zulip_bridge.zulip_events WHERE event_id = 2"
+        )
     finally:
         await pool.close()
 
@@ -6441,6 +6670,83 @@ async def _event_processor_requeues_preparation_failure(dsn: str) -> None:
             "processed_at": None,
             "outcome_reason": "preparation_error:RuntimeError",
         }
+    finally:
+        await pool.close()
+
+
+def test_event_processor_recovers_exhausted_preparation_deadlocks() -> None:
+    asyncio.run(_event_processor_recovers_preparation_deadlocks(_dsn()))
+
+
+async def _event_processor_recovers_preparation_deadlocks(dsn: str) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            owner_uuid = await _insert_user(
+                connection, 10, 100, queue_id="queue-owner", status="active"
+            )
+        assert await store.store_events(
+            owner_uuid,
+            "queue-owner",
+            (
+                ZulipEvent(
+                    event_id=1,
+                    event_type="message",
+                    payload_json=json.dumps({"id": 1, "type": "message"}),
+                ),
+                ZulipEvent(
+                    event_id=2,
+                    event_type="message",
+                    payload_json=json.dumps({"id": 2, "type": "message"}),
+                ),
+            ),
+            2,
+        ) == (2, True)
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.zulip_events
+            SET processing_status = 'failed', attempt_count = 10,
+                processed_at = clock_timestamp(),
+                outcome_reason =
+                  'retry_exhausted:preparation_error:DeadlockDetectedError'
+            WHERE event_id = 1;
+
+            UPDATE workspace_zulip_bridge.zulip_events
+            SET attempt_count = 7,
+                available_at = clock_timestamp() + interval '1 hour',
+                outcome_reason = 'preparation_error:DeadlockDetectedError'
+            WHERE event_id = 2
+            """
+        )
+
+        processor = ZulipEventProcessor(
+            pool,
+            store,
+            Settings.from_env({"WZB_DATABASE_DSN": dsn}),
+        )
+        assert await processor._requeue_preparation_deadlocks() == 2
+        rows = await pool.fetch(
+            "SELECT processing_status, attempt_count, claimed_at, processed_at, "
+            "outcome_reason FROM workspace_zulip_bridge.zulip_events "
+            "ORDER BY event_id"
+        )
+        assert [dict(row) for row in rows] == [
+            {
+                "processing_status": "pending",
+                "attempt_count": 0,
+                "claimed_at": None,
+                "processed_at": None,
+                "outcome_reason": "requeued_preparation_deadlock",
+            },
+            {
+                "processing_status": "pending",
+                "attempt_count": 0,
+                "claimed_at": None,
+                "processed_at": None,
+                "outcome_reason": "requeued_preparation_deadlock",
+            },
+        ]
     finally:
         await pool.close()
 
