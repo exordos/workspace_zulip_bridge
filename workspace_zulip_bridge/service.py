@@ -80,26 +80,34 @@ class BridgeService:
                     workspace_event_processor = WorkspaceEventProcessor(
                         pool, self._settings
                     )
+                    workspace_diff_planner = WorkspaceDiffWorker(
+                        pool,
+                        self._settings,
+                        plan_enabled=True,
+                        partition=0,
+                        partition_count=self._settings.workspace_sync_workers,
+                        scope="unpartitioned",
+                        tokens=tokens,
+                    )
                     workspace_diff_workers = [
                         WorkspaceDiffWorker(
                             pool,
                             self._settings,
-                            plan_enabled=index == 0,
+                            plan_enabled=False,
                             partition=index,
                             partition_count=self._settings.workspace_sync_workers,
+                            scope="partitioned",
                             tokens=tokens,
                         )
                         for index in range(self._settings.workspace_sync_workers)
                     ]
-                    # Partition zero also owns planning and all non-partitioned
-                    # entities. Keep a drain-only worker on that partition so a
-                    # slow reconciliation pass cannot starve its delivery queue.
-                    workspace_partition_zero_drainer = WorkspaceDiffWorker(
+                    workspace_unpartitioned_drainer = WorkspaceDiffWorker(
                         pool,
                         self._settings,
                         plan_enabled=False,
                         partition=0,
                         partition_count=self._settings.workspace_sync_workers,
+                        scope="unpartitioned",
                         tokens=tokens,
                     )
                     supervised_tasks.extend(
@@ -118,6 +126,12 @@ class BridgeService:
                             ),
                         )
                     )
+                    supervised_tasks.append(
+                        asyncio.create_task(
+                            workspace_diff_planner.run(),
+                            name="workspace-diff-planner",
+                        )
+                    )
                     supervised_tasks.extend(
                         asyncio.create_task(
                             worker.run(),
@@ -127,8 +141,8 @@ class BridgeService:
                     )
                     supervised_tasks.append(
                         asyncio.create_task(
-                            workspace_partition_zero_drainer.run(),
-                            name="workspace-diff-drain-0",
+                            workspace_unpartitioned_drainer.run(),
+                            name="workspace-diff-unpartitioned",
                         )
                     )
             LOG.info("bridge daemon is ready")

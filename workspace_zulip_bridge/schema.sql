@@ -568,6 +568,68 @@ CREATE INDEX IF NOT EXISTS sync_diffs_live_pending_idx
 CREATE INDEX IF NOT EXISTS sync_diffs_processing_idx
     ON workspace_zulip_bridge.sync_diffs (claimed_at, entity_uuid)
     WHERE processing_status = 'processing';
+-- The default two delivery partitions must not sort the complete historical
+-- flag backlog for every 500-row claim. These partial indexes match the
+-- worker's stable partition predicate and delivery order exactly.
+CREATE INDEX IF NOT EXISTS sync_diffs_content_partition_0_pending_idx
+    ON workspace_zulip_bridge.sync_diffs (
+        provider_uuid,
+        delivery_priority,
+        (CASE entity_type
+            WHEN 'users' THEN 0 WHEN 'streams' THEN 1
+            WHEN 'stream_bindings' THEN 2 WHEN 'topics' THEN 3
+            WHEN 'topic_bindings' THEN 4 WHEN 'messages' THEN 5
+            WHEN 'message_flags' THEN 6 ELSE 7
+        END),
+        source_updated_at,
+        entity_uuid
+    )
+    WHERE processing_status IN ('pending', 'failed')
+      AND entity_type IN ('messages', 'message_flags', 'message_reactions')
+      AND (
+          (
+              (hashtextextended(COALESCE(partition_key, entity_uuid)::text, 0)
+                  >> 1) % 2 + 2
+          ) % 2
+      ) = 0;
+CREATE INDEX IF NOT EXISTS sync_diffs_content_partition_1_pending_idx
+    ON workspace_zulip_bridge.sync_diffs (
+        provider_uuid,
+        delivery_priority,
+        (CASE entity_type
+            WHEN 'users' THEN 0 WHEN 'streams' THEN 1
+            WHEN 'stream_bindings' THEN 2 WHEN 'topics' THEN 3
+            WHEN 'topic_bindings' THEN 4 WHEN 'messages' THEN 5
+            WHEN 'message_flags' THEN 6 ELSE 7
+        END),
+        source_updated_at,
+        entity_uuid
+    )
+    WHERE processing_status IN ('pending', 'failed')
+      AND entity_type IN ('messages', 'message_flags', 'message_reactions')
+      AND (
+          (
+              (hashtextextended(COALESCE(partition_key, entity_uuid)::text, 0)
+                  >> 1) % 2 + 2
+          ) % 2
+      ) = 1;
+CREATE INDEX IF NOT EXISTS sync_diffs_unpartitioned_pending_idx
+    ON workspace_zulip_bridge.sync_diffs (
+        provider_uuid,
+        delivery_priority,
+        (CASE entity_type
+            WHEN 'users' THEN 0 WHEN 'streams' THEN 1
+            WHEN 'stream_bindings' THEN 2 WHEN 'topics' THEN 3
+            WHEN 'topic_bindings' THEN 4 WHEN 'messages' THEN 5
+            WHEN 'message_flags' THEN 6 ELSE 7
+        END),
+        source_updated_at,
+        entity_uuid
+    )
+    WHERE processing_status IN ('pending', 'failed')
+      AND entity_type NOT IN (
+          'messages', 'message_flags', 'message_reactions'
+      );
 
 CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.sync_plan_cursors (
     provider_uuid uuid NOT NULL,

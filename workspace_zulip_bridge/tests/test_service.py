@@ -84,10 +84,11 @@ class FakeWorkspaceWorker:
         plan_enabled: bool = True,
         partition: int = 0,
         partition_count: int = 1,
+        scope: str = "both",
         tokens: object | None = None,
     ) -> None:
         self.calls.append(
-            f"{self.label}-init-{plan_enabled}-{partition}/{partition_count}"
+            f"{self.label}-init-{plan_enabled}-{partition}/{partition_count}-{scope}"
         )
 
     async def run(self) -> None:
@@ -557,8 +558,9 @@ async def _run_workspace_receiver_test(
     assert "workspace-receiver-run" in calls
     assert "workspace-bootstrap-ensure" in calls
     assert "workspace-event-processor-run" in calls
-    assert calls.count("workspace-diff-worker-run") == 3
-    assert "workspace-diff-worker-init-True-0/2" in calls
-    assert "workspace-diff-worker-init-False-0/2" in calls
-    assert "workspace-diff-worker-init-False-1/2" in calls
+    assert calls.count("workspace-diff-worker-run") == 4
+    assert "workspace-diff-worker-init-True-0/2-unpartitioned" in calls
+    assert "workspace-diff-worker-init-False-0/2-partitioned" in calls
+    assert "workspace-diff-worker-init-False-1/2-partitioned" in calls
+    assert "workspace-diff-worker-init-False-0/2-unpartitioned" in calls
     assert pool.closed

@@ -96,6 +96,9 @@ def test_schema_normalizes_workspace_like_entities_and_personal_state() -> None:
     assert "zulip_messages_sync_plan_idx" in schema
     assert "zulip_message_flags_sync_plan_idx" in schema
     assert "zulip_message_reactions_sync_plan_idx" in schema
+    assert "sync_diffs_content_partition_0_pending_idx" in schema
+    assert "sync_diffs_content_partition_1_pending_idx" in schema
+    assert "sync_diffs_unpartitioned_pending_idx" in schema
 
 
 def test_schema_contains_event_retention_and_workspace_outbox_state() -> None:

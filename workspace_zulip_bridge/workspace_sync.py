@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from datetime import UTC
 from datetime import datetime
 from typing import Any
+from typing import Literal
 from urllib.parse import urlsplit
 from urllib.parse import urlunsplit
 from uuid import UUID
@@ -1254,6 +1255,7 @@ class WorkspaceDiffWorker:
         plan_enabled: bool = True,
         partition: int = 0,
         partition_count: int = 1,
+        scope: Literal["both", "partitioned", "unpartitioned"] = "both",
         tokens: WorkspaceTokenManager | None = None,
     ) -> None:
         assert settings.workspace_provider_uuid is not None
@@ -1261,6 +1263,10 @@ class WorkspaceDiffWorker:
         assert settings.workspace_token_file is not None
         if partition_count < 1 or not 0 <= partition < partition_count:
             raise ValueError("invalid Workspace sync partition")
+        if scope not in {"both", "partitioned", "unpartitioned"}:
+            raise ValueError("invalid Workspace sync scope")
+        if scope == "unpartitioned" and partition != 0:
+            raise ValueError("unpartitioned Workspace sync must use partition zero")
         self._pool = pool
         self._settings = settings
         self._provider_uuid = settings.workspace_provider_uuid
@@ -1269,8 +1275,36 @@ class WorkspaceDiffWorker:
         self._plan_enabled = plan_enabled
         self._partition = partition
         self._partition_count = partition_count
+        self._scope = scope
         self._unmapped_cleanup_done = False
         self._zulip_writer = ZulipOutboundWriter(pool, settings)
+
+    @property
+    def _partition_filter(self) -> str:
+        unpartitioned = """
+            entity_type NOT IN (
+                'messages', 'message_flags', 'message_reactions'
+            )
+        """
+        partitioned = f"""
+            entity_type IN ('messages', 'message_flags', 'message_reactions')
+            AND (
+                (
+                    (
+                        hashtextextended(
+                            COALESCE(partition_key, entity_uuid)::text, 0
+                        ) >> 1
+                    ) % {self._partition_count} + {self._partition_count}
+                ) % {self._partition_count}
+            ) = {self._partition}
+        """
+        scope = getattr(self, "_scope", "both")
+        if scope == "partitioned":
+            return f"({partitioned})"
+        if scope == "unpartitioned":
+            return f"({unpartitioned})"
+        non_partitioned = "TRUE" if self._partition == 0 else "FALSE"
+        return f"(({non_partitioned} AND ({unpartitioned})) OR ({partitioned}))"
 
     async def run(self) -> None:
         verify: bool | str = (
@@ -1990,7 +2024,7 @@ class WorkspaceDiffWorker:
     async def process_once(self, client: httpx.AsyncClient) -> int:
         async with self._pool.acquire() as connection, connection.transaction():
             await connection.execute(
-                """
+                f"""
                 UPDATE workspace_zulip_bridge.sync_diffs
                 SET processing_status = 'pending', claimed_at = NULL,
                     available_at = clock_timestamp(), processed_at = NULL,
@@ -2001,100 +2035,36 @@ class WorkspaceDiffWorker:
                       clock_timestamp()
                       - make_interval(secs => $2::double precision)
                   )
-                  AND (
-                      ($3 = 0 AND entity_type NOT IN (
-                          'messages', 'message_flags', 'message_reactions'
-                      ))
-                      OR (
-                          entity_type IN (
-                              'messages', 'message_flags', 'message_reactions'
-                          )
-                          AND (
-                              (
-                                  (
-                                      hashtextextended(
-                                          COALESCE(partition_key, entity_uuid)::text,
-                                          0
-                                      ) >> 1
-                                  ) % $4 + $4
-                              ) % $4
-                          ) = $3
-                      )
-                  )
+                  AND {self._partition_filter}
                 """,
                 self._provider_uuid,
                 self._settings.event_processor_claim_timeout_seconds,
-                self._partition,
-                self._partition_count,
             )
             delivery_priority = await connection.fetchval(
-                """
+                f"""
                 SELECT delivery_priority
                 FROM workspace_zulip_bridge.sync_diffs
                 WHERE provider_uuid = $1
                   AND processing_status IN ('pending', 'failed')
                   AND available_at <= clock_timestamp()
-                  AND (
-                      ($2 = 0 AND entity_type NOT IN (
-                          'messages', 'message_flags', 'message_reactions'
-                      ))
-                      OR (
-                          entity_type IN (
-                              'messages', 'message_flags', 'message_reactions'
-                          )
-                          AND (
-                              (
-                                  (
-                                      hashtextextended(
-                                          COALESCE(partition_key, entity_uuid)::text,
-                                          0
-                                      ) >> 1
-                                  ) % $3 + $3
-                              ) % $3
-                          ) = $2
-                      )
-                  )
+                  AND {self._partition_filter}
                 ORDER BY delivery_priority
                 LIMIT 1
                 """,
                 self._provider_uuid,
-                self._partition,
-                self._partition_count,
             )
             if delivery_priority is None:
                 return 0
             rows = await connection.fetch(
-                """
+                f"""
                 WITH claim AS (
                     SELECT provider_uuid, entity_type, entity_uuid
                     FROM workspace_zulip_bridge.sync_diffs
                     WHERE provider_uuid = $1
                       AND processing_status IN ('pending', 'failed')
                       AND available_at <= clock_timestamp()
-                      AND delivery_priority = $5
-                      AND (
-                          ($3 = 0 AND entity_type NOT IN (
-                              'messages', 'message_flags', 'message_reactions'
-                          ))
-                          OR (
-                              entity_type IN (
-                                  'messages', 'message_flags',
-                                  'message_reactions'
-                              )
-                              AND (
-                                  (
-                                      (
-                                          hashtextextended(
-                                              COALESCE(
-                                                  partition_key, entity_uuid
-                                              )::text,
-                                              0
-                                          ) >> 1
-                                      ) % $4 + $4
-                                  ) % $4
-                              ) = $3
-                          )
-                      )
+                      AND delivery_priority = $3
+                      AND {self._partition_filter}
                     ORDER BY delivery_priority,
                         CASE entity_type
                         WHEN 'users' THEN 0 WHEN 'streams' THEN 1
@@ -2114,8 +2084,6 @@ class WorkspaceDiffWorker:
                 """,
                 self._provider_uuid,
                 self._settings.workspace_sync_batch_size,
-                self._partition,
-                self._partition_count,
                 delivery_priority,
             )
         if not rows:
