@@ -2564,12 +2564,45 @@ async def _workspace_diff_dependencies_gate_children_and_batch_errors_isolate(
             """,
             provider_uuid,
         )
-        assert states[0]["processing_status"] == "failed"
+        assert states[0]["processing_status"] == "blocked"
         assert states[0]["attempt_count"] == 1
         assert states[0]["last_error"].endswith("item_index=0")
         assert states[1]["processing_status"] == "pending"
         assert states[1]["attempt_count"] == 0
         assert states[1]["last_error"] == "workspace_batch_rolled_back item_index=0"
+
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.sync_diffs
+            SET processing_status = 'processing', claimed_at = clock_timestamp(),
+                attempt_count = 1, last_error = NULL
+            WHERE provider_uuid = $1
+            """,
+            provider_uuid,
+        )
+        rows = await pool.fetch(
+            """
+            SELECT * FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1 ORDER BY entity_uuid
+            """,
+            provider_uuid,
+        )
+        await worker._isolate_provider_failure(
+            [(rows[0], message_data, b"m" * 32), (rows[1], message_data, b"n" * 32)],
+            ProviderApiError(503, "provider_unavailable", 0),
+        )
+        states = await pool.fetch(
+            """
+            SELECT entity_uuid, processing_status, attempt_count, last_error
+            FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1 ORDER BY entity_uuid
+            """,
+            provider_uuid,
+        )
+        assert states[0]["processing_status"] == "failed"
+        assert states[0]["last_error"].endswith("item_index=0")
+        assert states[1]["processing_status"] == "pending"
+        assert states[1]["attempt_count"] == 0
     finally:
         await pool.close()
 

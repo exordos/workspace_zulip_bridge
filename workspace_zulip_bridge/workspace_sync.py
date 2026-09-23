@@ -2313,7 +2313,8 @@ class WorkspaceDiffWorker:
         rolled_back = [
             record[0] for index, record in enumerate(records) if index != item_index
         ]
-        await self._mark([failed], "failed", str(error)[:2048])
+        failed_status = "blocked" if 400 <= error.status_code < 500 else "failed"
+        await self._mark([failed], failed_status, str(error)[:2048])
         if rolled_back:
             await self._release_claims(
                 rolled_back,
