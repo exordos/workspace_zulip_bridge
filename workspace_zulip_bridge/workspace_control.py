@@ -707,21 +707,36 @@ class WorkspaceControlWorker:
         realm_uuid = stable_realm_uuid(endpoint)
         user_uuid = stable_user_uuid(endpoint, identity.user_id)
         async with self._pool.acquire() as connection, connection.transaction():
-            other_realm = await connection.fetchval(
+            busy_other_realm = await connection.fetchval(
                 """
-                SELECT uuid
-                FROM workspace_zulip_bridge.zulip_realms
-                WHERE workspace_provider_uuid = $1 AND uuid <> $2
-                LIMIT 1
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM workspace_zulip_bridge.zulip_realms AS realm
+                    JOIN workspace_zulip_bridge.zulip_connections AS source
+                      ON source.realm_uuid = realm.uuid
+                     AND source.sync_enabled
+                    WHERE realm.workspace_provider_uuid = $1
+                      AND realm.uuid <> $2
+                )
                 """,
                 provider_uuid,
                 realm_uuid,
             )
-            if other_realm is not None:
+            if busy_other_realm:
                 raise _DesiredResourceError(
                     "provider_realm_mismatch",
                     "The bridge is already connected to another Zulip realm.",
                 )
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_realms
+                SET workspace_project_id = NULL, workspace_provider_uuid = NULL,
+                    updated_at = clock_timestamp()
+                WHERE workspace_provider_uuid = $1 AND uuid <> $2
+                """,
+                provider_uuid,
+                realm_uuid,
+            )
             await connection.execute(
                 """
                 INSERT INTO workspace_zulip_bridge.zulip_realms (

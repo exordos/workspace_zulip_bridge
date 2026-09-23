@@ -6,11 +6,27 @@
 set -euo pipefail
 
 APP_DIR="/opt/workspace_zulip_bridge"
+SOURCE_DIR="/tmp/workspace_zulip_bridge_source"
 CONFIG_DIR="/etc/workspace_zulip_bridge"
 BOOTSTRAP_DIR="/var/lib/exordos/bootstrap/scripts"
 SYSTEMD_DIR="/etc/systemd/system"
 SERVICE_USER="workspace_zulip_bridge"
 PG_VERSION="18"
+
+if [[ ! -s "${SOURCE_DIR}/.source-commit" ]]; then
+    echo "staged bridge source provenance is missing" >&2
+    exit 1
+fi
+
+SOURCE_REVISION="$(tr -d '[:space:]' < "${SOURCE_DIR}/.source-commit")"
+if [[ ! "${SOURCE_REVISION}" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "staged bridge source provenance is invalid" >&2
+    exit 1
+fi
+echo "Installing Workspace Zulip bridge source ${SOURCE_REVISION}"
+
+sudo rm -rf -- "${APP_DIR}"
+sudo mv "${SOURCE_DIR}" "${APP_DIR}"
 
 sudo apt-get update
 sudo apt-get install -y postgresql-common python3

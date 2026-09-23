@@ -110,6 +110,10 @@ jobs:
           command -v qemu-system-x86_64 >/dev/null
           command -v mkisofs >/dev/null
 
+          ./scripts/stage_element_source.sh
+          test "$(cat .build-source/workspace_zulip_bridge/.source-commit)" \
+            = "$(git rev-parse HEAD)"
+
       - name: Build element
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.profile != 'production_release' }}
         run: |

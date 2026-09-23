@@ -614,7 +614,10 @@ class WorkspaceBootstrapper:
             ) AS active_connection ON TRUE
             WHERE NOT zulip_user.is_bot
               AND (
-                    realm.workspace_provider_uuid = $1
+                    (
+                        realm.workspace_provider_uuid = $1
+                        AND realm.workspace_project_id = $2
+                    )
                     OR (
                         realm.workspace_provider_uuid IS NULL
                         AND realm.workspace_project_id = $2
@@ -1078,6 +1081,7 @@ class WorkspaceEventProcessor:
                 partition_key,
                 target_hash,
                 source_updated_at,
+                UUID(str(row["workspace_project_id"])),
             )
             applied = True
         return applied
@@ -1178,6 +1182,7 @@ class WorkspaceEventProcessor:
         partition_key: UUID | None,
         target_hash: bytes | None,
         target_updated_at: datetime,
+        project_uuid: UUID,
     ) -> bool:
         updated = await self._pool.fetchval(
             """
@@ -1189,6 +1194,7 @@ class WorkspaceEventProcessor:
             SELECT $1, $2, $3, realm.uuid, $4, 'to_zulip', NULL, $5, $6, $6, 0
             FROM workspace_zulip_bridge.zulip_realms AS realm
             WHERE realm.workspace_provider_uuid = $1
+              AND realm.workspace_project_id = $7
               AND (
                   $2 = 'users'
                   OR EXISTS (
@@ -1234,6 +1240,7 @@ class WorkspaceEventProcessor:
             partition_key,
             target_hash,
             target_updated_at,
+            project_uuid,
         )
         return bool(updated)
 
@@ -2748,24 +2755,85 @@ class WorkspaceDiffWorker:
     async def _link_realm(self) -> UUID | None:
         rows = await self._pool.fetch(
             """
-            SELECT uuid, workspace_provider_uuid
-            FROM workspace_zulip_bridge.zulip_realms
-            WHERE workspace_provider_uuid = $1
-               OR (workspace_provider_uuid IS NULL
-                   AND (workspace_project_id IS NULL OR workspace_project_id = $2))
-            ORDER BY uuid
+            SELECT realm.uuid, realm.workspace_project_id,
+                   realm.workspace_provider_uuid,
+                   count(connection.uuid) FILTER (
+                       WHERE connection.sync_enabled
+                   ) AS active_connections
+            FROM workspace_zulip_bridge.zulip_realms AS realm
+            LEFT JOIN workspace_zulip_bridge.zulip_connections AS connection
+              ON connection.realm_uuid = realm.uuid
+            WHERE (
+                    realm.workspace_provider_uuid = $1
+                  )
+               OR (
+                    realm.workspace_provider_uuid IS NULL
+                    AND (
+                        realm.workspace_project_id IS NULL
+                        OR realm.workspace_project_id = $2
+                    )
+                  )
+            GROUP BY realm.uuid
+            ORDER BY realm.uuid
             """,
             self._provider_uuid,
             self._project_uuid,
         )
-        exact = [row for row in rows if row["workspace_provider_uuid"] is not None]
+        active = [
+            row
+            for row in rows
+            if row["workspace_provider_uuid"] is not None
+            and row["active_connections"] > 0
+        ]
+        if len(active) > 1:
+            raise RuntimeError(
+                "Workspace provider maps to multiple active Zulip realms"
+            )
+        if active:
+            realm_uuid = UUID(str(active[0]["uuid"]))
+            if (
+                active[0]["workspace_project_id"] != self._project_uuid
+                or sum(row["workspace_provider_uuid"] is not None for row in rows) > 1
+            ):
+                async with self._pool.acquire() as connection, connection.transaction():
+                    await connection.execute(
+                        """
+                        UPDATE workspace_zulip_bridge.zulip_realms
+                        SET workspace_project_id = NULL,
+                            workspace_provider_uuid = NULL,
+                            updated_at = clock_timestamp()
+                        WHERE workspace_provider_uuid = $1 AND uuid <> $2
+                        """,
+                        self._provider_uuid,
+                        realm_uuid,
+                    )
+                    await connection.execute(
+                        """
+                        UPDATE workspace_zulip_bridge.zulip_realms
+                        SET workspace_project_id = $2,
+                            workspace_provider_uuid = $3,
+                            updated_at = clock_timestamp()
+                        WHERE uuid = $1
+                        """,
+                        realm_uuid,
+                        self._project_uuid,
+                        self._provider_uuid,
+                    )
+            return realm_uuid
+        exact = [
+            row
+            for row in rows
+            if row["workspace_provider_uuid"] is not None
+            and row["workspace_project_id"] == self._project_uuid
+        ]
         if len(exact) == 1:
             return UUID(str(exact[0]["uuid"]))
-        if not rows:
+        unlinked = [row for row in rows if row["workspace_provider_uuid"] is None]
+        if not unlinked:
             return None
-        if len(rows) != 1:
+        if len(unlinked) != 1:
             raise RuntimeError("Workspace provider maps to multiple Zulip realms")
-        realm_uuid = UUID(str(rows[0]["uuid"]))
+        realm_uuid = UUID(str(unlinked[0]["uuid"]))
         await self._pool.execute(
             """
             UPDATE workspace_zulip_bridge.zulip_realms

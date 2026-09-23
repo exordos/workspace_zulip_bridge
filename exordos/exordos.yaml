@@ -1,8 +1,8 @@
 build:
   deps:
-    - dst: /opt/workspace_zulip_bridge
+    - dst: /tmp/workspace_zulip_bridge_source
       path:
-        src: ../../workspace_zulip_bridge
+        src: ../.build-source/workspace_zulip_bridge
       exclude:
         - .git
         - .mypy_cache

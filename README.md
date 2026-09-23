@@ -292,9 +292,11 @@ WZB_BENCHMARK_DATABASE_DSN=postgresql:///workspace_zulip_bridge_benchmark \
 ## Exordos Core build
 
 The element manifest requires the destination Exordos Core project UUID at
-build time:
+build time. Stage the exact tracked Git tree first so the image cannot reuse a
+stale working-tree copy:
 
 ```bash
+./scripts/stage_element_source.sh
 exordos build \
   --manifest-var project_id=<project-uuid> \
   --manifest-var repository=https://repo.example.com/exordos-elements \

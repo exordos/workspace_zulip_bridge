@@ -47,6 +47,7 @@ from workspace_zulip_bridge.stable_ids import stable_stream_binding_uuid
 from workspace_zulip_bridge.stable_ids import stable_topic_binding_uuid
 from workspace_zulip_bridge.stable_ids import stable_topic_uuid
 from workspace_zulip_bridge.stable_ids import stable_user_uuid
+from workspace_zulip_bridge.workspace_control import WorkspaceControlWorker
 from workspace_zulip_bridge.workspace_events import WorkspaceEvent
 from workspace_zulip_bridge.workspace_events import WorkspaceEventReceiver
 from workspace_zulip_bridge.workspace_events import WorkspaceEventStore
@@ -2711,6 +2712,23 @@ def test_workspace_diff_planner_schedules_unready_entity_graph(
     )
 
 
+def test_workspace_sync_scopes_provider_realm_to_project(tmp_path: Path) -> None:
+    asyncio.run(_workspace_sync_scopes_provider_realm_to_project(_dsn(), tmp_path))
+
+
+def test_workspace_control_replaces_inactive_provider_realm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asyncio.run(
+        _workspace_control_replaces_inactive_provider_realm(
+            _dsn(),
+            tmp_path,
+            monkeypatch,
+        )
+    )
+
+
 def test_workspace_diff_materializes_topic_bindings(tmp_path: Path) -> None:
     asyncio.run(_workspace_diff_materializes_topic_bindings(_dsn(), tmp_path))
 
@@ -2741,6 +2759,237 @@ def test_workspace_event_uses_entity_timestamp_for_diff_direction() -> None:
 
 def test_workspace_batched_event_suppresses_older_item_retry() -> None:
     asyncio.run(_workspace_batched_event_suppresses_older_item_retry(_dsn()))
+
+
+async def _workspace_sync_scopes_provider_realm_to_project(
+    dsn: str,
+    tmp_path: Path,
+) -> None:
+    pool = await _pool(dsn)
+    provider_uuid = UUID("10000000-0000-0000-0000-000000000201")
+    project_uuid = UUID("10000000-0000-0000-0000-000000000202")
+    other_project_uuid = UUID("10000000-0000-0000-0000-000000000203")
+    realm_uuid = UUID("10000000-0000-0000-0000-000000000204")
+    other_realm_uuid = UUID("10000000-0000-0000-0000-000000000205")
+    entity_uuid = UUID("10000000-0000-0000-0000-000000000206")
+    user_uuid = UUID("10000000-0000-0000-0000-000000000207")
+    token_file = tmp_path / "workspace-sync-project.token"
+    token_file.write_text("integration-token")
+    try:
+        await pool.executemany(
+            """
+            INSERT INTO workspace_zulip_bridge.zulip_realms (
+                uuid, identity_key, endpoint, workspace_project_id,
+                workspace_provider_uuid
+            ) VALUES ($1, $2, $2, $3, $4)
+            """,
+            [
+                (
+                    realm_uuid,
+                    "https://current.example.test",
+                    project_uuid,
+                    provider_uuid,
+                ),
+                (
+                    other_realm_uuid,
+                    "https://other.example.test",
+                    other_project_uuid,
+                    provider_uuid,
+                ),
+            ],
+        )
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.zulip_users (
+                uuid, realm_uuid, zulip_user_id, login, full_name, role
+            ) VALUES ($1, $2, 7, 'member@example.test', 'Member', 400)
+            """,
+            user_uuid,
+            other_realm_uuid,
+        )
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.zulip_connections (
+                uuid, realm_uuid, zulip_user_uuid, login, api_key, sync_enabled
+            ) VALUES ($1, $2, $3, 'member@example.test', 'private-key', true)
+            """,
+            UUID("10000000-0000-0000-0000-000000000208"),
+            other_realm_uuid,
+            user_uuid,
+        )
+        settings = Settings.from_env(
+            {
+                "WZB_DATABASE_DSN": dsn,
+                "WZB_WORKSPACE_API_URL": "http://workspace.test/api/workspace/v1",
+                "WZB_WORKSPACE_WEBSOCKET_URL": (
+                    "ws://workspace.test/api/workspace/v1/events/ws"
+                ),
+                "WZB_WORKSPACE_PROJECT_ID": str(project_uuid),
+                "WZB_WORKSPACE_PROVIDER_UUID": str(provider_uuid),
+                "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+            }
+        )
+        worker = WorkspaceDiffWorker(pool, settings)
+        assert await worker._link_realm() == other_realm_uuid
+        current_realm = await pool.fetchrow(
+            """
+            SELECT workspace_project_id, workspace_provider_uuid
+            FROM workspace_zulip_bridge.zulip_realms WHERE uuid = $1
+            """,
+            realm_uuid,
+        )
+        active_realm = await pool.fetchrow(
+            """
+            SELECT workspace_project_id, workspace_provider_uuid
+            FROM workspace_zulip_bridge.zulip_realms WHERE uuid = $1
+            """,
+            other_realm_uuid,
+        )
+        assert current_realm is not None
+        assert current_realm["workspace_project_id"] is None
+        assert current_realm["workspace_provider_uuid"] is None
+        assert active_realm is not None
+        assert active_realm["workspace_project_id"] == project_uuid
+        assert active_realm["workspace_provider_uuid"] == provider_uuid
+
+        processor = WorkspaceEventProcessor(pool, settings)
+        assert await processor._upsert_diff(
+            "users",
+            entity_uuid,
+            None,
+            b"t" * 32,
+            datetime.now(UTC),
+            project_uuid,
+        )
+        row = await pool.fetchrow(
+            """
+            SELECT realm_uuid
+            FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1 AND entity_type = 'users'
+              AND entity_uuid = $2
+            """,
+            provider_uuid,
+            entity_uuid,
+        )
+        assert row is not None
+        assert row["realm_uuid"] == other_realm_uuid
+    finally:
+        await pool.close()
+
+
+async def _workspace_control_replaces_inactive_provider_realm(
+    dsn: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = await _pool(dsn)
+    provider_uuid = UUID("10000000-0000-0000-0000-000000000211")
+    project_uuid = UUID("10000000-0000-0000-0000-000000000212")
+    other_project_uuid = UUID("10000000-0000-0000-0000-000000000213")
+    stale_realm_uuid = UUID("10000000-0000-0000-0000-000000000214")
+    target_endpoint = "https://replacement.example.test"
+    target_realm_uuid = stable_realm_uuid(target_endpoint)
+    account_uuid = UUID("10000000-0000-0000-0000-000000000215")
+    owner_uuid = UUID("10000000-0000-0000-0000-000000000216")
+    provider_user_uuid = stable_user_uuid(target_endpoint, 7)
+    secret = tmp_path / "enrollment.secret"
+    secret.write_text("integration-secret")
+    try:
+        await pool.executemany(
+            """
+            INSERT INTO workspace_zulip_bridge.zulip_realms (
+                uuid, identity_key, endpoint, workspace_project_id,
+                workspace_provider_uuid
+            ) VALUES ($1, $2, $2, $3, $4)
+            """,
+            [
+                (
+                    stale_realm_uuid,
+                    "https://stale.example.test",
+                    project_uuid,
+                    provider_uuid,
+                ),
+                (
+                    target_realm_uuid,
+                    target_endpoint,
+                    other_project_uuid,
+                    provider_uuid,
+                ),
+            ],
+        )
+        settings = Settings(
+            database_dsn=dsn,
+            workspace_control_url="https://control.example.test",
+            workspace_control_bootstrap_url="http://control.example.test",
+            workspace_control_hostname="control.example.test",
+            workspace_project_id=project_uuid,
+            workspace_provider_uuid=provider_uuid,
+            workspace_realm_uuid=UUID("10000000-0000-0000-0000-000000000217"),
+            workspace_bridge_instance_uuid=UUID("10000000-0000-0000-0000-000000000218"),
+            workspace_enrollment_secret_file=secret,
+            workspace_control_state_dir=tmp_path / "control",
+        )
+        worker = WorkspaceControlWorker(pool, settings)
+        monkeypatch.setattr(
+            worker,
+            "_decrypt_credentials",
+            lambda *args: {
+                "server_url": target_endpoint,
+                "email": "member@example.test",
+                "api_key": "private-key",
+            },
+        )
+        monkeypatch.setattr(
+            worker,
+            "_read_zulip_identity",
+            lambda *args: SimpleNamespace(user_id=7, full_name="Member", role=400),
+        )
+        await worker._apply_account(
+            {
+                "uuid": str(account_uuid),
+                "generation": 1,
+                "owner_user_uuid": str(owner_uuid),
+                "synchronization_enabled": True,
+                "settings": {
+                    "server_url": target_endpoint,
+                    "default_project_id": str(project_uuid),
+                },
+                "credential_envelope": {},
+            }
+        )
+        stale = await pool.fetchrow(
+            """
+            SELECT workspace_project_id, workspace_provider_uuid
+            FROM workspace_zulip_bridge.zulip_realms WHERE uuid = $1
+            """,
+            stale_realm_uuid,
+        )
+        target = await pool.fetchrow(
+            """
+            SELECT workspace_project_id, workspace_provider_uuid
+            FROM workspace_zulip_bridge.zulip_realms WHERE uuid = $1
+            """,
+            target_realm_uuid,
+        )
+        connection = await pool.fetchrow(
+            """
+            SELECT realm_uuid, zulip_user_uuid, sync_enabled
+            FROM workspace_zulip_bridge.zulip_connections WHERE uuid = $1
+            """,
+            account_uuid,
+        )
+        assert stale is not None
+        assert stale["workspace_project_id"] is None
+        assert stale["workspace_provider_uuid"] is None
+        assert target is not None
+        assert target["workspace_project_id"] == project_uuid
+        assert target["workspace_provider_uuid"] == provider_uuid
+        assert connection is not None
+        assert connection["realm_uuid"] == target_realm_uuid
+        assert connection["zulip_user_uuid"] == provider_user_uuid
+        assert connection["sync_enabled"] is True
+    finally:
+        await pool.close()
 
 
 async def _workspace_batched_event_suppresses_older_item_retry(dsn: str) -> None:
