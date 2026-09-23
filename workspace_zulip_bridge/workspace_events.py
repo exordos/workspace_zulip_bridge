@@ -6,7 +6,7 @@ import json
 import logging
 import random
 import ssl
-from dataclasses import dataclass
+import threading
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl
@@ -15,12 +15,14 @@ from urllib.parse import urlsplit
 from urllib.parse import urlunsplit
 from uuid import UUID
 
-import asyncpg
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 from websockets.typing import Subprotocol
 
 from workspace_zulip_bridge.config import Settings
+from workspace_zulip_bridge.database import open_pool
+from workspace_zulip_bridge.models import WorkspaceEventCursor
+from workspace_zulip_bridge.v4_store import V4Store
 from workspace_zulip_bridge.workspace_auth import WorkspaceTokenManager
 
 LOG = logging.getLogger(__name__)
@@ -28,213 +30,17 @@ WORKSPACE_EVENTS_PROTOCOL = "workspace.events.v1"
 
 
 class WorkspaceCursorGapError(RuntimeError):
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class WorkspaceEventCursor:
-    epoch_generation: UUID | None
-    last_epoch_version: int
-    recovery_required: bool
-    recovery_reason: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class WorkspaceEvent:
-    uuid: UUID
-    epoch_version: int
-    object_type: str
-    action: str
-    entity_uuid: UUID | None
-    frame: dict[str, Any]
-
-
-class WorkspaceEventStore:
-    def __init__(self, pool: asyncpg.Pool) -> None:
-        self._pool = pool
-
-    async def cursor(
-        self,
-        provider_uuid: UUID,
-        project_uuid: UUID,
-    ) -> WorkspaceEventCursor:
-        async with self._pool.acquire() as connection, connection.transaction():
-            await connection.execute(
-                """
-                INSERT INTO workspace_zulip_bridge.workspace_event_cursors (
-                    provider_uuid, workspace_project_id
-                ) VALUES ($1, $2)
-                ON CONFLICT (provider_uuid) DO NOTHING
-                """,
-                provider_uuid,
-                project_uuid,
-            )
-            row = await connection.fetchrow(
-                """
-                SELECT workspace_project_id, epoch_generation,
-                       last_epoch_version, recovery_required, recovery_reason
-                FROM workspace_zulip_bridge.workspace_event_cursors
-                WHERE provider_uuid = $1
-                """,
-                provider_uuid,
-            )
-        if row is None or row["workspace_project_id"] != project_uuid:
-            raise RuntimeError("Workspace provider cursor belongs to another project")
-        return WorkspaceEventCursor(
-            epoch_generation=row["epoch_generation"],
-            last_epoch_version=row["last_epoch_version"],
-            recovery_required=row["recovery_required"],
-            recovery_reason=row["recovery_reason"],
-        )
-
-    async def persist(
-        self,
-        provider_uuid: UUID,
-        project_uuid: UUID,
-        epoch_generation: UUID | None,
-        events: list[WorkspaceEvent],
-    ) -> int:
-        if not events:
-            return 0
-        async with self._pool.acquire() as connection, connection.transaction():
-            inserted = await connection.fetchval(
-                """
-                WITH input AS (
-                    SELECT *
-                    FROM unnest(
-                        $1::uuid[], $2::bigint[], $3::text[], $4::text[],
-                        $5::uuid[], $6::text[]
-                    ) AS item(
-                        uuid, epoch_version, object_type, action,
-                        entity_uuid, payload
-                    )
-                ), inserted AS (
-                    INSERT INTO workspace_zulip_bridge.workspace_events (
-                        uuid, provider_uuid, workspace_project_id,
-                        epoch_generation, epoch_version, object_type, action,
-                        entity_uuid, payload
-                    )
-                    SELECT uuid, $7, $8, $9, epoch_version, object_type,
-                           action, entity_uuid, payload::jsonb
-                    FROM input
-                    ON CONFLICT (uuid) DO NOTHING
-                    RETURNING 1
-                )
-                SELECT count(*) FROM inserted
-                """,
-                [event.uuid for event in events],
-                [event.epoch_version for event in events],
-                [event.object_type for event in events],
-                [event.action for event in events],
-                [event.entity_uuid for event in events],
-                [
-                    json.dumps(event.frame, separators=(",", ":"), sort_keys=True)
-                    for event in events
-                ],
-                provider_uuid,
-                project_uuid,
-                epoch_generation,
-            )
-            if epoch_generation is not None:
-                await connection.execute(
-                    """
-                    UPDATE workspace_zulip_bridge.workspace_event_cursors
-                    SET epoch_generation = $3,
-                        last_epoch_version = GREATEST(last_epoch_version, $4),
-                        updated_at = clock_timestamp()
-                    WHERE provider_uuid = $1 AND workspace_project_id = $2
-                    """,
-                    provider_uuid,
-                    project_uuid,
-                    epoch_generation,
-                    max(event.epoch_version for event in events),
-                )
-        return int(inserted or 0)
-
-    async def mark_ready(
-        self,
-        provider_uuid: UUID,
-        project_uuid: UUID,
-        epoch_generation: UUID,
-        epoch_version: int,
-    ) -> None:
-        async with self._pool.acquire() as connection, connection.transaction():
-            await connection.execute(
-                """
-                UPDATE workspace_zulip_bridge.workspace_events
-                SET epoch_generation = $3,
-                    updated_at = clock_timestamp()
-                WHERE provider_uuid = $1 AND workspace_project_id = $2
-                  AND epoch_generation IS NULL
-                  AND epoch_version <= $4
-                """,
-                provider_uuid,
-                project_uuid,
-                epoch_generation,
-                epoch_version,
-            )
-            await connection.execute(
-                """
-                UPDATE workspace_zulip_bridge.workspace_event_cursors
-                SET epoch_generation = $3,
-                    last_epoch_version = GREATEST(last_epoch_version, $4),
-                    recovery_required = false,
-                    recovery_reason = NULL,
-                    updated_at = clock_timestamp()
-                WHERE provider_uuid = $1 AND workspace_project_id = $2
-                """,
-                provider_uuid,
-                project_uuid,
-                epoch_generation,
-                epoch_version,
-            )
-
-    async def mark_connected(self, provider_uuid: UUID) -> None:
-        await self._pool.execute(
-            """
-            UPDATE workspace_zulip_bridge.workspace_event_cursors
-            SET connected_at = clock_timestamp(),
-                disconnected_at = NULL,
-                updated_at = clock_timestamp()
-            WHERE provider_uuid = $1
-            """,
-            provider_uuid,
-        )
-
-    async def mark_disconnected(self, provider_uuid: UUID) -> None:
-        await self._pool.execute(
-            """
-            UPDATE workspace_zulip_bridge.workspace_event_cursors
-            SET disconnected_at = clock_timestamp(),
-                updated_at = clock_timestamp()
-            WHERE provider_uuid = $1
-            """,
-            provider_uuid,
-        )
-
-    async def mark_recovery_required(
-        self,
-        provider_uuid: UUID,
-        reason: str,
-    ) -> None:
-        await self._pool.execute(
-            """
-            UPDATE workspace_zulip_bridge.workspace_event_cursors
-            SET recovery_required = true,
-                recovery_reason = $2,
-                disconnected_at = clock_timestamp(),
-                updated_at = clock_timestamp()
-            WHERE provider_uuid = $1
-            """,
-            provider_uuid,
-            reason[:2048],
-        )
+    def __init__(self, minimum_epoch_version: int = 0) -> None:
+        super().__init__("workspace_cursor_expired")
+        self.minimum_epoch_version = minimum_epoch_version
 
 
 class WorkspaceEventReceiver:
+    """Maintain the Workspace socket and discard frames after cursoring them."""
+
     def __init__(
         self,
-        pool: asyncpg.Pool,
+        store: V4Store,
         settings: Settings,
         tokens: WorkspaceTokenManager | None = None,
     ) -> None:
@@ -243,79 +49,46 @@ class WorkspaceEventReceiver:
         assert settings.workspace_websocket_url is not None
         assert settings.workspace_project_id is not None
         assert settings.workspace_provider_uuid is not None
-        assert settings.workspace_token_file is not None
-        self._pool = pool
+        self._store = store
         self._settings = settings
         self._url = settings.workspace_websocket_url
         self._project_uuid = settings.workspace_project_id
         self._provider_uuid = settings.workspace_provider_uuid
         self._tokens = tokens or WorkspaceTokenManager(settings)
-        self._store = WorkspaceEventStore(pool)
 
     async def run(self) -> None:
-        while True:
-            async with self._pool.acquire() as lease:
-                acquired = await lease.fetchval(
-                    """
-                    SELECT pg_try_advisory_lock(
-                        hashtextextended('workspace_zulip_bridge:workspace-events:'
-                            || $1::text, 0)
-                    )
-                    """,
-                    str(self._provider_uuid),
-                )
-                if acquired:
-                    LOG.info("Workspace event receiver lease acquired")
-                    try:
-                        await self._run_leader()
-                    finally:
-                        await lease.execute(
-                            """
-                            SELECT pg_advisory_unlock(
-                                hashtextextended(
-                                    'workspace_zulip_bridge:workspace-events:'
-                                    || $1::text,
-                                    0
-                                )
-                            )
-                            """,
-                            str(self._provider_uuid),
-                        )
-            await asyncio.sleep(self._settings.workspace_lease_retry_seconds)
-
-    async def _run_leader(self) -> None:
         retry_seconds = self._settings.workspace_retry_base_seconds
         while True:
-            cursor = await self._store.cursor(
+            cursor = await self._store.workspace_cursor(
                 self._provider_uuid,
                 self._project_uuid,
             )
-            if cursor.recovery_required:
-                LOG.error(
-                    "Workspace event cursor requires snapshot recovery: %s",
-                    cursor.recovery_reason,
-                )
-                await asyncio.sleep(self._settings.workspace_lease_retry_seconds)
-                continue
             try:
                 await self._receive(cursor)
                 retry_seconds = self._settings.workspace_retry_base_seconds
             except asyncio.CancelledError:
                 raise
             except WorkspaceCursorGapError as exc:
-                await self._store.mark_recovery_required(
+                await self._store.reset_workspace_cursor(
                     self._provider_uuid,
-                    str(exc),
+                    self._project_uuid,
+                    max(0, exc.minimum_epoch_version - 1),
                 )
-            except Exception:
-                LOG.exception("Workspace event websocket disconnected")
-                await self._store.mark_disconnected(self._provider_uuid)
-                delay = random.uniform(retry_seconds * 0.5, retry_seconds)
-                await asyncio.sleep(delay)
-                retry_seconds = min(
-                    retry_seconds * 2,
-                    self._settings.workspace_retry_cap_seconds,
+            except Exception as exc:
+                LOG.warning(
+                    "Workspace event websocket reconnecting: error=%s",
+                    type(exc).__name__,
                 )
+                await self._store.mark_workspace_disconnected(
+                    self._provider_uuid,
+                    type(exc).__name__,
+                )
+            delay = random.uniform(retry_seconds * 0.5, retry_seconds)
+            await asyncio.sleep(delay)
+            retry_seconds = min(
+                retry_seconds * 2,
+                self._settings.workspace_retry_cap_seconds,
+            )
 
     async def _receive(self, cursor: WorkspaceEventCursor) -> None:
         token = await self._tokens.access_token()
@@ -336,7 +109,6 @@ class WorkspaceEventReceiver:
         ) as websocket:
             if websocket.subprotocol != WORKSPACE_EVENTS_PROTOCOL:
                 raise RuntimeError("Workspace websocket subprotocol was not selected")
-            await self._store.mark_connected(self._provider_uuid)
             LOG.info(
                 "Workspace event websocket connected at epoch %d",
                 cursor.last_epoch_version,
@@ -346,75 +118,141 @@ class WorkspaceEventReceiver:
             except ConnectionClosed as exc:
                 close_code = None if exc.rcvd is None else exc.rcvd.code
                 if close_code == 4410:
-                    raise WorkspaceCursorGapError("workspace_cursor_expired") from exc
+                    raise WorkspaceCursorGapError from exc
                 raise
             finally:
-                await self._store.mark_disconnected(self._provider_uuid)
+                await self._store.mark_workspace_disconnected(
+                    self._provider_uuid,
+                    None,
+                )
 
-    async def _consume(
-        self,
-        websocket: Any,
-        cursor: WorkspaceEventCursor,
-    ) -> None:
+    async def _consume(self, websocket: Any, cursor: WorkspaceEventCursor) -> None:
         generation = cursor.epoch_generation
-        batch: list[WorkspaceEvent] = []
+        pending_version = cursor.last_epoch_version
+        pending_count = 0
         try:
             while True:
                 timeout = (
-                    self._settings.workspace_event_flush_seconds if batch else None
+                    self._settings.workspace_event_flush_seconds
+                    if pending_count
+                    else None
                 )
                 try:
                     raw = await asyncio.wait_for(websocket.recv(), timeout=timeout)
                 except TimeoutError:
-                    await self._flush(batch, generation)
-                    batch.clear()
+                    if generation is not None:
+                        await self._store.advance_workspace_cursor(
+                            self._provider_uuid,
+                            self._project_uuid,
+                            generation,
+                            pending_version,
+                        )
+                    pending_count = 0
                     continue
                 frame = _decode_frame(raw)
                 if frame.get("error") == "epoch_pruned" or frame.get("code") == 410:
-                    await self._flush(batch, generation)
-                    batch.clear()
-                    minimum_epoch_version = _nonnegative_int(
-                        frame.get("minimum_epoch_version"),
+                    minimum = _nonnegative_int(
+                        frame.get("minimum_epoch_version", 0),
                         "minimum_epoch_version",
                     )
-                    raise WorkspaceCursorGapError(
-                        "workspace_cursor_expired:"
-                        f"minimum_epoch_version={minimum_epoch_version}"
-                    )
+                    raise WorkspaceCursorGapError(minimum)
                 if frame.get("type") == "ready":
-                    await self._flush(batch, generation)
-                    batch.clear()
                     generation = UUID(str(frame["epoch_generation"]))
-                    await self._store.mark_ready(
+                    pending_version = _nonnegative_int(
+                        frame["epoch_version"],
+                        "epoch_version",
+                    )
+                    await self._store.advance_workspace_cursor(
                         self._provider_uuid,
                         self._project_uuid,
                         generation,
-                        _nonnegative_int(frame["epoch_version"], "epoch_version"),
+                        pending_version,
                     )
+                    pending_count = 0
                     continue
-                batch.append(
-                    _parse_event(frame, self._project_uuid, self._provider_uuid)
+                _validate_event_route(frame, self._project_uuid, self._provider_uuid)
+                pending_version = max(
+                    pending_version,
+                    _nonnegative_int(frame["epoch_version"], "epoch_version"),
                 )
-                if len(batch) >= self._settings.workspace_event_batch_size:
-                    await self._flush(batch, generation)
-                    batch.clear()
+                pending_count += 1
+                if pending_count < self._settings.workspace_event_batch_size:
+                    continue
+                if generation is None:
+                    raise ValueError("Workspace event arrived before ready frame")
+                await self._store.advance_workspace_cursor(
+                    self._provider_uuid,
+                    self._project_uuid,
+                    generation,
+                    pending_version,
+                )
+                pending_count = 0
         finally:
-            if batch:
-                await self._flush(batch, generation)
+            if pending_count:
+                if generation is None:
+                    raise ValueError("Workspace event arrived before ready frame")
+                await self._store.advance_workspace_cursor(
+                    self._provider_uuid,
+                    self._project_uuid,
+                    generation,
+                    pending_version,
+                )
 
-    async def _flush(
-        self,
-        batch: list[WorkspaceEvent],
-        generation: UUID | None,
-    ) -> None:
-        if not batch:
-            return
-        await self._store.persist(
-            self._provider_uuid,
-            self._project_uuid,
-            generation,
-            batch,
-        )
+
+class WorkspaceEventThread(threading.Thread):
+    """Run the Workspace WebSocket on an event loop isolated in one OS thread."""
+
+    def __init__(self, settings: Settings) -> None:
+        super().__init__(name="workspace-events", daemon=True)
+        self._settings = settings
+        self._state_lock = threading.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._task: asyncio.Task[None] | None = None
+        self._stop_requested = threading.Event()
+        self.error: BaseException | None = None
+
+    def stop(self) -> None:
+        self._stop_requested.set()
+        with self._state_lock:
+            loop = self._loop
+            task = self._task
+        if loop is not None and task is not None:
+            loop.call_soon_threadsafe(task.cancel)
+
+    def run(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        task = loop.create_task(self._run(), name="workspace-event-receiver")
+        with self._state_lock:
+            self._loop = loop
+            self._task = task
+        if self._stop_requested.is_set():
+            task.cancel()
+        try:
+            loop.run_until_complete(task)
+        except asyncio.CancelledError:
+            pass
+        except BaseException as exc:
+            self.error = exc
+            LOG.exception("Workspace event thread failed")
+        finally:
+            with self._state_lock:
+                self._loop = None
+                self._task = None
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.close()
+
+    async def _run(self) -> None:
+        pool = await open_pool(self._settings)
+        try:
+            receiver = WorkspaceEventReceiver(
+                V4Store(pool),
+                self._settings,
+                WorkspaceTokenManager(self._settings),
+            )
+            await receiver.run()
+        finally:
+            await pool.close()
 
 
 def _cursor_url(url: str, cursor: WorkspaceEventCursor) -> str:
@@ -443,35 +281,19 @@ def _decode_frame(raw: str | bytes) -> dict[str, Any]:
     return frame
 
 
+def _validate_event_route(
+    frame: dict[str, Any],
+    project_uuid: UUID,
+    provider_uuid: UUID,
+) -> None:
+    if UUID(str(frame["project_id"])) != project_uuid:
+        raise ValueError("Workspace event belongs to another project")
+    if UUID(str(frame["user_uuid"])) != provider_uuid:
+        raise ValueError("Workspace event belongs to another provider consumer")
+
+
 def _nonnegative_int(value: object, field: str) -> int:
     result = int(str(value))
     if result < 0:
         raise ValueError(f"{field} must be non-negative")
     return result
-
-
-def _parse_event(
-    frame: dict[str, Any],
-    project_uuid: UUID,
-    provider_uuid: UUID,
-) -> WorkspaceEvent:
-    if UUID(str(frame["project_id"])) != project_uuid:
-        raise ValueError("Workspace event belongs to another project")
-    if UUID(str(frame["user_uuid"])) != provider_uuid:
-        raise ValueError("Workspace event belongs to another provider consumer")
-    payload = frame.get("payload")
-    if not isinstance(payload, dict):
-        raise ValueError("Workspace event payload must be an object")
-    entity_uuid = None
-    try:
-        entity_uuid = UUID(str(payload["uuid"]))
-    except (KeyError, TypeError, ValueError):
-        pass
-    return WorkspaceEvent(
-        uuid=UUID(str(frame["uuid"])),
-        epoch_version=_nonnegative_int(frame["epoch_version"], "epoch_version"),
-        object_type=str(frame["object_type"]),
-        action=str(frame["action"]),
-        entity_uuid=entity_uuid,
-        frame=frame,
-    )

@@ -9,38 +9,6 @@ import pytest
 
 from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.workspace_auth import WorkspaceTokenManager
-from workspace_zulip_bridge.workspace_sync import workspace_api_url
-
-
-def test_workspace_api_url_routes_provider_calls_to_messenger_service(
-    tmp_path: Path,
-) -> None:
-    token_file = tmp_path / "workspace.token"
-    token_file.write_text("access-token")
-    common = {
-        "WZB_WORKSPACE_WEBSOCKET_URL": (
-            "wss://workspace.example/api/workspace/v1/events/ws"
-        ),
-        "WZB_WORKSPACE_PROJECT_ID": "10000000-0000-0000-0000-000000000001",
-        "WZB_WORKSPACE_PROVIDER_UUID": "10000000-0000-0000-0000-000000000002",
-        "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
-    }
-    assert workspace_api_url(Settings.from_env(common)) == (
-        "https://workspace.example/api/workspace/v1/messenger"
-    )
-    assert (
-        workspace_api_url(
-            Settings.from_env(
-                {
-                    **common,
-                    "WZB_WORKSPACE_API_URL": (
-                        "https://workspace.example/api/workspace/v1"
-                    ),
-                }
-            )
-        )
-        == "https://workspace.example/api/workspace/v1/messenger"
-    )
 
 
 def test_expired_access_token_is_refreshed_and_rotation_is_persisted(

@@ -1,5 +1,5 @@
 name: "workspace_zulip_bridge"
-description: "Low-latency Workspace and Zulip integration bridge"
+description: "Workspace and Zulip connection foundation for protocol v4"
 schema_version: 1
 version: "{{ version }}"
 api_version: "v1"
@@ -88,7 +88,7 @@ resources:
         command: >-
           rm -f /var/lib/workspace_zulip_bridge/workspace.token
           /var/lib/workspace_zulip_bridge/workspace.refresh-token
-          /var/lib/workspace_zulip_bridge/control/desired-state-cursor &&
+          /var/lib/workspace_zulip_bridge/control/desired-state-v4-cursor &&
           systemctl restart workspace-zulip-bridge
       body:
         kind: text
