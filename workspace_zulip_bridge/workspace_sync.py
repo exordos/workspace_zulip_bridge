@@ -2214,6 +2214,7 @@ class WorkspaceDiffWorker:
         list[asyncpg.Record],
     ]:
         dependencies: dict[str, set[UUID]] = defaultdict(set)
+        message_flag_binding_ids = await self._load_message_flag_binding_ids(candidates)
         for row, data, _, _ in candidates:
             if not data:
                 continue
@@ -2221,6 +2222,10 @@ class WorkspaceDiffWorker:
                 row["entity_type"], data
             ):
                 dependencies[dependency_type].add(dependency_uuid)
+            if row["entity_type"] == "message_flags":
+                binding_uuid = message_flag_binding_ids.get(row["entity_uuid"])
+                if binding_uuid is not None:
+                    dependencies["stream_bindings"].add(binding_uuid)
         ready_ids = await self._load_ready_dependency_ids(dependencies)
         ready = []
         deferred = []
@@ -2229,7 +2234,15 @@ class WorkspaceDiffWorker:
             key=lambda item: PRIORITY[item[0]["entity_type"]],
         ):
             row, data, _, _ = candidate
-            required = _entity_dependencies(row["entity_type"], data) if data else ()
+            required = list(
+                _entity_dependencies(row["entity_type"], data) if data else ()
+            )
+            if row["entity_type"] == "message_flags":
+                binding_uuid = message_flag_binding_ids.get(row["entity_uuid"])
+                if binding_uuid is None:
+                    deferred.append(row)
+                    continue
+                required.append(("stream_bindings", binding_uuid))
             if all(
                 dependency_uuid in ready_ids[dependency_type]
                 for dependency_type, dependency_uuid in required
@@ -2240,6 +2253,33 @@ class WorkspaceDiffWorker:
             else:
                 deferred.append(row)
         return ready, deferred
+
+    async def _load_message_flag_binding_ids(
+        self,
+        candidates: list[tuple[asyncpg.Record, dict[str, Any], bytes, dict[str, Any]]],
+    ) -> dict[UUID, UUID]:
+        flag_uuids = [
+            row["entity_uuid"]
+            for row, _, _, _ in candidates
+            if row["entity_type"] == "message_flags"
+        ]
+        if not flag_uuids:
+            return {}
+        rows = await self._pool.fetch(
+            """
+            SELECT flag.uuid AS entity_uuid, binding.uuid AS binding_uuid
+            FROM workspace_zulip_bridge.zulip_message_flags AS flag
+            JOIN workspace_zulip_bridge.zulip_stream_bindings AS binding
+              ON binding.zulip_stream_uuid = flag.zulip_stream_uuid
+             AND binding.zulip_user_uuid = flag.zulip_user_uuid
+            WHERE flag.uuid = ANY($1::uuid[])
+            """,
+            flag_uuids,
+        )
+        return {
+            UUID(str(row["entity_uuid"])): UUID(str(row["binding_uuid"]))
+            for row in rows
+        }
 
     async def _load_ready_dependency_ids(
         self,
@@ -2269,19 +2309,25 @@ class WorkspaceDiffWorker:
             JOIN active ON active.active_generation = entity.snapshot_generation
             WHERE entity.provider_uuid = $1 AND entity.uuid = ANY($3::uuid[])
             UNION ALL
+            SELECT 'stream_bindings', entity.uuid
+            FROM workspace_zulip_bridge.workspace_stream_bindings AS entity
+            JOIN active ON active.active_generation = entity.snapshot_generation
+            WHERE entity.provider_uuid = $1 AND entity.uuid = ANY($4::uuid[])
+            UNION ALL
             SELECT 'topics', entity.uuid
             FROM workspace_zulip_bridge.workspace_topics AS entity
             JOIN active ON active.active_generation = entity.snapshot_generation
-            WHERE entity.provider_uuid = $1 AND entity.uuid = ANY($4::uuid[])
+            WHERE entity.provider_uuid = $1 AND entity.uuid = ANY($5::uuid[])
             UNION ALL
             SELECT 'messages', entity.uuid
             FROM workspace_zulip_bridge.workspace_messages AS entity
             JOIN active ON active.active_generation = entity.snapshot_generation
-            WHERE entity.provider_uuid = $1 AND entity.uuid = ANY($5::uuid[])
+            WHERE entity.provider_uuid = $1 AND entity.uuid = ANY($6::uuid[])
             """,
             self._provider_uuid,
             list(dependencies.get("users", ())),
             list(dependencies.get("streams", ())),
+            list(dependencies.get("stream_bindings", ())),
             list(dependencies.get("topics", ())),
             list(dependencies.get("messages", ())),
         )

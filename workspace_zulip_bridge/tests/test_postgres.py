@@ -2552,6 +2552,135 @@ async def _workspace_diff_dependencies_gate_children_and_batch_errors_isolate(
         assert ready == [candidate]
         assert deferred == []
 
+        binding_uuid = stable_stream_binding_uuid(stream_uuid, user_uuid)
+        flag_uuid = stable_message_flag_uuid(message_uuid, user_uuid)
+        async with pool.acquire() as connection:
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_streams (
+                    uuid, realm_uuid, chat_type, chat_key, name,
+                    content_hash, source_connection_uuid
+                ) VALUES ($1, $2, 'channel', 'channel:111', 'Dependencies',
+                          $3, $4)
+                """,
+                stream_uuid,
+                realm_uuid,
+                b"s" * 32,
+                user_uuid,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_stream_bindings (
+                    uuid, zulip_stream_uuid, zulip_user_uuid, role,
+                    membership_kind, content_hash
+                ) VALUES ($1, $2, $3, 'member', 'subscriber', $4)
+                """,
+                binding_uuid,
+                stream_uuid,
+                user_uuid,
+                b"b" * 32,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_messages (
+                    uuid, realm_uuid, source_connection_uuid, zulip_stream_uuid,
+                    sender_user_uuid, zulip_message_id, content, content_hash,
+                    message_hash, created_at, source_updated_at
+                ) VALUES ($1, $2, $3, $4, $3, 11101, 'dependencies', $5, $6,
+                          clock_timestamp(), clock_timestamp())
+                """,
+                message_uuid,
+                realm_uuid,
+                user_uuid,
+                stream_uuid,
+                b"c" * 32,
+                b"m" * 32,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_message_flags (
+                    uuid, realm_uuid, zulip_stream_uuid, message_uuid,
+                    zulip_user_uuid, is_read, flags_hash
+                ) VALUES ($1, $2, $3, $4, $5, true, $6)
+                """,
+                flag_uuid,
+                realm_uuid,
+                stream_uuid,
+                message_uuid,
+                user_uuid,
+                b"f" * 32,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.workspace_messages (
+                    provider_uuid, snapshot_generation, uuid,
+                    workspace_project_id, content_hash, source_updated_at, data
+                ) VALUES ($1, $2, $3, $4, $5, clock_timestamp(), '{}'::jsonb)
+                """,
+                provider_uuid,
+                generation,
+                message_uuid,
+                project_uuid,
+                b"m" * 32,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.sync_diffs (
+                    provider_uuid, entity_type, entity_uuid, realm_uuid,
+                    partition_key, direction, processing_status,
+                    source_updated_at, attempt_count, claimed_at
+                ) VALUES ($1, 'message_flags', $2, $3, $4, 'to_workspace',
+                          'processing', clock_timestamp(), 1, $5)
+                """,
+                provider_uuid,
+                flag_uuid,
+                realm_uuid,
+                stream_uuid,
+                claimed_at,
+            )
+        flag_row = await pool.fetchrow(
+            """
+            SELECT * FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1 AND entity_type = 'message_flags'
+              AND entity_uuid = $2
+            """,
+            provider_uuid,
+            flag_uuid,
+        )
+        assert flag_row is not None
+        flag_data = {
+            "stream_uuid": str(stream_uuid),
+            "message_uuid": str(message_uuid),
+            "user_uuid": str(user_uuid),
+        }
+        flag_candidate = (
+            flag_row,
+            flag_data,
+            b"f" * 32,
+            {"action": "upsert", "type": "message_flags", "uuid": str(flag_uuid)},
+        )
+
+        ready, deferred = await worker._partition_dependency_ready([flag_candidate])
+        assert ready == []
+        assert deferred == [flag_row]
+
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.workspace_stream_bindings (
+                provider_uuid, snapshot_generation, uuid,
+                workspace_project_id, content_hash, source_updated_at, data
+            ) VALUES ($1, $2, $3, $4, $5, clock_timestamp(), '{}'::jsonb)
+            """,
+            provider_uuid,
+            generation,
+            binding_uuid,
+            project_uuid,
+            b"b" * 32,
+        )
+        ready, deferred = await worker._partition_dependency_ready([flag_candidate])
+        assert ready == [flag_candidate]
+        assert deferred == []
+
         await worker._isolate_provider_failure(
             [(rows[0], message_data, b"m" * 32), (rows[1], message_data, b"n" * 32)],
             ProviderApiError(422, "invalid_entity", 0),
