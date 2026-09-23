@@ -1,6 +1,6 @@
 [project]
 name = "workspace-zulip-bridge"
-description = "Low-latency Workspace and Zulip integration bridge"
+description = "Workspace and Zulip connection foundation for protocol v4"
 readme = "README.md"
 authors = [{name = "Genesis Corporation", email = "cassi@exordos.com"}]
 dynamic = ["version"]
@@ -68,7 +68,7 @@ include = ["workspace_zulip_bridge"]
 namespaces = false
 
 [tool.setuptools.package-data]
-workspace_zulip_bridge = ["schema.sql", "schema_upgrades.sql"]
+workspace_zulip_bridge = ["schema_v4.sql"]
 
 [tool.ruff]
 line-length = 88

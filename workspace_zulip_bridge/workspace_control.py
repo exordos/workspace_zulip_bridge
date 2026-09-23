@@ -18,6 +18,9 @@ import typing
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+from urllib.parse import SplitResult
+from urllib.parse import urlsplit
+from urllib.parse import urlunsplit
 from uuid import UUID
 from uuid import uuid4
 from uuid import uuid5
@@ -33,9 +36,7 @@ from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
 from workspace_zulip_bridge.config import Settings
-from workspace_zulip_bridge.stable_ids import canonical_endpoint
-from workspace_zulip_bridge.stable_ids import stable_realm_uuid
-from workspace_zulip_bridge.stable_ids import stable_user_uuid
+from workspace_zulip_bridge.v4_store import V4Store
 from workspace_zulip_bridge.zulip_api import ZulipApiClient
 from workspace_zulip_bridge.zulip_api import ZulipApiError
 
@@ -48,22 +49,7 @@ _CREDENTIAL_SCHEMA = "workspace.external-credential.zulip/v1"
 _CREDENTIAL_ALGORITHM = "HPKE-v1-BASE-X25519-HKDF-SHA256-AES-256-GCM"
 _RESOURCE_TYPES = ("custom_ca_bundle", "external_account")
 _CERTIFICATE_RENEWAL_WINDOW = datetime.timedelta(days=7)
-_CAPABILITIES = {
-    name: {"revision": 1, "limits": {}}
-    for name in (
-        "messenger.chat_catalog",
-        "messenger.message.delete",
-        "messenger.message.edit",
-        "messenger.message.read",
-        "messenger.message.read.paging",
-        "messenger.message.send",
-        "messenger.membership.write",
-        "messenger.notification.write",
-        "messenger.reaction.write",
-        "messenger.stream.rename",
-        "messenger.topic.rename",
-    )
-}
+_CAPABILITIES: dict[str, object] = {}
 
 
 class _DesiredResourceError(ValueError):
@@ -85,7 +71,7 @@ class WorkspaceControlWorker:
         assert settings.workspace_realm_uuid is not None
         assert settings.workspace_bridge_instance_uuid is not None
         assert settings.workspace_enrollment_secret_file is not None
-        self._pool = pool
+        self._store = V4Store(pool)
         self._settings = settings
         self._state = settings.workspace_control_state_dir
         self._ca = self._state / "control-ca.pem"
@@ -93,7 +79,7 @@ class WorkspaceControlWorker:
         self._certificate = self._state / "bridge.crt"
         self._credential_key = self._state / "credential-x25519.key"
         self._request = self._state / "enrollment-request.json"
-        self._cursor = self._state / "desired-state-cursor"
+        self._cursor = self._state / "desired-state-v4-cursor"
         self._last_heartbeat = 0.0
         self._enrollment_lock = asyncio.Lock()
 
@@ -693,129 +679,30 @@ class WorkspaceControlWorker:
             generation,
             envelope,
         )
-        endpoint = canonical_endpoint(str(settings["server_url"]))
-        if endpoint != canonical_endpoint(credentials["server_url"]):
+        endpoint = _canonical_endpoint(str(settings["server_url"]))
+        if endpoint != _canonical_endpoint(credentials["server_url"]):
             raise ValueError("external account endpoint mismatch")
-        identity = await asyncio.to_thread(
-            self._read_zulip_identity,
+        await asyncio.to_thread(
+            self._check_zulip_auth,
             endpoint,
             credentials["email"],
             credentials["api_key"],
         )
-        provider_uuid = self._settings.workspace_provider_uuid
-        assert provider_uuid is not None
-        realm_uuid = stable_realm_uuid(endpoint)
-        user_uuid = stable_user_uuid(endpoint, identity.user_id)
-        async with self._pool.acquire() as connection, connection.transaction():
-            busy_other_realm = await connection.fetchval(
-                """
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM workspace_zulip_bridge.zulip_realms AS realm
-                    JOIN workspace_zulip_bridge.zulip_connections AS source
-                      ON source.realm_uuid = realm.uuid
-                     AND source.sync_enabled
-                    WHERE realm.workspace_provider_uuid = $1
-                      AND realm.uuid <> $2
-                )
-                """,
-                provider_uuid,
-                realm_uuid,
-            )
-            if busy_other_realm:
-                raise _DesiredResourceError(
-                    "provider_realm_mismatch",
-                    "The bridge is already connected to another Zulip realm.",
-                )
-            await connection.execute(
-                """
-                UPDATE workspace_zulip_bridge.zulip_realms
-                SET workspace_project_id = NULL, workspace_provider_uuid = NULL,
-                    updated_at = clock_timestamp()
-                WHERE workspace_provider_uuid = $1 AND uuid <> $2
-                """,
-                provider_uuid,
-                realm_uuid,
-            )
-            await connection.execute(
-                """
-                INSERT INTO workspace_zulip_bridge.zulip_realms (
-                    uuid, identity_key, endpoint, workspace_project_id,
-                    workspace_provider_uuid
-                ) VALUES ($1, $2, $2, $3, $4)
-                ON CONFLICT (uuid) DO UPDATE SET
-                    workspace_project_id = EXCLUDED.workspace_project_id,
-                    workspace_provider_uuid = EXCLUDED.workspace_provider_uuid,
-                    updated_at = clock_timestamp()
-                """,
-                realm_uuid,
-                endpoint,
-                project_uuid,
-                provider_uuid,
-            )
-            await connection.execute(
-                """
-                INSERT INTO workspace_zulip_bridge.zulip_users (
-                    uuid, realm_uuid, zulip_user_id, login, full_name, role,
-                    workspace_user_uuid
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-                ON CONFLICT (uuid) DO UPDATE SET
-                    login = EXCLUDED.login, full_name = EXCLUDED.full_name,
-                    role = EXCLUDED.role, disabled = false,
-                    workspace_user_uuid = EXCLUDED.workspace_user_uuid,
-                    updated_at = clock_timestamp()
-                """,
-                user_uuid,
-                realm_uuid,
-                identity.user_id,
-                credentials["email"],
-                identity.full_name,
-                identity.role,
-                owner_uuid,
-            )
-            existing = await connection.fetchrow(
-                """
-                SELECT uuid
-                FROM workspace_zulip_bridge.zulip_connections
-                WHERE external_account_uuid = $1
-                   OR (realm_uuid = $2 AND login = $3)
-                ORDER BY (external_account_uuid = $1) DESC
-                LIMIT 1
-                FOR UPDATE
-                """,
-                account_uuid,
-                realm_uuid,
-                credentials["email"],
-            )
-            connection_uuid = account_uuid if existing is None else existing["uuid"]
-            await connection.execute(
-                """
-                INSERT INTO workspace_zulip_bridge.zulip_connections (
-                    uuid, external_account_uuid, owner_workspace_user_uuid,
-                    desired_generation, realm_uuid, zulip_user_uuid, login,
-                    api_key, sync_enabled
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE)
-                ON CONFLICT (uuid) DO UPDATE SET
-                    external_account_uuid = EXCLUDED.external_account_uuid,
-                    owner_workspace_user_uuid = EXCLUDED.owner_workspace_user_uuid,
-                    desired_generation = EXCLUDED.desired_generation,
-                    realm_uuid = EXCLUDED.realm_uuid,
-                    zulip_user_uuid = EXCLUDED.zulip_user_uuid,
-                    login = EXCLUDED.login, api_key = EXCLUDED.api_key,
-                    sync_enabled = TRUE, updated_at = clock_timestamp()
-                """,
-                connection_uuid,
-                account_uuid,
-                owner_uuid,
-                generation,
-                realm_uuid,
-                user_uuid,
-                credentials["email"],
-                credentials["api_key"],
-            )
-        LOG.info("Workspace external account activated: account_uuid=%s", account_uuid)
+        await self._store.upsert_external_account(
+            account_uuid,
+            owner_uuid,
+            generation,
+            project_uuid,
+            endpoint,
+            credentials["email"],
+            credentials["api_key"],
+        )
+        LOG.info(
+            "Workspace external account configured: account_uuid=%s",
+            account_uuid,
+        )
 
-    def _read_zulip_identity(self, endpoint: str, email: str, api_key: str) -> Any:
+    def _check_zulip_auth(self, endpoint: str, email: str, api_key: str) -> None:
         client = ZulipApiClient(
             endpoint,
             email,
@@ -826,11 +713,9 @@ class WorkspaceControlWorker:
                 self._settings.zulip_default_longpoll_timeout_seconds
             ),
             idle_queue_timeout_seconds=self._settings.zulip_idle_queue_timeout_seconds,
-            chat_fill_timeout_seconds=self._settings.zulip_chat_fill_timeout_seconds,
-            message_page_size=self._settings.zulip_message_page_size,
         )
         try:
-            return client.get_own_user()
+            client.check_auth()
         finally:
             client.close()
 
@@ -896,27 +781,10 @@ class WorkspaceControlWorker:
         }
 
     async def _disable_account(self, account_uuid: UUID) -> None:
-        await self._pool.execute(
-            """
-            UPDATE workspace_zulip_bridge.zulip_connections
-            SET sync_enabled = false, queue_id = NULL, last_event_id = NULL,
-                updated_at = clock_timestamp()
-            WHERE external_account_uuid = $1
-            """,
-            account_uuid,
-        )
+        await self._store.disable_external_account(account_uuid)
 
     async def _disable_absent_accounts(self, account_uuids: set[UUID]) -> None:
-        await self._pool.execute(
-            """
-            UPDATE workspace_zulip_bridge.zulip_connections
-            SET sync_enabled = false, queue_id = NULL, last_event_id = NULL,
-                updated_at = clock_timestamp()
-            WHERE external_account_uuid IS NOT NULL
-              AND NOT (external_account_uuid = ANY($1::uuid[]))
-            """,
-            list(account_uuids),
-        )
+        await self._store.disable_absent_external_accounts(account_uuids)
 
     async def _heartbeat(self) -> None:
         now = asyncio.get_running_loop().time()
@@ -928,7 +796,7 @@ class WorkspaceControlWorker:
                 json={
                     "heartbeat_uuid": str(uuid4()),
                     "client_timestamp": _utc_now(),
-                    "image_version": "v3",
+                    "image_version": "v4",
                     "provider_kind": "zulip",
                     "capabilities": _CAPABILITIES,
                     "blocked_batch": None,
@@ -995,6 +863,22 @@ class WorkspaceControlWorker:
 
 def _utc_now() -> str:
     return datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
+
+
+def _canonical_endpoint(value: str) -> str:
+    parsed = urlsplit(value.strip())
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("Zulip endpoint must be an absolute HTTP(S) URL")
+    host = parsed.hostname
+    if host is None:
+        raise ValueError("Zulip endpoint must contain a host")
+    scheme = parsed.scheme.lower()
+    default_port = 443 if scheme == "https" else 80
+    port = parsed.port
+    netloc = host.lower()
+    if port is not None and port != default_port:
+        netloc = f"{netloc}:{port}"
+    return urlunsplit(SplitResult(scheme, netloc, parsed.path.rstrip("/"), "", ""))
 
 
 def _retry_delay(attempt: int) -> float:

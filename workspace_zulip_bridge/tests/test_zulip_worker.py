@@ -2,971 +2,232 @@
 # Licensed under the Apache License, Version 2.0 (the "License").
 
 import asyncio
-import concurrent.futures
 import threading
-import time
-from datetime import UTC
-from datetime import datetime
 from uuid import UUID
 
+import pytest
+
 from workspace_zulip_bridge.config import Settings
-from workspace_zulip_bridge.models import ChatCatalogWrite
-from workspace_zulip_bridge.models import ChatScheduleReconcile
-from workspace_zulip_bridge.models import HistoryWrite
-from workspace_zulip_bridge.models import LiveMessageWrite
-from workspace_zulip_bridge.models import MessagePage
-from workspace_zulip_bridge.models import MessagePageWrite
-from workspace_zulip_bridge.models import RecentPrivateConversation
+from workspace_zulip_bridge.models import ExternalAccount
 from workspace_zulip_bridge.models import RegisteredQueue
-from workspace_zulip_bridge.models import ScheduledChat
-from workspace_zulip_bridge.models import UserDirectoryWrite
-from workspace_zulip_bridge.models import UserStatus
-from workspace_zulip_bridge.models import ZulipChatCatalog
-from workspace_zulip_bridge.models import ZulipDirectoryUser
-from workspace_zulip_bridge.models import ZulipEvent
-from workspace_zulip_bridge.models import ZulipIdentity
-from workspace_zulip_bridge.models import ZulipUser
 from workspace_zulip_bridge.zulip_api import ZulipApiError
-from workspace_zulip_bridge.zulip_worker import EndpointDirectoryCache
 from workspace_zulip_bridge.zulip_worker import ZulipEventThread
 from workspace_zulip_bridge.zulip_worker import ZulipThreadSupervisor
 
-USER_ONE = ZulipUser(
-    UUID("00000000-0000-0000-0000-000000000001"),
-    "https://zulip.example.test",
-    "one@example.test",
-    "not-a-real-api-key",
-)
-USER_TWO = ZulipUser(
-    UUID("00000000-0000-0000-0000-000000000002"),
-    "https://zulip.example.test",
-    "two@example.test",
-    "not-a-real-api-key",
-)
-
-
-def test_user_representation_hides_api_key() -> None:
-    assert "not-a-real-api-key" not in repr(USER_ONE)
-
-
-def test_directory_cache_coalesces_concurrent_endpoint_loads() -> None:
-    cache = EndpointDirectoryCache(60.0)
-    calls = 0
-    lock = threading.Lock()
-    directory = [
-        ZulipDirectoryUser(10, "one@example.test", "Current User", 400, False, False)
-    ]
-
-    def load() -> tuple[list[ZulipDirectoryUser], UserDirectoryWrite]:
-        nonlocal calls
-        with lock:
-            calls += 1
-        time.sleep(0.02)
-        return directory, UserDirectoryWrite(users=1, bots=0, changed=1)
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        results = list(
-            executor.map(lambda _: cache.get_or_load(USER_ONE.endpoint, load), range(8))
-        )
-
-    assert calls == 1
-    assert all(result[0] == tuple(directory) for result in results)
-    assert sorted(result[1].changed for result in results) == [0] * 7 + [1]
-
-
-def test_directory_cache_force_refresh_bypasses_fresh_entry() -> None:
-    cache = EndpointDirectoryCache(60.0)
-    calls = 0
-
-    def load() -> tuple[list[ZulipDirectoryUser], UserDirectoryWrite]:
-        nonlocal calls
-        calls += 1
-        directory = [
-            ZulipDirectoryUser(
-                10 + calls,
-                f"user-{calls}@example.test",
-                f"User {calls}",
-                400,
-                False,
-                False,
-            )
-        ]
-        return directory, UserDirectoryWrite(users=1, bots=0, changed=1)
-
-    first, _ = cache.get_or_load(USER_ONE.endpoint, load)
-    cached, cached_result = cache.get_or_load(USER_ONE.endpoint, load)
-    refreshed, refreshed_result = cache.get_or_load(
-        USER_ONE.endpoint,
-        load,
-        force_refresh=True,
-    )
-
-    assert calls == 2
-    assert cached == first
-    assert cached_result.changed == 0
-    assert refreshed != first
-    assert refreshed_result.changed == 1
-
-
-def test_directory_cache_coalesces_concurrent_forced_refreshes() -> None:
-    cache = EndpointDirectoryCache(60.0)
-    calls = 0
-    lock = threading.Lock()
-    ready = threading.Barrier(8)
-
-    def load() -> tuple[list[ZulipDirectoryUser], UserDirectoryWrite]:
-        nonlocal calls
-        with lock:
-            calls += 1
-            user_id = 10 + calls
-        time.sleep(0.02)
-        directory = [
-            ZulipDirectoryUser(
-                user_id,
-                f"user-{user_id}@example.test",
-                f"User {user_id}",
-                400,
-                False,
-                False,
-            )
-        ]
-        return directory, UserDirectoryWrite(users=1, bots=0, changed=1)
-
-    initial, _ = cache.get_or_load(USER_ONE.endpoint, load)
-
-    def force_refresh(
-        _: int,
-    ) -> tuple[tuple[ZulipDirectoryUser, ...], UserDirectoryWrite]:
-        ready.wait()
-        return cache.get_or_load(
-            USER_ONE.endpoint,
-            load,
-            force_refresh=True,
-        )
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        refreshed = list(executor.map(force_refresh, range(8)))
-
-    assert calls == 2
-    assert all(result[0] != initial for result in refreshed)
-    assert sorted(result[1].changed for result in refreshed) == [0] * 7 + [1]
+ACCOUNT_UUID = UUID("10000000-0000-0000-0000-000000000001")
+OWNER_UUID = UUID("10000000-0000-0000-0000-000000000002")
+PROJECT_UUID = UUID("10000000-0000-0000-0000-000000000003")
 
 
 class FakeStore:
     def __init__(self) -> None:
-        self.users = [USER_ONE, USER_TWO]
-        self.queues: list[tuple[UUID, str, int]] = []
-        self.cleared: list[tuple[UUID, str]] = []
-        self.reconciliation_windows: list[float] = []
-        self.disabled: list[UUID] = []
-        self.batches: list[tuple[UUID, str, list[ZulipEvent], int]] = []
-        self.statuses: list[tuple[UUID, UserStatus]] = []
-        self.catalogs: list[tuple[UUID, str, ZulipChatCatalog]] = []
-        self.live_message_counts: list[int] = []
-        self.history_begins = 0
-        self.stored = asyncio.Event()
-        self.catalog_stored = asyncio.Event()
-        self.presence_thresholds: list[tuple[str, int]] = []
+        self.queues: list[tuple[str, int]] = []
+        self.cursors: list[tuple[str, int]] = []
+        self.cleared: list[str] = []
 
-    async def set_presence_offline_threshold(
-        self, endpoint: str, threshold_seconds: int
-    ) -> None:
-        self.presence_thresholds.append((endpoint, threshold_seconds))
-
-    async def set_user_identity(
-        self,
-        user_uuid: UUID,
-        endpoint: str,
-        zulip_user_id: int,
-        full_name: str,
-        role: int,
+    async def set_zulip_queue(
+        self, account_uuid: UUID, queue_id: str, event_id: int
     ) -> bool:
+        assert account_uuid == ACCOUNT_UUID
+        self.queues.append((queue_id, event_id))
         return True
 
-    async def begin_catalog_fill(self, user_uuid: UUID, queue_id: str) -> bool:
-        self.statuses.append((user_uuid, "filling"))
-        return True
-
-    async def list_pending_history_chats(
-        self, user_uuid: UUID, queue_id: str
-    ) -> list[object]:
-        return []
-
-    async def reconcile_chat_schedules(self) -> ChatScheduleReconcile:
-        return ChatScheduleReconcile(0, 0, 0)
-
-    async def store_user_directory(
-        self, endpoint: str, users: list[ZulipDirectoryUser]
-    ) -> UserDirectoryWrite:
-        return UserDirectoryWrite(
-            users=len(users),
-            bots=sum(user.is_bot for user in users),
-            changed=len(users),
-        )
-
-    async def list_user_chat_keys(self, user_uuid: UUID) -> set[str]:
-        return {"channel:7", "direct:10,12"}
-
-    async def begin_history(self, user_uuid: UUID, queue_id: str) -> "FakeHistory":
-        self.history_begins += 1
-        return FakeHistory()
-
-    async def apply_live_messages(
-        self,
-        user_uuid: UUID,
-        queue_id: str,
-        chats: object,
-        messages: object,
-        deleted_message_ids: object,
-    ) -> LiveMessageWrite:
-        self.live_message_counts.append(len(messages))  # type: ignore[arg-type]
-        return LiveMessageWrite(len(messages), 0, 0, 0)  # type: ignore[arg-type]
-
-    async def list_users(self) -> list[ZulipUser]:
-        return self.users
-
-    async def set_queue(
-        self, user_uuid: UUID, queue_id: str, last_event_id: int
+    async def advance_zulip_cursor(
+        self, account_uuid: UUID, queue_id: str, event_id: int
     ) -> bool:
-        self.queues.append((user_uuid, queue_id, last_event_id))
-        self.statuses.append((user_uuid, "streaming"))
+        assert account_uuid == ACCOUNT_UUID
+        self.cursors.append((queue_id, event_id))
         return True
 
-    async def clear_queue(
-        self,
-        user_uuid: UUID,
-        queue_id: str,
-        reconciliation_window_seconds: float = 86400.0,
-    ) -> bool:
-        self.reconciliation_windows.append(reconciliation_window_seconds)
-        self.cleared.append((user_uuid, queue_id))
-        self.statuses.append((user_uuid, "init"))
+    async def clear_zulip_queue(self, account_uuid: UUID, queue_id: str) -> bool:
+        assert account_uuid == ACCOUNT_UUID
+        self.cleared.append(queue_id)
         return True
 
-    async def disable_unauthorized_connection(self, user_uuid: UUID) -> bool:
-        self.disabled.append(user_uuid)
-        return True
 
-    async def set_user_status(
-        self, user_uuid: UUID, queue_id: str, status: UserStatus
-    ) -> bool:
-        self.statuses.append((user_uuid, status))
-        return True
-
-    async def get_user_status(
-        self, user_uuid: UUID, queue_id: str
-    ) -> UserStatus | None:
-        return "active"
-
-    async def store_chat_catalog(
-        self,
-        user_uuid: UUID,
-        queue_id: str,
-        catalog: ZulipChatCatalog,
-        *,
-        bootstrap_user_topics: object = None,
-    ) -> ChatCatalogWrite:
-        self.catalogs.append((user_uuid, queue_id, catalog))
-        self.statuses.append((user_uuid, "scheduling"))
-        self.catalog_stored.set()
-        return ChatCatalogWrite(True, False, len(catalog.chats), 0)
-
-    async def store_events(
-        self,
-        user_uuid: UUID,
-        queue_id: str,
-        events: list[ZulipEvent],
-        last_event_id: int,
-    ) -> tuple[int, bool]:
-        self.batches.append((user_uuid, queue_id, events, last_event_id))
-        self.stored.set()
-        return len(events), True
-
-    async def store_user_attachments(
-        self,
-        user_uuid: UUID,
-        queue_id: str,
-        attachments: object,
-        *,
-        replace_all: bool,
-    ) -> int:
-        return 0
-
-
-class FakeApi:
+class FakeClient:
     def __init__(self) -> None:
-        self.closed = threading.Event()
-        self.polls = 0
+        self.worker: ZulipEventThread | None = None
 
     def register(self) -> RegisteredQueue:
-        return RegisteredQueue(
-            "queue-1",
-            -1,
-            90,
-            (
-                RecentPrivateConversation((12,), 100),
-                RecentPrivateConversation((99,), 101),
-            ),
-        )
+        return RegisteredQueue("queue-1", 0, 90)
 
-    def get_own_user(self) -> ZulipIdentity:
-        return ZulipIdentity(10, "Current User", 400)
-
-    def get_subscriptions(self) -> list[dict[str, object]]:
-        return [
-            {
-                "stream_id": 7,
-                "name": "Engineering",
-                "history_public_to_subscribers": False,
-            }
-        ]
-
-    def get_first_accessible_channel_message_id(self, stream_id: int) -> int:
-        assert stream_id == 7
-        return 55
-
-    def get_attachments(self) -> list[object]:
-        return []
-
-    def get_users(self) -> list[ZulipDirectoryUser]:
-        return [
-            ZulipDirectoryUser(
-                10, "one@example.test", "Current User", 400, False, False
-            ),
-            ZulipDirectoryUser(
-                12, "two@example.test", "Second User", 400, False, False
-            ),
-            ZulipDirectoryUser(99, "bot@example.test", "Build Bot", 400, False, True),
-        ]
-
-    def get_messages_page(
-        self,
-        anchor: str | int,
-        *,
-        include_anchor: bool,
-        narrow: object = None,
-    ) -> MessagePage:
-        return MessagePage(
-            messages=[
-                {
-                    "id": 100,
-                    "type": "private",
-                    "sender_id": 10,
-                    "content": "hello",
-                    "timestamp": 1_700_000_000,
-                    "flags": ["read"],
-                    "reactions": [],
-                    "display_recipient": [
-                        {"id": 10, "full_name": "Current User"},
-                        {"id": 12, "full_name": "Second User"},
-                    ],
-                }
-            ],
-            found_oldest=True,
-        )
-
-    def get_events(
-        self, queue_id: str, last_event_id: int, timeout: float
-    ) -> list[dict[str, object]]:
-        self.polls += 1
-        if self.polls == 1:
-            return [
-                {"id": 1, "type": "heartbeat"},
-                {
-                    "id": 2,
-                    "type": "message",
-                    "message": {"id": 42, "sender_id": 99},
-                },
-            ]
-        self.closed.wait(5)
-        return []
-
-    def close(self) -> None:
-        self.closed.set()
+    def poll(self, queue_id: str, event_id: int, timeout: float) -> int:
+        assert (queue_id, event_id, timeout) == ("queue-1", 0, 90)
+        assert self.worker is not None
+        self.worker._stop_requested.set()
+        return 7
 
 
-class FakeHistory:
-    async def store_chats(self, chats: object) -> int:
-        return 0
-
-    async def store_page(self, messages: object) -> MessagePageWrite:
-        return MessagePageWrite(1, 1, 0, 0, 0)
-
-    async def finish(
-        self,
-        chat_keys: object,
-        *,
-        reconcile_since: object = None,
-    ) -> HistoryWrite:
-        return HistoryWrite(True, 0, 0, 1)
-
-    async def close(self) -> None:
-        return None
+def test_worker_registers_queue_and_only_advances_cursor() -> None:
+    asyncio.run(_run_worker_test())
 
 
-class TrackingGate:
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self.active = 0
-        self.entries = 0
-
-    def __enter__(self) -> "TrackingGate":
-        self._lock.acquire()
-        self.active += 1
-        self.entries += 1
-        return self
-
-    def __exit__(self, *args: object) -> None:
-        self.active -= 1
-        self._lock.release()
-
-
-class GateAwareHistory(FakeHistory):
-    def __init__(self, gate: TrackingGate) -> None:
-        self._gate = gate
-
-    async def finish(
-        self,
-        chat_keys: object,
-        *,
-        reconcile_since: object = None,
-    ) -> HistoryWrite:
-        assert self._gate.active == 1
-        return await super().finish(
-            chat_keys,
-            reconcile_since=reconcile_since,
-        )
-
-
-class GateAwareStore(FakeStore):
-    def __init__(self, gate: TrackingGate) -> None:
-        super().__init__()
-        self._gate = gate
-
-    async def begin_history(self, user_uuid: UUID, queue_id: str) -> GateAwareHistory:
-        self.history_begins += 1
-        return GateAwareHistory(self._gate)
-
-
-class DirectHistoryApi(FakeApi):
-    def get_chat_messages_page(
-        self,
-        chat_key: str,
-        own_user_id: int,
-        anchor: str | int,
-        *,
-        include_anchor: bool,
-    ) -> MessagePage:
-        assert chat_key == "direct:10,12"
-        assert own_user_id == 10
-        return self.get_messages_page(anchor, include_anchor=include_anchor)
-
-
-def test_history_finalization_uses_catalog_write_gate() -> None:
-    asyncio.run(_history_finalization_gate_test())
-
-
-async def _history_finalization_gate_test() -> None:
-    gate = TrackingGate()
-    store = GateAwareStore(gate)
-    api = DirectHistoryApi()
-    worker = ZulipEventThread(
-        USER_ONE,
-        store,  # type: ignore[arg-type]
-        asyncio.get_running_loop(),
-        Settings(database_dsn="postgresql:///test"),
-        threading.BoundedSemaphore(1),
-        catalog_write_gate=gate,  # type: ignore[arg-type]
-        api_factory=lambda user: api,  # type: ignore[arg-type]
+async def _run_worker_test() -> None:
+    account = ExternalAccount(
+        ACCOUNT_UUID,
+        OWNER_UUID,
+        1,
+        PROJECT_UUID,
+        "https://zulip.example.test",
+        "user@example.test",
+        "private-key",
     )
-    worker._identity = ZulipIdentity(10, "Current User", 400)
-    worker._queue_id = "queue-1"
-    worker._user_uuids = {10: USER_ONE.uuid, 12: USER_TWO.uuid}
-
-    loaded = await asyncio.to_thread(
-        worker._load_scheduled_history,
-        api,
-        "queue-1",
-        [ScheduledChat("direct:10,12", 1)],
-    )
-
-    assert loaded
-    assert gate.entries == 1
-
-
-class BoundedHistory(FakeHistory):
-    def __init__(self) -> None:
-        self.pages: list[object] = []
-        self.reconcile_since: object = None
-
-    async def store_page(self, messages: object) -> MessagePageWrite:
-        message_list = list(messages)  # type: ignore[arg-type]
-        self.pages.append(message_list)
-        return MessagePageWrite(
-            len(message_list),
-            len(message_list),
-            0,
-            0,
-            0,
-        )
-
-    async def finish(
-        self,
-        chat_keys: object,
-        *,
-        reconcile_since: object = None,
-    ) -> HistoryWrite:
-        self.reconcile_since = reconcile_since
-        return await super().finish(
-            chat_keys,
-            reconcile_since=reconcile_since,
-        )
-
-
-class BoundedHistoryStore(FakeStore):
-    def __init__(self) -> None:
-        super().__init__()
-        self.history = BoundedHistory()
-
-    async def begin_history(self, user_uuid: UUID, queue_id: str) -> BoundedHistory:
-        self.history_begins += 1
-        return self.history
-
-
-class BoundedHistoryApi(DirectHistoryApi):
-    def __init__(self) -> None:
-        super().__init__()
-        self.page_reads = 0
-
-    def get_chat_messages_page(
-        self,
-        chat_key: str,
-        own_user_id: int,
-        anchor: str | int,
-        *,
-        include_anchor: bool,
-    ) -> MessagePage:
-        self.page_reads += 1
-        messages = []
-        for message_id, timestamp in ((102, 1_700_000_060), (101, 1_699_999_940)):
-            messages.append(
-                {
-                    "id": message_id,
-                    "type": "private",
-                    "sender_id": 10,
-                    "content": f"message {message_id}",
-                    "timestamp": timestamp,
-                    "flags": ["read"],
-                    "reactions": [],
-                    "display_recipient": [
-                        {"id": 10, "full_name": "Current User"},
-                        {"id": 12, "full_name": "Second User"},
-                    ],
-                }
-            )
-        return MessagePage(messages=messages, found_oldest=False)
-
-
-def test_queue_gap_history_is_bounded_by_reconciliation_cutoff() -> None:
-    asyncio.run(_queue_gap_history_is_bounded_by_reconciliation_cutoff())
-
-
-async def _queue_gap_history_is_bounded_by_reconciliation_cutoff() -> None:
-    store = BoundedHistoryStore()
-    api = BoundedHistoryApi()
-    worker = ZulipEventThread(
-        USER_ONE,
-        store,  # type: ignore[arg-type]
-        asyncio.get_running_loop(),
-        Settings(database_dsn="postgresql:///test"),
-        threading.BoundedSemaphore(1),
-        api_factory=lambda user: api,  # type: ignore[arg-type]
-    )
-    worker._identity = ZulipIdentity(10, "Current User", 400)
-    worker._queue_id = "queue-1"
-    worker._user_uuids = {10: USER_ONE.uuid, 12: USER_TWO.uuid}
-    cutoff = datetime.fromtimestamp(1_700_000_000, UTC)
-
-    loaded = await asyncio.to_thread(
-        worker._load_scheduled_history,
-        api,
-        "queue-1",
-        [ScheduledChat("direct:10,12", 2, cutoff)],
-    )
-
-    assert loaded
-    assert api.page_reads == 1
-    assert len(store.history.pages) == 1
-    assert len(store.history.pages[0]) == 1  # type: ignore[arg-type]
-    assert store.history.reconcile_since == cutoff
-
-
-class BlockingCatalogApi(FakeApi):
-    def __init__(self) -> None:
-        super().__init__()
-        self.catalog_started = threading.Event()
-        self.release_catalog = threading.Event()
-
-    def get_own_user(self) -> ZulipIdentity:
-        self.catalog_started.set()
-        self.release_catalog.wait(5)
-        return super().get_own_user()
-
-    def close(self) -> None:
-        self.release_catalog.set()
-        super().close()
-
-
-def test_longpoll_persists_events_while_catalog_loading_is_blocked() -> None:
-    asyncio.run(_nonblocking_catalog_test())
-
-
-async def _nonblocking_catalog_test() -> None:
     store = FakeStore()
-    poll_api = FakeApi()
-    maintenance_api = BlockingCatalogApi()
-    clients = iter((poll_api, maintenance_api))
+    client = FakeClient()
     worker = ZulipEventThread(
-        USER_ONE,
+        account,
         store,  # type: ignore[arg-type]
         asyncio.get_running_loop(),
-        Settings(database_dsn="postgresql:///test"),
+        Settings(),
         threading.BoundedSemaphore(1),
-        api_factory=lambda user: next(clients),  # type: ignore[arg-type]
     )
+    client.worker = worker
 
-    worker.start()
-    assert await asyncio.to_thread(maintenance_api.catalog_started.wait, 2)
-    await asyncio.wait_for(store.stored.wait(), timeout=2)
+    await asyncio.to_thread(worker._poll, client)  # type: ignore[arg-type]
 
-    assert not store.catalog_stored.is_set()
-    assert len(store.batches) == 1
-
-    worker.stop()
-    await asyncio.to_thread(worker.join, 2)
-    assert not worker.is_alive()
+    assert store.queues == [("queue-1", 0)]
+    assert store.cursors == [("queue-1", 7)]
 
 
-def test_one_thread_persists_a_batch_and_advances_past_heartbeat() -> None:
-    asyncio.run(_thread_test())
-
-
-async def _thread_test() -> None:
-    store = FakeStore()
-    api = FakeApi()
-    worker = ZulipEventThread(
-        USER_ONE,
-        store,  # type: ignore[arg-type]
-        asyncio.get_running_loop(),
-        Settings(database_dsn="postgresql:///test"),
-        threading.BoundedSemaphore(1),
-        api_factory=lambda user: api,  # type: ignore[arg-type]
-    )
-
-    worker.start()
-    await asyncio.wait_for(store.stored.wait(), timeout=2)
-    await asyncio.wait_for(store.catalog_stored.wait(), timeout=2)
-    worker.stop()
-    await asyncio.to_thread(worker.join, 2)
-
-    assert not worker.is_alive()
-    assert store.queues == [(USER_ONE.uuid, "queue-1", -1)]
-    statuses = [status for _, status in store.statuses]
-    assert statuses[0] == "streaming"
-    assert statuses[-2:] == ["filling", "scheduling"]
-    assert len(store.catalogs) == 1
-    assert [chat.chat_key for chat in store.catalogs[0][2].chats] == [
-        "channel:7",
-        "direct:10,12",
-        "direct:10,99",
-    ]
-    assert store.catalogs[0][2].chats[0].first_visible_message_id == 55
-    assert len(store.batches) == 1
-    assert store.live_message_counts == []
-    user_uuid, queue_id, events, last_event_id = store.batches[0]
-    assert user_uuid == USER_ONE.uuid
-    assert queue_id == "queue-1"
-    assert [(event.event_id, event.event_type) for event in events] == [(2, "message")]
-    assert last_event_id == 2
-
-
-def test_active_user_resumes_valid_queue_without_reloading_history() -> None:
-    asyncio.run(_resume_queue_test())
-
-
-async def _resume_queue_test() -> None:
-    store = FakeStore()
-    api = FakeApi()
-    active_user = ZulipUser(
-        uuid=USER_ONE.uuid,
-        endpoint=USER_ONE.endpoint,
-        login=USER_ONE.login,
-        api_key=USER_ONE.api_key,
-        queue_id="queue-1",
-        last_event_id=-1,
-        status="active",
-    )
-    worker = ZulipEventThread(
-        active_user,
-        store,  # type: ignore[arg-type]
-        asyncio.get_running_loop(),
-        Settings(database_dsn="postgresql:///test"),
-        threading.BoundedSemaphore(1),
-        api_factory=lambda user: api,  # type: ignore[arg-type]
-    )
-
-    worker.start()
-    await asyncio.wait_for(store.stored.wait(), timeout=2)
-    worker.stop()
-    await asyncio.to_thread(worker.join, 2)
-
-    assert not worker.is_alive()
-    assert store.queues == []
-    assert store.statuses == []
-    assert store.history_begins == 0
-    assert store.catalogs == []
-    assert len(store.batches) == 1
-    assert store.live_message_counts == []
-
-
-class SlowCloseApi(FakeApi):
-    def __init__(self) -> None:
-        super().__init__()
-        self.polling = threading.Event()
-        self.release = threading.Event()
-
-    def get_events(
-        self, queue_id: str, last_event_id: int, timeout: float
-    ) -> list[dict[str, object]]:
-        self.polling.set()
-        self.release.wait(5)
-        return []
-
-    def close(self) -> None:
-        self.release.wait(5)
-
-
-def test_stop_does_not_block_on_an_active_http_request() -> None:
-    asyncio.run(_nonblocking_stop_test())
-
-
-async def _nonblocking_stop_test() -> None:
-    store = FakeStore()
-    api = SlowCloseApi()
-    worker = ZulipEventThread(
-        USER_ONE,
-        store,  # type: ignore[arg-type]
-        asyncio.get_running_loop(),
-        Settings(database_dsn="postgresql:///test"),
-        threading.BoundedSemaphore(1),
-        api_factory=lambda user: api,  # type: ignore[arg-type]
-    )
-
-    worker.start()
-    assert await asyncio.to_thread(api.polling.wait, 2)
-    started = time.monotonic()
-    worker.stop()
-    elapsed = time.monotonic() - started
-    api.release.set()
-    await asyncio.to_thread(worker.join, 2)
-
-    assert elapsed < 0.2
-    assert not worker.is_alive()
-
-
-class ExpiredQueueApi(FakeApi):
-    def __init__(self) -> None:
-        super().__init__()
-        self.catalog_reads = 0
-
+class ExpiringClient:
     def register(self) -> RegisteredQueue:
-        return RegisteredQueue("fresh-queue", -1, 90)
+        return RegisteredQueue("queue-b", 20, 90)
 
-    def get_own_user(self) -> ZulipIdentity:
-        self.catalog_reads += 1
-        return super().get_own_user()
-
-    def get_events(
-        self, queue_id: str, last_event_id: int, timeout: float
-    ) -> list[dict[str, object]]:
-        if queue_id == "expired-queue":
+    def poll(self, queue_id: str, event_id: int, timeout: float) -> int:
+        if queue_id == "queue-a":
+            assert (event_id, timeout) == (10, 180)
             raise ZulipApiError("BAD_EVENT_QUEUE_ID", retryable=True)
-        if self.polls == 0:
-            self.polls += 1
-            return [{"id": 0, "type": "message", "message": {"id": 43}}]
-        self.closed.wait(5)
-        return []
+        assert (queue_id, event_id, timeout) == ("queue-b", 20, 90)
+        raise ZulipApiError("RATE_LIMIT_HIT", retryable=True)
 
 
-def test_expired_queue_is_cleared_and_registered_again() -> None:
-    asyncio.run(_expired_queue_test())
-
-
-async def _expired_queue_test() -> None:
-    store = FakeStore()
-    api = ExpiredQueueApi()
-    user = ZulipUser(
-        USER_ONE.uuid,
-        USER_ONE.endpoint,
-        USER_ONE.login,
-        USER_ONE.api_key,
-        "expired-queue",
-        7,
-    )
-    worker = ZulipEventThread(
-        user,
-        store,  # type: ignore[arg-type]
-        asyncio.get_running_loop(),
-        Settings(
-            database_dsn="postgresql:///test",
-            zulip_retry_base_seconds=0.001,
-            zulip_retry_cap_seconds=0.001,
-        ),
-        threading.BoundedSemaphore(1),
-        api_factory=lambda selected_user: api,  # type: ignore[arg-type]
-    )
-
-    worker.start()
-    await asyncio.wait_for(store.stored.wait(), timeout=2)
-    await asyncio.wait_for(store.catalog_stored.wait(), timeout=2)
-    worker.stop()
-    await asyncio.to_thread(worker.join, 2)
-
-    assert store.cleared == [(user.uuid, "expired-queue")]
-    assert store.reconciliation_windows == [86400.0]
-    assert store.queues == [(user.uuid, "fresh-queue", -1)]
-    assert api.catalog_reads >= 1
-    assert store.catalogs[-1][1] == "fresh-queue"
-    assert "init" in [status for _, status in store.statuses]
-    assert [status for _, status in store.statuses][-2:] == [
-        "filling",
-        "scheduling",
-    ]
-    assert store.batches[0][1] == "fresh-queue"
-    assert store.batches[0][3] == 0
-
-
-class RejectedApi(FakeApi):
-    def __init__(self) -> None:
-        super().__init__()
-        self.attempted = threading.Event()
-        self.attempts = 0
+class ResumingClient:
+    def __init__(self, worker: ZulipEventThread) -> None:
+        self._worker = worker
 
     def register(self) -> RegisteredQueue:
-        self.attempts += 1
-        self.attempted.set()
-        raise ZulipApiError("UNAUTHORIZED", retryable=False)
+        raise AssertionError("the replacement queue must be resumed")
+
+    def poll(self, queue_id: str, event_id: int, timeout: float) -> int:
+        assert (queue_id, event_id, timeout) == ("queue-b", 20, 90)
+        self._worker._stop_requested.set()
+        return 21
 
 
-def test_nonretryable_api_error_parks_worker_until_configuration_changes() -> None:
-    asyncio.run(_rejected_api_test())
+def test_worker_resumes_replacement_queue_after_retryable_failure() -> None:
+    asyncio.run(_run_reconnect_test())
 
 
-async def _rejected_api_test() -> None:
+async def _run_reconnect_test() -> None:
+    account = ExternalAccount(
+        ACCOUNT_UUID,
+        OWNER_UUID,
+        1,
+        PROJECT_UUID,
+        "https://zulip.example.test",
+        "user@example.test",
+        "private-key",
+        queue_id="queue-a",
+        last_event_id=10,
+    )
     store = FakeStore()
-    api = RejectedApi()
     worker = ZulipEventThread(
-        USER_ONE,
+        account,
         store,  # type: ignore[arg-type]
         asyncio.get_running_loop(),
-        Settings(database_dsn="postgresql:///test"),
+        Settings(),
         threading.BoundedSemaphore(1),
-        api_factory=lambda user: api,  # type: ignore[arg-type]
     )
 
-    worker.start()
-    assert await asyncio.to_thread(api.attempted.wait, 2)
-    await asyncio.sleep(0.05)
+    with pytest.raises(ZulipApiError, match="RATE_LIMIT_HIT"):
+        await asyncio.to_thread(worker._poll, ExpiringClient())  # type: ignore[arg-type]
+    await asyncio.to_thread(
+        worker._poll,
+        ResumingClient(worker),  # type: ignore[arg-type]
+    )
 
-    assert worker.is_alive()
-    assert api.attempts == 1
-    assert USER_ONE.uuid in store.disabled
-
-    worker.stop()
-    await asyncio.to_thread(worker.join, 2)
-    assert not worker.is_alive()
+    assert store.cleared == ["queue-a"]
+    assert store.queues == [("queue-b", 20)]
+    assert store.cursors == [("queue-b", 21)]
 
 
-class FakeWorker:
-    def __init__(self, user: ZulipUser) -> None:
-        self.user = user
+class SupervisorStore:
+    def __init__(self, account: ExternalAccount) -> None:
+        self.account = account
+
+    async def list_external_accounts(self) -> list[ExternalAccount]:
+        return [self.account]
+
+
+class SupervisorWorker:
+    def __init__(self, account: ExternalAccount) -> None:
+        self.account = account
         self.alive = False
-        self.stopped = False
+        self.stop_calls = 0
 
     def start(self) -> None:
         self.alive = True
 
     def stop(self) -> None:
-        self.alive = False
-        self.stopped = True
+        self.stop_calls += 1
 
     def is_alive(self) -> bool:
         return self.alive
 
 
-class ScheduleTrackingStore(FakeStore):
-    def __init__(self) -> None:
-        super().__init__()
-        self.schedule_reconciliations = 0
-
-    async def reconcile_chat_schedules(self) -> ChatScheduleReconcile:
-        self.schedule_reconciliations += 1
-        return ChatScheduleReconcile(0, 0, 0)
+def test_supervisor_does_not_replace_worker_that_timed_out_stopping() -> None:
+    asyncio.run(_run_stuck_worker_test())
 
 
-def test_schedule_reconciliation_waits_for_catalog_write_gate() -> None:
-    asyncio.run(_schedule_reconciliation_gate_test())
-
-
-async def _schedule_reconciliation_gate_test() -> None:
-    store = ScheduleTrackingStore()
-    supervisor = ZulipThreadSupervisor(
-        store,  # type: ignore[arg-type]
-        asyncio.get_running_loop(),
-        Settings(database_dsn="postgresql:///test"),
-        worker_factory=lambda user, gate: FakeWorker(user),  # type: ignore[arg-type]
+async def _run_stuck_worker_test() -> None:
+    account = ExternalAccount(
+        ACCOUNT_UUID,
+        OWNER_UUID,
+        1,
+        PROJECT_UUID,
+        "https://zulip.example.test",
+        "user@example.test",
+        "private-key",
     )
-    supervisor._catalog_write_gate.acquire()
-    task = asyncio.create_task(supervisor.reconcile())
-
-    await asyncio.sleep(0.05)
-    assert store.schedule_reconciliations == 0
-
-    supervisor._catalog_write_gate.release()
-    await asyncio.wait_for(task, timeout=1)
-    assert store.schedule_reconciliations == 1
-
-
-def test_supervisor_owns_exactly_one_thread_per_user() -> None:
-    asyncio.run(_supervisor_test())
-
-
-async def _supervisor_test() -> None:
-    store = FakeStore()
-    workers: list[FakeWorker] = []
+    store = SupervisorStore(account)
+    workers: list[SupervisorWorker] = []
 
     def worker_factory(
-        user: ZulipUser,
+        worker_account: ExternalAccount,
         registration_gate: threading.Semaphore,
-    ) -> FakeWorker:
-        worker = FakeWorker(user)
+    ) -> SupervisorWorker:
+        del registration_gate
+        worker = SupervisorWorker(worker_account)
         workers.append(worker)
         return worker
 
     supervisor = ZulipThreadSupervisor(
         store,  # type: ignore[arg-type]
         asyncio.get_running_loop(),
-        Settings(database_dsn="postgresql:///test"),
-        worker_factory=worker_factory,  # type: ignore[arg-type]
+        Settings(thread_stop_timeout_seconds=0),
+        worker_factory,
     )
     await supervisor.reconcile()
+    first_worker = workers[0]
+
+    store.account = ExternalAccount(
+        ACCOUNT_UUID,
+        OWNER_UUID,
+        2,
+        PROJECT_UUID,
+        "https://zulip.example.test",
+        "user@example.test",
+        "rotated-key",
+    )
+    await supervisor.reconcile()
+
+    assert first_worker.stop_calls == 1
+    assert workers == [first_worker]
+    assert supervisor._workers[ACCOUNT_UUID][1] is first_worker
+
+    first_worker.alive = False
     await supervisor.reconcile()
 
     assert len(workers) == 2
-    assert all(worker.alive for worker in workers)
-
-    store.users = [USER_TWO]
-    await supervisor.reconcile()
-
-    assert workers[0].stopped
-    assert workers[1].alive
+    assert supervisor._workers[ACCOUNT_UUID][1] is workers[1]
