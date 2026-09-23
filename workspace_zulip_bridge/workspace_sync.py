@@ -2001,9 +2001,31 @@ class WorkspaceDiffWorker:
                       clock_timestamp()
                       - make_interval(secs => $2::double precision)
                   )
+                  AND (
+                      ($3 = 0 AND entity_type NOT IN (
+                          'messages', 'message_flags', 'message_reactions'
+                      ))
+                      OR (
+                          entity_type IN (
+                              'messages', 'message_flags', 'message_reactions'
+                          )
+                          AND (
+                              (
+                                  (
+                                      hashtextextended(
+                                          COALESCE(partition_key, entity_uuid)::text,
+                                          0
+                                      ) >> 1
+                                  ) % $4 + $4
+                              ) % $4
+                          ) = $3
+                      )
+                  )
                 """,
                 self._provider_uuid,
                 self._settings.event_processor_claim_timeout_seconds,
+                self._partition,
+                self._partition_count,
             )
             delivery_priority = await connection.fetchval(
                 """
@@ -2022,9 +2044,11 @@ class WorkspaceDiffWorker:
                           )
                           AND (
                               (
-                                  hashtextextended(
-                                      COALESCE(partition_key, entity_uuid)::text,
-                                      0
+                                  (
+                                      hashtextextended(
+                                          COALESCE(partition_key, entity_uuid)::text,
+                                          0
+                                      ) >> 1
                                   ) % $3 + $3
                               ) % $3
                           ) = $2
@@ -2059,11 +2083,13 @@ class WorkspaceDiffWorker:
                               )
                               AND (
                                   (
-                                      hashtextextended(
-                                          COALESCE(
-                                              partition_key, entity_uuid
-                                          )::text,
-                                          0
+                                      (
+                                          hashtextextended(
+                                              COALESCE(
+                                                  partition_key, entity_uuid
+                                              )::text,
+                                              0
+                                          ) >> 1
                                       ) % $4 + $4
                                   ) % $4
                               ) = $3
