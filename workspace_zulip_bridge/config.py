@@ -57,6 +57,7 @@ class Settings:
     zulip_registration_concurrency: int = 8
     zulip_message_scan_concurrency: int = 32
     zulip_history_concurrency: int = 12
+    zulip_queue_gap_reconciliation_seconds: float = 86400.0
     zulip_directory_cache_ttl_seconds: float = 60.0
     zulip_chat_fill_timeout_seconds: float = 120.0
     zulip_message_page_size: int = 5000
@@ -91,10 +92,11 @@ class Settings:
     # Keep the producer bounded by the delivery batch.  A substantially larger
     # planning batch lets the cursor outrun delivery and turns the durable diff
     # table into an unbounded copy of high-cardinality message flags.
-    workspace_sync_plan_batch_size: int = 500
+    workspace_sync_plan_batch_size: int = 5000
     workspace_sync_batch_size: int = 500
     workspace_sync_workers: int = 2
-    workspace_reconciliation_interval_seconds: float = 300.0
+    workspace_dependency_retry_base_seconds: float = 2.0
+    workspace_dependency_retry_cap_seconds: float = 300.0
     workspace_control_url: str | None = None
     workspace_control_bootstrap_url: str | None = None
     workspace_control_hostname: str | None = None
@@ -165,6 +167,11 @@ class Settings:
             ),
             zulip_history_concurrency=_read_int(
                 source, "WZB_ZULIP_HISTORY_CONCURRENCY", 12
+            ),
+            zulip_queue_gap_reconciliation_seconds=_read_float(
+                source,
+                "WZB_ZULIP_QUEUE_GAP_RECONCILIATION_SECONDS",
+                86400.0,
             ),
             zulip_directory_cache_ttl_seconds=_read_float(
                 source, "WZB_ZULIP_DIRECTORY_CACHE_TTL_SECONDS", 60.0
@@ -256,14 +263,17 @@ class Settings:
                 source, "WZB_WORKSPACE_SYNC_POLL_SECONDS", 0.1
             ),
             workspace_sync_plan_batch_size=_read_int(
-                source, "WZB_WORKSPACE_SYNC_PLAN_BATCH_SIZE", 500
+                source, "WZB_WORKSPACE_SYNC_PLAN_BATCH_SIZE", 5000
             ),
             workspace_sync_batch_size=_read_int(
                 source, "WZB_WORKSPACE_SYNC_BATCH_SIZE", 500
             ),
             workspace_sync_workers=_read_int(source, "WZB_WORKSPACE_SYNC_WORKERS", 2),
-            workspace_reconciliation_interval_seconds=_read_float(
-                source, "WZB_WORKSPACE_RECONCILIATION_INTERVAL_SECONDS", 300.0
+            workspace_dependency_retry_base_seconds=_read_float(
+                source, "WZB_WORKSPACE_DEPENDENCY_RETRY_BASE_SECONDS", 2.0
+            ),
+            workspace_dependency_retry_cap_seconds=_read_float(
+                source, "WZB_WORKSPACE_DEPENDENCY_RETRY_CAP_SECONDS", 300.0
             ),
             workspace_control_url=(source.get("WZB_WORKSPACE_CONTROL_URL") or None),
             workspace_control_bootstrap_url=(
@@ -326,6 +336,9 @@ class Settings:
             "WZB_ZULIP_CHAT_FILL_TIMEOUT_SECONDS": (
                 self.zulip_chat_fill_timeout_seconds
             ),
+            "WZB_ZULIP_QUEUE_GAP_RECONCILIATION_SECONDS": (
+                self.zulip_queue_gap_reconciliation_seconds
+            ),
             "WZB_EVENT_PROCESSOR_POLL_SECONDS": self.event_processor_poll_seconds,
             "WZB_EVENT_PROCESSOR_CLAIM_TIMEOUT_SECONDS": (
                 self.event_processor_claim_timeout_seconds
@@ -349,8 +362,11 @@ class Settings:
                 self.workspace_request_timeout_seconds
             ),
             "WZB_WORKSPACE_SYNC_POLL_SECONDS": self.workspace_sync_poll_seconds,
-            "WZB_WORKSPACE_RECONCILIATION_INTERVAL_SECONDS": (
-                self.workspace_reconciliation_interval_seconds
+            "WZB_WORKSPACE_DEPENDENCY_RETRY_BASE_SECONDS": (
+                self.workspace_dependency_retry_base_seconds
+            ),
+            "WZB_WORKSPACE_DEPENDENCY_RETRY_CAP_SECONDS": (
+                self.workspace_dependency_retry_cap_seconds
             ),
             "WZB_WORKSPACE_CONTROL_POLL_SECONDS": (self.workspace_control_poll_seconds),
             "WZB_THREAD_STOP_TIMEOUT_SECONDS": self.thread_stop_timeout_seconds,
@@ -362,6 +378,14 @@ class Settings:
             raise ValueError(
                 "WZB_ZULIP_RETRY_CAP_SECONDS must be at least "
                 "WZB_ZULIP_RETRY_BASE_SECONDS"
+            )
+        if (
+            self.workspace_dependency_retry_cap_seconds
+            < self.workspace_dependency_retry_base_seconds
+        ):
+            raise ValueError(
+                "WZB_WORKSPACE_DEPENDENCY_RETRY_CAP_SECONDS must be at least "
+                "WZB_WORKSPACE_DEPENDENCY_RETRY_BASE_SECONDS"
             )
         if self.zulip_db_ack_timeout_seconds <= self.db_command_timeout_seconds:
             raise ValueError(

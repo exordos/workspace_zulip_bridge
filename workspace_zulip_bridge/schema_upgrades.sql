@@ -35,6 +35,13 @@ BEGIN
             ADD COLUMN IF NOT EXISTS owner_workspace_user_uuid uuid;
         ALTER TABLE workspace_zulip_bridge.zulip_connections
             ADD COLUMN IF NOT EXISTS desired_generation bigint;
+        ALTER TABLE workspace_zulip_bridge.zulip_connections
+            ADD COLUMN IF NOT EXISTS last_event_cursor_at timestamptz;
+        ALTER TABLE workspace_zulip_bridge.zulip_connections
+            ADD COLUMN IF NOT EXISTS reconcile_since timestamptz;
+        UPDATE workspace_zulip_bridge.zulip_connections
+        SET last_event_cursor_at = updated_at
+        WHERE queue_id IS NOT NULL AND last_event_cursor_at IS NULL;
         IF NOT EXISTS (
             SELECT 1
             FROM pg_constraint
@@ -57,6 +64,16 @@ BEGIN
                 ADD CONSTRAINT zulip_connections_desired_generation_check
                 CHECK (desired_generation IS NULL OR desired_generation > 0);
         END IF;
+    END IF;
+
+    IF to_regclass('workspace_zulip_bridge.zulip_streams') IS NOT NULL THEN
+        ALTER TABLE workspace_zulip_bridge.zulip_streams
+            ALTER COLUMN description SET DEFAULT '';
+        UPDATE workspace_zulip_bridge.zulip_streams
+        SET description = ''
+        WHERE description IS NULL;
+        ALTER TABLE workspace_zulip_bridge.zulip_streams
+            ALTER COLUMN description SET NOT NULL;
     END IF;
 
     IF to_regclass('workspace_zulip_bridge.zulip_stream_bindings') IS NOT NULL THEN
@@ -158,6 +175,20 @@ BEGIN
         ALTER TABLE workspace_zulip_bridge.sync_diffs
             ADD COLUMN IF NOT EXISTS delivery_priority smallint
             NOT NULL DEFAULT 1;
+        ALTER TABLE workspace_zulip_bridge.sync_diffs
+            ADD COLUMN IF NOT EXISTS dependency_wait_count integer
+            NOT NULL DEFAULT 0;
+        IF NOT EXISTS (
+            SELECT 1
+            FROM pg_constraint
+            WHERE conrelid =
+                    'workspace_zulip_bridge.sync_diffs'::regclass
+              AND conname = 'sync_diffs_dependency_wait_count_check'
+        ) THEN
+            ALTER TABLE workspace_zulip_bridge.sync_diffs
+                ADD CONSTRAINT sync_diffs_dependency_wait_count_check
+                CHECK (dependency_wait_count >= 0);
+        END IF;
     END IF;
 END;
 $upgrade$;

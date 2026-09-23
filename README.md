@@ -118,8 +118,11 @@ assigned history remains. Existing row hashes suppress identical writes, so
 their backend `updated_at` value does not move.
 
 If Zulip reports that a queue was deleted, the worker returns the user to
-`init`, removes its selected-chat snapshots, registers a new queue, rediscovers
-the catalog, and backfills its assignments again. Deleting or disabling a
+`init`, registers a new queue, rediscovers the catalog, and reconciles only a
+bounded recent-history window with a small cursor-overlap margin. Normal
+operation is event-driven: Zulip long-poll events and the durable Workspace
+journal advance the two projections without repeatedly scanning all source
+tables. Deleting or disabling a
 selected user clears the affected assignments, removes that source's messages,
 and deterministically selects the next eligible user. A process restart resumes
 a still-valid queue and rebuilds only its in-memory directory and chat-key maps.
@@ -215,6 +218,7 @@ deployment.
 | `WZB_ZULIP_REGISTRATION_CONCURRENCY` | `8` | Concurrent queue registrations |
 | `WZB_ZULIP_MESSAGE_SCAN_CONCURRENCY` | `32` | Concurrent in-memory message pages across all user threads |
 | `WZB_ZULIP_HISTORY_CONCURRENCY` | `12` | Concurrent history sessions; must leave database-pool capacity free |
+| `WZB_ZULIP_QUEUE_GAP_RECONCILIATION_SECONDS` | `86400` | Recent-history window reconciled after a deleted or expired Zulip queue |
 | `WZB_ZULIP_DIRECTORY_CACHE_TTL_SECONDS` | `60` | Shared endpoint directory cache lifetime |
 | `WZB_ZULIP_CHAT_FILL_TIMEOUT_SECONDS` | `120` | Read timeout for a catalog API page |
 | `WZB_ZULIP_MESSAGE_PAGE_SIZE` | `5000` | Combined message-history page size |
@@ -238,6 +242,8 @@ deployment.
 | `WZB_WORKSPACE_RETRY_BASE_SECONDS` | `1` | Initial reconnect window |
 | `WZB_WORKSPACE_RETRY_CAP_SECONDS` | `60` | Maximum reconnect window |
 | `WZB_WORKSPACE_LEASE_RETRY_SECONDS` | `5` | Standby receiver lease retry interval |
+| `WZB_WORKSPACE_DEPENDENCY_RETRY_BASE_SECONDS` | `2` | Initial retry delay for entities whose Workspace parents are not ready |
+| `WZB_WORKSPACE_DEPENDENCY_RETRY_CAP_SECONDS` | `300` | Maximum dependency retry delay |
 | `WZB_THREAD_STOP_TIMEOUT_SECONDS` | `5` | Worker shutdown deadline |
 | `WZB_LOG_LEVEL` | `INFO` | Python log level |
 

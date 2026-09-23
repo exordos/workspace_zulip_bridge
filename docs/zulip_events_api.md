@@ -43,16 +43,17 @@ The thread repeatedly calls `GET /api/v1/events` with the persisted `queue_id`
 and `last_event_id`. Event IDs increase but are not assumed to be consecutive.
 A `BAD_EVENT_QUEUE_ID` response clears the persisted cursor, changes the user
 status to `init`, and registers a new queue. It also invalidates the worker's
-in-memory catalog-ready state. The replacement queue therefore always causes a
-complete channel and direct-message history reload before long polling resumes.
-The old catalog hash remains available only to suppress unchanged PostgreSQL
-row writes; it never suppresses the required Zulip reread. Network and server
-failures use exponential full-jitter backoff and retain the catalog-ready state
-when the queue remains valid. On a daemon restart, an `active` user with a
+in-memory catalog-ready state. The replacement queue therefore reloads the
+catalog and reconciles only the configured recent-history window, starting
+slightly before the last confirmed event cursor. Older captured history is not
+rescanned. The old catalog hash remains available only to suppress unchanged
+PostgreSQL row writes; it never suppresses the required bounded Zulip reread.
+Network and server failures use exponential full-jitter backoff and retain the
+catalog-ready state when the queue remains valid. On a daemon restart, an `active` user with a
 persisted cursor refreshes only the in-memory user, subscription, and existing
 chat-key maps before polling that queue. A valid queue therefore resumes
-without a history scan; an expired one enters the full replacement-queue path
-above. A shared registration semaphore also bounds these lightweight resume
+without a history scan; an expired one enters the bounded replacement-queue
+path above. A shared registration semaphore also bounds these lightweight resume
 requests and prevents a restart from registering every user simultaneously.
 
 ## Directory, chat, topic, and message fill

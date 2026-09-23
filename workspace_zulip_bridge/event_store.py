@@ -49,6 +49,7 @@ from workspace_zulip_bridge.stable_ids import stable_user_uuid
 class EventStore:
     SCHEDULE_STREAM_BATCH_SIZE = 64
     SCHEDULE_MESSAGE_BATCH_SIZE = 10_000
+    QUEUE_GAP_SAFETY_SECONDS = 300.0
 
     def __init__(self, pool: asyncpg.Pool) -> None:
         self._pool = pool
@@ -408,6 +409,24 @@ class EventStore:
                     WHERE stream.uuid = changed.uuid
                       AND message_counts.mismatch_count =
                           COALESCE(adopted_counts.adopted_count, 0)
+                    RETURNING stream.uuid
+                ), touched_bindings AS (
+                    UPDATE workspace_zulip_bridge.zulip_stream_bindings AS binding
+                    SET updated_at = clock_timestamp()
+                    FROM updated
+                    WHERE binding.zulip_stream_uuid = updated.uuid
+                    RETURNING 1
+                ), touched_topics AS (
+                    UPDATE workspace_zulip_bridge.zulip_topics AS topic
+                    SET updated_at = clock_timestamp()
+                    FROM updated
+                    WHERE topic.zulip_stream_uuid = updated.uuid
+                    RETURNING 1
+                ), touched_topic_bindings AS (
+                    UPDATE workspace_zulip_bridge.zulip_topic_bindings AS binding
+                    SET updated_at = clock_timestamp()
+                    FROM updated
+                    WHERE binding.zulip_stream_uuid = updated.uuid
                     RETURNING 1
                 )
                 SELECT (SELECT count(*) FROM updated) AS assigned_count,
@@ -998,6 +1017,7 @@ class EventStore:
                     source_updated_at = EXCLUDED.source_updated_at,
                     target_updated_at = EXCLUDED.target_updated_at,
                     processing_status = 'pending', attempt_count = 0,
+                    dependency_wait_count = 0,
                     available_at = clock_timestamp(), claimed_at = NULL,
                     processed_at = NULL, last_error = NULL,
                     updated_at = clock_timestamp()
@@ -1241,20 +1261,37 @@ class EventStore:
     ) -> bool:
         return await self._update_connection(
             user_uuid,
-            "queue_id = $2, last_event_id = $3, lifecycle_status = 'streaming'",
+            "queue_id = $2, last_event_id = $3, lifecycle_status = 'streaming', "
+            "last_event_cursor_at = clock_timestamp()",
             queue_id,
             last_event_id,
         )
 
-    async def clear_queue(self, user_uuid: UUID, queue_id: str) -> bool:
+    async def clear_queue(
+        self,
+        user_uuid: UUID,
+        queue_id: str,
+        reconciliation_window_seconds: float = 86400.0,
+    ) -> bool:
         async with self._pool.acquire() as connection, connection.transaction():
-            active = await connection.fetchval(
-                "SELECT EXISTS (SELECT 1 FROM workspace_zulip_bridge.zulip_connections "
-                "WHERE uuid = $1 AND queue_id = $2 FOR UPDATE)",
+            active = await connection.fetchrow(
+                """
+                SELECT GREATEST(
+                    COALESCE(last_event_cursor_at, clock_timestamp())
+                        - make_interval(secs => $4::double precision),
+                    clock_timestamp()
+                        - make_interval(secs => $3::double precision)
+                ) AS reconcile_since
+                FROM workspace_zulip_bridge.zulip_connections
+                WHERE uuid = $1 AND queue_id = $2
+                FOR UPDATE
+                """,
                 user_uuid,
                 queue_id,
+                reconciliation_window_seconds,
+                self.QUEUE_GAP_SAFETY_SECONDS,
             )
-            if not active:
+            if active is None:
                 return False
             await connection.execute(
                 "UPDATE workspace_zulip_bridge.zulip_streams "
@@ -1275,11 +1312,15 @@ class EventStore:
                 """
                 UPDATE workspace_zulip_bridge.zulip_connections
                 SET queue_id = NULL, last_event_id = NULL,
-                    lifecycle_status = 'init', catalog_completed_at = NULL
+                    lifecycle_status = 'init', catalog_completed_at = NULL,
+                    reconcile_since = LEAST(
+                        COALESCE(reconcile_since, $3), $3
+                    )
                 WHERE uuid = $1 AND queue_id = $2
                 """,
                 user_uuid,
                 queue_id,
+                active["reconcile_since"],
             )
         return status == "UPDATE 1"
 
@@ -1352,7 +1393,8 @@ class EventStore:
         async with self._pool.acquire() as connection:
             rows = await connection.fetch(
                 """
-                SELECT stream.chat_key, binding.available_message_count
+                SELECT stream.chat_key, binding.available_message_count,
+                       connection.reconcile_since
                 FROM workspace_zulip_bridge.zulip_connections AS connection
                 JOIN workspace_zulip_bridge.zulip_stream_bindings AS binding
                   ON binding.zulip_user_uuid = connection.zulip_user_uuid
@@ -1371,7 +1413,11 @@ class EventStore:
                 queue_id,
             )
         return [
-            ScheduledChat(row["chat_key"], row["available_message_count"])
+            ScheduledChat(
+                row["chat_key"],
+                row["available_message_count"],
+                row["reconcile_since"],
+            )
             for row in rows
         ]
 
@@ -1494,7 +1540,10 @@ class EventStore:
                     RETURNING 1
                 ), cursor_update AS (
                     UPDATE workspace_zulip_bridge.zulip_connections AS connection
-                    SET last_event_id = GREATEST(COALESCE(connection.last_event_id, -1), $6)
+                    SET last_event_id = GREATEST(
+                            COALESCE(connection.last_event_id, -1), $6
+                        ),
+                        last_event_cursor_at = clock_timestamp()
                     FROM active WHERE connection.uuid = active.uuid RETURNING 1
                 )
                 SELECT (SELECT count(*) FROM inserted) AS inserted_count,
@@ -1956,6 +2005,7 @@ class HistorySession:
                     source_updated_at = EXCLUDED.source_updated_at,
                     target_updated_at = EXCLUDED.target_updated_at,
                     processing_status = 'pending', attempt_count = 0,
+                    dependency_wait_count = 0,
                     available_at = clock_timestamp(), claimed_at = NULL,
                     processed_at = NULL, last_error = NULL,
                     updated_at = clock_timestamp()
@@ -2044,7 +2094,12 @@ class HistorySession:
             )
         return changed
 
-    async def finish(self, chat_keys: Sequence[str]) -> HistoryWrite:
+    async def finish(
+        self,
+        chat_keys: Sequence[str],
+        *,
+        reconcile_since: datetime | None = None,
+    ) -> HistoryWrite:
         if self._closed:
             raise RuntimeError("history session is closed")
         if (
@@ -2073,6 +2128,7 @@ class HistorySession:
                     WHERE message.source_connection_uuid = $1
                       AND message.zulip_stream_uuid = ANY($2::uuid[])
                       AND message.updated_at <= $3
+                      AND ($4::timestamptz IS NULL OR message.created_at >= $4)
                       AND NOT EXISTS (
                           SELECT 1 FROM wzb_seen_messages AS seen
                           WHERE seen.zulip_message_id = message.zulip_message_id
@@ -2111,6 +2167,7 @@ class HistorySession:
                         source_updated_at = EXCLUDED.source_updated_at,
                         target_updated_at = EXCLUDED.target_updated_at,
                         processing_status = 'pending', attempt_count = 0,
+                        dependency_wait_count = 0,
                         available_at = clock_timestamp(), claimed_at = NULL,
                         processed_at = NULL, last_error = NULL,
                         updated_at = clock_timestamp()
@@ -2125,6 +2182,7 @@ class HistorySession:
                     self._connection_uuid,
                     stream_uuids,
                     self._started_at,
+                    reconcile_since,
                 )
             )
             await self._connection.execute(
@@ -2138,6 +2196,7 @@ class HistorySession:
                     WHERE flag.zulip_user_uuid = $1
                       AND flag.zulip_stream_uuid = ANY($2::uuid[])
                       AND flag.updated_at <= $3
+                      AND ($4::timestamptz IS NULL OR message.created_at >= $4)
                       AND NOT EXISTS (
                           SELECT 1 FROM wzb_seen_messages AS seen
                           WHERE seen.zulip_message_id = message.zulip_message_id
@@ -2176,6 +2235,7 @@ class HistorySession:
                         source_updated_at = EXCLUDED.source_updated_at,
                         target_updated_at = EXCLUDED.target_updated_at,
                         processing_status = 'pending', attempt_count = 0,
+                        dependency_wait_count = 0,
                         available_at = clock_timestamp(), claimed_at = NULL,
                         processed_at = NULL, last_error = NULL,
                         updated_at = clock_timestamp()
@@ -2190,6 +2250,7 @@ class HistorySession:
                 self._zulip_user_uuid,
                 stream_uuids,
                 self._started_at,
+                reconcile_since,
             )
             deleted_topics = int(
                 await self._connection.fetchval(
@@ -2239,6 +2300,7 @@ class HistorySession:
                         source_updated_at = EXCLUDED.source_updated_at,
                         target_updated_at = EXCLUDED.target_updated_at,
                         processing_status = 'pending', attempt_count = 0,
+                        dependency_wait_count = 0,
                         available_at = clock_timestamp(), claimed_at = NULL,
                         processed_at = NULL, last_error = NULL,
                         updated_at = clock_timestamp()
@@ -2282,20 +2344,29 @@ class HistorySession:
             )
             await self._connection.execute(
                 """
+                WITH remaining AS (
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM workspace_zulip_bridge.zulip_connections AS owner
+                        JOIN workspace_zulip_bridge.zulip_stream_bindings AS binding
+                          ON binding.zulip_user_uuid = owner.zulip_user_uuid
+                        JOIN workspace_zulip_bridge.zulip_streams AS stream
+                          ON stream.uuid = binding.zulip_stream_uuid
+                        WHERE owner.uuid = $1
+                          AND (
+                              (stream.source_connection_uuid = owner.uuid
+                               AND stream.history_loaded_at IS NULL)
+                              OR (stream.history_loaded_at IS NOT NULL
+                                  AND binding.personal_state_loaded_at IS NULL)
+                          )
+                    ) AS pending
+                )
                 UPDATE workspace_zulip_bridge.zulip_connections AS connection
-                SET lifecycle_status = CASE WHEN EXISTS (
-                    SELECT 1
-                    FROM workspace_zulip_bridge.zulip_stream_bindings AS binding
-                    JOIN workspace_zulip_bridge.zulip_streams AS stream
-                      ON stream.uuid = binding.zulip_stream_uuid
-                    WHERE binding.zulip_user_uuid = connection.zulip_user_uuid
-                      AND (
-                          (stream.source_connection_uuid = connection.uuid
-                           AND stream.history_loaded_at IS NULL)
-                          OR (stream.history_loaded_at IS NOT NULL
-                              AND binding.personal_state_loaded_at IS NULL)
-                      )
-                ) THEN 'backfilling' ELSE 'active' END
+                SET lifecycle_status = CASE WHEN remaining.pending
+                        THEN 'backfilling' ELSE 'active' END,
+                    reconcile_since = CASE WHEN remaining.pending
+                        THEN connection.reconcile_since ELSE NULL END
+                FROM remaining
                 WHERE connection.uuid = $1 AND connection.queue_id = $2
                 """,
                 self._connection_uuid,
@@ -2566,29 +2637,6 @@ async def _store_chats(
         stable_stream_binding_uuid(stream_uuid, zulip_user_uuid)
         for stream_uuid in stream_uuids
     ]
-    # Catalogs from many accounts share most stream rows.  Lock the existing
-    # rows in one deterministic order before the bulk upsert so concurrent
-    # bootstrap and realtime writes cannot form a row-lock cycle.  Unlike a
-    # process-wide mutex, this only makes transactions with overlapping chats
-    # wait and lets unrelated realtime work continue during history imports.
-    await connection.fetch(
-        """
-        SELECT uuid FROM workspace_zulip_bridge.zulip_streams
-        WHERE uuid = ANY($1::uuid[])
-        ORDER BY uuid
-        FOR UPDATE
-        """,
-        stream_uuids,
-    )
-    await connection.fetch(
-        """
-        SELECT uuid FROM workspace_zulip_bridge.zulip_stream_bindings
-        WHERE uuid = ANY($1::uuid[])
-        ORDER BY uuid
-        FOR UPDATE
-        """,
-        binding_uuids,
-    )
     row = await connection.fetchrow(
         """
         WITH incoming AS MATERIALIZED (
@@ -2603,23 +2651,20 @@ async def _store_chats(
                        membership_kind, notification_mode, chat_parameters,
                        membership_parameters, content_hash, membership_hash,
                        available_message_count, first_visible_message_id)
-        ), streams AS (
-            INSERT INTO workspace_zulip_bridge.zulip_streams
-                (uuid, realm_uuid, chat_type, chat_key, name, description,
-                 invite_only, announce, private, is_archived, color,
-                 chat_parameters, content_hash)
-            SELECT stream_uuid, $15, chat_type, chat_key, name,
-                   chat_parameters ->> 'description',
-                   COALESCE((chat_parameters ->> 'invite_only')::boolean, false),
+        ), prepared AS MATERIALIZED (
+            SELECT incoming.*,
+                   COALESCE(chat_parameters ->> 'description', '')
+                       AS description,
+                   COALESCE(
+                       (chat_parameters ->> 'invite_only')::boolean, false
+                   ) AS invite_only,
                    COALESCE(
                        (chat_parameters ->> 'is_announcement_only')::boolean,
                        false
-                   ),
-                   -- Workspace private streams are strictly 1:1. Zulip group
-                   -- DMs remain ordinary multi-user streams there, while their
-                   -- group_direct kind stays canonical in this bridge table.
-                   chat_type = 'direct',
-                   COALESCE((chat_parameters ->> 'is_archived')::boolean, false),
+                   ) AS announce,
+                   COALESCE(
+                       (chat_parameters ->> 'is_archived')::boolean, false
+                   ) AS is_archived,
                    CASE
                        WHEN membership_parameters ->> 'color'
                             ~ '^#[0-9A-Fa-f]{6}$'
@@ -2627,9 +2672,35 @@ async def _store_chats(
                            membership_parameters ->> 'color', 2
                        ))::bit(24)::int
                        ELSE NULL
-                   END,
-                   chat_parameters, content_hash FROM incoming
-            ORDER BY stream_uuid
+                   END AS color
+            FROM incoming
+        ), streams AS (
+            INSERT INTO workspace_zulip_bridge.zulip_streams
+                (uuid, realm_uuid, chat_type, chat_key, name, description,
+                 invite_only, announce, private, is_archived, color,
+                 chat_parameters, content_hash)
+            SELECT candidate.stream_uuid, $15, candidate.chat_type,
+                   candidate.chat_key, candidate.name, candidate.description,
+                   candidate.invite_only, candidate.announce,
+                   -- Workspace private streams are strictly 1:1. Zulip group
+                   -- DMs remain ordinary multi-user streams there, while their
+                   -- group_direct kind stays canonical in this bridge table.
+                   candidate.chat_type = 'direct', candidate.is_archived,
+                   candidate.color, candidate.chat_parameters,
+                   candidate.content_hash
+            FROM prepared AS candidate
+            LEFT JOIN workspace_zulip_bridge.zulip_streams AS existing
+              ON existing.uuid = candidate.stream_uuid
+            LEFT JOIN workspace_zulip_bridge.zulip_connections AS source
+              ON source.uuid = existing.source_connection_uuid
+             AND source.zulip_user_uuid = $16
+            WHERE existing.uuid IS NULL
+               OR existing.content_hash IS DISTINCT FROM candidate.content_hash
+               OR (
+                    source.uuid IS NOT NULL
+                    AND existing.color IS DISTINCT FROM candidate.color
+               )
+            ORDER BY candidate.stream_uuid
             ON CONFLICT (uuid) DO UPDATE SET chat_type = EXCLUDED.chat_type,
                 name = EXCLUDED.name, description = EXCLUDED.description,
                 invite_only = EXCLUDED.invite_only,
@@ -2660,10 +2731,27 @@ async def _store_chats(
                 (uuid, zulip_stream_uuid, zulip_user_uuid, role, membership_kind,
                  notification_mode, membership_parameters, content_hash,
                  available_message_count, first_visible_message_id)
-            SELECT binding_uuid, stream_uuid, $16, role, membership_kind,
-                   notification_mode, membership_parameters, membership_hash,
-                   available_message_count, first_visible_message_id FROM incoming
-            ORDER BY stream_uuid
+            SELECT candidate.binding_uuid, candidate.stream_uuid, $16,
+                   candidate.role, candidate.membership_kind,
+                   candidate.notification_mode,
+                   candidate.membership_parameters,
+                   candidate.membership_hash,
+                   candidate.available_message_count,
+                   candidate.first_visible_message_id
+            FROM incoming AS candidate
+            LEFT JOIN workspace_zulip_bridge.zulip_stream_bindings AS existing
+              ON existing.zulip_stream_uuid = candidate.stream_uuid
+             AND existing.zulip_user_uuid = $16
+            WHERE existing.uuid IS NULL
+               OR existing.content_hash IS DISTINCT FROM candidate.membership_hash
+               OR ($17 AND (
+                    existing.available_message_count,
+                    existing.first_visible_message_id
+                  ) IS DISTINCT FROM (
+                    candidate.available_message_count,
+                    candidate.first_visible_message_id
+                  ))
+            ORDER BY candidate.stream_uuid
             ON CONFLICT (zulip_stream_uuid, zulip_user_uuid) DO UPDATE SET
                 role = EXCLUDED.role, membership_kind = EXCLUDED.membership_kind,
                 notification_mode = EXCLUDED.notification_mode,
@@ -2728,6 +2816,7 @@ async def _store_chats(
                 source_updated_at = EXCLUDED.source_updated_at,
                 target_updated_at = EXCLUDED.target_updated_at,
                 processing_status = 'pending', attempt_count = 0,
+                dependency_wait_count = 0,
                 available_at = clock_timestamp(), claimed_at = NULL,
                 processed_at = NULL, last_error = NULL,
                 updated_at = clock_timestamp()

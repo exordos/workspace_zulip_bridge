@@ -45,7 +45,7 @@ ENTITY_TYPES = (
     "message_reactions",
 )
 PRIORITY = {entity_type: index for index, entity_type in enumerate(ENTITY_TYPES)}
-RECONCILIATION_VERSION = 3
+RECONCILIATION_VERSION = 6
 
 
 class ProviderApiError(RuntimeError):
@@ -1215,6 +1215,11 @@ class WorkspaceEventProcessor:
                     EXCLUDED.partition_key, sync_diffs.partition_key
                 ),
                 delivery_priority = 0,
+                dependency_wait_count = CASE
+                    WHEN sync_diffs.target_hash IS DISTINCT FROM EXCLUDED.target_hash
+                      OR sync_diffs.target_updated_at
+                         IS DISTINCT FROM EXCLUDED.target_updated_at
+                    THEN 0 ELSE sync_diffs.dependency_wait_count END,
                 processing_status = CASE
                     WHEN sync_diffs.target_hash IS DISTINCT FROM EXCLUDED.target_hash
                       OR sync_diffs.target_updated_at
@@ -1339,16 +1344,16 @@ class WorkspaceDiffWorker:
             await self._zulip_writer.close()
 
     async def _plan_and_drain(self, client: httpx.AsyncClient) -> int:
+        # Delivery has dedicated partitioned and unpartitioned workers.  The
+        # planner must never wait for a slow Provider API batch: doing so stalls
+        # every source cursor and turns a handful of rejected legacy entities
+        # into a global synchronization pause.
         planned = await self.plan()
         if planned is None:
             return 0
-        # Keep planning live while a large history queue is draining. Exhausting
-        # one partition here can otherwise postpone cursor-independent repair for
-        # hours or days.
-        processed = await self.process_once(client)
-        if planned == 0 and processed == 0:
+        if planned == 0:
             await self._complete_initial_sync()
-        return processed
+        return planned
 
     async def _drain(self, client: httpx.AsyncClient) -> int:
         processed = 0
@@ -1412,12 +1417,11 @@ class WorkspaceDiffWorker:
                 self._provider_uuid,
                 generation,
             )
-        total += await self._repair_missing_source_diffs(
-            realm_uuid,
-            generation,
-        )
-        if int(state.get("reconciliation_version", 0)) < RECONCILIATION_VERSION:
-            total += await self._requeue_provider_owned_mentions()
+        current_reconciliation_version = int(state.get("reconciliation_version", 0))
+        if current_reconciliation_version < RECONCILIATION_VERSION:
+            total += await self._apply_projection_upgrade(
+                current_reconciliation_version
+            )
             await self._pool.execute(
                 """
                 UPDATE workspace_zulip_bridge.workspace_mirror_state
@@ -1431,15 +1435,18 @@ class WorkspaceDiffWorker:
             )
         return total
 
-    async def _requeue_provider_owned_mentions(self) -> int:
-        """Retry rows blocked before ``mentioned`` became provider-owned."""
-        result = await self._pool.execute(
-            """
+    async def _apply_projection_upgrade(self, current_version: int = 0) -> int:
+        """Apply bounded, one-time repair required by projection corrections."""
+        changed = 0
+        if current_version < 5:
+            mentioned = await self._pool.execute(
+                """
             UPDATE workspace_zulip_bridge.sync_diffs
             SET processing_status = 'pending', attempt_count = 0,
                 available_at = clock_timestamp(), claimed_at = NULL,
                 processed_at = NULL,
                 last_error = 'requeued_provider_owned_mentioned',
+                dependency_wait_count = 0,
                 updated_at = clock_timestamp()
             WHERE provider_uuid = $1
               AND entity_type = 'message_flags'
@@ -1448,207 +1455,75 @@ class WorkspaceDiffWorker:
               AND last_error =
                   'Zulip message flags cannot be updated: mentioned'
             """,
-            self._provider_uuid,
-        )
-        return int(result.rsplit(" ", 1)[-1])
-
-    async def _repair_missing_source_diffs(
-        self,
-        realm_uuid: UUID,
-        generation: UUID,
-    ) -> int:
-        """Continuously sweep for source rows skipped by the main cursor."""
-        cursor_rows = await self._pool.fetch(
-            """
-            SELECT entity_type, snapshot_generation, next_run_at
-            FROM workspace_zulip_bridge.sync_repair_cursors
+                self._provider_uuid,
+            )
+            streams = await self._pool.execute(
+                """
+            UPDATE workspace_zulip_bridge.sync_diffs
+            SET processing_status = 'pending', attempt_count = 0,
+                dependency_wait_count = 0,
+                available_at = clock_timestamp(), claimed_at = NULL,
+                processed_at = NULL,
+                last_error = 'requeued_normalized_stream_description',
+                updated_at = clock_timestamp()
             WHERE provider_uuid = $1
+              AND entity_type = 'streams'
+              AND direction = 'to_workspace'
+              AND processing_status = 'blocked'
+              AND last_error LIKE
+                  'Workspace Provider API returned 422 error=invalid_entity%'
             """,
-            self._provider_uuid,
-        )
-        cursors = {row["entity_type"]: row for row in cursor_rows}
-        now = datetime.now(UTC)
-        total = 0
-        for entity_type, source in _SOURCE_TABLES.items():
-            cursor = cursors.get(entity_type)
-            if (
-                cursor is not None
-                and cursor["snapshot_generation"] == generation
-                and cursor["next_run_at"] > now
-            ):
-                continue
-            total += await self._repair_entity(
-                entity_type,
-                source,
-                realm_uuid,
-                generation,
+                self._provider_uuid,
             )
-        if total:
-            LOG.info("Reconciled missing Workspace source rows: count=%d", total)
-        return total
-
-    async def _repair_entity(
-        self,
-        entity_type: str,
-        source: Mapping[str, str],
-        realm_uuid: UUID,
-        generation: UUID,
-    ) -> int:
-        source_timestamp_column = (
-            "source.source_updated_at"
-            if entity_type == "messages"
-            else "source.updated_at"
-        )
-        cursor_timestamp_column = source_timestamp_column
-        async with self._pool.acquire() as connection, connection.transaction():
-            await connection.execute(
+            topic_bindings = await self._pool.execute(
                 """
-                INSERT INTO workspace_zulip_bridge.sync_repair_cursors (
-                    provider_uuid, entity_type, snapshot_generation
-                ) VALUES ($1, $2, $3)
-                ON CONFLICT (provider_uuid, entity_type) DO UPDATE
-                SET snapshot_generation = EXCLUDED.snapshot_generation,
-                    source_updated_at = CASE
-                        WHEN sync_repair_cursors.snapshot_generation
-                             IS DISTINCT FROM EXCLUDED.snapshot_generation
-                        THEN NULL ELSE sync_repair_cursors.source_updated_at END,
-                    entity_uuid = CASE
-                        WHEN sync_repair_cursors.snapshot_generation
-                             IS DISTINCT FROM EXCLUDED.snapshot_generation
-                        THEN NULL ELSE sync_repair_cursors.entity_uuid END,
-                    next_run_at = CASE
-                        WHEN sync_repair_cursors.snapshot_generation
-                             IS DISTINCT FROM EXCLUDED.snapshot_generation
-                        THEN clock_timestamp()
-                        ELSE sync_repair_cursors.next_run_at END,
+            UPDATE workspace_zulip_bridge.sync_diffs
+            SET processing_status = 'pending', attempt_count = 0,
+                dependency_wait_count = 0,
+                available_at = clock_timestamp(), claimed_at = NULL,
+                processed_at = NULL,
+                last_error = 'requeued_after_topic_projection_repair',
+                updated_at = clock_timestamp()
+            WHERE provider_uuid = $1
+              AND entity_type = 'topic_bindings'
+              AND direction = 'to_workspace'
+              AND processing_status = 'blocked'
+              AND last_error LIKE
+                  'Workspace Provider API returned 422 error=invalid_entity%'
+            """,
+                self._provider_uuid,
+            )
+            # A previous one-shot repair missed topics that fell behind its
+            # cursor. Rewind only the compact topic planner once.
+            await self._pool.execute(
+                """
+            UPDATE workspace_zulip_bridge.sync_plan_cursors
+            SET source_updated_at = NULL, entity_uuid = NULL,
+                updated_at = clock_timestamp()
+            WHERE provider_uuid = $1 AND entity_type = 'topics'
+            """,
+                self._provider_uuid,
+            )
+            changed += sum(
+                int(result.rsplit(" ", 1)[-1])
+                for result in (mentioned, streams, topic_bindings)
+            )
+        if current_version < 6:
+            # Older releases could commit a captured message after the
+            # timestamp cursor had advanced past it.  Rewind this one compact
+            # planner cursor exactly once to repair that proven gap.  Normal
+            # operation remains incremental, and the 28M-row flag projection
+            # is deliberately not rescanned.
+            await self._pool.execute(
+                """
+                UPDATE workspace_zulip_bridge.sync_plan_cursors
+                SET source_updated_at = NULL, entity_uuid = NULL,
                     updated_at = clock_timestamp()
+                WHERE provider_uuid = $1 AND entity_type = 'messages'
                 """,
                 self._provider_uuid,
-                entity_type,
-                generation,
             )
-            cursor = await connection.fetchrow(
-                """
-                SELECT source_updated_at, entity_uuid, next_run_at
-                FROM workspace_zulip_bridge.sync_repair_cursors
-                WHERE provider_uuid = $1 AND entity_type = $2
-                FOR UPDATE
-                """,
-                self._provider_uuid,
-                entity_type,
-            )
-            assert cursor is not None
-            if cursor["next_run_at"] > datetime.now(UTC):
-                return 0
-            rows = await connection.fetch(
-                f"""
-                WITH scanned AS MATERIALIZED (
-                    SELECT source.uuid AS entity_uuid,
-                           {source["partition"]} AS partition_key,
-                           {source["hash"]} AS source_hash,
-                           {source_timestamp_column} AS source_updated_at,
-                           {cursor_timestamp_column} AS cursor_updated_at,
-                           target.uuid AS target_uuid
-                    FROM {source["from"]} AS source
-                    {source["joins"]}
-                    LEFT JOIN workspace_zulip_bridge.workspace_{entity_type}
-                        AS target
-                      ON target.provider_uuid = $1
-                     AND target.snapshot_generation = $4
-                     AND target.uuid = source.uuid
-                    WHERE {source["where"]}
-                      AND (
-                          $5::timestamptz IS NULL
-                          OR ({cursor_timestamp_column}, source.uuid) > ($5, $6)
-                      )
-                    ORDER BY {cursor_timestamp_column}, source.uuid
-                    LIMIT $7
-                ), repaired AS (
-                    INSERT INTO workspace_zulip_bridge.sync_diffs (
-                        provider_uuid, entity_type, entity_uuid, realm_uuid,
-                        partition_key, direction, source_hash, target_hash,
-                        source_updated_at, target_updated_at
-                    )
-                    SELECT $1, $2, scanned.entity_uuid, $3,
-                           scanned.partition_key, 'to_workspace',
-                           scanned.source_hash, NULL,
-                           scanned.source_updated_at, NULL
-                    FROM scanned
-                    WHERE scanned.target_uuid IS NULL
-                    ON CONFLICT (provider_uuid, entity_type, entity_uuid)
-                    DO UPDATE SET
-                        realm_uuid = EXCLUDED.realm_uuid,
-                        partition_key = EXCLUDED.partition_key,
-                        direction = 'to_workspace',
-                        source_hash = EXCLUDED.source_hash,
-                        target_hash = NULL,
-                        source_updated_at = EXCLUDED.source_updated_at,
-                        target_updated_at = NULL,
-                        processing_status = 'pending',
-                        available_at = clock_timestamp(),
-                        claimed_at = NULL,
-                        processed_at = NULL,
-                        last_error = 'reconciled_missing_workspace_entity',
-                        updated_at = clock_timestamp()
-                    WHERE sync_diffs.processing_status IN ('applied', 'skipped')
-                       OR sync_diffs.direction <> 'to_workspace'
-                       OR (
-                            sync_diffs.processing_status = 'blocked'
-                            AND (
-                                sync_diffs.source_hash
-                                    IS DISTINCT FROM EXCLUDED.source_hash
-                                OR sync_diffs.source_updated_at
-                                    IS DISTINCT FROM EXCLUDED.source_updated_at
-                                OR sync_diffs.partition_key
-                                    IS DISTINCT FROM EXCLUDED.partition_key
-                            )
-                       )
-                    RETURNING 1
-                )
-                SELECT entity_uuid, cursor_updated_at,
-                       (SELECT count(*) FROM repaired) AS repaired_count
-                FROM scanned
-                """,
-                self._provider_uuid,
-                entity_type,
-                realm_uuid,
-                generation,
-                cursor["source_updated_at"],
-                cursor["entity_uuid"],
-                self._settings.workspace_sync_plan_batch_size,
-            )
-            if not rows:
-                await connection.execute(
-                    """
-                    UPDATE workspace_zulip_bridge.sync_repair_cursors
-                    SET source_updated_at = NULL, entity_uuid = NULL,
-                        next_run_at = clock_timestamp()
-                            + make_interval(secs => $3::double precision),
-                        updated_at = clock_timestamp()
-                    WHERE provider_uuid = $1 AND entity_type = $2
-                    """,
-                    self._provider_uuid,
-                    entity_type,
-                    self._settings.workspace_reconciliation_interval_seconds,
-                )
-                return 0
-            last = max(
-                rows,
-                key=lambda row: (row["cursor_updated_at"], row["entity_uuid"]),
-            )
-            await connection.execute(
-                """
-                UPDATE workspace_zulip_bridge.sync_repair_cursors
-                SET source_updated_at = $3, entity_uuid = $4,
-                    updated_at = clock_timestamp()
-                WHERE provider_uuid = $1 AND entity_type = $2
-                """,
-                self._provider_uuid,
-                entity_type,
-                last["cursor_updated_at"],
-                last["entity_uuid"],
-            )
-            return int(rows[0]["repaired_count"])
+        return changed
 
     async def _plan_target_only(
         self,
@@ -1960,6 +1835,7 @@ class WorkspaceDiffWorker:
                     target_hash = EXCLUDED.target_hash,
                     source_updated_at = EXCLUDED.source_updated_at,
                     target_updated_at = EXCLUDED.target_updated_at,
+                    dependency_wait_count = 0,
                     processing_status = CASE
                         WHEN sync_diffs.source_hash IS DISTINCT FROM EXCLUDED.source_hash
                           OR sync_diffs.target_hash IS DISTINCT FROM EXCLUDED.target_hash
@@ -2364,10 +2240,40 @@ class WorkspaceDiffWorker:
         return ready
 
     async def _defer_for_dependencies(self, rows: list[asyncpg.Record]) -> None:
-        await self._release_claims(
-            rows,
-            "waiting_for_workspace_dependencies",
-            delay_seconds=max(1.0, self._settings.workspace_sync_poll_seconds * 10),
+        if not rows:
+            return
+        await self._pool.executemany(
+            """
+            UPDATE workspace_zulip_bridge.sync_diffs
+            SET processing_status = 'pending', claimed_at = NULL,
+                attempt_count = GREATEST(attempt_count - 1, 0),
+                dependency_wait_count = dependency_wait_count + 1,
+                available_at = clock_timestamp() + make_interval(
+                    secs => LEAST(
+                        $6::double precision,
+                        $5::double precision * power(
+                            2::double precision,
+                            LEAST(dependency_wait_count, 16)
+                        )
+                    )
+                ),
+                processed_at = NULL,
+                last_error = 'waiting_for_workspace_dependencies',
+                updated_at = clock_timestamp()
+            WHERE provider_uuid = $1 AND entity_type = $2 AND entity_uuid = $3
+              AND processing_status = 'processing' AND claimed_at = $4
+            """,
+            [
+                (
+                    row["provider_uuid"],
+                    row["entity_type"],
+                    row["entity_uuid"],
+                    row["claimed_at"],
+                    self._settings.workspace_dependency_retry_base_seconds,
+                    self._settings.workspace_dependency_retry_cap_seconds,
+                )
+                for row in rows
+            ],
         )
 
     async def _isolate_provider_failure(
@@ -2510,6 +2416,7 @@ class WorkspaceDiffWorker:
             """
             UPDATE workspace_zulip_bridge.sync_diffs
             SET processing_status = 'applied', processed_at = clock_timestamp(),
+                dependency_wait_count = 0,
                 source_hash = target_hash,
                 source_updated_at = COALESCE(target_updated_at, source_updated_at),
                 last_error = $5, updated_at = clock_timestamp()
@@ -2687,6 +2594,7 @@ class WorkspaceDiffWorker:
                 """
                 UPDATE workspace_zulip_bridge.sync_diffs AS diff
                 SET processing_status = 'applied', processed_at = clock_timestamp(),
+                    dependency_wait_count = 0,
                     target_hash = input.target_hash,
                     target_updated_at = diff.source_updated_at,
                     last_error = NULL, updated_at = clock_timestamp()
@@ -2752,6 +2660,7 @@ class WorkspaceDiffWorker:
                 """
                 UPDATE workspace_zulip_bridge.sync_diffs AS diff
                 SET processing_status = 'applied', processed_at = clock_timestamp(),
+                    dependency_wait_count = 0,
                     source_hash = input.content_hash,
                     target_hash = input.content_hash,
                     target_updated_at = diff.source_updated_at,
@@ -3379,7 +3288,7 @@ _ENTITY_QUERIES = {
     """,
     "streams": """
         SELECT stream.uuid AS entity_uuid, jsonb_build_object(
-            'name', stream.name, 'description', stream.description,
+            'name', stream.name, 'description', COALESCE(stream.description, ''),
             'owner_uuid', COALESCE(
                 owner_user.workspace_user_uuid, stream.owner_user_uuid,
                 connection_user.workspace_user_uuid, connection.zulip_user_uuid

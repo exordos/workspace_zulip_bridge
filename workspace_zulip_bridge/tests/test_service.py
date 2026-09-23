@@ -236,7 +236,7 @@ async def _run_workspace_diff_worker_fair_plan_test(
             assert "active_generation" in query
             return {
                 "active_generation": UUID("20000000-0000-0000-0000-000000000001"),
-                "reconciliation_version": 3,
+                "reconciliation_version": 6,
             }
 
     worker = WorkspaceDiffWorker(PlanningPool(), settings)  # type: ignore[arg-type]
@@ -261,15 +261,10 @@ async def _run_workspace_diff_worker_fair_plan_test(
         calls.append(entity_type)
         return 1 if entity_type == "users" else 0
 
-    async def fake_repair(realm_uuid: UUID, generation: UUID) -> int:
-        del realm_uuid, generation
-        return 0
-
     monkeypatch.setattr(worker, "_link_realm", fake_link_realm)
     monkeypatch.setattr(worker, "_ensure_direct_topics", fake_ensure_direct_topics)
     monkeypatch.setattr(worker, "_ensure_topic_bindings", fake_ensure_topic_bindings)
     monkeypatch.setattr(worker, "_plan_entity", fake_plan_entity)
-    monkeypatch.setattr(worker, "_repair_missing_source_diffs", fake_repair)
 
     assert await worker.plan() == 1
     assert calls == [
@@ -317,8 +312,8 @@ async def _run_workspace_diff_worker_drain_test(
     monkeypatch.setattr(worker, "process_once", fake_process_once)
     monkeypatch.setattr(worker, "_complete_initial_sync", fake_complete)
 
-    assert await worker._plan_and_drain(object()) == 100  # type: ignore[arg-type]
-    assert calls == ["plan", "process"]
+    assert await worker._plan_and_drain(object()) == 200  # type: ignore[arg-type]
+    assert calls == ["plan"]
 
 
 def test_workspace_diff_worker_completes_only_after_empty_plan(
@@ -362,7 +357,7 @@ async def _run_workspace_diff_worker_completion_test(
     monkeypatch.setattr(worker, "_complete_initial_sync", fake_complete)
 
     assert await worker._plan_and_drain(object()) == 0  # type: ignore[arg-type]
-    assert calls == ["plan", "process", "complete"]
+    assert calls == ["plan", "complete"]
 
 
 def test_workspace_diff_worker_waits_for_control_realm(
