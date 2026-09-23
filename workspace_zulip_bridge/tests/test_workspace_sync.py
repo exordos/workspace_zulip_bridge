@@ -1,11 +1,17 @@
 # Copyright 2026 Genesis Corporation
 # Licensed under the Apache License, Version 2.0 (the "License").
 
+import asyncio
+from datetime import UTC
+from datetime import datetime
+from pathlib import Path
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import httpx
 
 from workspace_zulip_bridge.config import Settings
+from workspace_zulip_bridge.workspace_sync import WorkspaceDiffWorker
 from workspace_zulip_bridge.workspace_sync import _entity_dependencies
 from workspace_zulip_bridge.workspace_sync import _equivalent_entity
 from workspace_zulip_bridge.workspace_sync import _provider_api_error
@@ -59,6 +65,86 @@ def test_provider_api_error_preserves_safe_item_index() -> None:
         "Workspace Provider API returned 422 error=invalid_entity item_index=17"
     )
     assert "private message content" not in str(error)
+
+
+def test_workspace_batch_continues_after_terminal_item_rejection(
+    tmp_path: Path,
+) -> None:
+    asyncio.run(_workspace_batch_continues_after_terminal_item_rejection(tmp_path))
+
+
+async def _workspace_batch_continues_after_terminal_item_rejection(
+    tmp_path: Path,
+) -> None:
+    token_file = tmp_path / "workspace-batch.token"
+    token_file.write_text("integration-token")
+    settings = Settings.from_env(
+        {
+            "WZB_WORKSPACE_WEBSOCKET_URL": (
+                "ws://workspace.test/api/workspace/v1/events/ws"
+            ),
+            "WZB_WORKSPACE_PROJECT_ID": "10000000-0000-0000-0000-000000000001",
+            "WZB_WORKSPACE_PROVIDER_UUID": "10000000-0000-0000-0000-000000000002",
+            "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+        }
+    )
+    worker = WorkspaceDiffWorker(object(), settings)  # type: ignore[arg-type]
+    rejected_row = {
+        "entity_type": "users",
+        "entity_uuid": UUID("10000000-0000-0000-0000-000000000003"),
+        "claimed_at": datetime(2026, 9, 23, tzinfo=UTC),
+    }
+    accepted_row = {
+        "entity_type": "users",
+        "entity_uuid": UUID("10000000-0000-0000-0000-000000000004"),
+        "claimed_at": datetime(2026, 9, 23, tzinfo=UTC),
+    }
+    ready = [
+        (
+            rejected_row,
+            {"name": "rejected"},
+            b"r" * 32,
+            {
+                "action": "upsert",
+                "type": "users",
+                "uuid": str(rejected_row["entity_uuid"]),
+            },
+        ),
+        (
+            accepted_row,
+            {"name": "accepted"},
+            b"a" * 32,
+            {
+                "action": "upsert",
+                "type": "users",
+                "uuid": str(accepted_row["entity_uuid"]),
+            },
+        ),
+    ]
+    worker._post = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[
+            httpx.Response(
+                409,
+                json={"error": "provider_user_is_referenced", "item_index": 0},
+            ),
+            httpx.Response(200, json={"results": [{}]}),
+        ]
+    )
+    worker._mark = AsyncMock()  # type: ignore[method-assign]
+    worker._accept = AsyncMock()  # type: ignore[method-assign]
+
+    await worker._apply_workspace_batch(object(), "backfill", ready)  # type: ignore[arg-type]
+
+    assert worker._post.await_count == 2
+    worker._mark.assert_awaited_once_with(
+        [rejected_row],
+        "blocked",
+        "Workspace Provider API returned 409 "
+        "error=provider_user_is_referenced item_index=0",
+    )
+    worker._accept.assert_awaited_once_with(
+        [(accepted_row, {"name": "accepted"}, b"a" * 32)]
+    )
 
 
 def test_message_dependencies_include_container_and_author() -> None:

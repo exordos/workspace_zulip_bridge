@@ -2750,7 +2750,7 @@ async def _workspace_diff_dependencies_gate_children_and_batch_errors_isolate(
         assert ready == [flag_candidate]
         assert deferred == []
 
-        await worker._isolate_provider_failure(
+        assert await worker._isolate_provider_failure(
             [(rows[0], message_data, b"m" * 32), (rows[1], message_data, b"n" * 32)],
             ProviderApiError(422, "invalid_entity", 0),
         )
@@ -2785,7 +2785,7 @@ async def _workspace_diff_dependencies_gate_children_and_batch_errors_isolate(
             """,
             provider_uuid,
         )
-        await worker._isolate_provider_failure(
+        assert not await worker._isolate_provider_failure(
             [(rows[0], message_data, b"m" * 32), (rows[1], message_data, b"n" * 32)],
             ProviderApiError(503, "provider_unavailable", 0),
         )

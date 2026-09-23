@@ -2185,35 +2185,60 @@ class WorkspaceDiffWorker:
         if not ready:
             return len(rows)
         ready.sort(key=lambda item: PRIORITY[item[0]["entity_type"]])
-        operations = [item[3] for item in ready]
-        records = [item[:3] for item in ready]
-        try:
-            response = await self._post(
-                client,
-                f"{workspace_api_url(self._settings)}/provider/entities/actions/apply/invoke",
-                json={
-                    "delivery_class": delivery_class,
-                    "operations": operations,
-                },
-            )
-            if response.is_error:
-                error = _provider_api_error(response)
-                await self._isolate_provider_failure(records, error)
-                raise error
-            results = response.json()["results"]
-            if len(results) != len(records):
-                raise RuntimeError("Workspace batch result length mismatch")
-            await self._accept(records)
-        except ProviderApiError:
-            raise
-        except Exception as exc:
-            await self._mark(
-                [record[0] for record in records],
-                "failed",
-                str(exc)[:2048],
-            )
-            raise
+        await self._apply_workspace_batch(client, delivery_class, ready)
         return len(rows)
+
+    async def _apply_workspace_batch(
+        self,
+        client: httpx.AsyncClient,
+        delivery_class: str,
+        ready: list[tuple[asyncpg.Record, dict[str, Any], bytes, dict[str, Any]]],
+    ) -> None:
+        remaining = list(ready)
+        while remaining:
+            operations = [item[3] for item in remaining]
+            records = [item[:3] for item in remaining]
+            try:
+                response = await self._post(
+                    client,
+                    f"{workspace_api_url(self._settings)}"
+                    "/provider/entities/actions/apply/invoke",
+                    json={
+                        "delivery_class": delivery_class,
+                        "operations": operations,
+                    },
+                )
+                if response.is_error:
+                    error = _provider_api_error(response)
+                    item_index = error.item_index
+                    if (
+                        400 <= error.status_code < 500
+                        and item_index is not None
+                        and item_index < len(records)
+                    ):
+                        await self._mark(
+                            [records[item_index][0]],
+                            "blocked",
+                            str(error)[:2048],
+                        )
+                        del remaining[item_index]
+                        continue
+                    await self._isolate_provider_failure(records, error)
+                    raise error
+                results = response.json()["results"]
+                if len(results) != len(records):
+                    raise RuntimeError("Workspace batch result length mismatch")
+                await self._accept(records)
+                return
+            except ProviderApiError:
+                raise
+            except Exception as exc:
+                await self._mark(
+                    [record[0] for record in records],
+                    "failed",
+                    str(exc)[:2048],
+                )
+                raise
 
     async def _partition_dependency_ready(
         self,
@@ -2355,7 +2380,7 @@ class WorkspaceDiffWorker:
         self,
         records: list[tuple[asyncpg.Record, dict[str, Any], bytes]],
         error: ProviderApiError,
-    ) -> None:
+    ) -> bool:
         item_index = error.item_index
         if item_index is None or item_index >= len(records):
             await self._mark(
@@ -2363,7 +2388,7 @@ class WorkspaceDiffWorker:
                 "failed",
                 str(error)[:2048],
             )
-            return
+            return False
         failed = records[item_index][0]
         rolled_back = [
             record[0] for index, record in enumerate(records) if index != item_index
@@ -2376,6 +2401,7 @@ class WorkspaceDiffWorker:
                 f"workspace_batch_rolled_back item_index={item_index}",
                 delay_seconds=0.0,
             )
+        return failed_status == "blocked"
 
     async def _release_claims(
         self,
