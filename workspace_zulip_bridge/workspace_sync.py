@@ -1556,10 +1556,19 @@ class WorkspaceDiffWorker:
                         processed_at = NULL,
                         last_error = 'reconciled_missing_workspace_entity',
                         updated_at = clock_timestamp()
-                    WHERE sync_diffs.processing_status IN (
-                        'applied', 'skipped', 'blocked'
-                    )
+                    WHERE sync_diffs.processing_status IN ('applied', 'skipped')
                        OR sync_diffs.direction <> 'to_workspace'
+                       OR (
+                            sync_diffs.processing_status = 'blocked'
+                            AND (
+                                sync_diffs.source_hash
+                                    IS DISTINCT FROM EXCLUDED.source_hash
+                                OR sync_diffs.source_updated_at
+                                    IS DISTINCT FROM EXCLUDED.source_updated_at
+                                OR sync_diffs.partition_key
+                                    IS DISTINCT FROM EXCLUDED.partition_key
+                            )
+                       )
                     RETURNING 1
                 )
                 SELECT entity_uuid, cursor_updated_at,

@@ -2381,11 +2381,80 @@ async def _workspace_reconciliation_revisits_completed_sweeps(
             )
             == 1
         )
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.sync_diffs
+            SET processing_status = 'blocked', last_error = 'invalid_entity'
+            WHERE provider_uuid = $1 AND entity_type = 'topics'
+              AND entity_uuid = $2
+            """,
+            provider_uuid,
+            topic_uuid,
+        )
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.sync_repair_cursors
+            SET source_updated_at = NULL, entity_uuid = NULL,
+                next_run_at = clock_timestamp() - interval '1 second'
+            WHERE provider_uuid = $1 AND entity_type = 'topics'
+            """,
+            provider_uuid,
+        )
         assert (
             await worker._repair_entity(
                 "topics", _SOURCE_TABLES["topics"], realm_uuid, generation
             )
             == 0
+        )
+        assert (
+            await pool.fetchval(
+                """
+                SELECT processing_status
+                FROM workspace_zulip_bridge.sync_diffs
+                WHERE provider_uuid = $1 AND entity_type = 'topics'
+                  AND entity_uuid = $2
+                """,
+                provider_uuid,
+                topic_uuid,
+            )
+            == "blocked"
+        )
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.zulip_topics
+            SET content_hash = $2, updated_at = clock_timestamp()
+            WHERE uuid = $1
+            """,
+            topic_uuid,
+            b"u" * 32,
+        )
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.sync_repair_cursors
+            SET source_updated_at = NULL, entity_uuid = NULL,
+                next_run_at = clock_timestamp() - interval '1 second'
+            WHERE provider_uuid = $1 AND entity_type = 'topics'
+            """,
+            provider_uuid,
+        )
+        assert (
+            await worker._repair_entity(
+                "topics", _SOURCE_TABLES["topics"], realm_uuid, generation
+            )
+            == 1
+        )
+        assert (
+            await pool.fetchval(
+                """
+                SELECT processing_status
+                FROM workspace_zulip_bridge.sync_diffs
+                WHERE provider_uuid = $1 AND entity_type = 'topics'
+                  AND entity_uuid = $2
+                """,
+                provider_uuid,
+                topic_uuid,
+            )
+            == "pending"
         )
         await pool.execute(
             """
