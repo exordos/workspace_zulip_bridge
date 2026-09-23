@@ -62,7 +62,7 @@ resources:
       name: "workspace-zulip-bridge"
       description: "Workspace Zulip bridge service and local PostgreSQL"
       project_id: "12345678-c625-4fee-81d5-f691897b8142"
-      cores: 2
+      cores: 8
       ram: 4096
       disk_spec:
         kind: "disks"
@@ -97,6 +97,7 @@ resources:
           WZB_DATABASE_DSN=postgresql:///workspace_zulip_bridge?host=/var/run/postgresql
           WZB_DB_POOL_MIN_SIZE=2
           WZB_DB_POOL_MAX_SIZE=16
+          WZB_WORKSPACE_SYNC_WORKERS=4
           WZB_ZULIP_CA_FILE=/var/lib/workspace_zulip_bridge/control/zulip-ca.pem
           WZB_WORKSPACE_WEBSOCKET_URL=ws://workspace-backend.{$workspace_zulip_bridge.imports.$core_local_domain:name}/api/workspace/v1/events/ws
           WZB_WORKSPACE_API_URL=http://workspace-backend.{$workspace_zulip_bridge.imports.$core_local_domain:name}/api/workspace/v1/messenger

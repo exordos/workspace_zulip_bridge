@@ -85,10 +85,12 @@ class FakeWorkspaceWorker:
         partition: int = 0,
         partition_count: int = 1,
         scope: str = "both",
+        delivery_priority: int | None = None,
         tokens: object | None = None,
     ) -> None:
         self.calls.append(
-            f"{self.label}-init-{plan_enabled}-{partition}/{partition_count}-{scope}"
+            f"{self.label}-init-{plan_enabled}-{partition}/{partition_count}-"
+            f"{scope}-{delivery_priority}"
         )
 
     async def run(self) -> None:
@@ -188,6 +190,23 @@ def test_workspace_diff_worker_plans_once_before_draining(
     asyncio.run(_run_workspace_diff_worker_drain_test(monkeypatch, tmp_path))
 
 
+def test_content_workers_share_the_two_indexed_partitions() -> None:
+    assert BridgeService.content_worker_partitions(4) == [
+        (0, 2),
+        (1, 2),
+        (0, 2),
+        (1, 2),
+    ]
+    assert BridgeService.content_worker_partitions(1) == [(0, 1)]
+
+
+def test_unpartitioned_workers_scale_conservatively() -> None:
+    assert BridgeService.unpartitioned_worker_count(1) == 1
+    assert BridgeService.unpartitioned_worker_count(2) == 1
+    assert BridgeService.unpartitioned_worker_count(4) == 2
+    assert BridgeService.unpartitioned_worker_count(8) == 2
+
+
 def test_workspace_diff_worker_rejects_invalid_partition(tmp_path: Path) -> None:
     token_file = tmp_path / "workspace.token"
     token_file.write_text("token")
@@ -207,6 +226,41 @@ def test_workspace_diff_worker_rejects_invalid_partition(tmp_path: Path) -> None
             partition=2,
             partition_count=2,
         )
+
+
+def test_workspace_diff_worker_bounds_unpartitioned_batches(tmp_path: Path) -> None:
+    token_file = tmp_path / "workspace.token"
+    token_file.write_text("token")
+    settings = Settings.from_env(
+        {
+            "WZB_WORKSPACE_WEBSOCKET_URL": "wss://workspace.example/events/ws",
+            "WZB_WORKSPACE_PROJECT_ID": "10000000-0000-0000-0000-000000000001",
+            "WZB_WORKSPACE_PROVIDER_UUID": "10000000-0000-0000-0000-000000000002",
+            "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+        }
+    )
+
+    unpartitioned = WorkspaceDiffWorker(
+        object(),  # type: ignore[arg-type]
+        settings,
+        scope="unpartitioned",
+    )
+    partitioned = WorkspaceDiffWorker(
+        object(),  # type: ignore[arg-type]
+        settings,
+        scope="partitioned",
+    )
+    live = WorkspaceDiffWorker(
+        object(),  # type: ignore[arg-type]
+        settings,
+        delivery_priority=0,
+    )
+
+    assert unpartitioned._claim_batch_size == 50
+    assert partitioned._claim_batch_size == settings.workspace_sync_batch_size
+    assert live._claim_batch_size == 50
+    assert live._delivery_priority_filter == "delivery_priority = 0"
+    assert partitioned._delivery_priority_filter == "TRUE"
 
 
 def test_workspace_diff_worker_plans_every_entity_without_starvation(
@@ -236,7 +290,7 @@ async def _run_workspace_diff_worker_fair_plan_test(
             assert "active_generation" in query
             return {
                 "active_generation": UUID("20000000-0000-0000-0000-000000000001"),
-                "reconciliation_version": 3,
+                "reconciliation_version": 6,
             }
 
     worker = WorkspaceDiffWorker(PlanningPool(), settings)  # type: ignore[arg-type]
@@ -261,15 +315,10 @@ async def _run_workspace_diff_worker_fair_plan_test(
         calls.append(entity_type)
         return 1 if entity_type == "users" else 0
 
-    async def fake_repair(realm_uuid: UUID, generation: UUID) -> int:
-        del realm_uuid, generation
-        return 0
-
     monkeypatch.setattr(worker, "_link_realm", fake_link_realm)
     monkeypatch.setattr(worker, "_ensure_direct_topics", fake_ensure_direct_topics)
     monkeypatch.setattr(worker, "_ensure_topic_bindings", fake_ensure_topic_bindings)
     monkeypatch.setattr(worker, "_plan_entity", fake_plan_entity)
-    monkeypatch.setattr(worker, "_repair_missing_source_diffs", fake_repair)
 
     assert await worker.plan() == 1
     assert calls == [
@@ -317,8 +366,8 @@ async def _run_workspace_diff_worker_drain_test(
     monkeypatch.setattr(worker, "process_once", fake_process_once)
     monkeypatch.setattr(worker, "_complete_initial_sync", fake_complete)
 
-    assert await worker._plan_and_drain(object()) == 100  # type: ignore[arg-type]
-    assert calls == ["plan", "process"]
+    assert await worker._plan_and_drain(object()) == 200  # type: ignore[arg-type]
+    assert calls == ["plan"]
 
 
 def test_workspace_diff_worker_completes_only_after_empty_plan(
@@ -362,7 +411,7 @@ async def _run_workspace_diff_worker_completion_test(
     monkeypatch.setattr(worker, "_complete_initial_sync", fake_complete)
 
     assert await worker._plan_and_drain(object()) == 0  # type: ignore[arg-type]
-    assert calls == ["plan", "process", "complete"]
+    assert calls == ["plan", "complete"]
 
 
 def test_workspace_diff_worker_waits_for_control_realm(
@@ -558,9 +607,10 @@ async def _run_workspace_receiver_test(
     assert "workspace-receiver-run" in calls
     assert "workspace-bootstrap-ensure" in calls
     assert "workspace-event-processor-run" in calls
-    assert calls.count("workspace-diff-worker-run") == 4
-    assert "workspace-diff-worker-init-True-0/2-unpartitioned" in calls
-    assert "workspace-diff-worker-init-False-0/2-partitioned" in calls
-    assert "workspace-diff-worker-init-False-1/2-partitioned" in calls
-    assert "workspace-diff-worker-init-False-0/2-unpartitioned" in calls
+    assert calls.count("workspace-diff-worker-run") == 5
+    assert "workspace-diff-worker-init-True-0/2-unpartitioned-None" in calls
+    assert "workspace-diff-worker-init-False-0/2-partitioned-1" in calls
+    assert "workspace-diff-worker-init-False-1/2-partitioned-1" in calls
+    assert "workspace-diff-worker-init-False-0/2-unpartitioned-1" in calls
+    assert "workspace-diff-worker-init-False-0/1-both-0" in calls
     assert pool.closed

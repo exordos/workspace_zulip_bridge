@@ -58,6 +58,8 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_connections (
     sync_enabled boolean NOT NULL DEFAULT true,
     queue_id text,
     last_event_id bigint,
+    last_event_cursor_at timestamptz,
+    reconcile_since timestamptz,
     lifecycle_status text NOT NULL DEFAULT 'init'
         CHECK (lifecycle_status IN (
             'init', 'streaming', 'filling', 'scheduling', 'backfilling', 'active'
@@ -80,7 +82,7 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_streams (
     chat_type text NOT NULL CHECK (chat_type IN ('channel', 'direct', 'group_direct')),
     chat_key text NOT NULL,
     name text NOT NULL,
-    description text,
+    description text NOT NULL DEFAULT '',
     owner_user_uuid uuid
         REFERENCES workspace_zulip_bridge.zulip_users (uuid) ON DELETE SET NULL,
     invite_only boolean NOT NULL DEFAULT false,
@@ -549,6 +551,8 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.sync_diffs (
     source_updated_at timestamptz NOT NULL,
     target_updated_at timestamptz,
     attempt_count integer NOT NULL DEFAULT 0,
+    dependency_wait_count integer NOT NULL DEFAULT 0
+        CHECK (dependency_wait_count >= 0),
     available_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     claimed_at timestamptz,
     processed_at timestamptz,

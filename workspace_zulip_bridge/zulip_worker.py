@@ -308,7 +308,13 @@ class ZulipEventThread(threading.Thread):
             except ZulipApiError as exc:
                 if exc.code != "BAD_EVENT_QUEUE_ID":
                     raise
-                if not self._submit(self._store.clear_queue(self.user.uuid, queue_id)):
+                if not self._submit(
+                    self._store.clear_queue(
+                        self.user.uuid,
+                        queue_id,
+                        self._settings.zulip_queue_gap_reconciliation_seconds,
+                    )
+                ):
                     return
                 LOG.info(
                     "Zulip queue lost; catalog reload required user_uuid=%s",
@@ -645,6 +651,11 @@ class ZulipEventThread(threading.Thread):
                     return False
                 anchor: str | int = "newest"
                 include_anchor = True
+                reconcile_since_epoch = (
+                    None
+                    if scheduled_chat.reconcile_since is None
+                    else scheduled_chat.reconcile_since.timestamp()
+                )
                 while not self._stop_requested.is_set():
                     with self._message_scan_gate:
                         page = client.get_chat_messages_page(
@@ -654,8 +665,29 @@ class ZulipEventThread(threading.Thread):
                             include_anchor=include_anchor,
                         )
                         source_message_count += len(page.messages)
+                        page_messages = page.messages
+                        reached_reconciliation_boundary = False
+                        if reconcile_since_epoch is not None:
+                            timestamps = [
+                                timestamp
+                                for message in page_messages
+                                if isinstance(
+                                    (timestamp := message.get("timestamp")),
+                                    (int, float),
+                                )
+                            ]
+                            reached_reconciliation_boundary = any(
+                                timestamp < reconcile_since_epoch
+                                for timestamp in timestamps
+                            )
+                            page_messages = [
+                                message
+                                for message in page_messages
+                                if isinstance(message.get("timestamp"), (int, float))
+                                and float(message["timestamp"]) >= reconcile_since_epoch
+                            ]
                         built_page = build_message_page(
-                            page.messages,
+                            page_messages,
                             own_user_id=self._identity.user_id,
                             user_uuids=self._user_uuids,
                             stream_ids_by_name=self._stream_ids_by_name,
@@ -673,7 +705,9 @@ class ZulipEventThread(threading.Thread):
                         skipped_reaction_count += built_page.skipped_reactions
                         topics_inserted += page_write.topics_inserted
                         unknown_flags.update(built_page.unknown_flags)
-                        found_oldest = page.found_oldest
+                        found_oldest = (
+                            page.found_oldest or reached_reconciliation_boundary
+                        )
                         next_anchor = (
                             anchor
                             if found_oldest
@@ -692,7 +726,12 @@ class ZulipEventThread(threading.Thread):
                 with self._catalog_write_gate:
                     if self._stop_requested.is_set() or self._queue_id != queue_id:
                         return False
-                    chat_write = self._submit(history.finish([scheduled_chat.chat_key]))
+                    chat_write = self._submit(
+                        history.finish(
+                            [scheduled_chat.chat_key],
+                            reconcile_since=scheduled_chat.reconcile_since,
+                        )
+                    )
                 if not chat_write.activated:
                     return False
                 schedules_loaded += chat_write.schedules_loaded

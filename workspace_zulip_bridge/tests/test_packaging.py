@@ -73,7 +73,7 @@ def test_exordos_manifest_renders_without_implicit_values() -> None:
 
     node = manifest["resources"]["$core.compute.nodes"]["bridge_node"]
     assert manifest["name"] == "workspace_zulip_bridge"
-    assert node["cores"] == 2
+    assert node["cores"] == 8
     assert node["ram"] == 4096
     assert node["disk_spec"] == {
         "kind": "disks",
@@ -113,6 +113,7 @@ def test_exordos_manifest_renders_without_implicit_values() -> None:
         "workspace_zulip_bridge_config"
     ]["body"]["content"]
     assert "WZB_WORKSPACE_CONTROL_URL=" in config
+    assert "WZB_WORKSPACE_SYNC_WORKERS=4" in config
     assert f"WZB_WORKSPACE_PROJECT_ID={{{workspace_project_id}}}" in config
     assert "WZB_WORKSPACE_USERNAME=" in config
     assert "WZB_WORKSPACE_PASSWORD_FILE=" in config

@@ -1423,6 +1423,61 @@ def test_history_rescan_enqueues_message_and_topic_tombstones() -> None:
     asyncio.run(_history_rescan_enqueues_tombstones(_dsn()))
 
 
+def test_unchanged_catalog_rows_do_not_wait_on_stream_locks() -> None:
+    asyncio.run(_unchanged_catalog_rows_do_not_wait_on_stream_locks(_dsn()))
+
+
+async def _unchanged_catalog_rows_do_not_wait_on_stream_locks(dsn: str) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            first_connection = await _insert_user(
+                connection,
+                10,
+                400,
+                queue_id="queue-catalog-first",
+                status="filling",
+            )
+        first_catalog = _catalog(10, [(7, "Shared")], {"channel:7": 1})
+        expanded_catalog = _catalog(
+            10,
+            [(7, "Shared"), (8, "New")],
+            {"channel:7": 1, "channel:8": 1},
+        )
+        assert (
+            await store.store_chat_catalog(
+                first_connection,
+                "queue-catalog-first",
+                first_catalog,
+            )
+        ).activated
+        stream_uuid = stable_chat_uuid(ENDPOINT, "channel:7")
+
+        async with pool.acquire() as locked, locked.transaction():
+            await locked.fetchval(
+                """
+                SELECT uuid
+                FROM workspace_zulip_bridge.zulip_streams
+                WHERE uuid = $1
+                FOR UPDATE
+                """,
+                stream_uuid,
+            )
+            result = await asyncio.wait_for(
+                store.store_chat_catalog(
+                    first_connection,
+                    "queue-catalog-first",
+                    expanded_catalog,
+                ),
+                timeout=1.0,
+            )
+            assert result.activated
+            assert result.upserted == 1
+    finally:
+        await pool.close()
+
+
 async def _history_rescan_enqueues_tombstones(dsn: str) -> None:
     pool = await _pool(dsn)
     provider_uuid = UUID("10000000-0000-0000-0000-0000000000e1")
@@ -1513,8 +1568,25 @@ async def _history_rescan_enqueues_tombstones(dsn: str) -> None:
                     project_uuid,
                     content_hash,
                 )
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_connections
+                SET last_event_cursor_at = clock_timestamp() - interval '2 hours'
+                WHERE uuid = $1
+                """,
+                connection_uuid,
+            )
 
-        assert await store.clear_queue(connection_uuid, "queue-66")
+        assert await store.clear_queue(connection_uuid, "queue-66", 3600.0)
+        reconcile_age = await pool.fetchval(
+            """
+            SELECT EXTRACT(EPOCH FROM (clock_timestamp() - reconcile_since))
+            FROM workspace_zulip_bridge.zulip_connections
+            WHERE uuid = $1
+            """,
+            connection_uuid,
+        )
+        assert 3590 <= float(reconcile_age) <= 3610
         assert await pool.fetchval(
             "SELECT EXISTS (SELECT 1 FROM "
             "workspace_zulip_bridge.zulip_messages WHERE uuid = $1)",
@@ -1599,6 +1671,57 @@ async def _history_rescan_enqueues_tombstones(dsn: str) -> None:
                 "processing_status": "pending",
             },
         ]
+
+        old_message_uuid = stable_message_uuid(ENDPOINT, 662)
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.zulip_messages (
+                uuid, realm_uuid, source_connection_uuid, zulip_stream_uuid,
+                sender_user_uuid, zulip_message_id, content, content_hash,
+                message_hash, created_at, source_updated_at
+            ) VALUES ($1, $2, $3, $4, $3, 662, 'outside recovery window',
+                      $5, $5, clock_timestamp() - interval '2 days',
+                      clock_timestamp() - interval '2 days')
+            """,
+            old_message_uuid,
+            stable_realm_uuid(ENDPOINT),
+            connection_uuid,
+            stream_uuid,
+            b"o" * 32,
+        )
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.zulip_connections
+            SET last_event_cursor_at = clock_timestamp()
+            WHERE uuid = $1
+            """,
+            connection_uuid,
+        )
+        assert await store.clear_queue(
+            connection_uuid,
+            "queue-66-rescan",
+            3600.0,
+        )
+        assert await store.set_queue(connection_uuid, "queue-66-bounded", 0)
+        pending = await store.list_pending_history_chats(
+            connection_uuid,
+            "queue-66-bounded",
+        )
+        assert len(pending) == 1
+        assert pending[0].reconcile_since is not None
+        bounded = await store.begin_history(connection_uuid, "queue-66-bounded")
+        try:
+            await bounded.finish(
+                ["channel:66"],
+                reconcile_since=pending[0].reconcile_since,
+            )
+        finally:
+            await bounded.close()
+        assert await pool.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM "
+            "workspace_zulip_bridge.zulip_messages WHERE uuid = $1)",
+            old_message_uuid,
+        )
     finally:
         await pool.close()
 
@@ -2292,11 +2415,11 @@ def test_workspace_diff_worker_batches_and_converges(
     asyncio.run(_workspace_diff_worker_round_trip(_dsn(), tmp_path))
 
 
-def test_workspace_reconciliation_revisits_completed_sweeps(tmp_path: Path) -> None:
-    asyncio.run(_workspace_reconciliation_revisits_completed_sweeps(_dsn(), tmp_path))
+def test_workspace_planner_does_not_rescan_completed_history(tmp_path: Path) -> None:
+    asyncio.run(_workspace_planner_does_not_rescan_completed_history(_dsn(), tmp_path))
 
 
-async def _workspace_reconciliation_revisits_completed_sweeps(
+async def _workspace_planner_does_not_rescan_completed_history(
     dsn: str,
     tmp_path: Path,
 ) -> None:
@@ -2306,7 +2429,7 @@ async def _workspace_reconciliation_revisits_completed_sweeps(
     generation = UUID("10000000-0000-0000-0000-0000000000a3")
     stream_uuid = UUID("10000000-0000-0000-0000-0000000000a4")
     topic_uuid = UUID("10000000-0000-0000-0000-0000000000a5")
-    token_file = tmp_path / "workspace-reconciliation.token"
+    token_file = tmp_path / "workspace-cursor-driven.token"
     token_file.write_text("integration-token")
     try:
         async with pool.acquire() as connection:
@@ -2368,7 +2491,6 @@ async def _workspace_reconciliation_revisits_completed_sweeps(
                 "WZB_WORKSPACE_PROJECT_ID": str(project_uuid),
                 "WZB_WORKSPACE_PROVIDER_UUID": str(provider_uuid),
                 "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
-                "WZB_WORKSPACE_RECONCILIATION_INTERVAL_SECONDS": "1",
             }
         )
         worker = WorkspaceDiffWorker(pool, settings)
@@ -2392,7 +2514,56 @@ async def _workspace_reconciliation_revisits_completed_sweeps(
             stream_uuid,
             b"f" * 32,
         )
-        assert await worker._requeue_provider_owned_mentions() == 1
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.sync_diffs (
+                provider_uuid, entity_type, entity_uuid, realm_uuid,
+                partition_key, direction, source_hash, source_updated_at,
+                processing_status, attempt_count, last_error
+            ) VALUES (
+                $1, 'streams', $2, $3, $2, 'to_workspace', $4,
+                clock_timestamp(), 'blocked', 1,
+                'Workspace Provider API returned 422 error=invalid_entity item_index=0'
+            )
+            """,
+            provider_uuid,
+            stream_uuid,
+            realm_uuid,
+            b"s" * 32,
+        )
+        topic_binding_uuid = UUID("10000000-0000-0000-0000-0000000000a7")
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.sync_diffs (
+                provider_uuid, entity_type, entity_uuid, realm_uuid,
+                partition_key, direction, source_hash, source_updated_at,
+                processing_status, attempt_count, last_error
+            ) VALUES (
+                $1, 'topic_bindings', $2, $3, $4, 'to_workspace', $5,
+                clock_timestamp(), 'blocked', 1,
+                'Workspace Provider API returned 422 error=invalid_entity item_index=1'
+            )
+            """,
+            provider_uuid,
+            topic_binding_uuid,
+            realm_uuid,
+            stream_uuid,
+            b"b" * 32,
+        )
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.sync_plan_cursors (
+                provider_uuid, entity_type, snapshot_generation,
+                source_updated_at, entity_uuid
+            ) VALUES
+                ($1, 'topics', $2, clock_timestamp(), $3),
+                ($1, 'messages', $2, clock_timestamp(), $3)
+            """,
+            provider_uuid,
+            generation,
+            topic_uuid,
+        )
+        assert await worker._apply_projection_upgrade() == 3
         recovered = await pool.fetchrow(
             """
             SELECT processing_status, attempt_count, last_error
@@ -2407,9 +2578,57 @@ async def _workspace_reconciliation_revisits_completed_sweeps(
         assert recovered["processing_status"] == "pending"
         assert recovered["attempt_count"] == 0
         assert recovered["last_error"] == "requeued_provider_owned_mentioned"
+        stream_recovered = await pool.fetchrow(
+            """
+            SELECT processing_status, attempt_count, last_error
+            FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1 AND entity_type = 'streams'
+              AND entity_uuid = $2
+            """,
+            provider_uuid,
+            stream_uuid,
+        )
+        assert stream_recovered is not None
+        assert stream_recovered["processing_status"] == "pending"
+        assert stream_recovered["attempt_count"] == 0
+        assert stream_recovered["last_error"] == (
+            "requeued_normalized_stream_description"
+        )
+        topic_binding_recovered = await pool.fetchrow(
+            """
+            SELECT processing_status, attempt_count, last_error
+            FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1 AND entity_type = 'topic_bindings'
+              AND entity_uuid = $2
+            """,
+            provider_uuid,
+            topic_binding_uuid,
+        )
+        assert topic_binding_recovered is not None
+        assert topic_binding_recovered["processing_status"] == "pending"
+        assert topic_binding_recovered["attempt_count"] == 0
+        assert topic_binding_recovered["last_error"] == (
+            "requeued_after_topic_projection_repair"
+        )
+        repaired_cursors = await pool.fetch(
+            """
+            SELECT entity_type, source_updated_at, entity_uuid
+            FROM workspace_zulip_bridge.sync_plan_cursors
+            WHERE provider_uuid = $1
+              AND entity_type IN ('topics', 'messages')
+            ORDER BY entity_type
+            """,
+            provider_uuid,
+        )
+        assert [row["entity_type"] for row in repaired_cursors] == [
+            "messages",
+            "topics",
+        ]
+        assert all(row["source_updated_at"] is None for row in repaired_cursors)
+        assert all(row["entity_uuid"] is None for row in repaired_cursors)
 
         assert (
-            await worker._repair_entity(
+            await worker._plan_entity(
                 "topics", _SOURCE_TABLES["topics"], realm_uuid, generation
             )
             == 1
@@ -2424,17 +2643,8 @@ async def _workspace_reconciliation_revisits_completed_sweeps(
             provider_uuid,
             topic_uuid,
         )
-        await pool.execute(
-            """
-            UPDATE workspace_zulip_bridge.sync_repair_cursors
-            SET source_updated_at = NULL, entity_uuid = NULL,
-                next_run_at = clock_timestamp() - interval '1 second'
-            WHERE provider_uuid = $1 AND entity_type = 'topics'
-            """,
-            provider_uuid,
-        )
         assert (
-            await worker._repair_entity(
+            await worker._plan_entity(
                 "topics", _SOURCE_TABLES["topics"], realm_uuid, generation
             )
             == 0
@@ -2461,17 +2671,8 @@ async def _workspace_reconciliation_revisits_completed_sweeps(
             topic_uuid,
             b"u" * 32,
         )
-        await pool.execute(
-            """
-            UPDATE workspace_zulip_bridge.sync_repair_cursors
-            SET source_updated_at = NULL, entity_uuid = NULL,
-                next_run_at = clock_timestamp() - interval '1 second'
-            WHERE provider_uuid = $1 AND entity_type = 'topics'
-            """,
-            provider_uuid,
-        )
         assert (
-            await worker._repair_entity(
+            await worker._plan_entity(
                 "topics", _SOURCE_TABLES["topics"], realm_uuid, generation
             )
             == 1
@@ -2498,22 +2699,39 @@ async def _workspace_reconciliation_revisits_completed_sweeps(
             provider_uuid,
             topic_uuid,
         )
+        assert (
+            await worker._plan_entity(
+                "topics", _SOURCE_TABLES["topics"], realm_uuid, generation
+            )
+            == 0
+        )
         await pool.execute(
             """
-            UPDATE workspace_zulip_bridge.sync_repair_cursors
-            SET source_updated_at = NULL, entity_uuid = NULL,
-                next_run_at = clock_timestamp() - interval '1 second'
-            WHERE provider_uuid = $1 AND entity_type = 'topics'
+            UPDATE workspace_zulip_bridge.sync_plan_cursors
+            SET source_updated_at = clock_timestamp(), entity_uuid = $2
+            WHERE provider_uuid = $1
+              AND entity_type IN ('topics', 'messages')
+            """,
+            provider_uuid,
+            topic_uuid,
+        )
+        assert await worker._apply_projection_upgrade(5) == 0
+        version_six_cursors = await pool.fetch(
+            """
+            SELECT entity_type, source_updated_at, entity_uuid
+            FROM workspace_zulip_bridge.sync_plan_cursors
+            WHERE provider_uuid = $1
+              AND entity_type IN ('topics', 'messages')
+            ORDER BY entity_type
             """,
             provider_uuid,
         )
-
-        assert (
-            await worker._repair_entity(
-                "topics", _SOURCE_TABLES["topics"], realm_uuid, generation
-            )
-            == 1
-        )
+        assert version_six_cursors[0]["entity_type"] == "messages"
+        assert version_six_cursors[0]["source_updated_at"] is None
+        assert version_six_cursors[0]["entity_uuid"] is None
+        assert version_six_cursors[1]["entity_type"] == "topics"
+        assert version_six_cursors[1]["source_updated_at"] is not None
+        assert version_six_cursors[1]["entity_uuid"] == topic_uuid
     finally:
         await pool.close()
 
@@ -2636,6 +2854,35 @@ async def _workspace_diff_dependencies_gate_children_and_batch_errors_isolate(
         ready, deferred = await worker._partition_dependency_ready([candidate])
         assert ready == []
         assert deferred == [rows[0]]
+
+        await worker._defer_for_dependencies(deferred)
+        deferred_state = await pool.fetchrow(
+            """
+            SELECT processing_status, attempt_count, dependency_wait_count,
+                   EXTRACT(EPOCH FROM (available_at - updated_at)) AS retry_seconds
+            FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1 AND entity_type = 'messages'
+              AND entity_uuid = $2
+            """,
+            provider_uuid,
+            message_uuid,
+        )
+        assert deferred_state is not None
+        assert deferred_state["processing_status"] == "pending"
+        assert deferred_state["attempt_count"] == 0
+        assert deferred_state["dependency_wait_count"] == 1
+        assert 1.5 <= float(deferred_state["retry_seconds"]) <= 2.5
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.sync_diffs
+            SET processing_status = 'processing', claimed_at = $3,
+                attempt_count = 1
+            WHERE provider_uuid = $1 AND entity_uuid = $2
+            """,
+            provider_uuid,
+            message_uuid,
+            claimed_at,
+        )
 
         await pool.execute(
             """
@@ -4171,7 +4418,7 @@ async def _workspace_diff_planner_schedules_unready_entity_graph(
                 """,
                 provider_uuid,
             )
-            == 3
+            == 6
         )
     finally:
         await pool.close()
@@ -4231,6 +4478,8 @@ async def _workspace_diff_worker_round_trip(dsn: str, tmp_path: Path) -> None:
             }
         )
         worker = WorkspaceDiffWorker(pool, settings)
+        live_worker = WorkspaceDiffWorker(pool, settings, delivery_priority=0)
+        history_worker = WorkspaceDiffWorker(pool, settings, delivery_priority=1)
         assert await worker.plan() >= 1
         requests: list[dict[str, object]] = []
 
@@ -4348,9 +4597,9 @@ async def _workspace_diff_worker_round_trip(dsn: str, tmp_path: Path) -> None:
                 provider_uuid,
                 user_uuid,
             )
-            assert await worker.process_once(client) == 1
+            assert await live_worker.process_once(client) == 1
             assert requests[-1]["delivery_class"] == "live"
-            assert await worker.process_once(client) == 1
+            assert await history_worker.process_once(client) == 1
             assert len(requests) == 2
             assert (
                 await pool.fetchval(
@@ -4963,6 +5212,42 @@ async def _scheduler_incomplete_catalog_round_trip(dsn: str) -> None:
                 ready_uuid, "queue-ready", _catalog(10, [(7, "Shared")], {})
             )
         ).activated
+        stream_uuid = stable_chat_uuid(ENDPOINT, "channel:7")
+        user_uuid = stable_user_uuid(ENDPOINT, 10)
+        topic_uuid = stable_topic_uuid(stream_uuid, "General")
+        topic_binding_uuid = stable_topic_binding_uuid(topic_uuid, user_uuid)
+        async with pool.acquire() as connection:
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_topics (
+                    uuid, zulip_stream_uuid, name, content_hash, updated_at
+                ) VALUES ($1, $2, 'General', $3, '2000-01-01T00:00:00Z')
+                """,
+                topic_uuid,
+                stream_uuid,
+                b"t" * 32,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_topic_bindings (
+                    uuid, zulip_stream_uuid, topic_uuid, zulip_user_uuid,
+                    content_hash, updated_at
+                ) VALUES ($1, $2, $3, $4, $5, '2000-01-01T00:00:00Z')
+                """,
+                topic_binding_uuid,
+                stream_uuid,
+                topic_uuid,
+                user_uuid,
+                b"b" * 32,
+            )
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_stream_bindings
+                SET updated_at = '2000-01-01T00:00:00Z'
+                WHERE zulip_stream_uuid = $1
+                """,
+                stream_uuid,
+            )
 
         reconciled = await store.reconcile_chat_schedules()
         assert reconciled.assigned == 1
@@ -4974,6 +5259,28 @@ async def _scheduler_incomplete_catalog_round_trip(dsn: str) -> None:
             )
             == ready_uuid
         )
+        touched = await pool.fetchrow(
+            """
+            SELECT
+                (SELECT min(updated_at)
+                 FROM workspace_zulip_bridge.zulip_stream_bindings
+                 WHERE zulip_stream_uuid = $1) AS binding_updated_at,
+                (SELECT updated_at
+                 FROM workspace_zulip_bridge.zulip_topics
+                 WHERE uuid = $2) AS topic_updated_at,
+                (SELECT updated_at
+                 FROM workspace_zulip_bridge.zulip_topic_bindings
+                 WHERE uuid = $3) AS topic_binding_updated_at
+            """,
+            stream_uuid,
+            topic_uuid,
+            topic_binding_uuid,
+        )
+        assert touched is not None
+        old_timestamp = datetime(2000, 1, 1, tzinfo=UTC)
+        assert touched["binding_updated_at"] > old_timestamp
+        assert touched["topic_updated_at"] > old_timestamp
+        assert touched["topic_binding_updated_at"] > old_timestamp
     finally:
         await pool.close()
 

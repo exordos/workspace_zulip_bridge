@@ -5,6 +5,8 @@ import asyncio
 import concurrent.futures
 import threading
 import time
+from datetime import UTC
+from datetime import datetime
 from uuid import UUID
 
 from workspace_zulip_bridge.config import Settings
@@ -155,6 +157,7 @@ class FakeStore:
         self.users = [USER_ONE, USER_TWO]
         self.queues: list[tuple[UUID, str, int]] = []
         self.cleared: list[tuple[UUID, str]] = []
+        self.reconciliation_windows: list[float] = []
         self.disabled: list[UUID] = []
         self.batches: list[tuple[UUID, str, list[ZulipEvent], int]] = []
         self.statuses: list[tuple[UUID, UserStatus]] = []
@@ -229,7 +232,13 @@ class FakeStore:
         self.statuses.append((user_uuid, "streaming"))
         return True
 
-    async def clear_queue(self, user_uuid: UUID, queue_id: str) -> bool:
+    async def clear_queue(
+        self,
+        user_uuid: UUID,
+        queue_id: str,
+        reconciliation_window_seconds: float = 86400.0,
+    ) -> bool:
+        self.reconciliation_windows.append(reconciliation_window_seconds)
         self.cleared.append((user_uuid, queue_id))
         self.statuses.append((user_uuid, "init"))
         return True
@@ -383,7 +392,12 @@ class FakeHistory:
     async def store_page(self, messages: object) -> MessagePageWrite:
         return MessagePageWrite(1, 1, 0, 0, 0)
 
-    async def finish(self, chat_keys: object) -> HistoryWrite:
+    async def finish(
+        self,
+        chat_keys: object,
+        *,
+        reconcile_since: object = None,
+    ) -> HistoryWrite:
         return HistoryWrite(True, 0, 0, 1)
 
     async def close(self) -> None:
@@ -411,9 +425,17 @@ class GateAwareHistory(FakeHistory):
     def __init__(self, gate: TrackingGate) -> None:
         self._gate = gate
 
-    async def finish(self, chat_keys: object) -> HistoryWrite:
+    async def finish(
+        self,
+        chat_keys: object,
+        *,
+        reconcile_since: object = None,
+    ) -> HistoryWrite:
         assert self._gate.active == 1
-        return await super().finish(chat_keys)
+        return await super().finish(
+            chat_keys,
+            reconcile_since=reconcile_since,
+        )
 
 
 class GateAwareStore(FakeStore):
@@ -470,6 +492,113 @@ async def _history_finalization_gate_test() -> None:
 
     assert loaded
     assert gate.entries == 1
+
+
+class BoundedHistory(FakeHistory):
+    def __init__(self) -> None:
+        self.pages: list[object] = []
+        self.reconcile_since: object = None
+
+    async def store_page(self, messages: object) -> MessagePageWrite:
+        message_list = list(messages)  # type: ignore[arg-type]
+        self.pages.append(message_list)
+        return MessagePageWrite(
+            len(message_list),
+            len(message_list),
+            0,
+            0,
+            0,
+        )
+
+    async def finish(
+        self,
+        chat_keys: object,
+        *,
+        reconcile_since: object = None,
+    ) -> HistoryWrite:
+        self.reconcile_since = reconcile_since
+        return await super().finish(
+            chat_keys,
+            reconcile_since=reconcile_since,
+        )
+
+
+class BoundedHistoryStore(FakeStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.history = BoundedHistory()
+
+    async def begin_history(self, user_uuid: UUID, queue_id: str) -> BoundedHistory:
+        self.history_begins += 1
+        return self.history
+
+
+class BoundedHistoryApi(DirectHistoryApi):
+    def __init__(self) -> None:
+        super().__init__()
+        self.page_reads = 0
+
+    def get_chat_messages_page(
+        self,
+        chat_key: str,
+        own_user_id: int,
+        anchor: str | int,
+        *,
+        include_anchor: bool,
+    ) -> MessagePage:
+        self.page_reads += 1
+        messages = []
+        for message_id, timestamp in ((102, 1_700_000_060), (101, 1_699_999_940)):
+            messages.append(
+                {
+                    "id": message_id,
+                    "type": "private",
+                    "sender_id": 10,
+                    "content": f"message {message_id}",
+                    "timestamp": timestamp,
+                    "flags": ["read"],
+                    "reactions": [],
+                    "display_recipient": [
+                        {"id": 10, "full_name": "Current User"},
+                        {"id": 12, "full_name": "Second User"},
+                    ],
+                }
+            )
+        return MessagePage(messages=messages, found_oldest=False)
+
+
+def test_queue_gap_history_is_bounded_by_reconciliation_cutoff() -> None:
+    asyncio.run(_queue_gap_history_is_bounded_by_reconciliation_cutoff())
+
+
+async def _queue_gap_history_is_bounded_by_reconciliation_cutoff() -> None:
+    store = BoundedHistoryStore()
+    api = BoundedHistoryApi()
+    worker = ZulipEventThread(
+        USER_ONE,
+        store,  # type: ignore[arg-type]
+        asyncio.get_running_loop(),
+        Settings(database_dsn="postgresql:///test"),
+        threading.BoundedSemaphore(1),
+        api_factory=lambda user: api,  # type: ignore[arg-type]
+    )
+    worker._identity = ZulipIdentity(10, "Current User", 400)
+    worker._queue_id = "queue-1"
+    worker._user_uuids = {10: USER_ONE.uuid, 12: USER_TWO.uuid}
+    cutoff = datetime.fromtimestamp(1_700_000_000, UTC)
+
+    loaded = await asyncio.to_thread(
+        worker._load_scheduled_history,
+        api,
+        "queue-1",
+        [ScheduledChat("direct:10,12", 2, cutoff)],
+    )
+
+    assert loaded
+    assert api.page_reads == 1
+    assert len(store.history.pages) == 1
+    assert len(store.history.pages[0]) == 1  # type: ignore[arg-type]
+    assert store.history.reconcile_since == cutoff
 
 
 class BlockingCatalogApi(FakeApi):
@@ -704,6 +833,7 @@ async def _expired_queue_test() -> None:
     await asyncio.to_thread(worker.join, 2)
 
     assert store.cleared == [(user.uuid, "expired-queue")]
+    assert store.reconciliation_windows == [86400.0]
     assert store.queues == [(user.uuid, "fresh-queue", -1)]
     assert api.catalog_reads >= 1
     assert store.catalogs[-1][1] == "fresh-queue"

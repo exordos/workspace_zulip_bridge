@@ -30,8 +30,21 @@ class _Bootstrapper(typing.Protocol):
 
 
 class BridgeService:
+    CONTENT_PARTITION_COUNT = 2
+
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
+
+    @classmethod
+    def content_worker_partitions(cls, worker_count: int) -> list[tuple[int, int]]:
+        partition_count = min(worker_count, cls.CONTENT_PARTITION_COUNT)
+        return [
+            (index % partition_count, partition_count) for index in range(worker_count)
+        ]
+
+    @staticmethod
+    def unpartitioned_worker_count(worker_count: int) -> int:
+        return min(2, max(1, worker_count // 2))
 
     async def run(self, stop: asyncio.Event) -> None:
         pool = await open_pool(self._settings)
@@ -73,6 +86,10 @@ class BridgeService:
                     )
                 )
             if self._settings.workspace_events_enabled:
+                content_worker_partitions = self.content_worker_partitions(
+                    self._settings.workspace_sync_workers
+                )
+                content_partition_count = content_worker_partitions[0][1]
                 tokens = WorkspaceTokenManager(self._settings)
                 bootstrapper = WorkspaceBootstrapper(pool, self._settings, tokens)
                 if await self._ensure_bootstrap(bootstrapper, stop):
@@ -85,7 +102,7 @@ class BridgeService:
                         self._settings,
                         plan_enabled=True,
                         partition=0,
-                        partition_count=self._settings.workspace_sync_workers,
+                        partition_count=content_partition_count,
                         scope="unpartitioned",
                         tokens=tokens,
                     )
@@ -94,20 +111,39 @@ class BridgeService:
                             pool,
                             self._settings,
                             plan_enabled=False,
-                            partition=index,
-                            partition_count=self._settings.workspace_sync_workers,
+                            partition=partition,
+                            partition_count=partition_count,
                             scope="partitioned",
+                            delivery_priority=1,
                             tokens=tokens,
                         )
-                        for index in range(self._settings.workspace_sync_workers)
+                        for partition, partition_count in content_worker_partitions
                     ]
-                    workspace_unpartitioned_drainer = WorkspaceDiffWorker(
+                    workspace_unpartitioned_drainers = [
+                        WorkspaceDiffWorker(
+                            pool,
+                            self._settings,
+                            plan_enabled=False,
+                            partition=0,
+                            partition_count=content_partition_count,
+                            scope="unpartitioned",
+                            delivery_priority=1,
+                            tokens=tokens,
+                        )
+                        for _ in range(
+                            self.unpartitioned_worker_count(
+                                self._settings.workspace_sync_workers
+                            )
+                        )
+                    ]
+                    workspace_realtime_drainer = WorkspaceDiffWorker(
                         pool,
                         self._settings,
                         plan_enabled=False,
                         partition=0,
-                        partition_count=self._settings.workspace_sync_workers,
-                        scope="unpartitioned",
+                        partition_count=1,
+                        scope="both",
+                        delivery_priority=0,
                         tokens=tokens,
                     )
                     supervised_tasks.extend(
@@ -139,10 +175,17 @@ class BridgeService:
                         )
                         for index, worker in enumerate(workspace_diff_workers)
                     )
+                    supervised_tasks.extend(
+                        asyncio.create_task(
+                            worker.run(),
+                            name=f"workspace-diff-unpartitioned-{index}",
+                        )
+                        for index, worker in enumerate(workspace_unpartitioned_drainers)
+                    )
                     supervised_tasks.append(
                         asyncio.create_task(
-                            workspace_unpartitioned_drainer.run(),
-                            name="workspace-diff-unpartitioned",
+                            workspace_realtime_drainer.run(),
+                            name="workspace-diff-realtime",
                         )
                     )
             LOG.info("bridge daemon is ready")

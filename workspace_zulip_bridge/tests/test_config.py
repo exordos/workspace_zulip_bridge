@@ -28,10 +28,12 @@ def test_defaults_use_local_postgresql_socket() -> None:
     assert not settings.workspace_events_enabled
     assert settings.workspace_event_batch_size == 500
     assert settings.workspace_event_max_attempts == 8
-    assert settings.workspace_sync_plan_batch_size == 500
+    assert settings.workspace_sync_plan_batch_size == 5000
     assert settings.workspace_sync_batch_size == 500
     assert settings.workspace_sync_workers == 2
-    assert settings.workspace_reconciliation_interval_seconds == 300.0
+    assert settings.zulip_queue_gap_reconciliation_seconds == 86400.0
+    assert settings.workspace_dependency_retry_base_seconds == 2.0
+    assert settings.workspace_dependency_retry_cap_seconds == 300.0
 
 
 def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
@@ -74,7 +76,9 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
             "WZB_WORKSPACE_SYNC_PLAN_BATCH_SIZE": "2500",
             "WZB_WORKSPACE_SYNC_BATCH_SIZE": "250",
             "WZB_WORKSPACE_SYNC_WORKERS": "4",
-            "WZB_WORKSPACE_RECONCILIATION_INTERVAL_SECONDS": "45",
+            "WZB_ZULIP_QUEUE_GAP_RECONCILIATION_SECONDS": "7200",
+            "WZB_WORKSPACE_DEPENDENCY_RETRY_BASE_SECONDS": "4",
+            "WZB_WORKSPACE_DEPENDENCY_RETRY_CAP_SECONDS": "90",
         }
     )
 
@@ -107,7 +111,9 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
     assert settings.workspace_sync_plan_batch_size == 2500
     assert settings.workspace_sync_batch_size == 250
     assert settings.workspace_sync_workers == 4
-    assert settings.workspace_reconciliation_interval_seconds == 45.0
+    assert settings.zulip_queue_gap_reconciliation_seconds == 7200.0
+    assert settings.workspace_dependency_retry_base_seconds == 4.0
+    assert settings.workspace_dependency_retry_cap_seconds == 90.0
 
 
 @pytest.mark.parametrize(
@@ -126,7 +132,9 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
         ("WZB_EVENT_PROCESSOR_BATCH_SIZE", "0"),
         ("WZB_EVENT_PROCESSOR_BATCH_SIZE", "10001"),
         ("WZB_EVENT_PROCESSOR_POLL_SECONDS", "0"),
-        ("WZB_WORKSPACE_RECONCILIATION_INTERVAL_SECONDS", "0"),
+        ("WZB_ZULIP_QUEUE_GAP_RECONCILIATION_SECONDS", "0"),
+        ("WZB_WORKSPACE_DEPENDENCY_RETRY_BASE_SECONDS", "0"),
+        ("WZB_WORKSPACE_DEPENDENCY_RETRY_CAP_SECONDS", "0"),
         ("WZB_EVENT_PROCESSOR_CLAIM_TIMEOUT_SECONDS", "0"),
         ("WZB_EVENT_PROCESSOR_MAX_ATTEMPTS", "0"),
         ("WZB_EVENT_PROCESSOR_RETRY_BASE_SECONDS", "0"),
@@ -177,6 +185,16 @@ def test_retry_cap_cannot_be_smaller_than_base() -> None:
             {
                 "WZB_ZULIP_RETRY_BASE_SECONDS": "10",
                 "WZB_ZULIP_RETRY_CAP_SECONDS": "5",
+            }
+        )
+
+
+def test_dependency_retry_cap_cannot_be_smaller_than_base() -> None:
+    with pytest.raises(ValueError, match="at least"):
+        Settings.from_env(
+            {
+                "WZB_WORKSPACE_DEPENDENCY_RETRY_BASE_SECONDS": "10",
+                "WZB_WORKSPACE_DEPENDENCY_RETRY_CAP_SECONDS": "5",
             }
         )
 

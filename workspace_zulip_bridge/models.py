@@ -4,6 +4,7 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import field
+from datetime import datetime
 from typing import Any
 from typing import Literal
 from uuid import UUID
@@ -245,3 +246,4 @@ class ChatScheduleReconcile:
 class ScheduledChat:
     chat_key: str
     available_message_count: int
+    reconcile_since: datetime | None = None
