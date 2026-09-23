@@ -557,7 +557,8 @@ async def _run_workspace_receiver_test(
     assert "workspace-receiver-run" in calls
     assert "workspace-bootstrap-ensure" in calls
     assert "workspace-event-processor-run" in calls
-    assert calls.count("workspace-diff-worker-run") == 2
+    assert calls.count("workspace-diff-worker-run") == 3
     assert "workspace-diff-worker-init-True-0/2" in calls
+    assert "workspace-diff-worker-init-False-0/2" in calls
     assert "workspace-diff-worker-init-False-1/2" in calls
     assert pool.closed
