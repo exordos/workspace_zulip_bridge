@@ -48,6 +48,7 @@ class BridgeService:
 
     async def run(self, stop: asyncio.Event) -> None:
         pool = await open_pool(self._settings)
+        supervised_tasks: list[asyncio.Task[typing.Any]] = []
         try:
             await prepare_database(pool)
             await probe_database(pool)
@@ -195,15 +196,50 @@ class BridgeService:
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if stop_task not in completed:
-                    failed_task = next(iter(completed))
-                    failed_task.result()
+                    failed_task = next(
+                        task for task in completed if task is not stop_task
+                    )
+                    try:
+                        failed_task.result()
+                    except asyncio.CancelledError as error:
+                        raise RuntimeError(
+                            f"bridge task {failed_task.get_name()} was cancelled"
+                        ) from error
+                    raise RuntimeError(
+                        f"bridge task {failed_task.get_name()} stopped unexpectedly"
+                    )
             finally:
-                for task in supervised_tasks:
-                    task.cancel()
-                await asyncio.gather(*supervised_tasks, return_exceptions=True)
+                await self._cancel_tasks(supervised_tasks)
         finally:
-            await pool.close()
+            try:
+                await asyncio.wait_for(
+                    pool.close(),
+                    timeout=self._settings.thread_stop_timeout_seconds,
+                )
+            except TimeoutError:
+                LOG.error("Database pool shutdown timed out; terminating pool")
+                pool.terminate()
             LOG.info("bridge daemon stopped")
+
+    async def _cancel_tasks(
+        self,
+        tasks: list[asyncio.Task[typing.Any]],
+    ) -> None:
+        if not tasks:
+            return
+        for task in tasks:
+            task.cancel()
+        done, pending = await asyncio.wait(
+            tasks,
+            timeout=self._settings.thread_stop_timeout_seconds,
+        )
+        if done:
+            await asyncio.gather(*done, return_exceptions=True)
+        if pending:
+            LOG.error(
+                "Bridge task shutdown timed out tasks=%s",
+                ",".join(sorted(task.get_name() for task in pending)),
+            )
 
     async def _probe_loop(self, pool: asyncpg.Pool) -> None:
         while True:

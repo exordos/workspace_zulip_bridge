@@ -17,9 +17,13 @@ from workspace_zulip_bridge.workspace_sync import WorkspaceDiffWorker
 class FakePool:
     def __init__(self) -> None:
         self.closed = False
+        self.terminated = False
 
     async def close(self) -> None:
         self.closed = True
+
+    def terminate(self) -> None:
+        self.terminated = True
 
 
 class FakeSupervisor:
@@ -532,6 +536,64 @@ async def _run_daemon_lifecycle_test(monkeypatch: object) -> None:
         "event-processor-run",
     ]
     assert pool.closed
+
+
+def test_daemon_fails_and_forces_pool_shutdown_when_component_stops(
+    monkeypatch: object,
+) -> None:
+    asyncio.run(_run_daemon_component_failure_test(monkeypatch))
+
+
+async def _run_daemon_component_failure_test(monkeypatch: object) -> None:
+    calls: list[str] = []
+    stop = asyncio.Event()
+
+    class HangingPool(FakePool):
+        async def close(self) -> None:
+            self.closed = True
+            await asyncio.Future()
+
+    class StoppedSupervisor(FakeSupervisor):
+        async def run(self) -> None:
+            self.calls.append("supervisor-run")
+
+    pool = HangingPool()
+
+    async def fake_open_pool(settings: Settings) -> HangingPool:
+        return pool
+
+    async def fake_prepare_database(candidate: HangingPool) -> None:
+        return None
+
+    async def fake_probe_database(candidate: HangingPool) -> None:
+        return None
+
+    monkeypatch.setattr(service_module, "open_pool", fake_open_pool)  # type: ignore[attr-defined]
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        service_module, "prepare_database", fake_prepare_database
+    )
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        service_module, "probe_database", fake_probe_database
+    )
+    StoppedSupervisor.stop = stop
+    StoppedSupervisor.calls = calls
+    FakeEventProcessor.calls = calls
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        service_module, "ZulipThreadSupervisor", StoppedSupervisor
+    )
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        service_module, "ZulipEventProcessor", FakeEventProcessor
+    )
+    settings = Settings.from_env({"WZB_THREAD_STOP_TIMEOUT_SECONDS": "0.01"})
+
+    with pytest.raises(
+        RuntimeError,
+        match="bridge task zulip-thread-supervisor stopped unexpectedly",
+    ):
+        await asyncio.wait_for(BridgeService(settings).run(stop), timeout=0.2)
+
+    assert pool.closed
+    assert pool.terminated
 
 
 def test_daemon_starts_workspace_receiver_when_configured(
