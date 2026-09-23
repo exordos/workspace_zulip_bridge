@@ -2,7 +2,6 @@
 # Licensed under the Apache License, Version 2.0 (the "License").
 
 import json
-import time
 from urllib.parse import parse_qs
 
 import httpx
@@ -10,85 +9,49 @@ import pytest
 
 from workspace_zulip_bridge.zulip_api import ZulipApiClient
 from workspace_zulip_bridge.zulip_api import ZulipApiError
-from workspace_zulip_bridge.zulip_api import _parse_user_presences
 
 
-def test_presence_snapshot_expires_old_timestamps(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("workspace_zulip_bridge.zulip_api.time.time", lambda: 1_000)
-
-    presences = _parse_user_presences(
-        {"11": {"active_timestamp": 700, "idle_timestamp": 600}},
-        offline_threshold_seconds=200,
+def _client(handler: object) -> ZulipApiClient:
+    return ZulipApiClient(
+        "https://zulip.example.test",
+        "user@example.test",
+        "not-a-real-key",
+        ca_file=None,
+        connect_timeout_seconds=2,
+        default_longpoll_timeout_seconds=180,
+        idle_queue_timeout_seconds=3600,
+        transport=httpx.MockTransport(handler),  # type: ignore[arg-type]
     )
 
-    assert presences[0].status == "offline"
 
-
-def test_register_and_get_events() -> None:
+def test_registers_all_live_events_without_initial_state_and_discards_payloads() -> (
+    None
+):
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         if request.url.path.endswith("/register"):
-            assert request.headers["authorization"].startswith("Basic ")
             form = parse_qs(request.content.decode())
-            assert json.loads(form["fetch_event_types"][0]) == [
-                "recent_private_conversations",
-                "presence",
-                "user_status",
-                "user_topic",
-            ]
-            assert form["slim_presence"] == ["true"]
-            assert json.loads(form["client_capabilities"][0]) == {
-                "notification_settings_null": False,
-                "simplified_presence_events": True,
-            }
-            assert form["idle_queue_timeout"] == ["3600"]
+            assert json.loads(form["fetch_event_types"][0]) == []
+            assert "event_types" not in form
             return httpx.Response(
                 200,
                 json={
                     "result": "success",
-                    "msg": "",
                     "queue_id": "queue-1",
                     "last_event_id": -1,
                     "event_queue_longpoll_timeout_seconds": 90,
-                    "server_presence_offline_threshold_seconds": 200,
-                    "recent_private_conversations": [
-                        {"user_ids": [12, 11], "max_message_id": 42}
-                    ],
-                    "user_topics": [
-                        {
-                            "stream_id": 7,
-                            "topic_name": "Review",
-                            "visibility_policy": 3,
-                            "last_updated": 1_700_000_000,
-                        }
-                    ],
-                    "presences": {
-                        "11": {
-                            "active_timestamp": int(time.time()),
-                            "idle_timestamp": int(time.time()) - 1,
-                        }
-                    },
-                    "user_status": {
-                        "11": {
-                            "status_text": "Reviewing",
-                            "emoji_name": "eyes",
-                        }
-                    },
                 },
             )
-        assert request.url.path.endswith("/events")
-        assert request.url.params["queue_id"] == "queue-1"
-        assert request.url.params["last_event_id"] == "-1"
         return httpx.Response(
             200,
             json={
                 "result": "success",
-                "msg": "",
-                "events": [{"id": 1, "type": "heartbeat"}],
+                "events": [
+                    {"id": 4, "type": "message", "sensitive": "discarded"},
+                    {"id": 5, "type": "heartbeat"},
+                ],
             },
         )
 
@@ -96,381 +59,47 @@ def test_register_and_get_events() -> None:
     try:
         queue = client.register()
         assert queue.queue_id == "queue-1"
-        assert queue.last_event_id == -1
-        assert queue.longpoll_timeout_seconds == 90
-        assert queue.recent_private_conversations[0].user_ids == (11, 12)
-        assert queue.user_topics[0].topic_name == "Review"
-        assert queue.user_presences[0].status == "active"
-        assert queue.presence_offline_threshold_seconds == 200
-        assert queue.user_statuses[0].status_emoji == "eyes"
-        assert client.get_events("queue-1", -1, 90) == [{"id": 1, "type": "heartbeat"}]
+        assert client.poll(queue.queue_id, queue.last_event_id, 90) == 5
     finally:
         client.close()
-
     assert len(requests) == 2
 
 
-def test_register_uses_default_longpoll_timeout_when_initial_state_is_empty() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "result": "success",
-                "msg": "",
-                "queue_id": "queue-1",
-                "last_event_id": -1,
-                "recent_private_conversations": [],
-            },
-        )
-
-    client = _client(handler)
-    try:
-        assert client.register().longpoll_timeout_seconds == 180
-    finally:
-        client.close()
-
-
-def test_bad_event_queue_id_is_classified() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
+def test_expired_queue_is_retryable() -> None:
+    client = _client(
+        lambda _request: httpx.Response(
             400,
-            json={
-                "result": "error",
-                "msg": "queue expired",
-                "code": "BAD_EVENT_QUEUE_ID",
-            },
+            json={"result": "error", "code": "BAD_EVENT_QUEUE_ID"},
         )
-
-    client = _client(handler)
-    try:
-        with pytest.raises(ZulipApiError) as error:
-            client.get_events("expired", 12, 90)
-        assert error.value.code == "BAD_EVENT_QUEUE_ID"
-        assert error.value.retryable
-        assert error.value.status_code == 400
-    finally:
-        client.close()
-
-
-def test_rate_limit_preserves_http_status() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            429,
-            json={
-                "result": "error",
-                "msg": "rate limited",
-                "code": "RATE_LIMIT_HIT",
-            },
-        )
-
-    client = _client(handler)
-    try:
-        with pytest.raises(ZulipApiError) as error:
-            client.get_events("queue", 1, 90)
-        assert error.value.retryable
-        assert error.value.status_code == 429
-    finally:
-        client.close()
-
-
-def test_chat_catalog_endpoints() -> None:
-    requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        if request.url.path.endswith("/users/me/subscriptions"):
-            assert request.url.params["include_subscribers"] == "false"
-            return httpx.Response(
-                200,
-                json={
-                    "result": "success",
-                    "msg": "",
-                    "subscriptions": [{"stream_id": 7, "name": "General"}],
-                },
-            )
-        if request.url.path.endswith("/users/me"):
-            return httpx.Response(
-                200,
-                json={
-                    "result": "success",
-                    "msg": "",
-                    "user_id": 42,
-                    "full_name": "Test User",
-                    "role": 400,
-                },
-            )
-        raise AssertionError(f"unexpected request: {request.url}")
-
-    client = _client(handler)
-    try:
-        assert client.get_own_user().user_id == 42
-        assert client.get_subscriptions() == [{"stream_id": 7, "name": "General"}]
-    finally:
-        client.close()
-
-    assert len(requests) == 2
-
-
-def test_topic_notification_uses_visibility_policy_endpoint() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.method == "POST"
-        assert request.url.path.endswith("/user_topics")
-        form = parse_qs(request.content.decode())
-        assert form == {
-            "stream_id": ["7"],
-            "topic": ["General"],
-            "visibility_policy": ["3"],
-        }
-        return httpx.Response(200, json={"result": "success", "msg": ""})
-
-    client = _client(handler)
-    try:
-        client.update_topic_notification(
-            7,
-            "General",
-            visibility_policy=3,
-        )
-    finally:
-        client.close()
-
-
-def test_user_directory_and_full_message_history_endpoints() -> None:
-    requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        if request.url.path.endswith("/users"):
-            assert request.url.params["client_gravatar"] == "true"
-            assert request.url.params["include_custom_profile_fields"] == "false"
-            return httpx.Response(
-                200,
-                json={
-                    "result": "success",
-                    "msg": "",
-                    "members": [
-                        {
-                            "user_id": 10,
-                            "email": "human@example.test",
-                            "full_name": "Human",
-                            "is_active": True,
-                            "is_bot": False,
-                            "role": 400,
-                        },
-                        {
-                            "user_id": 99,
-                            "email": "bot@example.test",
-                            "full_name": "Bot",
-                            "is_active": False,
-                            "is_bot": True,
-                            "role": 600,
-                        },
-                    ],
-                },
-            )
-        assert request.url.path.endswith("/messages")
-        assert request.url.params["anchor"] == "newest"
-        assert request.url.params["include_anchor"] == "true"
-        assert request.url.params["num_before"] == "5000"
-        assert request.url.params["allow_empty_topic_name"] == "true"
-        assert "narrow" not in request.url.params
-        return httpx.Response(
-            200,
-            json={
-                "result": "success",
-                "msg": "",
-                "found_oldest": True,
-                "messages": [{"id": 123}],
-            },
-        )
-
-    client = _client(handler)
-    try:
-        users = client.get_users()
-        page = client.get_messages_page("newest", include_anchor=True)
-    finally:
-        client.close()
-
-    assert [(user.user_id, user.disabled, user.is_bot) for user in users] == [
-        (10, False, False),
-        (99, True, True),
-    ]
-    assert page.messages == [{"id": 123}]
-    assert page.found_oldest
-    assert len(requests) == 2
-
-
-def test_attachment_directory_contains_metadata_without_file_bytes() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path.endswith("/attachments")
-        return httpx.Response(
-            200,
-            json={
-                "result": "success",
-                "msg": "",
-                "attachments": [
-                    {
-                        "id": 41,
-                        "path_id": "1/a/report.csv",
-                        "name": "report.csv",
-                        "size": 123,
-                        "create_time": 1_700_000_000,
-                        "message_ids": [9, 7, 9],
-                    }
-                ],
-            },
-        )
-
-    client = _client(handler)
-    try:
-        attachments = client.get_attachments()
-    finally:
-        client.close()
-
-    assert len(attachments) == 1
-    attachment = attachments[0]
-    assert attachment.source_path == "/user_uploads/1/a/report.csv"
-    assert attachment.message_ids == (7, 9)
-    assert attachment.size_bytes == 123
-    assert len(attachment.metadata_hash) == 32
-
-
-@pytest.mark.parametrize(
-    ("chat_key", "own_user_id", "expected_narrow"),
-    [
-        ("channel:7", 10, [{"operator": "channel", "operand": 7}]),
-        (
-            "direct:10,12,13",
-            10,
-            [{"operator": "dm", "operand": [12, 13]}],
-        ),
-    ],
-)
-def test_history_pages_are_narrowed_to_one_scheduled_chat(
-    chat_key: str,
-    own_user_id: int,
-    expected_narrow: list[dict[str, object]],
-) -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path.endswith("/messages")
-        assert json.loads(request.url.params["narrow"]) == expected_narrow
-        return httpx.Response(
-            200,
-            json={
-                "result": "success",
-                "msg": "",
-                "found_oldest": True,
-                "messages": [],
-            },
-        )
-
-    client = _client(handler)
-    try:
-        page = client.get_chat_messages_page(
-            chat_key,
-            own_user_id,
-            "newest",
-            include_anchor=True,
-        )
-    finally:
-        client.close()
-    assert page.found_oldest
-
-
-def test_first_accessible_channel_message_uses_oldest_narrow() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path.endswith("/messages")
-        assert request.url.params["anchor"] == "oldest"
-        assert request.url.params["num_before"] == "0"
-        assert request.url.params["num_after"] == "1"
-        assert json.loads(request.url.params["narrow"]) == [
-            {"operator": "channel", "operand": 7}
-        ]
-        return httpx.Response(
-            200,
-            json={
-                "result": "success",
-                "msg": "",
-                "found_oldest": True,
-                "messages": [{"id": 105}],
-            },
-        )
-
-    client = _client(handler)
-    try:
-        message_id = client.get_first_accessible_channel_message_id(7)
-    finally:
-        client.close()
-    assert message_id == 105
-
-
-def test_message_write_endpoints_preserve_actor_and_provider_ids() -> None:
-    requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        form = parse_qs(request.content.decode())
-        if request.method == "POST" and request.url.path.endswith("/messages"):
-            assert form == {
-                "type": ["stream"],
-                "to": ["7"],
-                "topic": ["Operations"],
-                "content": ["created"],
-                "queue_id": ["queue-42"],
-                "local_id": ["local-42"],
-                "read_by_sender": ["true"],
-            }
-            return httpx.Response(200, json={"result": "success", "id": 123})
-        if request.method == "PATCH":
-            assert request.url.path.endswith("/messages/123")
-            assert form == {"content": ["updated"]}
-        elif request.url.path.endswith("/messages/flags"):
-            assert json.loads(form["messages"][0]) == [123]
-            assert form["op"] == ["add"]
-            assert form["flag"] == ["read"]
-        elif request.url.path.endswith("/messages/123/reactions"):
-            assert form == {"emoji_name": ["thumbs_up"]}
-        else:
-            assert request.method == "DELETE"
-            assert request.url.path.endswith("/messages/123")
-        return httpx.Response(200, json={"result": "success", "msg": ""})
-
-    client = _client(handler)
-    try:
-        message_id = client.send_message(
-            "channel:7",
-            42,
-            "created",
-            topic="Operations",
-            queue_id="queue-42",
-            local_id="local-42",
-        )
-        client.update_message(message_id, content="updated")
-        client.update_message_flag(message_id, "read", True)
-        client.update_reaction(message_id, "thumbs_up", enabled=True)
-        client.delete_message(message_id)
-    finally:
-        client.close()
-
-    assert message_id == 123
-    assert [request.method for request in requests] == [
-        "POST",
-        "PATCH",
-        "POST",
-        "POST",
-        "DELETE",
-    ]
-
-
-def _client(handler: object) -> ZulipApiClient:
-    return ZulipApiClient(
-        "https://zulip.example.test",
-        "user@example.test",
-        "not-a-real-api-key",
-        ca_file=None,
-        connect_timeout_seconds=2,
-        default_longpoll_timeout_seconds=180,
-        idle_queue_timeout_seconds=3600,
-        chat_fill_timeout_seconds=120,
-        message_page_size=5000,
-        transport=httpx.MockTransport(handler),  # type: ignore[arg-type]
     )
+    try:
+        with pytest.raises(ZulipApiError) as error:
+            client.poll("expired", 3, 90)
+    finally:
+        client.close()
+
+    assert error.value.code == "BAD_EVENT_QUEUE_ID"
+    assert error.value.retryable
+
+
+def test_auth_check_discards_profile_payload() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "result": "success",
+                "user_id": 42,
+                "full_name": "Discarded profile",
+            },
+        )
+
+    client = _client(handler)
+    try:
+        client.check_auth()
+    finally:
+        client.close()
+
+    assert [request.url.path for request in requests] == ["/api/v1/users/me"]

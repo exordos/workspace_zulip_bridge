@@ -121,4 +121,5 @@ def test_exordos_manifest_renders_without_implicit_values() -> None:
     ]["on_change"]["command"]
     assert "rm -f /var/lib/workspace_zulip_bridge/workspace.token" in on_change
     assert "workspace.refresh-token" in on_change
-    assert "control/desired-state-cursor" in on_change
+    assert "control/desired-state-v4-cursor" in on_change
+    assert "control/desired-state-cursor" not in on_change
