@@ -88,7 +88,10 @@ class Settings:
     workspace_bootstrap_timeout_seconds: float = 600.0
     workspace_request_timeout_seconds: float = 60.0
     workspace_sync_poll_seconds: float = 0.1
-    workspace_sync_plan_batch_size: int = 50000
+    # Keep the producer bounded by the delivery batch.  A substantially larger
+    # planning batch lets the cursor outrun delivery and turns the durable diff
+    # table into an unbounded copy of high-cardinality message flags.
+    workspace_sync_plan_batch_size: int = 500
     workspace_sync_batch_size: int = 500
     workspace_sync_workers: int = 2
     workspace_reconciliation_interval_seconds: float = 300.0
@@ -253,7 +256,7 @@ class Settings:
                 source, "WZB_WORKSPACE_SYNC_POLL_SECONDS", 0.1
             ),
             workspace_sync_plan_batch_size=_read_int(
-                source, "WZB_WORKSPACE_SYNC_PLAN_BATCH_SIZE", 50000
+                source, "WZB_WORKSPACE_SYNC_PLAN_BATCH_SIZE", 500
             ),
             workspace_sync_batch_size=_read_int(
                 source, "WZB_WORKSPACE_SYNC_BATCH_SIZE", 500

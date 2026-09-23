@@ -29,6 +29,20 @@ fi
 
 prepare_persistent_disk "$PERSISTENT_DISK" "$PERSISTENT_MOUNT"
 
+# Core grows the backing volume when the element raises its requested data
+# size, but an existing GPT partition and ext4 filesystem retain their old
+# boundary.  Grow both in place before PostgreSQL starts using the mount.
+PERSISTENT_PARTITION="$(get_partition_name "$PERSISTENT_DISK")"
+GROWPART_OUTPUT=""
+if ! GROWPART_OUTPUT="$(growpart "$PERSISTENT_DISK" 1 2>&1)"; then
+    if [[ "$GROWPART_OUTPUT" != *NOCHANGE* ]]; then
+        echo "$GROWPART_OUTPUT" >&2
+        exit 1
+    fi
+fi
+partprobe "$PERSISTENT_DISK" 2>/dev/null || true
+resize2fs "$PERSISTENT_PARTITION"
+
 postgres_cluster_valid() {
     local data_root="$1"
     local cluster_dir="${data_root}/${PG_VERSION}/main"

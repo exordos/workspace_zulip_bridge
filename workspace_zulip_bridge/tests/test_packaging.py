@@ -37,6 +37,13 @@ def test_runtime_configuration_survives_image_replacement() -> None:
     assert '"$DATABASE_ROLE"' in bootstrap
 
 
+def test_persistent_data_disk_grows_with_the_manifest() -> None:
+    bootstrap = (ROOT / "exordos/images/bootstrap.sh").read_text()
+
+    assert 'growpart "$PERSISTENT_DISK" 1' in bootstrap
+    assert 'resize2fs "$PERSISTENT_PARTITION"' in bootstrap
+
+
 def test_incomplete_first_boot_migration_preserves_valid_postgresql() -> None:
     bootstrap = (ROOT / "exordos/images/bootstrap.sh").read_text()
 
@@ -76,7 +83,7 @@ def test_exordos_manifest_renders_without_implicit_values() -> None:
                 "image": "urn:images:00000000-0000-0000-0000-000000000000",
                 "label": "root",
             },
-            {"size": 20, "label": "data"},
+            {"size": 64, "label": "data"},
         ],
     }
     infrastructure_project_id = "12345678-c625-4fee-81d5-f691897b8142"

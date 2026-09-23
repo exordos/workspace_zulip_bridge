@@ -28,7 +28,7 @@ def test_defaults_use_local_postgresql_socket() -> None:
     assert not settings.workspace_events_enabled
     assert settings.workspace_event_batch_size == 500
     assert settings.workspace_event_max_attempts == 8
-    assert settings.workspace_sync_plan_batch_size == 50000
+    assert settings.workspace_sync_plan_batch_size == 500
     assert settings.workspace_sync_batch_size == 500
     assert settings.workspace_sync_workers == 2
     assert settings.workspace_reconciliation_interval_seconds == 300.0
