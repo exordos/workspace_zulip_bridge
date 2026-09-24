@@ -358,6 +358,7 @@ class ZulipEventProcessor:
                 message_routes,
                 transitioning_chats,
                 pending_history_endpoints,
+                pending_catalog_endpoints,
             ) = await self._load_routes(events)
         except asyncio.CancelledError:
             raise
@@ -387,6 +388,7 @@ class ZulipEventProcessor:
                     message_routes,
                     transitioning_chats,
                     pending_history_endpoints,
+                    pending_catalog_endpoints,
                 )
             )
             for event in events
@@ -853,6 +855,7 @@ class ZulipEventProcessor:
         dict[tuple[str, int], _MessageRoute],
         set[tuple[str, str]],
         set[str],
+        set[str],
     ]:
         chat_uuids: set[UUID] = set()
         message_ids_by_endpoint: dict[str, set[int]] = {}
@@ -877,6 +880,7 @@ class ZulipEventProcessor:
         transitioning_chats: set[tuple[str, str]] = set()
         message_routes: dict[tuple[str, int], _MessageRoute] = {}
         pending_history_rows: list[asyncpg.Record] = []
+        pending_catalog_rows: list[asyncpg.Record] = []
         async with self._pool.acquire() as connection:
             pending_history_rows = await connection.fetch(
                 """
@@ -887,6 +891,18 @@ class ZulipEventProcessor:
                 WHERE realm.identity_key = ANY($1::text[])
                   AND stream.source_connection_uuid IS NOT NULL
                   AND stream.history_loaded_at IS NULL
+                """,
+                sorted({event.endpoint for event in events}),
+            )
+            pending_catalog_rows = await connection.fetch(
+                """
+                SELECT DISTINCT realm.identity_key
+                FROM workspace_zulip_bridge.zulip_connections AS source
+                JOIN workspace_zulip_bridge.zulip_realms AS realm
+                  ON realm.uuid = source.realm_uuid
+                WHERE realm.identity_key = ANY($1::text[])
+                  AND source.sync_enabled
+                  AND source.lifecycle_status NOT IN ('active', 'backfilling')
                 """,
                 sorted({event.endpoint for event in events}),
             )
@@ -961,6 +977,7 @@ class ZulipEventProcessor:
             message_routes,
             transitioning_chats,
             {row["identity_key"] for row in pending_history_rows},
+            {row["identity_key"] for row in pending_catalog_rows},
         )
 
     def _route_event(
@@ -970,6 +987,7 @@ class ZulipEventProcessor:
         message_routes: Mapping[tuple[str, int], _MessageRoute],
         transitioning_chats: set[tuple[str, str]],
         pending_history_endpoints: set[str],
+        pending_catalog_endpoints: set[str],
     ) -> _RoutedEvent:
         if not event.active_queue:
             return _RoutedEvent(event, skip_reason="stale_queue")
@@ -1007,7 +1025,12 @@ class ZulipEventProcessor:
             supplier = chat_suppliers.get((event.endpoint, chat_key))
             if supplier is None:
                 return _RoutedEvent(
-                    event, chat_key=chat_key, skip_reason="chat_unassigned"
+                    event,
+                    chat_key=chat_key,
+                    skip_reason=self._missing_chat_reason(
+                        event,
+                        pending_history_endpoints | pending_catalog_endpoints,
+                    ),
                 )
             if (
                 event.endpoint,
@@ -1032,7 +1055,12 @@ class ZulipEventProcessor:
             supplier = chat_suppliers.get((event.endpoint, chat_key))
             if supplier is None:
                 return _RoutedEvent(
-                    event, chat_key=chat_key, skip_reason="chat_unassigned"
+                    event,
+                    chat_key=chat_key,
+                    skip_reason=self._missing_chat_reason(
+                        event,
+                        pending_history_endpoints | pending_catalog_endpoints,
+                    ),
                 )
             if (
                 event.endpoint,
@@ -1147,6 +1175,18 @@ class ZulipEventProcessor:
         ):
             return "message_not_materialized"
         return "message_out_of_scope"
+
+    def _missing_chat_reason(
+        self,
+        event: _ClaimedEvent,
+        pending_history_endpoints: set[str],
+    ) -> str:
+        if (
+            event.endpoint in pending_history_endpoints
+            or event.attempt_count <= self._settings.event_processor_max_attempts
+        ):
+            return "chat_unassigned"
+        return "chat_out_of_scope"
 
     async def _apply_event(self, item: _RoutedEvent) -> _Outcome:
         event_type = item.event.event_type

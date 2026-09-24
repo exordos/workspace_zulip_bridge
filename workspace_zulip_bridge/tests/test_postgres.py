@@ -6883,6 +6883,72 @@ def test_event_processor_applies_supplier_message_during_history_backfill() -> N
     asyncio.run(_event_processor_applies_during_history_backfill(_dsn()))
 
 
+def test_event_processor_retires_message_for_out_of_scope_chat() -> None:
+    asyncio.run(_event_processor_retires_message_for_out_of_scope_chat(_dsn()))
+
+
+async def _event_processor_retires_message_for_out_of_scope_chat(dsn: str) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            owner_uuid = await _insert_user(
+                connection, 10, 100, queue_id="queue-owner", status="active"
+            )
+            await connection.execute(
+                "UPDATE workspace_zulip_bridge.zulip_connections "
+                "SET catalog_completed_at = clock_timestamp() WHERE uuid = $1",
+                owner_uuid,
+            )
+        event = {
+            "id": 1,
+            "type": "message",
+            "message": {
+                "id": 701,
+                "type": "stream",
+                "stream_id": 77,
+                "display_recipient": "Out of scope",
+                "subject": "General",
+                "sender_id": 10,
+                "content": "not visible in the active catalog",
+                "timestamp": 1_700_000_000,
+                "flags": [],
+                "reactions": [],
+            },
+        }
+        assert await store.store_events(
+            owner_uuid,
+            "queue-owner",
+            (
+                ZulipEvent(
+                    event_id=1,
+                    event_type="message",
+                    payload_json=json.dumps(event),
+                ),
+            ),
+            1,
+        ) == (1, True)
+        await pool.execute(
+            "UPDATE workspace_zulip_bridge.zulip_events SET attempt_count = 8"
+        )
+
+        processor = ZulipEventProcessor(
+            pool,
+            store,
+            Settings.from_env({"WZB_DATABASE_DSN": dsn}),
+        )
+        processed = await processor.process_once()
+        assert (processed.claimed, processed.skipped, processed.retried) == (1, 1, 0)
+        assert (
+            await pool.fetchval(
+                "SELECT outcome_reason FROM workspace_zulip_bridge.zulip_events"
+            )
+            == "chat_out_of_scope"
+        )
+    finally:
+        await pool.close()
+
+
 async def _event_processor_applies_during_history_backfill(dsn: str) -> None:
     pool = await _pool(dsn)
     try:
