@@ -2510,7 +2510,9 @@ class WorkspaceDiffWorker:
         topic_binding_stream_binding_ids = (
             await self._load_topic_binding_stream_binding_ids(candidates)
         )
-        for row, data, _, _ in candidates:
+        for row, data, _, operation in candidates:
+            if operation.get("action") == "delete":
+                continue
             if not data:
                 continue
             for dependency_type, dependency_uuid in _entity_dependencies(
@@ -2532,7 +2534,10 @@ class WorkspaceDiffWorker:
             candidates,
             key=lambda item: PRIORITY[item[0]["entity_type"]],
         ):
-            row, data, _, _ = candidate
+            row, data, _, operation = candidate
+            if operation.get("action") == "delete":
+                ready.append(candidate)
+                continue
             required = list(
                 _entity_dependencies(row["entity_type"], data) if data else ()
             )
@@ -2565,8 +2570,9 @@ class WorkspaceDiffWorker:
     ) -> dict[UUID, UUID]:
         flag_uuids = [
             row["entity_uuid"]
-            for row, _, _, _ in candidates
+            for row, _, _, operation in candidates
             if row["entity_type"] == "message_flags"
+            and operation.get("action") != "delete"
         ]
         if not flag_uuids:
             return {}
@@ -2592,8 +2598,9 @@ class WorkspaceDiffWorker:
     ) -> dict[UUID, UUID]:
         topic_binding_uuids = [
             row["entity_uuid"]
-            for row, _, _, _ in candidates
+            for row, _, _, operation in candidates
             if row["entity_type"] == "topic_bindings"
+            and operation.get("action") != "delete"
         ]
         if not topic_binding_uuids:
             return {}

@@ -230,6 +230,56 @@ async def _topic_binding_waits_for_matching_stream_binding(tmp_path: Path) -> No
     assert deferred == []
 
 
+def test_dependency_deletes_do_not_wait_for_removed_source_rows(
+    tmp_path: Path,
+) -> None:
+    asyncio.run(_dependency_deletes_do_not_wait_for_removed_source_rows(tmp_path))
+
+
+async def _dependency_deletes_do_not_wait_for_removed_source_rows(
+    tmp_path: Path,
+) -> None:
+    token_file = tmp_path / "workspace-dependency-deletes.token"
+    token_file.write_text("integration-token")
+    settings = Settings.from_env(
+        {
+            "WZB_WORKSPACE_WEBSOCKET_URL": (
+                "ws://workspace.test/api/workspace/v1/events/ws"
+            ),
+            "WZB_WORKSPACE_PROJECT_ID": "10000000-0000-0000-0000-000000000001",
+            "WZB_WORKSPACE_PROVIDER_UUID": "10000000-0000-0000-0000-000000000002",
+            "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+        }
+    )
+    worker = WorkspaceDiffWorker(object(), settings)  # type: ignore[arg-type]
+    topic_binding_row = {
+        "entity_type": "topic_bindings",
+        "entity_uuid": UUID("10000000-0000-0000-0000-000000000003"),
+    }
+    message_flag_row = {
+        "entity_type": "message_flags",
+        "entity_uuid": UUID("10000000-0000-0000-0000-000000000004"),
+    }
+    candidates = [
+        (topic_binding_row, {}, b"", {"action": "delete"}),
+        (message_flag_row, {}, b"", {"action": "delete"}),
+    ]
+    worker._load_message_flag_binding_ids = AsyncMock(  # type: ignore[method-assign]
+        return_value={}
+    )
+    worker._load_topic_binding_stream_binding_ids = AsyncMock(  # type: ignore[method-assign]
+        return_value={}
+    )
+    worker._load_ready_dependency_ids = AsyncMock(  # type: ignore[method-assign]
+        return_value={}
+    )
+
+    ready, deferred = await worker._partition_dependency_ready(candidates)
+
+    assert ready == candidates
+    assert deferred == []
+
+
 def test_reaction_equivalence_ignores_reload_timestamp() -> None:
     source = {
         "message_uuid": "10000000-0000-0000-0000-000000000001",
