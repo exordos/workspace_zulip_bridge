@@ -280,6 +280,106 @@ async def _dependency_deletes_do_not_wait_for_removed_source_rows(
     assert deferred == []
 
 
+def test_message_identity_alias_is_redirected_to_workspace(tmp_path: Path) -> None:
+    asyncio.run(_message_identity_alias_is_redirected_to_workspace(tmp_path))
+
+
+async def _message_identity_alias_is_redirected_to_workspace(
+    tmp_path: Path,
+) -> None:
+    token_file = tmp_path / "workspace-identity-rebind.token"
+    token_file.write_text("integration-token")
+    settings = Settings.from_env(
+        {
+            "WZB_WORKSPACE_WEBSOCKET_URL": (
+                "ws://workspace.test/api/workspace/v1/events/ws"
+            ),
+            "WZB_WORKSPACE_PROJECT_ID": "10000000-0000-0000-0000-000000000001",
+            "WZB_WORKSPACE_PROVIDER_UUID": "10000000-0000-0000-0000-000000000002",
+            "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+        }
+    )
+    pool = AsyncMock()
+    worker = WorkspaceDiffWorker(pool, settings)
+    message_uuid = UUID("10000000-0000-0000-0000-000000000003")
+    zulip_user_uuid = UUID("10000000-0000-0000-0000-000000000004")
+    workspace_user_uuid = UUID("10000000-0000-0000-0000-000000000005")
+    row = {"entity_type": "messages", "entity_uuid": message_uuid}
+    source = {
+        "stream_uuid": "10000000-0000-0000-0000-000000000006",
+        "topic_uuid": "10000000-0000-0000-0000-000000000007",
+        "author_uuid": str(workspace_user_uuid),
+        "payload": {"kind": "markdown", "content": "same"},
+        "created_at": "2026-09-24T12:00:00Z",
+    }
+    target = {**source, "author_uuid": str(zulip_user_uuid)}
+    pool.fetch.return_value = [
+        {
+            "uuid": zulip_user_uuid,
+            "workspace_user_uuid": workspace_user_uuid,
+        }
+    ]
+
+    rebinds = await worker._message_identity_rebinds(
+        [row],
+        {("messages", message_uuid): source},
+        {("messages", message_uuid): target},
+    )
+
+    assert rebinds == {("messages", message_uuid)}
+
+    changed_target = {**target, "payload": {"kind": "markdown", "content": "new"}}
+    rebinds = await worker._message_identity_rebinds(
+        [row],
+        {("messages", message_uuid): source},
+        {("messages", message_uuid): changed_target},
+    )
+
+    assert rebinds == set()
+
+
+def test_message_identity_redirect_is_versioned_backfill(tmp_path: Path) -> None:
+    asyncio.run(_message_identity_redirect_is_versioned_backfill(tmp_path))
+
+
+async def _message_identity_redirect_is_versioned_backfill(
+    tmp_path: Path,
+) -> None:
+    token_file = tmp_path / "workspace-identity-redirect.token"
+    token_file.write_text("integration-token")
+    settings = Settings.from_env(
+        {
+            "WZB_WORKSPACE_WEBSOCKET_URL": (
+                "ws://workspace.test/api/workspace/v1/events/ws"
+            ),
+            "WZB_WORKSPACE_PROJECT_ID": "10000000-0000-0000-0000-000000000001",
+            "WZB_WORKSPACE_PROVIDER_UUID": "10000000-0000-0000-0000-000000000002",
+            "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+        }
+    )
+    pool = AsyncMock()
+    worker = WorkspaceDiffWorker(pool, settings)
+    row = {
+        "provider_uuid": UUID("10000000-0000-0000-0000-000000000002"),
+        "entity_type": "messages",
+        "entity_uuid": UUID("10000000-0000-0000-0000-000000000003"),
+        "claimed_at": datetime(2026, 9, 25, tzinfo=UTC),
+    }
+
+    await worker._redirect_identity_rebind(row)
+
+    query, *parameters = pool.execute.await_args.args
+    assert "delivery_priority = 1" in query
+    assert "GREATEST(" in query
+    assert "+ interval '1 microsecond'" in query
+    assert parameters == [
+        row["provider_uuid"],
+        row["entity_type"],
+        row["entity_uuid"],
+        row["claimed_at"],
+    ]
+
+
 def test_reaction_equivalence_ignores_reload_timestamp() -> None:
     source = {
         "message_uuid": "10000000-0000-0000-0000-000000000001",

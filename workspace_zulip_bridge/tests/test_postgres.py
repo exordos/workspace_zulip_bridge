@@ -2450,6 +2450,191 @@ def test_workspace_planner_does_not_rescan_completed_history(tmp_path: Path) -> 
     asyncio.run(_workspace_planner_does_not_rescan_completed_history(_dsn(), tmp_path))
 
 
+def test_workspace_identity_rebind_conflict_is_requeued_as_backfill(
+    tmp_path: Path,
+) -> None:
+    asyncio.run(
+        _workspace_identity_rebind_conflict_is_requeued_as_backfill(_dsn(), tmp_path)
+    )
+
+
+async def _workspace_identity_rebind_conflict_is_requeued_as_backfill(
+    dsn: str,
+    tmp_path: Path,
+) -> None:
+    pool = await _pool(dsn)
+    provider_uuid = UUID("10000000-0000-0000-0000-0000000000c1")
+    project_uuid = UUID("10000000-0000-0000-0000-0000000000c2")
+    generation = UUID("10000000-0000-0000-0000-0000000000c3")
+    workspace_user_uuid = UUID("10000000-0000-0000-0000-0000000000c4")
+    stream_uuid = UUID("10000000-0000-0000-0000-0000000000c5")
+    topic_uuid = UUID("10000000-0000-0000-0000-0000000000c6")
+    message_uuid = UUID("10000000-0000-0000-0000-0000000000c7")
+    source_version = datetime(2026, 9, 24, 12, tzinfo=UTC)
+    token_file = tmp_path / "workspace-identity-rebind-conflict.token"
+    token_file.write_text("integration-token")
+    try:
+        async with pool.acquire() as connection:
+            user_uuid = await _insert_user(connection, 121, 400)
+            realm_uuid = stable_realm_uuid(ENDPOINT)
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_users
+                SET workspace_user_uuid = $2
+                WHERE uuid = $1
+                """,
+                user_uuid,
+                workspace_user_uuid,
+            )
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_realms
+                SET workspace_project_id = $2, workspace_provider_uuid = $3
+                WHERE uuid = $1
+                """,
+                realm_uuid,
+                project_uuid,
+                provider_uuid,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.workspace_mirror_state (
+                    provider_uuid, workspace_project_id, active_generation,
+                    bootstrap_status, reconciliation_version
+                ) VALUES ($1, $2, $3, 'ready', 10)
+                """,
+                provider_uuid,
+                project_uuid,
+                generation,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_streams (
+                    uuid, realm_uuid, chat_type, chat_key, name,
+                    owner_user_uuid, content_hash, source_connection_uuid
+                ) VALUES ($1, $2, 'channel', 'identity-rebind',
+                          'Identity rebind', $3, $4, $3)
+                """,
+                stream_uuid,
+                realm_uuid,
+                user_uuid,
+                b"s" * 32,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_topics (
+                    uuid, zulip_stream_uuid, name, content_hash
+                ) VALUES ($1, $2, 'Identity rebind', $3)
+                """,
+                topic_uuid,
+                stream_uuid,
+                b"t" * 32,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_messages (
+                    uuid, realm_uuid, source_connection_uuid,
+                    zulip_stream_uuid, topic_uuid, sender_user_uuid,
+                    zulip_message_id, content, content_hash, message_hash,
+                    created_at, source_updated_at
+                ) VALUES ($1, $2, $3, $4, $5, $3, 12101,
+                          'identity rebind', $6, $7, $8, $8)
+                """,
+                message_uuid,
+                realm_uuid,
+                user_uuid,
+                stream_uuid,
+                topic_uuid,
+                b"m" * 32,
+                b"h" * 32,
+                source_version,
+            )
+            target_data = {
+                "stream_uuid": str(stream_uuid),
+                "topic_uuid": str(topic_uuid),
+                "author_uuid": str(user_uuid),
+                "payload": {"kind": "markdown", "content": "identity rebind"},
+                "created_at": source_version.isoformat(),
+            }
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.workspace_messages (
+                    provider_uuid, snapshot_generation, uuid,
+                    workspace_project_id, content_hash, source_updated_at, data
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                """,
+                provider_uuid,
+                generation,
+                message_uuid,
+                project_uuid,
+                b"w" * 32,
+                source_version,
+                json.dumps(target_data),
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.sync_diffs (
+                    provider_uuid, entity_type, entity_uuid, realm_uuid,
+                    partition_key, direction, delivery_priority,
+                    processing_status, source_hash, target_hash,
+                    source_updated_at, target_updated_at, attempt_count,
+                    last_error
+                ) VALUES ($1, 'messages', $2, $3, $4, 'to_workspace', 0,
+                          'blocked', $5, $6, $7, $7, 1,
+                          'Workspace Provider API returned 409 '
+                          'error=entity_version_conflict item_index=0')
+                """,
+                provider_uuid,
+                message_uuid,
+                realm_uuid,
+                stream_uuid,
+                b"m" * 32,
+                b"w" * 32,
+                source_version,
+            )
+        settings = Settings.from_env(
+            {
+                "WZB_DATABASE_DSN": dsn,
+                "WZB_DB_POOL_MIN_SIZE": "1",
+                "WZB_DB_POOL_MAX_SIZE": "4",
+                "WZB_ZULIP_HISTORY_CONCURRENCY": "2",
+                "WZB_WORKSPACE_WEBSOCKET_URL": (
+                    "ws://workspace.test/api/workspace/v1/events/ws"
+                ),
+                "WZB_WORKSPACE_PROJECT_ID": str(project_uuid),
+                "WZB_WORKSPACE_PROVIDER_UUID": str(provider_uuid),
+                "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+            }
+        )
+        worker = WorkspaceDiffWorker(pool, settings)
+
+        assert await worker._apply_projection_upgrade(10, realm_uuid, generation) == 1
+        repaired = await pool.fetchrow(
+            """
+            SELECT direction, delivery_priority, processing_status,
+                   source_updated_at, target_updated_at, attempt_count, last_error
+            FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1 AND entity_type = 'messages'
+              AND entity_uuid = $2
+            """,
+            provider_uuid,
+            message_uuid,
+        )
+        assert repaired is not None
+        assert repaired["direction"] == "to_workspace"
+        assert repaired["delivery_priority"] == 1
+        assert repaired["processing_status"] == "pending"
+        assert repaired["source_updated_at"] == source_version + timedelta(
+            microseconds=1
+        )
+        assert repaired["target_updated_at"] == source_version
+        assert repaired["attempt_count"] == 0
+        assert repaired["last_error"] == ("requeued_workspace_identity_rebind_version")
+        assert await worker._apply_projection_upgrade(11, realm_uuid, generation) == 0
+    finally:
+        await pool.close()
+
+
 async def _workspace_planner_does_not_rescan_completed_history(
     dsn: str,
     tmp_path: Path,
@@ -4661,7 +4846,7 @@ async def _workspace_diff_planner_schedules_unready_entity_graph(
                 """,
                 provider_uuid,
             )
-            == 9
+            == 11
         )
 
         late_message_uuid = UUID("10000000-0000-0000-0000-000000000091")

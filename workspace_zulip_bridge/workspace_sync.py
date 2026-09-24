@@ -46,7 +46,7 @@ ENTITY_TYPES = (
     "message_reactions",
 )
 PRIORITY = {entity_type: index for index, entity_type in enumerate(ENTITY_TYPES)}
-RECONCILIATION_VERSION = 9
+RECONCILIATION_VERSION = 11
 
 
 class ProviderApiError(RuntimeError):
@@ -1695,6 +1695,101 @@ class WorkspaceDiffWorker:
                 realm_uuid,
                 generation,
             )
+        if current_version < 10:
+            rebound_messages = await self._pool.execute(
+                """
+                UPDATE workspace_zulip_bridge.sync_diffs AS diff
+                SET direction = 'to_workspace',
+                    delivery_priority = 1,
+                    processing_status = 'pending', attempt_count = 0,
+                    dependency_wait_count = 0,
+                    source_updated_at = GREATEST(
+                        diff.source_updated_at,
+                        COALESCE(diff.target_updated_at, diff.source_updated_at)
+                    ) + interval '1 microsecond',
+                    available_at = clock_timestamp(), claimed_at = NULL,
+                    processed_at = NULL,
+                    last_error = 'requeued_workspace_identity_rebind',
+                    updated_at = clock_timestamp()
+                FROM workspace_zulip_bridge.zulip_messages AS message
+                JOIN workspace_zulip_bridge.zulip_users AS sender
+                  ON sender.uuid = message.sender_user_uuid
+                 AND sender.workspace_user_uuid IS NOT NULL
+                JOIN workspace_zulip_bridge.workspace_mirror_state AS mirror
+                  ON mirror.provider_uuid = $1
+                 AND mirror.active_generation IS NOT NULL
+                JOIN workspace_zulip_bridge.workspace_messages AS target
+                  ON target.provider_uuid = mirror.provider_uuid
+                 AND target.snapshot_generation = mirror.active_generation
+                 AND target.uuid = message.uuid
+                WHERE diff.provider_uuid = $1
+                  AND diff.entity_type = 'messages'
+                  AND diff.entity_uuid = message.uuid
+                  AND diff.direction = 'to_zulip'
+                  AND diff.processing_status = 'blocked'
+                  AND diff.last_error =
+                    'changing Zulip message authors is not supported'
+                  AND (target.data ->> 'author_uuid')::uuid = sender.uuid
+                  AND (target.data ->> 'stream_uuid')::uuid =
+                    message.zulip_stream_uuid
+                  AND (target.data ->> 'topic_uuid')::uuid = message.topic_uuid
+                  AND target.data -> 'payload' = jsonb_build_object(
+                    'kind', 'markdown', 'content', message.content
+                  )
+                  AND (target.data ->> 'created_at')::timestamptz =
+                    message.created_at
+                """,
+                self._provider_uuid,
+            )
+            changed += int(rebound_messages.rsplit(" ", 1)[-1])
+        if current_version < 11:
+            conflicted_rebinds = await self._pool.execute(
+                """
+                UPDATE workspace_zulip_bridge.sync_diffs AS diff
+                SET direction = 'to_workspace',
+                    delivery_priority = 1,
+                    processing_status = 'pending', attempt_count = 0,
+                    dependency_wait_count = 0,
+                    source_updated_at = GREATEST(
+                        diff.source_updated_at,
+                        COALESCE(diff.target_updated_at, diff.source_updated_at)
+                    ) + interval '1 microsecond',
+                    available_at = clock_timestamp(), claimed_at = NULL,
+                    processed_at = NULL,
+                    last_error = 'requeued_workspace_identity_rebind_version',
+                    updated_at = clock_timestamp()
+                FROM workspace_zulip_bridge.zulip_messages AS message
+                JOIN workspace_zulip_bridge.zulip_users AS sender
+                  ON sender.uuid = message.sender_user_uuid
+                 AND sender.workspace_user_uuid IS NOT NULL
+                JOIN workspace_zulip_bridge.workspace_mirror_state AS mirror
+                  ON mirror.provider_uuid = $1
+                 AND mirror.active_generation IS NOT NULL
+                JOIN workspace_zulip_bridge.workspace_messages AS target
+                  ON target.provider_uuid = mirror.provider_uuid
+                 AND target.snapshot_generation = mirror.active_generation
+                 AND target.uuid = message.uuid
+                WHERE diff.provider_uuid = $1
+                  AND diff.entity_type = 'messages'
+                  AND diff.entity_uuid = message.uuid
+                  AND diff.direction = 'to_workspace'
+                  AND diff.processing_status = 'blocked'
+                  AND diff.last_error LIKE
+                    'Workspace Provider API returned 409 error='
+                    'entity_version_conflict%'
+                  AND (target.data ->> 'author_uuid')::uuid = sender.uuid
+                  AND (target.data ->> 'stream_uuid')::uuid =
+                    message.zulip_stream_uuid
+                  AND (target.data ->> 'topic_uuid')::uuid = message.topic_uuid
+                  AND target.data -> 'payload' = jsonb_build_object(
+                    'kind', 'markdown', 'content', message.content
+                  )
+                  AND (target.data ->> 'created_at')::timestamptz =
+                    message.created_at
+                """,
+                self._provider_uuid,
+            )
+            changed += int(conflicted_rebinds.rsplit(" ", 1)[-1])
         return changed
 
     async def _repair_missing_catalog_dependencies(
@@ -2788,10 +2883,18 @@ class WorkspaceDiffWorker:
             target_entities.update(
                 await self._load_workspace_entities(entity_type, entity_uuids)
             )
+        identity_rebinds = await self._message_identity_rebinds(
+            rows,
+            source_entities,
+            target_entities,
+        )
         for row in rows:
             key = (row["entity_type"], row["entity_uuid"])
             source = source_entities.get(key)
             target = target_entities.get(key)
+            if key in identity_rebinds:
+                await self._redirect_identity_rebind(row)
+                continue
             if _equivalent_entity(row["entity_type"], source, target):
                 await self._accept_to_zulip(row, "equivalent")
                 continue
@@ -2843,6 +2946,75 @@ class WorkspaceDiffWorker:
                 )
             else:
                 await self._accept_to_zulip(row, "written")
+
+    async def _message_identity_rebinds(
+        self,
+        rows: list[asyncpg.Record],
+        source_entities: Mapping[tuple[str, UUID], dict[str, Any]],
+        target_entities: Mapping[tuple[str, UUID], dict[str, Any]],
+    ) -> set[tuple[str, UUID]]:
+        candidates: dict[tuple[str, UUID], tuple[UUID, UUID]] = {}
+        for row in rows:
+            key = (row["entity_type"], row["entity_uuid"])
+            if row["entity_type"] != "messages":
+                continue
+            source = source_entities.get(key)
+            target = target_entities.get(key)
+            if source is None or target is None:
+                continue
+            source_author = UUID(str(source["author_uuid"]))
+            target_author = UUID(str(target["author_uuid"]))
+            if source_author != target_author:
+                candidates[key] = (target_author, source_author)
+        if not candidates:
+            return set()
+        aliases = await self._pool.fetch(
+            """
+            SELECT uuid, workspace_user_uuid
+            FROM workspace_zulip_bridge.zulip_users
+            WHERE uuid = ANY($1::uuid[])
+              AND workspace_user_uuid IS NOT NULL
+            """,
+            list({target for target, _ in candidates.values()}),
+        )
+        mapped = {
+            UUID(str(row["uuid"])): UUID(str(row["workspace_user_uuid"]))
+            for row in aliases
+        }
+        result = set()
+        for key, (target_author, source_author) in candidates.items():
+            if mapped.get(target_author) != source_author:
+                continue
+            source = source_entities[key]
+            target = dict(target_entities[key])
+            target["author_uuid"] = str(source_author)
+            if _equivalent_entity("messages", source, target):
+                result.add(key)
+        return result
+
+    async def _redirect_identity_rebind(self, row: asyncpg.Record) -> None:
+        await self._pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.sync_diffs
+            SET direction = 'to_workspace', delivery_priority = 1,
+                processing_status = 'pending',
+                attempt_count = 0, dependency_wait_count = 0,
+                source_updated_at = GREATEST(
+                    source_updated_at,
+                    COALESCE(target_updated_at, source_updated_at)
+                ) + interval '1 microsecond',
+                available_at = clock_timestamp(), claimed_at = NULL,
+                processed_at = NULL,
+                last_error = 'redirected_workspace_identity_rebind',
+                updated_at = clock_timestamp()
+            WHERE provider_uuid = $1 AND entity_type = $2 AND entity_uuid = $3
+              AND processing_status = 'processing' AND claimed_at = $4
+            """,
+            row["provider_uuid"],
+            row["entity_type"],
+            row["entity_uuid"],
+            row["claimed_at"],
+        )
 
     async def _accept_to_zulip(
         self,
