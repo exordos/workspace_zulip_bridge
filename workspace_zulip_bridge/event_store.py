@@ -1920,9 +1920,10 @@ class HistorySession:
         )
 
     async def _store_topics(self) -> int:
-        return int(
-            await self._connection.fetchval(
-                """
+        if self._realm_uuid is None:
+            raise RuntimeError("history session is not initialized")
+        rows = await self._connection.fetch(
+            """
             WITH incoming AS MATERIALIZED (
                 SELECT DISTINCT page.topic_uuid, page.stream_uuid, page.topic_name,
                        page.topic_hash AS content_hash
@@ -1938,7 +1939,7 @@ class HistorySession:
                 ON CONFLICT (uuid) DO UPDATE SET name = EXCLUDED.name,
                     content_hash = EXCLUDED.content_hash
                 WHERE zulip_topics.content_hash IS DISTINCT FROM EXCLUDED.content_hash
-                RETURNING 1
+                RETURNING uuid
             ), aliases AS (
                 INSERT INTO workspace_zulip_bridge.zulip_topic_aliases
                     (zulip_stream_uuid, alias, topic_uuid)
@@ -1946,11 +1947,17 @@ class HistorySession:
                 ON CONFLICT (zulip_stream_uuid, alias) DO UPDATE
                 SET topic_uuid = EXCLUDED.topic_uuid, active = true
                 RETURNING 1
-            ) SELECT count(*) FROM topics
+            ) SELECT uuid FROM topics
             """,
-                self._connection_uuid,
-            )
+            self._connection_uuid,
         )
+        await _enqueue_workspace_upserts(
+            self._connection,
+            self._realm_uuid,
+            "topic",
+            [row["uuid"] for row in rows],
+        )
+        return len(rows)
 
     async def _store_messages_and_personal_state(self) -> asyncpg.Record:
         row = await self._connection.fetchrow(
@@ -2549,6 +2556,32 @@ async def _request_chat_schedule_reconciliation(
     )
 
 
+async def _enqueue_workspace_upserts(
+    connection: asyncpg.Connection | PoolConnectionProxy,
+    realm_uuid: UUID,
+    entity_type: str,
+    entity_uuids: Sequence[UUID],
+) -> None:
+    if not entity_uuids:
+        return
+    await connection.execute(
+        """
+        INSERT INTO workspace_zulip_bridge.workspace_outbox (
+            realm_uuid, entity_type, action, entity_uuid
+        )
+        SELECT $1, $2, 'upsert', entity_uuid
+        FROM unnest($3::uuid[]) AS queued(entity_uuid)
+        ON CONFLICT (realm_uuid, entity_type, entity_uuid)
+            WHERE delivery_status = 'pending'
+        DO UPDATE SET action = 'upsert', available_at = clock_timestamp(),
+                      updated_at = clock_timestamp()
+        """,
+        realm_uuid,
+        entity_type,
+        list(entity_uuids),
+    )
+
+
 async def _store_user_topics(
     connection: asyncpg.Connection | PoolConnectionProxy,
     realm_uuid: UUID,
@@ -2558,6 +2591,7 @@ async def _store_user_topics(
     replace_all: bool,
 ) -> int | None:
     changed = 0
+    reset_binding_uuids: list[UUID] = []
     if replace_all:
         rows = await connection.fetch(
             """
@@ -2592,6 +2626,14 @@ async def _store_user_topics(
                 ),
             )
             changed += status == "UPDATE 1"
+            if status == "UPDATE 1":
+                reset_binding_uuids.append(UUID(str(row["uuid"])))
+        await _enqueue_workspace_upserts(
+            connection,
+            realm_uuid,
+            "topic_binding",
+            reset_binding_uuids,
+        )
     for topic in topics:
         topic_change = await _store_user_topic(
             connection,
@@ -2631,7 +2673,7 @@ async def _store_user_topic(
     stream_uuid = UUID(str(stream["uuid"]))
     topic_uuid = stable_topic_uuid(stream_uuid, topic.topic_name)
     topic_created_at = datetime.fromtimestamp(topic.last_updated, UTC)
-    await connection.execute(
+    stored_topic_uuid = await connection.fetchval(
         """
         INSERT INTO workspace_zulip_bridge.zulip_topics (
             uuid, zulip_stream_uuid, name, content_hash, created_at
@@ -2640,6 +2682,7 @@ async def _store_user_topic(
         SET name = EXCLUDED.name, content_hash = EXCLUDED.content_hash,
             updated_at = clock_timestamp()
         WHERE zulip_topics.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+        RETURNING uuid
         """,
         topic_uuid,
         stream_uuid,
@@ -2647,6 +2690,13 @@ async def _store_user_topic(
         hashlib.sha256(topic.topic_name.encode("utf-8")).digest(),
         topic_created_at,
     )
+    if stored_topic_uuid is not None:
+        await _enqueue_workspace_upserts(
+            connection,
+            realm_uuid,
+            "topic",
+            [UUID(str(stored_topic_uuid))],
+        )
     await connection.execute(
         """
         INSERT INTO workspace_zulip_bridge.zulip_topic_aliases (
@@ -2679,7 +2729,7 @@ async def _store_user_topic(
         mode,
         created_at,
     )
-    status = await connection.execute(
+    stored_binding_uuid = await connection.fetchval(
         """
         INSERT INTO workspace_zulip_bridge.zulip_topic_bindings (
             uuid, zulip_stream_uuid, topic_uuid, zulip_user_uuid,
@@ -2693,6 +2743,7 @@ async def _store_user_topic(
                   IS DISTINCT FROM EXCLUDED.notification_mode
            OR zulip_topic_bindings.content_hash
                   IS DISTINCT FROM EXCLUDED.content_hash
+        RETURNING uuid
         """,
         stable_topic_binding_uuid(topic_uuid, user_uuid),
         stream_uuid,
@@ -2702,7 +2753,15 @@ async def _store_user_topic(
         content_hash,
         created_at,
     )
-    return int(status.rsplit(" ", 1)[-1])
+    if stored_binding_uuid is None:
+        return 0
+    await _enqueue_workspace_upserts(
+        connection,
+        realm_uuid,
+        "topic_binding",
+        [UUID(str(stored_binding_uuid))],
+    )
+    return 1
 
 
 async def _store_chats(

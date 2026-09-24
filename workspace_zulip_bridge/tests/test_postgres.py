@@ -1169,6 +1169,20 @@ async def _catalog_applies_registration_topic_snapshot_before_activation(
             connection_uuid,
         )
         assert tuple(snapshot) == ("mute", "scheduling")
+        queued_types = await pool.fetch(
+            """
+            SELECT entity_type, count(*) AS count
+            FROM workspace_zulip_bridge.workspace_outbox
+            WHERE realm_uuid = $1 AND delivery_status = 'pending'
+              AND entity_type IN ('topic', 'topic_binding')
+            GROUP BY entity_type ORDER BY entity_type
+            """,
+            stable_realm_uuid(ENDPOINT),
+        )
+        assert [tuple(row.values()) for row in queued_types] == [
+            ("topic", 1),
+            ("topic_binding", 1),
+        ]
 
         assert (
             await store.store_user_topics(
@@ -1311,6 +1325,7 @@ async def _reaction_removal_enqueues_workspace_tombstone(dsn: str) -> None:
             "1f44d",
         )
         flag_uuid = stable_message_flag_uuid(message_uuid, user_uuid)
+        topic_uuid = stable_topic_uuid(stream_uuid, "General")
         message = ZulipMessage(
             message_id=650,
             chat_key="channel:65",
@@ -1352,12 +1367,13 @@ async def _reaction_removal_enqueues_workspace_tombstone(dsn: str) -> None:
             ORDER BY entity_type
             """,
             stable_realm_uuid(ENDPOINT),
-            [message_uuid, flag_uuid, reaction_uuid],
+            [message_uuid, flag_uuid, reaction_uuid, topic_uuid],
         )
         assert [row["entity_type"] for row in outbox_types] == [
             "message",
             "message_flag",
             "message_reaction",
+            "topic",
         ]
         async with pool.acquire() as connection:
             await connection.execute(
@@ -2580,7 +2596,7 @@ async def _workspace_planner_does_not_rescan_completed_history(
             generation,
             topic_uuid,
         )
-        assert await worker._apply_projection_upgrade() == 4
+        assert await worker._apply_projection_upgrade() == 5
         recovered = await pool.fetchrow(
             """
             SELECT processing_status, attempt_count, last_error
@@ -2642,6 +2658,43 @@ async def _workspace_planner_does_not_rescan_completed_history(
         assert all(row["source_updated_at"] is None for row in repaired_cursors)
         assert all(row["entity_uuid"] is None for row in repaired_cursors)
 
+        repaired_topic = await pool.fetchrow(
+            """
+            SELECT processing_status, last_error
+            FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1 AND entity_type = 'topics'
+              AND entity_uuid = $2
+            """,
+            provider_uuid,
+            topic_uuid,
+        )
+        assert repaired_topic is not None
+        assert tuple(repaired_topic) == ("pending", None)
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.sync_diffs
+            SET processing_status = 'applied', processed_at = clock_timestamp()
+            WHERE provider_uuid = $1 AND entity_type = 'topics'
+              AND entity_uuid = $2
+            """,
+            provider_uuid,
+            topic_uuid,
+        )
+        assert await worker._apply_projection_upgrade(8, realm_uuid, generation) == 1
+        repaired_topic = await pool.fetchrow(
+            """
+            SELECT processing_status, last_error
+            FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1 AND entity_type = 'topics'
+              AND entity_uuid = $2
+            """,
+            provider_uuid,
+            topic_uuid,
+        )
+        assert tuple(repaired_topic) == (
+            "pending",
+            "requeued_missing_catalog_dependency",
+        )
         assert (
             await worker._plan_entity(
                 "topics", _SOURCE_TABLES["topics"], realm_uuid, generation
@@ -2730,7 +2783,7 @@ async def _workspace_planner_does_not_rescan_completed_history(
             provider_uuid,
             topic_uuid,
         )
-        assert await worker._apply_projection_upgrade(5) == 0
+        assert await worker._apply_projection_upgrade(5) == 1
         version_six_cursors = await pool.fetch(
             """
             SELECT entity_type, source_updated_at, entity_uuid
@@ -4415,7 +4468,7 @@ async def _workspace_diff_planner_schedules_unready_entity_graph(
         )
         worker = WorkspaceDiffWorker(pool, settings)
 
-        assert await worker.plan() == 8
+        assert await worker.plan() == 10
         assert (
             await pool.fetchval(
                 """
@@ -4436,7 +4489,7 @@ async def _workspace_diff_planner_schedules_unready_entity_graph(
                 """,
                 provider_uuid,
             )
-            == 8
+            == 9
         )
 
         late_message_uuid = UUID("10000000-0000-0000-0000-000000000091")

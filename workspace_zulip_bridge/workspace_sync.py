@@ -46,7 +46,7 @@ ENTITY_TYPES = (
     "message_reactions",
 )
 PRIORITY = {entity_type: index for index, entity_type in enumerate(ENTITY_TYPES)}
-RECONCILIATION_VERSION = 8
+RECONCILIATION_VERSION = 9
 
 
 class ProviderApiError(RuntimeError):
@@ -1436,11 +1436,14 @@ class WorkspaceDiffWorker:
             self._unmapped_cleanup_done = True
         total = await self._plan_source_outbox(realm_uuid, generation)
         current_reconciliation_version = int(state.get("reconciliation_version", 0))
+        if not self._topic_bindings_repair_done:
+            self._topic_bindings_repair_done = await self._ensure_topic_bindings(
+                realm_uuid
+            )
         refresh_topic_bindings = not self._topic_bindings_repair_done
         for entity_type, source in _SOURCE_TABLES.items():
-            if (
-                current_reconciliation_version >= 8
-                and entity_type in _OUTBOX_SOURCE_TYPES.values()
+            if current_reconciliation_version >= _OUTBOX_SOURCE_VERSIONS.get(
+                entity_type, RECONCILIATION_VERSION + 1
             ):
                 continue
             if entity_type == "topic_bindings" and refresh_topic_bindings:
@@ -1479,7 +1482,9 @@ class WorkspaceDiffWorker:
             )
         if current_reconciliation_version < RECONCILIATION_VERSION:
             total += await self._apply_projection_upgrade(
-                current_reconciliation_version
+                current_reconciliation_version,
+                realm_uuid,
+                generation,
             )
             await self._pool.execute(
                 """
@@ -1494,7 +1499,12 @@ class WorkspaceDiffWorker:
             )
         return total
 
-    async def _apply_projection_upgrade(self, current_version: int = 0) -> int:
+    async def _apply_projection_upgrade(
+        self,
+        current_version: int = 0,
+        realm_uuid: UUID | None = None,
+        generation: UUID | None = None,
+    ) -> int:
         """Apply bounded, one-time repair required by projection corrections."""
         changed = 0
         if current_version < 5:
@@ -1663,6 +1673,81 @@ class WorkspaceDiffWorker:
             )
             changed += int(orphaned.rsplit(" ", 1)[-1])
             changed += int(requeued.rsplit(" ", 1)[-1])
+        if current_version < 9:
+            if realm_uuid is None or generation is None:
+                mirror = await self._pool.fetchrow(
+                    """
+                    SELECT realm.uuid AS realm_uuid, mirror.active_generation
+                    FROM workspace_zulip_bridge.zulip_realms AS realm
+                    JOIN workspace_zulip_bridge.workspace_mirror_state AS mirror
+                      ON mirror.provider_uuid = realm.workspace_provider_uuid
+                    WHERE realm.workspace_provider_uuid = $1
+                      AND mirror.bootstrap_status = 'ready'
+                      AND mirror.active_generation IS NOT NULL
+                    """,
+                    self._provider_uuid,
+                )
+                if mirror is None:
+                    return changed
+                realm_uuid = UUID(str(mirror["realm_uuid"]))
+                generation = UUID(str(mirror["active_generation"]))
+            changed += await self._repair_missing_catalog_dependencies(
+                realm_uuid,
+                generation,
+            )
+        return changed
+
+    async def _repair_missing_catalog_dependencies(
+        self,
+        realm_uuid: UUID,
+        generation: UUID,
+    ) -> int:
+        """Requeue compact catalog rows missed by the old timestamp cursor."""
+        changed = 0
+        for entity_type in ("topics", "topic_bindings"):
+            source = _SOURCE_TABLES[entity_type]
+            source_timestamp_column = "source.updated_at"
+            result = await self._pool.execute(
+                f"""
+                INSERT INTO workspace_zulip_bridge.sync_diffs (
+                    provider_uuid, entity_type, entity_uuid, realm_uuid,
+                    partition_key, direction, source_hash, target_hash,
+                    source_updated_at, target_updated_at
+                )
+                SELECT $1, $2, source.uuid, $3, {source["partition"]},
+                       'to_workspace', {source["hash"]}, NULL,
+                       {source_timestamp_column}, NULL
+                FROM {source["from"]} AS source
+                {source["joins"]}
+                LEFT JOIN workspace_zulip_bridge.workspace_{entity_type} AS target
+                  ON target.provider_uuid = $1
+                 AND target.snapshot_generation = $4
+                 AND target.uuid = source.uuid
+                WHERE {source["where"]}
+                  AND target.uuid IS NULL
+                ON CONFLICT (provider_uuid, entity_type, entity_uuid)
+                DO UPDATE SET
+                    direction = 'to_workspace',
+                    partition_key = EXCLUDED.partition_key,
+                    source_hash = EXCLUDED.source_hash,
+                    target_hash = NULL,
+                    source_updated_at = EXCLUDED.source_updated_at,
+                    target_updated_at = NULL,
+                    processing_status = 'pending',
+                    attempt_count = 0,
+                    dependency_wait_count = 0,
+                    available_at = clock_timestamp(),
+                    claimed_at = NULL,
+                    processed_at = NULL,
+                    last_error = 'requeued_missing_catalog_dependency',
+                    updated_at = clock_timestamp()
+                """,
+                self._provider_uuid,
+                entity_type,
+                realm_uuid,
+                generation,
+            )
+            changed += int(result.rsplit(" ", 1)[-1])
         return changed
 
     async def _plan_source_outbox(
@@ -1701,6 +1786,8 @@ class WorkspaceDiffWorker:
                 remaining -= len(selected)
             if not rows:
                 return 0
+            if any(row["entity_type"] == "topic" for row in rows):
+                self._topic_bindings_repair_done = False
             for outbox_type, entity_type in _OUTBOX_SOURCE_TYPES.items():
                 entity_uuids = [
                     row["entity_uuid"]
@@ -3202,6 +3289,7 @@ class WorkspaceDiffWorker:
             if values:
                 await connection.execute(
                     """
+                    WITH inserted AS (
                     INSERT INTO workspace_zulip_bridge.zulip_topics
                         (uuid, zulip_stream_uuid, name, content_hash)
                     SELECT input.topic_uuid, input.stream_uuid, 'General',
@@ -3209,10 +3297,24 @@ class WorkspaceDiffWorker:
                     FROM unnest($1::uuid[], $2::uuid[], $3::bytea[])
                         AS input(topic_uuid, stream_uuid, content_hash)
                     ON CONFLICT (uuid) DO NOTHING
+                    RETURNING uuid
+                    ), outbox AS (
+                    INSERT INTO workspace_zulip_bridge.workspace_outbox (
+                        realm_uuid, entity_type, action, entity_uuid
+                    )
+                    SELECT $4, 'topic', 'upsert', uuid FROM inserted
+                    ON CONFLICT (realm_uuid, entity_type, entity_uuid)
+                        WHERE delivery_status = 'pending'
+                    DO UPDATE SET action = 'upsert',
+                                  available_at = clock_timestamp(),
+                                  updated_at = clock_timestamp()
+                    RETURNING 1
+                    ) SELECT count(*) FROM inserted
                     """,
                     topic_uuids,
                     stream_uuids,
                     content_hashes,
+                    realm_uuid,
                 )
             result = await connection.execute(
                 """
@@ -3313,6 +3415,7 @@ class WorkspaceDiffWorker:
             )
             await connection.execute(
                 """
+                WITH inserted AS (
                 INSERT INTO workspace_zulip_bridge.zulip_topic_bindings (
                     uuid, zulip_stream_uuid, topic_uuid, zulip_user_uuid,
                     notification_mode, content_hash, created_at, updated_at
@@ -3321,7 +3424,21 @@ class WorkspaceDiffWorker:
                        'default', content_hash, created_at, created_at
                 FROM pending_topic_bindings
                 ON CONFLICT (topic_uuid, zulip_user_uuid) DO NOTHING
-                """
+                RETURNING uuid
+                ), outbox AS (
+                INSERT INTO workspace_zulip_bridge.workspace_outbox (
+                    realm_uuid, entity_type, action, entity_uuid
+                )
+                SELECT $1, 'topic_binding', 'upsert', uuid FROM inserted
+                ON CONFLICT (realm_uuid, entity_type, entity_uuid)
+                    WHERE delivery_status = 'pending'
+                DO UPDATE SET action = 'upsert',
+                              available_at = clock_timestamp(),
+                              updated_at = clock_timestamp()
+                RETURNING 1
+                ) SELECT count(*) FROM inserted
+                """,
+                realm_uuid,
             )
         return len(rows) < self.TOPIC_BINDING_REPAIR_BATCH_SIZE
 
@@ -3606,11 +3723,22 @@ _SOURCE_TABLES = {
 }
 
 _OUTBOX_SOURCE_TYPES = {
-    # Plan the smaller latency-sensitive queues first. Any unused share then
-    # flows into the remaining high-volume types instead of wasting the batch.
+    # Dependencies must be planned before their consumers. Any unused share
+    # then flows into the remaining high-volume types instead of wasting the
+    # batch.
+    "topic": "topics",
+    "topic_binding": "topic_bindings",
     "message_reaction": "message_reactions",
     "message_flag": "message_flags",
     "message": "messages",
+}
+
+_OUTBOX_SOURCE_VERSIONS = {
+    "topics": 9,
+    "topic_bindings": 9,
+    "message_reactions": 8,
+    "message_flags": 8,
+    "messages": 8,
 }
 
 

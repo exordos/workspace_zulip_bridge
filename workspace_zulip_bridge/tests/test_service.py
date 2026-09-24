@@ -310,7 +310,7 @@ async def _run_workspace_diff_worker_fair_plan_test(
             assert "active_generation" in query
             return {
                 "active_generation": UUID("20000000-0000-0000-0000-000000000001"),
-                "reconciliation_version": 8,
+                "reconciliation_version": 9,
             }
 
     worker = WorkspaceDiffWorker(PlanningPool(), settings)  # type: ignore[arg-type]
@@ -361,8 +361,6 @@ async def _run_workspace_diff_worker_fair_plan_test(
             "users",
             "streams",
             "stream_bindings",
-            "topics",
-            "topic_bindings",
         ]
         * 2
     )
