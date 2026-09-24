@@ -47,6 +47,7 @@ _DEPENDENCY_DEFERRAL_REASONS = frozenset(
         "chat_rescheduling",
         "chat_unassigned",
         "message_not_materialized",
+        "topic_not_materialized",
     }
 )
 # Preserve mutation batching without letting one recovered queue monopolize a pass.
@@ -120,6 +121,7 @@ class _RoutedEvent:
     message_ids: tuple[int, ...] = ()
     chat_key: str | None = None
     skip_reason: str | None = None
+    history_pending: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -355,6 +357,7 @@ class ZulipEventProcessor:
                 chat_suppliers,
                 message_routes,
                 transitioning_chats,
+                pending_history_endpoints,
             ) = await self._load_routes(events)
         except asyncio.CancelledError:
             raise
@@ -383,6 +386,7 @@ class ZulipEventProcessor:
                     chat_suppliers,
                     message_routes,
                     transitioning_chats,
+                    pending_history_endpoints,
                 )
             )
             for event in events
@@ -848,6 +852,7 @@ class ZulipEventProcessor:
         dict[tuple[str, str], UUID | None],
         dict[tuple[str, int], _MessageRoute],
         set[tuple[str, str]],
+        set[str],
     ]:
         chat_uuids: set[UUID] = set()
         message_ids_by_endpoint: dict[str, set[int]] = {}
@@ -871,7 +876,20 @@ class ZulipEventProcessor:
         chat_suppliers: dict[tuple[str, str], UUID | None] = {}
         transitioning_chats: set[tuple[str, str]] = set()
         message_routes: dict[tuple[str, int], _MessageRoute] = {}
+        pending_history_rows: list[asyncpg.Record] = []
         async with self._pool.acquire() as connection:
+            pending_history_rows = await connection.fetch(
+                """
+                SELECT DISTINCT realm.identity_key
+                FROM workspace_zulip_bridge.zulip_streams AS stream
+                JOIN workspace_zulip_bridge.zulip_realms AS realm
+                  ON realm.uuid = stream.realm_uuid
+                WHERE realm.identity_key = ANY($1::text[])
+                  AND stream.source_connection_uuid IS NOT NULL
+                  AND stream.history_loaded_at IS NULL
+                """,
+                sorted({event.endpoint for event in events}),
+            )
             if chat_uuids:
                 rows = await connection.fetch(
                     """
@@ -938,7 +956,12 @@ class ZulipEventProcessor:
             )
             for message_id in announced_message_ids:
                 message_routes.setdefault((event.endpoint, message_id), route)
-        return chat_suppliers, message_routes, transitioning_chats
+        return (
+            chat_suppliers,
+            message_routes,
+            transitioning_chats,
+            {row["identity_key"] for row in pending_history_rows},
+        )
 
     def _route_event(
         self,
@@ -946,6 +969,7 @@ class ZulipEventProcessor:
         chat_suppliers: Mapping[tuple[str, str], UUID | None],
         message_routes: Mapping[tuple[str, int], _MessageRoute],
         transitioning_chats: set[tuple[str, str]],
+        pending_history_endpoints: set[str],
     ) -> _RoutedEvent:
         if not event.active_queue:
             return _RoutedEvent(event, skip_reason="stale_queue")
@@ -960,6 +984,11 @@ class ZulipEventProcessor:
             "user_topic",
         }:
             return _RoutedEvent(event, skip_reason="unsupported_event_type")
+        if event.event_type == "user_topic":
+            return _RoutedEvent(
+                event,
+                history_pending=event.endpoint in pending_history_endpoints,
+            )
         if event.event_type in {
             "attachment",
             "subscription",
@@ -967,7 +996,6 @@ class ZulipEventProcessor:
             "realm_bot",
             "presence",
             "user_status",
-            "user_topic",
         }:
             return _RoutedEvent(event)
         if event.event_type == "stream":
@@ -1026,7 +1054,10 @@ class ZulipEventProcessor:
                     return _RoutedEvent(
                         event,
                         chat_key=chat_key,
-                        skip_reason="message_not_materialized",
+                        skip_reason=self._missing_message_reason(
+                            event,
+                            pending_history_endpoints,
+                        ),
                     )
                 if route.chat_key != chat_key:
                     return _RoutedEvent(
@@ -1052,14 +1083,19 @@ class ZulipEventProcessor:
                 for message_id in message_ids
             ]
             if any(route is None for route in flag_routes):
-                return _RoutedEvent(event, skip_reason="message_not_materialized")
+                reason = self._missing_message_reason(
+                    event,
+                    pending_history_endpoints,
+                )
+                if reason == "message_not_materialized":
+                    return _RoutedEvent(event, skip_reason=reason)
             accepted_flags = [
                 message_id
                 for message_id, route in zip(message_ids, flag_routes, strict=True)
                 if route is not None
             ]
             if not accepted_flags:
-                return _RoutedEvent(event, skip_reason="message_not_materialized")
+                return _RoutedEvent(event, skip_reason="message_out_of_scope")
             return _RoutedEvent(event, message_ids=tuple(accepted_flags))
 
         destination_stream_id = event.payload.get("new_stream_id")
@@ -1091,11 +1127,26 @@ class ZulipEventProcessor:
                 (event.endpoint, message_id) in message_routes
                 for message_id in message_ids
             ):
-                reason = "message_not_materialized"
+                reason = self._missing_message_reason(
+                    event,
+                    pending_history_endpoints,
+                )
             else:
                 reason = "not_chat_supplier"
             return _RoutedEvent(event, skip_reason=reason)
         return _RoutedEvent(event, message_ids=tuple(accepted))
+
+    def _missing_message_reason(
+        self,
+        event: _ClaimedEvent,
+        pending_history_endpoints: set[str],
+    ) -> str:
+        if (
+            event.endpoint in pending_history_endpoints
+            or event.attempt_count <= self._settings.event_processor_max_attempts
+        ):
+            return "message_not_materialized"
+        return "message_out_of_scope"
 
     async def _apply_event(self, item: _RoutedEvent) -> _Outcome:
         event_type = item.event.event_type
@@ -1136,7 +1187,13 @@ class ZulipEventProcessor:
             replace_all=False,
         )
         if changed is None:
-            return _Outcome(item.event.uuid, "defer", "topic_not_materialized")
+            if (
+                item.history_pending
+                or item.event.attempt_count
+                <= self._settings.event_processor_max_attempts
+            ):
+                return _Outcome(item.event.uuid, "defer", "topic_not_materialized")
+            return _Outcome(item.event.uuid, "skipped", "topic_out_of_scope")
         return _Outcome(item.event.uuid, "applied", "user_topic")
 
     async def _apply_presence(self, item: _RoutedEvent) -> _Outcome:

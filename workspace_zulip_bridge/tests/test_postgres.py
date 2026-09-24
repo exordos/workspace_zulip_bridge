@@ -6810,6 +6810,47 @@ async def _event_processor_applies_during_history_backfill(dsn: str) -> None:
             "AND message.zulip_message_id = 701",
             owner_uuid,
         )
+
+        await pool.execute(
+            "UPDATE workspace_zulip_bridge.zulip_streams "
+            "SET history_loaded_at = clock_timestamp() "
+            "WHERE chat_key = 'channel:7'"
+        )
+        partial_flag_event = {
+            "id": 3,
+            "type": "update_message_flags",
+            "op": "add",
+            "flag": "starred",
+            "messages": [701, 999999],
+        }
+        assert await store.store_events(
+            owner_uuid,
+            "queue-owner",
+            (
+                ZulipEvent(
+                    event_id=3,
+                    event_type="update_message_flags",
+                    payload_json=json.dumps(partial_flag_event),
+                ),
+            ),
+            3,
+        ) == (1, True)
+        await pool.execute(
+            "UPDATE workspace_zulip_bridge.zulip_events "
+            "SET attempt_count = 8 "
+            "WHERE event_id = 3"
+        )
+        processed = await processor.process_once()
+        assert (processed.claimed, processed.applied, processed.retried) == (1, 1, 0)
+        assert await pool.fetchval(
+            "SELECT flag.is_starred "
+            "FROM workspace_zulip_bridge.zulip_message_flags AS flag "
+            "JOIN workspace_zulip_bridge.zulip_messages AS message "
+            "ON message.uuid = flag.message_uuid "
+            "WHERE flag.zulip_user_uuid = $1 "
+            "AND message.zulip_message_id = 701",
+            owner_uuid,
+        )
     finally:
         await pool.close()
 
@@ -6968,6 +7009,10 @@ def test_event_processor_dependency_deferrals_do_not_block_later_events() -> Non
     asyncio.run(_event_processor_dependency_deferrals_do_not_block_later_events(_dsn()))
 
 
+def test_event_processor_retires_missing_user_topic_after_history() -> None:
+    asyncio.run(_event_processor_retires_missing_user_topic_after_history(_dsn()))
+
+
 def test_backlog_dependency_deferrals_use_slow_retry_cap() -> None:
     asyncio.run(_backlog_dependency_deferrals_use_slow_retry_cap(_dsn()))
 
@@ -6980,6 +7025,14 @@ async def _backlog_dependency_deferrals_use_slow_retry_cap(dsn: str) -> None:
             owner_uuid = await _insert_user(
                 connection, 10, 100, queue_id="queue-owner", status="active"
             )
+        assert (
+            await store.store_chat_catalog(
+                owner_uuid,
+                "queue-owner",
+                _catalog(10, [(7, "Shared")], {"channel:7": 1}),
+            )
+        ).activated
+        assert (await store.reconcile_chat_schedules()).assigned == 1
         assert await store.store_events(
             owner_uuid,
             "queue-owner",
@@ -7022,6 +7075,22 @@ async def _backlog_dependency_deferrals_use_slow_retry_cap(dsn: str) -> None:
             "FROM workspace_zulip_bridge.zulip_events"
         )
         assert float(retry_delay) > 0.35
+
+        await pool.execute(
+            "UPDATE workspace_zulip_bridge.zulip_streams "
+            "SET history_loaded_at = clock_timestamp() "
+            "WHERE chat_key = 'channel:7'"
+        )
+        await pool.execute(
+            "UPDATE workspace_zulip_bridge.zulip_events "
+            "SET available_at = clock_timestamp()"
+        )
+        settled = await processor.process_once()
+        assert (settled.claimed, settled.skipped, settled.retried) == (1, 1, 0)
+        assert await pool.fetchval(
+            "SELECT outcome_reason = 'message_out_of_scope' "
+            "FROM workspace_zulip_bridge.zulip_events"
+        )
     finally:
         await pool.close()
 
@@ -7063,6 +7132,86 @@ async def _prepare_database_backfills_zulip_event_queue_registry(dsn: str) -> No
             "SELECT 1 FROM workspace_zulip_bridge.zulip_event_queues "
             "WHERE zulip_connection_uuid = $1 AND queue_id = 'queue-owner')",
             user_uuid,
+        )
+    finally:
+        await pool.close()
+
+
+async def _event_processor_retires_missing_user_topic_after_history(
+    dsn: str,
+) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            owner_uuid = await _insert_user(
+                connection, 10, 100, queue_id="queue-owner", status="active"
+            )
+        assert (
+            await store.store_chat_catalog(
+                owner_uuid,
+                "queue-owner",
+                _catalog(10, [(7, "Shared")], {"channel:7": 1}),
+            )
+        ).activated
+        assert (await store.reconcile_chat_schedules()).assigned == 1
+        events = (
+            {
+                "id": 1,
+                "type": "user_topic",
+                "stream_id": 8,
+                "topic_name": "Not selected",
+                "visibility_policy": 1,
+                "last_updated": 1_700_000_000,
+            },
+            {"id": 2, "type": "heartbeat"},
+        )
+        assert await store.store_events(
+            owner_uuid,
+            "queue-owner",
+            tuple(
+                ZulipEvent(
+                    event_id=event["id"],
+                    event_type=event["type"],
+                    payload_json=json.dumps(event),
+                )
+                for event in events
+            ),
+            2,
+        ) == (2, True)
+        processor = ZulipEventProcessor(
+            pool,
+            store,
+            Settings.from_env(
+                {
+                    "WZB_DATABASE_DSN": dsn,
+                    "WZB_EVENT_PROCESSOR_BATCH_SIZE": "1",
+                    "WZB_EVENT_PROCESSOR_MAX_ATTEMPTS": "1",
+                    "WZB_EVENT_PROCESSOR_RETRY_BASE_SECONDS": "30",
+                }
+            ),
+        )
+
+        assert (await processor.process_once()).retried == 1
+        bypass = await processor.process_once()
+        assert (bypass.claimed, bypass.skipped) == (1, 1)
+
+        await pool.execute(
+            "UPDATE workspace_zulip_bridge.zulip_streams "
+            "SET history_loaded_at = clock_timestamp() "
+            "WHERE chat_key = 'channel:7'"
+        )
+        await pool.execute(
+            "UPDATE workspace_zulip_bridge.zulip_events "
+            "SET available_at = clock_timestamp() "
+            "WHERE event_type = 'user_topic'"
+        )
+        settled = await processor.process_once()
+        assert (settled.claimed, settled.skipped, settled.retried) == (1, 1, 0)
+        assert await pool.fetchval(
+            "SELECT outcome_reason = 'topic_out_of_scope' "
+            "FROM workspace_zulip_bridge.zulip_events "
+            "WHERE event_type = 'user_topic'"
         )
     finally:
         await pool.close()
