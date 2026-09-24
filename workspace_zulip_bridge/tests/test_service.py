@@ -315,15 +315,20 @@ async def _run_workspace_diff_worker_fair_plan_test(
 
     worker = WorkspaceDiffWorker(PlanningPool(), settings)  # type: ignore[arg-type]
     calls: list[str] = []
+    maintenance_calls: list[str] = []
 
     async def fake_link_realm() -> UUID:
         return UUID("30000000-0000-0000-0000-000000000001")
 
-    async def fake_ensure_direct_topics(realm_uuid: UUID) -> None:
+    async def fake_ensure_direct_topics(realm_uuid: UUID) -> bool:
         assert realm_uuid == UUID("30000000-0000-0000-0000-000000000001")
+        maintenance_calls.append("direct_topics")
+        return True
 
-    async def fake_ensure_topic_bindings(realm_uuid: UUID) -> None:
+    async def fake_ensure_topic_bindings(realm_uuid: UUID) -> bool:
         assert realm_uuid == UUID("30000000-0000-0000-0000-000000000001")
+        maintenance_calls.append("topic_bindings")
+        return True
 
     async def fake_plan_entity(
         entity_type: str,
@@ -349,13 +354,19 @@ async def _run_workspace_diff_worker_fair_plan_test(
     monkeypatch.setattr(worker, "_plan_entity", fake_plan_entity)
 
     assert await worker.plan() == 1
-    assert calls == [
-        "users",
-        "streams",
-        "stream_bindings",
-        "topics",
-        "topic_bindings",
-    ]
+    assert await worker.plan() == 1
+    assert (
+        calls
+        == [
+            "users",
+            "streams",
+            "stream_bindings",
+            "topics",
+            "topic_bindings",
+        ]
+        * 2
+    )
+    assert maintenance_calls == ["direct_topics", "topic_bindings"]
 
 
 async def _run_workspace_diff_worker_drain_test(
@@ -554,8 +565,14 @@ async def _run_daemon_lifecycle_test(monkeypatch: object) -> None:
         "supervisor-init",
         "event-processor-init-backlog",
         "event-processor-init-realtime",
+        "event-processor-init-realtime",
+        "event-processor-init-realtime",
+        "event-processor-init-realtime",
         "supervisor-run",
         "event-processor-run-backlog",
+        "event-processor-run-realtime",
+        "event-processor-run-realtime",
+        "event-processor-run-realtime",
         "event-processor-run-realtime",
     ]
     assert pool.closed
@@ -692,7 +709,7 @@ async def _run_workspace_receiver_test(
     assert "workspace-receiver-run" in calls
     assert "workspace-bootstrap-ensure" in calls
     assert "workspace-event-processor-run" in calls
-    assert calls.count("workspace-diff-worker-run") == 6
+    assert calls.count("workspace-diff-worker-run") == 11
     assert "workspace-diff-worker-init-True-0/2-unpartitioned-None-all" in calls
     assert (
         "workspace-diff-worker-init-False-0/2-partitioned-1-message_flags,messages"
@@ -701,7 +718,14 @@ async def _run_workspace_receiver_test(
         "workspace-diff-worker-init-False-1/2-partitioned-1-message_flags,messages"
     ) in calls
     assert "workspace-diff-worker-init-False-0/2-unpartitioned-1-all" in calls
-    assert "workspace-diff-worker-init-False-0/1-both-0-all" in calls
+    assert "workspace-diff-worker-init-False-0/2-unpartitioned-0-all" in calls
+    assert "workspace-diff-worker-init-False-0/2-partitioned-0-messages" in calls
+    assert "workspace-diff-worker-init-False-1/2-partitioned-0-messages" in calls
+    assert "workspace-diff-worker-init-False-0/2-partitioned-0-message_flags" in calls
+    assert "workspace-diff-worker-init-False-1/2-partitioned-0-message_flags" in calls
+    assert (
+        "workspace-diff-worker-init-False-0/1-partitioned-0-message_reactions" in calls
+    )
     assert (
         "workspace-diff-worker-init-False-0/1-partitioned-1-message_reactions"
     ) in calls

@@ -34,6 +34,9 @@ def test_schema_separates_realm_identities_and_sync_connections() -> None:
     assert "desired_generation bigint" in schema
     assert "lifecycle_status text NOT NULL DEFAULT 'init'" in schema
     assert "streams_hash bytea" in schema
+    assert "zulip_schedule_reconcile_state" in schema
+    assert "requested_generation bigint NOT NULL DEFAULT 1" in schema
+    assert "completed_generation bigint NOT NULL DEFAULT 0" in schema
     assert "password" not in schema
 
 
@@ -68,6 +71,7 @@ def test_schema_normalizes_workspace_like_entities_and_personal_state() -> None:
     assert "source_path text NOT NULL" in schema
     assert "message_ids bigint[] NOT NULL DEFAULT '{}'::bigint[]" in schema
     assert "zulip_files_message_ids_idx" in schema
+    assert "zulip_message_flags_history_cleanup_idx" in schema
     assert "bytea" not in schema[
         schema.index(
             "CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_files"
@@ -98,6 +102,7 @@ def test_schema_normalizes_workspace_like_entities_and_personal_state() -> None:
     assert "zulip_message_reactions_sync_plan_idx" in schema
     assert "sync_diffs_content_partition_0_pending_idx" in schema
     assert "sync_diffs_content_partition_1_pending_idx" in schema
+    assert "sync_diffs_reactions_pending_idx" in schema
     assert "sync_diffs_unpartitioned_pending_idx" in schema
 
 
@@ -105,9 +110,14 @@ def test_schema_contains_event_retention_and_workspace_outbox_state() -> None:
     schema = _schema()
 
     assert "zulip_connection_uuid uuid NOT NULL" in schema
+    assert "workspace_zulip_bridge.zulip_event_queues" in schema
     assert "processing_status text NOT NULL DEFAULT 'pending'" in schema
     assert "attempt_count integer NOT NULL DEFAULT 0" in schema
     assert "zulip_events_pending_idx" in schema
+    assert "zulip_events_pending_queue_scope_idx" in schema
+    assert "zulip_events_pending_queue_idx" in schema
+    assert "zulip_events_pending_queue_schedule_idx" in schema
+    assert "zulip_events_processing_queue_idx" in schema
     assert "zulip_events_terminal_retention_idx" in schema
     assert "workspace_outbox" in schema
     assert "workspace_sync_cursors" in schema
@@ -119,6 +129,9 @@ def test_schema_contains_event_retention_and_workspace_outbox_state() -> None:
     assert "workspace_events_terminal_retention_idx" in schema
     assert "available_at timestamptz NOT NULL DEFAULT clock_timestamp()" in schema
     assert "recovery_required boolean NOT NULL DEFAULT false" in schema
+    assert "maintenance_migrations" in schema
+    assert "sync_diffs_live_delivery_pending_idx" in schema
+    assert "sync_diffs_pending_idx" not in schema
 
 
 def test_schema_is_a_clean_install_definition_without_upgrade_rewrites() -> None:

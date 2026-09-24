@@ -26,6 +26,7 @@ from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.stable_ids import stable_topic_binding_uuid
 from workspace_zulip_bridge.stable_ids import stable_topic_uuid
 from workspace_zulip_bridge.workspace_auth import WorkspaceTokenManager
+from workspace_zulip_bridge.workspace_entities import project_entity
 from workspace_zulip_bridge.workspace_entities import validate_entity
 from workspace_zulip_bridge.zulip_api import ZulipApiError
 from workspace_zulip_bridge.zulip_outbound import ZulipOutboundError
@@ -1254,6 +1255,8 @@ class WorkspaceEventProcessor:
 class WorkspaceDiffWorker:
     UNPARTITIONED_BATCH_SIZE = 50
     LIVE_BATCH_SIZE = 50
+    DIRECT_TOPIC_REPAIR_BATCH_SIZE = 10000
+    TOPIC_BINDING_REPAIR_BATCH_SIZE = 10000
 
     def __init__(
         self,
@@ -1293,6 +1296,8 @@ class WorkspaceDiffWorker:
         self._delivery_priority = delivery_priority
         self._entity_types = entity_types
         self._unmapped_cleanup_done = False
+        self._direct_topics_repair_done = False
+        self._topic_bindings_repair_done = False
         self._zulip_writer = ZulipOutboundWriter(pool, settings)
 
     @property
@@ -1403,8 +1408,10 @@ class WorkspaceDiffWorker:
         realm_uuid = await self._link_realm()
         if realm_uuid is None:
             return None
-        await self._ensure_direct_topics(realm_uuid)
-        await self._ensure_topic_bindings(realm_uuid)
+        if not self._direct_topics_repair_done:
+            self._direct_topics_repair_done = await self._ensure_direct_topics(
+                realm_uuid
+            )
         state = await self._pool.fetchrow(
             """
             SELECT active_generation, initial_sync_completed_at,
@@ -1429,12 +1436,18 @@ class WorkspaceDiffWorker:
             self._unmapped_cleanup_done = True
         total = await self._plan_source_outbox(realm_uuid, generation)
         current_reconciliation_version = int(state.get("reconciliation_version", 0))
+        refresh_topic_bindings = not self._topic_bindings_repair_done
         for entity_type, source in _SOURCE_TABLES.items():
             if (
                 current_reconciliation_version >= 8
                 and entity_type in _OUTBOX_SOURCE_TYPES.values()
             ):
                 continue
+            if entity_type == "topic_bindings" and refresh_topic_bindings:
+                self._topic_bindings_repair_done = await self._ensure_topic_bindings(
+                    realm_uuid
+                )
+                refresh_topic_bindings = not self._topic_bindings_repair_done
             planned = await self._plan_entity(
                 entity_type,
                 source,
@@ -1442,6 +1455,9 @@ class WorkspaceDiffWorker:
                 generation,
             )
             total += planned
+            if planned and entity_type in {"stream_bindings", "topics"}:
+                self._topic_bindings_repair_done = False
+                refresh_topic_bindings = True
             if scan_target_only:
                 total += await self._plan_target_only(
                     entity_type,
@@ -3158,7 +3174,7 @@ class WorkspaceDiffWorker:
         )
         return realm_uuid
 
-    async def _ensure_direct_topics(self, realm_uuid: UUID) -> None:
+    async def _ensure_direct_topics(self, realm_uuid: UUID) -> bool:
         rows = await self._pool.fetch(
             """
             SELECT stream.uuid
@@ -3198,7 +3214,7 @@ class WorkspaceDiffWorker:
                     stream_uuids,
                     content_hashes,
                 )
-            await connection.execute(
+            result = await connection.execute(
                 """
                 WITH pending AS MATERIALIZED (
                     SELECT message.ctid, topic.uuid AS topic_uuid
@@ -3208,10 +3224,11 @@ class WorkspaceDiffWorker:
                     JOIN workspace_zulip_bridge.zulip_topics AS topic
                       ON topic.zulip_stream_uuid = stream.uuid
                      AND topic.name = 'General'
-                    WHERE stream.realm_uuid = $1
+                    WHERE message.realm_uuid = $1
+                      AND stream.realm_uuid = $1
                       AND stream.chat_type <> 'channel'
                       AND message.topic_uuid IS NULL
-                    LIMIT 10000
+                    LIMIT $2
                     FOR UPDATE OF message SKIP LOCKED
                 )
                 UPDATE workspace_zulip_bridge.zulip_messages AS message
@@ -3219,9 +3236,11 @@ class WorkspaceDiffWorker:
                 FROM pending WHERE message.ctid = pending.ctid
                 """,
                 realm_uuid,
+                self.DIRECT_TOPIC_REPAIR_BATCH_SIZE,
             )
+        return int(result.rsplit(" ", 1)[-1]) < self.DIRECT_TOPIC_REPAIR_BATCH_SIZE
 
-    async def _ensure_topic_bindings(self, realm_uuid: UUID) -> None:
+    async def _ensure_topic_bindings(self, realm_uuid: UUID) -> bool:
         async with self._pool.acquire() as connection, connection.transaction():
             rows = await connection.fetch(
                 """
@@ -3249,11 +3268,14 @@ class WorkspaceDiffWorker:
                       WHERE existing.topic_uuid = topic.uuid
                         AND existing.zulip_user_uuid = binding.zulip_user_uuid
                   )
+                ORDER BY topic.uuid, binding.zulip_user_uuid
+                LIMIT $2
                 """,
                 realm_uuid,
+                self.TOPIC_BINDING_REPAIR_BATCH_SIZE,
             )
             if not rows:
-                return
+                return True
             records = [
                 (
                     stable_topic_binding_uuid(row["topic_uuid"], row["user_uuid"]),
@@ -3301,13 +3323,17 @@ class WorkspaceDiffWorker:
                 ON CONFLICT (topic_uuid, zulip_user_uuid) DO NOTHING
                 """
             )
+        return len(rows) < self.TOPIC_BINDING_REPAIR_BATCH_SIZE
 
     async def _load_zulip_entities(
         self, entity_type: str, entity_uuids: list[UUID]
     ) -> dict[tuple[str, UUID], dict[str, Any]]:
         rows = await self._pool.fetch(_ENTITY_QUERIES[entity_type], entity_uuids)
         return {
-            (entity_type, UUID(str(row["entity_uuid"]))): _json_object(row["data"])
+            (entity_type, UUID(str(row["entity_uuid"]))): project_entity(
+                entity_type,
+                _json_object(row["data"]),
+            )
             for row in rows
         }
 

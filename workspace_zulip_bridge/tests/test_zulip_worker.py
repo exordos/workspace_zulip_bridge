@@ -9,6 +9,8 @@ from datetime import UTC
 from datetime import datetime
 from uuid import UUID
 
+import asyncpg
+
 from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.models import ChatCatalogWrite
 from workspace_zulip_bridge.models import ChatScheduleReconcile
@@ -167,6 +169,7 @@ class FakeStore:
         self.stored = asyncio.Event()
         self.catalog_stored = asyncio.Event()
         self.presence_thresholds: list[tuple[str, int]] = []
+        self.schedule_reconciliation_requested = False
 
     async def set_presence_offline_threshold(
         self, endpoint: str, threshold_seconds: int
@@ -194,6 +197,9 @@ class FakeStore:
 
     async def reconcile_chat_schedules(self) -> ChatScheduleReconcile:
         return ChatScheduleReconcile(0, 0, 0)
+
+    async def chat_schedule_reconciliation_requested(self) -> bool:
+        return self.schedule_reconciliation_requested
 
     async def store_user_directory(
         self, endpoint: str, users: list[ZulipDirectoryUser]
@@ -383,6 +389,75 @@ class FakeApi:
 
     def close(self) -> None:
         self.closed.set()
+
+
+class AllDirectConversationsApi(FakeApi):
+    def __init__(self) -> None:
+        super().__init__()
+        self.anchors: list[tuple[str | int, bool]] = []
+
+    def get_messages_page(
+        self,
+        anchor: str | int,
+        *,
+        include_anchor: bool,
+        narrow: object = None,
+    ) -> MessagePage:
+        self.anchors.append((anchor, include_anchor))
+        assert narrow == [{"operator": "is", "operand": "dm"}]
+        if anchor == "newest":
+            return MessagePage(
+                messages=[
+                    {
+                        "id": 100,
+                        "display_recipient": [{"id": 10}, {"id": 12}],
+                    },
+                    {
+                        "id": 99,
+                        "display_recipient": [{"id": 10}, {"id": 13}],
+                    },
+                ],
+                found_oldest=False,
+            )
+        assert anchor == 99
+        return MessagePage(
+            messages=[
+                {
+                    "id": 50,
+                    "display_recipient": [{"id": 10}, {"id": 14}],
+                }
+            ],
+            found_oldest=True,
+        )
+
+
+def test_private_conversation_discovery_pages_through_complete_history() -> None:
+    asyncio.run(_private_conversation_discovery_pages_through_complete_history())
+
+
+async def _private_conversation_discovery_pages_through_complete_history() -> None:
+    api = AllDirectConversationsApi()
+    worker = ZulipEventThread(
+        USER_ONE,
+        FakeStore(),  # type: ignore[arg-type]
+        asyncio.get_running_loop(),
+        Settings(database_dsn="postgresql:///test"),
+        threading.BoundedSemaphore(1),
+        api_factory=lambda user: api,  # type: ignore[arg-type]
+    )
+
+    conversations = await asyncio.to_thread(
+        worker._discover_private_conversations,
+        api,
+        10,
+    )
+
+    assert conversations == (
+        RecentPrivateConversation((12,), 100),
+        RecentPrivateConversation((13,), 99),
+        RecentPrivateConversation((14,), 50),
+    )
+    assert api.anchors == [("newest", True), (99, False)]
 
 
 class FakeHistory:
@@ -908,9 +983,20 @@ class ScheduleTrackingStore(FakeStore):
     def __init__(self) -> None:
         super().__init__()
         self.schedule_reconciliations = 0
+        self.schedule_reconciliation_requested = True
 
     async def reconcile_chat_schedules(self) -> ChatScheduleReconcile:
         self.schedule_reconciliations += 1
+        self.schedule_reconciliation_requested = False
+        return ChatScheduleReconcile(0, 0, 0)
+
+
+class DeadlockingScheduleStore(ScheduleTrackingStore):
+    async def reconcile_chat_schedules(self) -> ChatScheduleReconcile:
+        self.schedule_reconciliations += 1
+        if self.schedule_reconciliations == 1:
+            raise asyncpg.DeadlockDetectedError("test deadlock")
+        self.schedule_reconciliation_requested = False
         return ChatScheduleReconcile(0, 0, 0)
 
 
@@ -934,6 +1020,74 @@ async def _schedule_reconciliation_gate_test() -> None:
 
     supervisor._catalog_write_gate.release()
     await asyncio.wait_for(task, timeout=1)
+    assert store.schedule_reconciliations == 1
+
+
+def test_schedule_reconciliation_is_skipped_without_a_request() -> None:
+    asyncio.run(_schedule_reconciliation_skip_test())
+
+
+async def _schedule_reconciliation_skip_test() -> None:
+    store = ScheduleTrackingStore()
+    store.schedule_reconciliation_requested = False
+    supervisor = ZulipThreadSupervisor(
+        store,  # type: ignore[arg-type]
+        asyncio.get_running_loop(),
+        Settings(database_dsn="postgresql:///test"),
+        worker_factory=lambda user, gate: FakeWorker(user),  # type: ignore[arg-type]
+    )
+
+    await supervisor.reconcile()
+
+    assert store.schedule_reconciliations == 0
+
+
+def test_schedule_reconciliation_deadlock_does_not_stop_supervisor() -> None:
+    asyncio.run(_schedule_reconciliation_deadlock_test())
+
+
+async def _schedule_reconciliation_deadlock_test() -> None:
+    store = DeadlockingScheduleStore()
+    workers: list[FakeWorker] = []
+    supervisor = ZulipThreadSupervisor(
+        store,  # type: ignore[arg-type]
+        asyncio.get_running_loop(),
+        Settings(database_dsn="postgresql:///test"),
+        worker_factory=lambda user, gate: (
+            workers.append(FakeWorker(user)) or workers[-1]
+        ),
+    )
+
+    assert not await supervisor._reconcile_once()
+    assert store.schedule_reconciliations == 1
+    assert not workers
+
+    assert await supervisor._reconcile_once()
+    assert store.schedule_reconciliations == 2
+    assert len(workers) == 2
+    assert all(worker.alive for worker in workers)
+
+
+def test_schedule_reconciliation_timeout_does_not_stop_supervisor() -> None:
+    asyncio.run(_schedule_reconciliation_timeout_test())
+
+
+async def _schedule_reconciliation_timeout_test() -> None:
+    store = ScheduleTrackingStore()
+
+    async def timeout_once() -> ChatScheduleReconcile:
+        store.schedule_reconciliations += 1
+        raise TimeoutError
+
+    store.reconcile_chat_schedules = timeout_once  # type: ignore[method-assign]
+    supervisor = ZulipThreadSupervisor(
+        store,  # type: ignore[arg-type]
+        asyncio.get_running_loop(),
+        Settings(database_dsn="postgresql:///test"),
+        worker_factory=lambda user, gate: FakeWorker(user),  # type: ignore[arg-type]
+    )
+
+    assert not await supervisor._reconcile_once()
     assert store.schedule_reconciliations == 1
 
 

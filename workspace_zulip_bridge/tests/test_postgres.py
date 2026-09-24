@@ -5366,6 +5366,76 @@ def test_scheduler_uses_completed_catalogs_while_another_account_is_filling() ->
     asyncio.run(_scheduler_incomplete_catalog_round_trip(_dsn()))
 
 
+def test_scheduler_does_not_deadlock_with_concurrent_reconcile_request() -> None:
+    asyncio.run(_scheduler_concurrent_request_round_trip(_dsn()))
+
+
+async def _scheduler_concurrent_request_round_trip(dsn: str) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            owner_uuid = await _insert_user(
+                connection, 10, 100, queue_id="queue-owner", status="filling"
+            )
+        assert (
+            await store.store_chat_catalog(
+                owner_uuid, "queue-owner", _catalog(10, [(7, "Shared")], {})
+            )
+        ).activated
+        assert (await store.reconcile_chat_schedules()).assigned == 1
+        stream_uuid = stable_chat_uuid(ENDPOINT, "channel:7")
+        await pool.execute(
+            "UPDATE workspace_zulip_bridge.zulip_users "
+            "SET disabled = true WHERE uuid = $1",
+            owner_uuid,
+        )
+        await pool.execute(
+            "UPDATE workspace_zulip_bridge.zulip_schedule_reconcile_state "
+            "SET requested_generation = requested_generation + 1 "
+            "WHERE singleton"
+        )
+
+        async with pool.acquire() as blocker, blocker.transaction():
+            await blocker.fetchval(
+                "SELECT 1 FROM workspace_zulip_bridge.zulip_streams "
+                "WHERE uuid = $1 FOR UPDATE",
+                stream_uuid,
+            )
+            reconcile = asyncio.create_task(store.reconcile_chat_schedules())
+            for _ in range(100):
+                waiting = await pool.fetchval(
+                    "SELECT EXISTS ("
+                    "SELECT 1 FROM pg_stat_activity "
+                    "WHERE datname = current_database() "
+                    "AND pid <> pg_backend_pid() "
+                    "AND wait_event_type = 'Lock' "
+                    "AND query LIKE '%WITH invalid AS MATERIALIZED%')"
+                )
+                if waiting:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                reconcile.cancel()
+                await asyncio.gather(reconcile, return_exceptions=True)
+                raise AssertionError("scheduler did not wait on the locked stream")
+
+            await asyncio.wait_for(
+                blocker.execute(
+                    "UPDATE workspace_zulip_bridge.zulip_schedule_reconcile_state "
+                    "SET requested_generation = requested_generation + 1 "
+                    "WHERE singleton"
+                ),
+                timeout=0.5,
+            )
+
+        result = await asyncio.wait_for(reconcile, timeout=2)
+        assert result.invalidated == 1
+        assert await store.chat_schedule_reconciliation_requested()
+    finally:
+        await pool.close()
+
+
 async def _scheduler_incomplete_catalog_round_trip(dsn: str) -> None:
     pool = await _pool(dsn)
     try:
@@ -5382,6 +5452,7 @@ async def _scheduler_incomplete_catalog_round_trip(dsn: str) -> None:
                 ready_uuid, "queue-ready", _catalog(10, [(7, "Shared")], {})
             )
         ).activated
+        assert await store.chat_schedule_reconciliation_requested()
         stream_uuid = stable_chat_uuid(ENDPOINT, "channel:7")
         user_uuid = stable_user_uuid(ENDPOINT, 10)
         topic_uuid = stable_topic_uuid(stream_uuid, "General")
@@ -5421,6 +5492,10 @@ async def _scheduler_incomplete_catalog_round_trip(dsn: str) -> None:
 
         reconciled = await store.reconcile_chat_schedules()
         assert reconciled.assigned == 1
+        assert await store.chat_schedule_reconciliation_requested()
+        settled = await store.reconcile_chat_schedules()
+        assert (settled.invalidated, settled.assigned) == (0, 0)
+        assert not await store.chat_schedule_reconciliation_requested()
         assert (
             await pool.fetchval(
                 "SELECT source_connection_uuid "
@@ -6771,20 +6846,26 @@ async def _event_processor_defers_stale_supplier(dsn: str) -> None:
             Settings.from_env(
                 {
                     "WZB_DATABASE_DSN": dsn,
-                    "WZB_EVENT_PROCESSOR_RETRY_BASE_SECONDS": "0.001",
-                    "WZB_EVENT_PROCESSOR_RETRY_CAP_SECONDS": "0.001",
+                    "WZB_EVENT_PROCESSOR_RETRY_BASE_SECONDS": "2",
+                    "WZB_EVENT_PROCESSOR_RETRY_CAP_SECONDS": "30",
                 }
             ),
         )
         first = await processor.process_once()
         assert (first.claimed, first.applied, first.retried) == (2, 1, 1)
         pending = await pool.fetchrow(
-            "SELECT processing_status, outcome_reason "
+            "SELECT processing_status, outcome_reason, attempt_count, "
+            "EXTRACT(EPOCH FROM (available_at - clock_timestamp())) "
+            "AS retry_seconds "
             "FROM workspace_zulip_bridge.zulip_events "
             "WHERE zulip_connection_uuid = $1 AND event_type = 'message'",
             member_uuid,
         )
-        assert tuple(pending) == ("pending", "chat_rescheduling")
+        assert pending is not None
+        assert pending["processing_status"] == "pending"
+        assert pending["outcome_reason"] == "chat_rescheduling"
+        assert pending["attempt_count"] == 1
+        assert 0.5 <= float(pending["retry_seconds"]) <= 2.1
         assert not await pool.fetchval(
             "SELECT EXISTS (SELECT 1 "
             "FROM workspace_zulip_bridge.zulip_messages "
@@ -6800,6 +6881,12 @@ async def _event_processor_defers_stale_supplier(dsn: str) -> None:
         ).activated
         schedule = await store.reconcile_chat_schedules()
         assert schedule.assigned == 1
+        await pool.execute(
+            "UPDATE workspace_zulip_bridge.zulip_events "
+            "SET available_at = clock_timestamp() "
+            "WHERE zulip_connection_uuid = $1 AND event_type = 'message'",
+            member_uuid,
+        )
         assert (
             await pool.fetchval(
                 "SELECT source_connection_uuid "
@@ -6813,7 +6900,6 @@ async def _event_processor_defers_stale_supplier(dsn: str) -> None:
             "SET history_loaded_at = clock_timestamp() "
             "WHERE chat_key = 'channel:7'"
         )
-        await asyncio.sleep(0.01)
         second = await processor.process_once()
         assert (second.claimed, second.applied, second.retried) == (1, 1, 0)
         assert await pool.fetchval(
@@ -6827,6 +6913,106 @@ async def _event_processor_defers_stale_supplier(dsn: str) -> None:
 
 def test_event_processor_dependency_deferrals_do_not_block_later_events() -> None:
     asyncio.run(_event_processor_dependency_deferrals_do_not_block_later_events(_dsn()))
+
+
+def test_backlog_dependency_deferrals_use_slow_retry_cap() -> None:
+    asyncio.run(_backlog_dependency_deferrals_use_slow_retry_cap(_dsn()))
+
+
+async def _backlog_dependency_deferrals_use_slow_retry_cap(dsn: str) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            owner_uuid = await _insert_user(
+                connection, 10, 100, queue_id="queue-owner", status="active"
+            )
+        assert await store.store_events(
+            owner_uuid,
+            "queue-owner",
+            (
+                ZulipEvent(
+                    event_id=1,
+                    event_type="update_message",
+                    payload_json=json.dumps(
+                        {"id": 1, "type": "update_message", "message_id": 999999}
+                    ),
+                ),
+            ),
+            1,
+        ) == (1, True)
+        await pool.execute(
+            "UPDATE workspace_zulip_bridge.zulip_events "
+            "SET created_at = clock_timestamp() - interval '10 minutes', "
+            "attempt_count = 16"
+        )
+        processor = ZulipEventProcessor(
+            pool,
+            store,
+            Settings.from_env(
+                {
+                    "WZB_DATABASE_DSN": dsn,
+                    "WZB_EVENT_PROCESSOR_BATCH_SIZE": "1",
+                    "WZB_EVENT_PROCESSOR_RETRY_BASE_SECONDS": "0.001",
+                    "WZB_EVENT_PROCESSOR_RETRY_CAP_SECONDS": "0.01",
+                    "WZB_EVENT_PROCESSOR_BACKLOG_RETRY_CAP_SECONDS": "0.5",
+                }
+            ),
+            claim_scope="backlog",
+        )
+
+        result = await processor.process_once()
+
+        assert (result.claimed, result.retried) == (1, 1)
+        retry_delay = await pool.fetchval(
+            "SELECT extract(epoch FROM available_at - clock_timestamp()) "
+            "FROM workspace_zulip_bridge.zulip_events"
+        )
+        assert float(retry_delay) > 0.35
+    finally:
+        await pool.close()
+
+
+def test_prepare_database_backfills_zulip_event_queue_registry() -> None:
+    asyncio.run(_prepare_database_backfills_zulip_event_queue_registry(_dsn()))
+
+
+async def _prepare_database_backfills_zulip_event_queue_registry(dsn: str) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            user_uuid = await _insert_user(
+                connection, 10, 100, queue_id="queue-owner", status="active"
+            )
+        assert await store.store_events(
+            user_uuid,
+            "queue-owner",
+            (
+                ZulipEvent(
+                    event_id=1,
+                    event_type="heartbeat",
+                    payload_json=json.dumps({"id": 1, "type": "heartbeat"}),
+                ),
+            ),
+            1,
+        ) == (1, True)
+        await pool.execute("DELETE FROM workspace_zulip_bridge.zulip_event_queues")
+        await pool.execute(
+            "DELETE FROM workspace_zulip_bridge.maintenance_migrations "
+            "WHERE name = '2026-09-24-zulip-event-queue-registry'"
+        )
+
+        await prepare_database(pool)
+
+        assert await pool.fetchval(
+            "SELECT EXISTS ("
+            "SELECT 1 FROM workspace_zulip_bridge.zulip_event_queues "
+            "WHERE zulip_connection_uuid = $1 AND queue_id = 'queue-owner')",
+            user_uuid,
+        )
+    finally:
+        await pool.close()
 
 
 async def _event_processor_dependency_deferrals_do_not_block_later_events(
@@ -6924,11 +7110,19 @@ def test_realtime_processor_does_not_overlap_an_inflight_backlog_queue() -> None
     asyncio.run(_realtime_processor_does_not_overlap_an_inflight_backlog_queue(_dsn()))
 
 
-def test_event_processor_recovers_expired_claims_on_startup() -> None:
-    asyncio.run(_event_processor_recovers_expired_claims_on_startup(_dsn()))
+def test_realtime_processors_claim_distinct_queues_concurrently() -> None:
+    asyncio.run(_realtime_processors_claim_distinct_queues_concurrently(_dsn()))
 
 
-async def _event_processor_recovers_expired_claims_on_startup(dsn: str) -> None:
+def test_realtime_processor_claims_oldest_recent_queue_first() -> None:
+    asyncio.run(_realtime_processor_claims_oldest_recent_queue_first(_dsn()))
+
+
+def test_event_processor_recovers_expired_claims_periodically() -> None:
+    asyncio.run(_event_processor_recovers_expired_claims_periodically(_dsn()))
+
+
+async def _event_processor_recovers_expired_claims_periodically(dsn: str) -> None:
     pool = await _pool(dsn)
     try:
         store = EventStore(pool)
@@ -6965,13 +7159,130 @@ async def _event_processor_recovers_expired_claims_on_startup(dsn: str) -> None:
             claim_scope="backlog",
         )
 
-        assert await processor._requeue_expired_claims() == 1
+        assert await processor._maybe_requeue_expired_claims() == 1
         row = await pool.fetchrow(
             "SELECT processing_status, claimed_at, outcome_reason "
             "FROM workspace_zulip_bridge.zulip_events"
         )
         assert row is not None
         assert tuple(row) == ("pending", None, "claim_expired")
+
+        await pool.execute(
+            "UPDATE workspace_zulip_bridge.zulip_events "
+            "SET processing_status = 'processing', "
+            "claimed_at = clock_timestamp() - interval '2 minutes', "
+            "outcome_reason = NULL"
+        )
+        assert await processor._maybe_requeue_expired_claims() == 0
+        processor._next_claim_recovery_at = 0.0
+        assert await processor._maybe_requeue_expired_claims() == 1
+        row = await pool.fetchrow(
+            "SELECT processing_status, claimed_at, outcome_reason "
+            "FROM workspace_zulip_bridge.zulip_events"
+        )
+        assert row is not None
+        assert tuple(row) == ("pending", None, "claim_expired")
+    finally:
+        await pool.close()
+
+
+async def _realtime_processors_claim_distinct_queues_concurrently(dsn: str) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            first_uuid = await _insert_user(
+                connection, 10, 100, queue_id="queue-first", status="active"
+            )
+            second_uuid = await _insert_user(
+                connection, 11, 100, queue_id="queue-second", status="active"
+            )
+        for user_uuid, queue_id in (
+            (first_uuid, "queue-first"),
+            (second_uuid, "queue-second"),
+        ):
+            assert await store.store_events(
+                user_uuid,
+                queue_id,
+                (
+                    ZulipEvent(
+                        event_id=1,
+                        event_type="heartbeat",
+                        payload_json=json.dumps({"id": 1, "type": "heartbeat"}),
+                    ),
+                ),
+                1,
+            ) == (1, True)
+        settings = Settings.from_env(
+            {
+                "WZB_DATABASE_DSN": dsn,
+                "WZB_EVENT_PROCESSOR_REALTIME_BATCH_SIZE": "1",
+            }
+        )
+        processors = [
+            ZulipEventProcessor(pool, store, settings, claim_scope="realtime")
+            for _ in range(2)
+        ]
+
+        claims = await asyncio.gather(
+            *(processor._claim_events() for processor in processors)
+        )
+
+        assert sorted(len(batch) for batch in claims) == [1, 1]
+        assert {batch[0].user_uuid for batch in claims} == {first_uuid, second_uuid}
+    finally:
+        await pool.close()
+
+
+async def _realtime_processor_claims_oldest_recent_queue_first(dsn: str) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            older_uuid = await _insert_user(
+                connection, 10, 100, queue_id="queue-older", status="active"
+            )
+            newer_uuid = await _insert_user(
+                connection, 11, 100, queue_id="queue-newer", status="active"
+            )
+        for user_uuid, queue_id in (
+            (older_uuid, "queue-older"),
+            (newer_uuid, "queue-newer"),
+        ):
+            assert await store.store_events(
+                user_uuid,
+                queue_id,
+                (
+                    ZulipEvent(
+                        event_id=1,
+                        event_type="heartbeat",
+                        payload_json=json.dumps({"id": 1, "type": "heartbeat"}),
+                    ),
+                ),
+                1,
+            ) == (1, True)
+        await pool.execute(
+            "UPDATE workspace_zulip_bridge.zulip_events "
+            "SET created_at = clock_timestamp() - interval '2 minutes' "
+            "WHERE zulip_connection_uuid = $1",
+            older_uuid,
+        )
+        processor = ZulipEventProcessor(
+            pool,
+            store,
+            Settings.from_env(
+                {
+                    "WZB_DATABASE_DSN": dsn,
+                    "WZB_EVENT_PROCESSOR_REALTIME_BATCH_SIZE": "1",
+                }
+            ),
+            claim_scope="realtime",
+        )
+
+        claims = await processor._claim_events()
+
+        assert len(claims) == 1
+        assert claims[0].user_uuid == older_uuid
     finally:
         await pool.close()
 

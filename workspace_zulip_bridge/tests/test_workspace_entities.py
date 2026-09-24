@@ -33,3 +33,24 @@ def test_workspace_stream_description_must_be_a_string(description: object) -> N
 
 def test_other_workspace_entities_do_not_gain_a_description_field() -> None:
     workspace_entities.validate_entity("messages", {})
+
+
+def test_workspace_stream_projection_bounds_derived_group_name() -> None:
+    original = {
+        "name": "x" * (workspace_entities.WORKSPACE_STREAM_NAME_MAX_LENGTH + 117),
+        "description": "description",
+    }
+
+    projected = workspace_entities.project_entity("streams", original)
+
+    assert (
+        projected["name"] == "x" * workspace_entities.WORKSPACE_STREAM_NAME_MAX_LENGTH
+    )
+    assert projected["description"] == "description"
+    assert original["name"] == "x" * 372
+
+
+def test_other_workspace_entity_projection_is_unchanged() -> None:
+    original = {"name": "x" * 300}
+
+    assert workspace_entities.project_entity("topics", original) == original

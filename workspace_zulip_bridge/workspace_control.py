@@ -25,6 +25,7 @@ from uuid import uuid5
 import asyncpg
 import httpx
 import pyhpke
+from asyncpg.pool import PoolConnectionProxy
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives import serialization
@@ -896,27 +897,33 @@ class WorkspaceControlWorker:
         }
 
     async def _disable_account(self, account_uuid: UUID) -> None:
-        await self._pool.execute(
-            """
-            UPDATE workspace_zulip_bridge.zulip_connections
-            SET sync_enabled = false, queue_id = NULL, last_event_id = NULL,
-                updated_at = clock_timestamp()
-            WHERE external_account_uuid = $1
-            """,
-            account_uuid,
-        )
+        async with self._pool.acquire() as connection, connection.transaction():
+            result = await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_connections
+                SET sync_enabled = false, queue_id = NULL, last_event_id = NULL,
+                    updated_at = clock_timestamp()
+                WHERE external_account_uuid = $1 AND sync_enabled
+                """,
+                account_uuid,
+            )
+            if result == "UPDATE 1":
+                await _request_chat_schedule_reconciliation(connection)
 
     async def _disable_absent_accounts(self, account_uuids: set[UUID]) -> None:
-        await self._pool.execute(
-            """
-            UPDATE workspace_zulip_bridge.zulip_connections
-            SET sync_enabled = false, queue_id = NULL, last_event_id = NULL,
-                updated_at = clock_timestamp()
-            WHERE external_account_uuid IS NOT NULL
-              AND NOT (external_account_uuid = ANY($1::uuid[]))
-            """,
-            list(account_uuids),
-        )
+        async with self._pool.acquire() as connection, connection.transaction():
+            result = await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_connections
+                SET sync_enabled = false, queue_id = NULL, last_event_id = NULL,
+                    updated_at = clock_timestamp()
+                WHERE external_account_uuid IS NOT NULL AND sync_enabled
+                  AND NOT (external_account_uuid = ANY($1::uuid[]))
+                """,
+                list(account_uuids),
+            )
+            if result != "UPDATE 0":
+                await _request_chat_schedule_reconciliation(connection)
 
     async def _heartbeat(self) -> None:
         now = asyncio.get_running_loop().time()
@@ -991,6 +998,22 @@ class WorkspaceControlWorker:
             return None
         value = self._cursor.read_text(encoding="ascii").strip()
         return value or None
+
+
+async def _request_chat_schedule_reconciliation(
+    connection: asyncpg.Connection | PoolConnectionProxy,
+) -> None:
+    await connection.execute(
+        """
+        INSERT INTO workspace_zulip_bridge.zulip_schedule_reconcile_state (
+            singleton, requested_generation, completed_generation, updated_at
+        ) VALUES (true, 1, 0, clock_timestamp())
+        ON CONFLICT (singleton) DO UPDATE
+        SET requested_generation =
+                zulip_schedule_reconcile_state.requested_generation + 1,
+            updated_at = clock_timestamp()
+        """
+    )
 
 
 def _utc_now() -> str:

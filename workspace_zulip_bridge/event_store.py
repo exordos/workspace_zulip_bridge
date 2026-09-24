@@ -251,6 +251,7 @@ class EventStore:
                 connection_uuid,
                 queue_id,
             )
+            await _request_chat_schedule_reconciliation(connection)
         return True
 
     async def has_pending_history(self, user_uuid: UUID, queue_id: str) -> bool:
@@ -279,8 +280,38 @@ class EventStore:
                 )
             )
 
+    async def chat_schedule_reconciliation_requested(self) -> bool:
+        async with self._pool.acquire() as connection:
+            return bool(
+                await connection.fetchval(
+                    """
+                    SELECT requested_generation > completed_generation
+                    FROM workspace_zulip_bridge.zulip_schedule_reconcile_state
+                    WHERE singleton
+                    """
+                )
+            )
+
     async def reconcile_chat_schedules(self) -> ChatScheduleReconcile:
         async with self._pool.acquire() as connection, connection.transaction():
+            await connection.fetchval(
+                """
+                SELECT pg_advisory_xact_lock(
+                    hashtextextended(
+                        'workspace_zulip_bridge:chat-schedule-reconcile', 0
+                    )
+                )
+                """
+            )
+            requested_generation = await connection.fetchval(
+                """
+                SELECT requested_generation
+                FROM workspace_zulip_bridge.zulip_schedule_reconcile_state
+                WHERE singleton
+                """
+            )
+            if requested_generation is None:
+                raise RuntimeError("chat schedule reconciliation state is missing")
             invalidated = await connection.fetchrow(
                 """
                 WITH invalid AS MATERIALIZED (
@@ -430,6 +461,7 @@ class EventStore:
                     RETURNING 1
                 )
                 SELECT (SELECT count(*) FROM updated) AS assigned_count,
+                       (SELECT count(*) FROM adopted) AS adopted_count,
                        0::bigint AS messages_deleted
                 """,
                 self.SCHEDULE_STREAM_BATCH_SIZE,
@@ -458,6 +490,25 @@ class EventStore:
                   AND connection.catalog_completed_at IS NOT NULL
                 """
             )
+            progressed = bool(
+                invalidated
+                and assigned
+                and (
+                    invalidated["invalidated_count"]
+                    or assigned["assigned_count"]
+                    or assigned["adopted_count"]
+                )
+            )
+            if not progressed:
+                await connection.execute(
+                    """
+                    UPDATE workspace_zulip_bridge.zulip_schedule_reconcile_state
+                    SET completed_generation = $1,
+                        updated_at = clock_timestamp()
+                    WHERE singleton
+                    """,
+                    requested_generation,
+                )
         if invalidated is None or assigned is None:
             raise RuntimeError("chat schedule reconciliation returned no row")
         return ChatScheduleReconcile(
@@ -530,6 +581,8 @@ class EventStore:
                 [user.avatar_url for user in users],
                 [_directory_user_profile_hash(user) for user in users],
             )
+            if row is not None and row["changed_count"]:
+                await _request_chat_schedule_reconciliation(connection)
         if row is None:
             raise RuntimeError("user directory query returned no row")
         return UserDirectoryWrite(
@@ -1326,7 +1379,7 @@ class EventStore:
 
     async def disable_unauthorized_connection(self, user_uuid: UUID) -> bool:
         """Remove a connection with rejected credentials from scheduling."""
-        async with self._pool.acquire() as connection:
+        async with self._pool.acquire() as connection, connection.transaction():
             result = await connection.execute(
                 """
                 UPDATE workspace_zulip_bridge.zulip_connections
@@ -1337,6 +1390,8 @@ class EventStore:
                 """,
                 user_uuid,
             )
+            if result == "UPDATE 1":
+                await _request_chat_schedule_reconciliation(connection)
         return result == "UPDATE 1"
 
     async def set_user_status(
@@ -1485,6 +1540,7 @@ class EventStore:
                     user_uuid,
                     queue_id,
                 )
+                await _request_chat_schedule_reconciliation(connection)
                 return ChatCatalogWrite(True, True, 0, 0, topic_changes)
             upserted, deleted = await _store_chats(
                 connection,
@@ -1516,6 +1572,7 @@ class EventStore:
                 queue_id,
                 catalog.content_hash,
             )
+            await _request_chat_schedule_reconciliation(connection)
         return ChatCatalogWrite(True, False, upserted, deleted, topic_changes)
 
     async def store_events(
@@ -1531,6 +1588,12 @@ class EventStore:
                 WITH active AS MATERIALIZED (
                     SELECT uuid FROM workspace_zulip_bridge.zulip_connections
                     WHERE uuid = $1 AND queue_id = $2 FOR UPDATE
+                ), registered_queue AS (
+                    INSERT INTO workspace_zulip_bridge.zulip_event_queues
+                        (zulip_connection_uuid, queue_id)
+                    SELECT active.uuid, $2 FROM active
+                    ON CONFLICT (zulip_connection_uuid, queue_id) DO NOTHING
+                    RETURNING 1
                 ), incoming AS (
                     SELECT event_id, event_type, payload::jsonb
                     FROM unnest($3::bigint[], $4::text[], $5::text[])
@@ -1539,7 +1602,9 @@ class EventStore:
                     INSERT INTO workspace_zulip_bridge.zulip_events
                         (zulip_connection_uuid, queue_id, event_id, event_type, payload)
                     SELECT active.uuid, $2, incoming.event_id, incoming.event_type,
-                           incoming.payload FROM incoming CROSS JOIN active
+                           incoming.payload
+                    FROM incoming CROSS JOIN active
+                    LEFT JOIN registered_queue ON true
                     ON CONFLICT (zulip_connection_uuid, queue_id, event_id) DO NOTHING
                     RETURNING 1
                 ), cursor_update AS (
@@ -2466,6 +2531,22 @@ def _topic_binding_hash(
             separators=(",", ":"),
         ).encode("utf-8")
     ).digest()
+
+
+async def _request_chat_schedule_reconciliation(
+    connection: asyncpg.Connection | PoolConnectionProxy,
+) -> None:
+    await connection.execute(
+        """
+        INSERT INTO workspace_zulip_bridge.zulip_schedule_reconcile_state (
+            singleton, requested_generation, completed_generation, updated_at
+        ) VALUES (true, 1, 0, clock_timestamp())
+        ON CONFLICT (singleton) DO UPDATE
+        SET requested_generation =
+                zulip_schedule_reconcile_state.requested_generation + 1,
+            updated_at = clock_timestamp()
+        """
+    )
 
 
 async def _store_user_topics(

@@ -217,19 +217,21 @@ deployment.
 | `WZB_ZULIP_IDLE_QUEUE_TIMEOUT_SECONDS` | `3600` | Requested queue lifetime |
 | `WZB_ZULIP_REGISTRATION_CONCURRENCY` | `8` | Concurrent queue registrations |
 | `WZB_ZULIP_MESSAGE_SCAN_CONCURRENCY` | `32` | Concurrent in-memory message pages across all user threads |
-| `WZB_ZULIP_HISTORY_CONCURRENCY` | `12` | Concurrent history sessions; must leave database-pool capacity free |
+| `WZB_ZULIP_HISTORY_CONCURRENCY` | `4` | Concurrent history sessions; bounded to preserve database capacity for realtime processing |
 | `WZB_ZULIP_QUEUE_GAP_RECONCILIATION_SECONDS` | `86400` | Recent-history window reconciled after a deleted or expired Zulip queue |
 | `WZB_ZULIP_DIRECTORY_CACHE_TTL_SECONDS` | `60` | Shared endpoint directory cache lifetime |
 | `WZB_ZULIP_CHAT_FILL_TIMEOUT_SECONDS` | `120` | Read timeout for a catalog API page |
-| `WZB_ZULIP_MESSAGE_PAGE_SIZE` | `5000` | Combined message-history page size |
+| `WZB_ZULIP_MESSAGE_PAGE_SIZE` | `2000` | Combined message-history page size; bounds each history write transaction |
 | `WZB_EVENT_PROCESSOR_BATCH_SIZE` | `128` | Maximum events claimed per processor pass |
 | `WZB_EVENT_PROCESSOR_REALTIME_BATCH_SIZE` | `16` | Maximum recent events claimed by the dedicated realtime processor |
+| `WZB_EVENT_PROCESSOR_REALTIME_WORKERS` | `4` | Concurrent realtime processors; queue claims remain mutually exclusive |
 | `WZB_EVENT_PROCESSOR_REALTIME_WINDOW_SECONDS` | `300` | Age window reserved for the realtime processor before events join backlog processing |
 | `WZB_EVENT_PROCESSOR_POLL_SECONDS` | `0.05` | Idle inbox polling interval |
 | `WZB_EVENT_PROCESSOR_CLAIM_TIMEOUT_SECONDS` | `60` | Stale processing-claim recovery threshold |
 | `WZB_EVENT_PROCESSOR_MAX_ATTEMPTS` | `8` | Attempts before a transient Zulip event failure becomes terminal |
 | `WZB_EVENT_PROCESSOR_RETRY_BASE_SECONDS` | `0.25` | Initial transient Zulip event retry delay |
 | `WZB_EVENT_PROCESSOR_RETRY_CAP_SECONDS` | `30` | Maximum transient Zulip event retry delay |
+| `WZB_EVENT_PROCESSOR_BACKLOG_RETRY_CAP_SECONDS` | `300` | Maximum retry delay for old dependency events; recent realtime events keep the shorter cap |
 | `WZB_EVENT_RETENTION_SECONDS` | `86400` | Terminal event retention from collection time |
 | `WZB_EVENT_CLEANUP_INTERVAL_SECONDS` | `300` | Interval between caught-up retention passes |
 | `WZB_EVENT_CLEANUP_BATCH_SIZE` | `10000` | Rows deleted per short retention transaction |

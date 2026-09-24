@@ -1,5 +1,10 @@
 CREATE SCHEMA IF NOT EXISTS workspace_zulip_bridge;
 
+CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.maintenance_migrations (
+    name text PRIMARY KEY,
+    completed_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
 CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_realms (
     uuid uuid PRIMARY KEY,
     identity_key text NOT NULL UNIQUE,
@@ -74,6 +79,26 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_connections (
 CREATE INDEX IF NOT EXISTS zulip_connections_active_idx
     ON workspace_zulip_bridge.zulip_connections (lifecycle_status, uuid)
     WHERE sync_enabled;
+
+CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_schedule_reconcile_state (
+    singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+    requested_generation bigint NOT NULL DEFAULT 1,
+    completed_generation bigint NOT NULL DEFAULT 0,
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    CHECK (completed_generation <= requested_generation)
+);
+
+INSERT INTO workspace_zulip_bridge.zulip_schedule_reconcile_state (singleton)
+VALUES (true)
+ON CONFLICT (singleton) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_event_queues (
+    zulip_connection_uuid uuid NOT NULL
+        REFERENCES workspace_zulip_bridge.zulip_connections (uuid) ON DELETE CASCADE,
+    queue_id text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (zulip_connection_uuid, queue_id)
+);
 
 CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_streams (
     uuid uuid PRIMARY KEY,
@@ -244,6 +269,10 @@ CREATE INDEX IF NOT EXISTS zulip_messages_updated_at_brin
 CREATE INDEX IF NOT EXISTS zulip_messages_sync_plan_idx
     ON workspace_zulip_bridge.zulip_messages
         (realm_uuid, source_updated_at, uuid);
+CREATE INDEX IF NOT EXISTS zulip_messages_missing_topic_idx
+    ON workspace_zulip_bridge.zulip_messages
+        (realm_uuid, zulip_stream_uuid, uuid)
+    WHERE topic_uuid IS NULL;
 
 CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_entity_links (
     realm_uuid uuid NOT NULL
@@ -287,6 +316,9 @@ CREATE INDEX IF NOT EXISTS zulip_message_flags_unread_user_idx
 CREATE INDEX IF NOT EXISTS zulip_message_flags_sync_plan_idx
     ON workspace_zulip_bridge.zulip_message_flags
         (realm_uuid, updated_at, uuid);
+CREATE INDEX IF NOT EXISTS zulip_message_flags_history_cleanup_idx
+    ON workspace_zulip_bridge.zulip_message_flags
+        (zulip_user_uuid, zulip_stream_uuid, updated_at, message_uuid);
 
 CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_message_reactions (
     uuid uuid PRIMARY KEY,
@@ -366,8 +398,28 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_events (
 CREATE INDEX IF NOT EXISTS zulip_events_pending_idx
     ON workspace_zulip_bridge.zulip_events (available_at, created_at, uuid)
     WHERE processing_status = 'pending';
+CREATE INDEX IF NOT EXISTS zulip_events_pending_queue_scope_idx
+    ON workspace_zulip_bridge.zulip_events (
+        zulip_connection_uuid, queue_id, created_at, event_id
+    ) INCLUDE (uuid, available_at, outcome_reason)
+    WHERE processing_status = 'pending';
+CREATE INDEX IF NOT EXISTS zulip_events_pending_queue_idx
+    ON workspace_zulip_bridge.zulip_events (
+        zulip_connection_uuid, queue_id, event_id
+    ) INCLUDE (uuid, available_at, created_at, outcome_reason)
+    WHERE processing_status = 'pending';
+CREATE INDEX IF NOT EXISTS zulip_events_pending_queue_schedule_idx
+    ON workspace_zulip_bridge.zulip_events (
+        zulip_connection_uuid, queue_id, available_at, event_id
+    ) INCLUDE (uuid, created_at, outcome_reason)
+    WHERE processing_status = 'pending';
 CREATE INDEX IF NOT EXISTS zulip_events_processing_idx
     ON workspace_zulip_bridge.zulip_events (claimed_at, uuid)
+    WHERE processing_status = 'processing';
+CREATE INDEX IF NOT EXISTS zulip_events_processing_queue_idx
+    ON workspace_zulip_bridge.zulip_events (
+        zulip_connection_uuid, queue_id, event_id
+    )
     WHERE processing_status = 'processing';
 CREATE INDEX IF NOT EXISTS zulip_events_terminal_retention_idx
     ON workspace_zulip_bridge.zulip_events (created_at, uuid)
@@ -565,14 +617,18 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.sync_diffs (
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (provider_uuid, entity_type, entity_uuid)
 );
-CREATE INDEX IF NOT EXISTS sync_diffs_pending_idx
+CREATE INDEX IF NOT EXISTS sync_diffs_live_delivery_pending_idx
     ON workspace_zulip_bridge.sync_diffs
-        (available_at, entity_type, source_updated_at, entity_uuid)
-    WHERE processing_status IN ('pending', 'failed');
-CREATE INDEX IF NOT EXISTS sync_diffs_live_pending_idx
-    ON workspace_zulip_bridge.sync_diffs
-        (delivery_priority, available_at, entity_type, source_updated_at, entity_uuid)
-    WHERE processing_status IN ('pending', 'failed');
+        (provider_uuid,
+         (CASE entity_type
+            WHEN 'users' THEN 0 WHEN 'streams' THEN 1
+            WHEN 'stream_bindings' THEN 2 WHEN 'topics' THEN 3
+            WHEN 'topic_bindings' THEN 4 WHEN 'messages' THEN 5
+            WHEN 'message_flags' THEN 6 ELSE 7
+         END),
+         source_updated_at, entity_uuid)
+    WHERE processing_status IN ('pending', 'failed')
+      AND delivery_priority = 0;
 CREATE INDEX IF NOT EXISTS sync_diffs_processing_idx
     ON workspace_zulip_bridge.sync_diffs (claimed_at, entity_uuid)
     WHERE processing_status = 'processing';
@@ -621,6 +677,18 @@ CREATE INDEX IF NOT EXISTS sync_diffs_content_partition_1_pending_idx
                   >> 1) % 2 + 2
           ) % 2
       ) = 1;
+-- Reactions have a dedicated unpartitioned drainer.  Its partition_count=1
+-- predicate cannot use the two content-partition indexes above, so keep the
+-- small remaining reaction backlog separate from applied reaction history.
+CREATE INDEX IF NOT EXISTS sync_diffs_reactions_pending_idx
+    ON workspace_zulip_bridge.sync_diffs (
+        provider_uuid,
+        delivery_priority,
+        source_updated_at,
+        entity_uuid
+    ) INCLUDE (available_at)
+    WHERE processing_status IN ('pending', 'failed')
+      AND entity_type = 'message_reactions';
 CREATE INDEX IF NOT EXISTS sync_diffs_unpartitioned_pending_idx
     ON workspace_zulip_bridge.sync_diffs (
         provider_uuid,

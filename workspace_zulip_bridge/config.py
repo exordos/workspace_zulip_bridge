@@ -56,19 +56,23 @@ class Settings:
     zulip_idle_queue_timeout_seconds: int = 3600
     zulip_registration_concurrency: int = 8
     zulip_message_scan_concurrency: int = 32
-    zulip_history_concurrency: int = 12
+    # Keep history writes below the pool and storage saturation point so the
+    # dedicated realtime processors always have room to make progress.
+    zulip_history_concurrency: int = 4
     zulip_queue_gap_reconciliation_seconds: float = 86400.0
     zulip_directory_cache_ttl_seconds: float = 60.0
     zulip_chat_fill_timeout_seconds: float = 120.0
-    zulip_message_page_size: int = 5000
+    zulip_message_page_size: int = 2000
     event_processor_batch_size: int = 128
     event_processor_realtime_batch_size: int = 16
+    event_processor_realtime_workers: int = 4
     event_processor_realtime_window_seconds: float = 300.0
     event_processor_poll_seconds: float = 0.05
     event_processor_claim_timeout_seconds: float = 60.0
     event_processor_max_attempts: int = 8
     event_processor_retry_base_seconds: float = 0.25
     event_processor_retry_cap_seconds: float = 30.0
+    event_processor_backlog_retry_cap_seconds: float = 300.0
     event_retention_seconds: float = 86400.0
     event_cleanup_interval_seconds: float = 300.0
     event_cleanup_batch_size: int = 10000
@@ -168,7 +172,7 @@ class Settings:
                 source, "WZB_ZULIP_MESSAGE_SCAN_CONCURRENCY", 32
             ),
             zulip_history_concurrency=_read_int(
-                source, "WZB_ZULIP_HISTORY_CONCURRENCY", 12
+                source, "WZB_ZULIP_HISTORY_CONCURRENCY", 4
             ),
             zulip_queue_gap_reconciliation_seconds=_read_float(
                 source,
@@ -182,13 +186,16 @@ class Settings:
                 source, "WZB_ZULIP_CHAT_FILL_TIMEOUT_SECONDS", 120.0
             ),
             zulip_message_page_size=_read_int(
-                source, "WZB_ZULIP_MESSAGE_PAGE_SIZE", 5000
+                source, "WZB_ZULIP_MESSAGE_PAGE_SIZE", 2000
             ),
             event_processor_batch_size=_read_int(
                 source, "WZB_EVENT_PROCESSOR_BATCH_SIZE", 128
             ),
             event_processor_realtime_batch_size=_read_int(
                 source, "WZB_EVENT_PROCESSOR_REALTIME_BATCH_SIZE", 16
+            ),
+            event_processor_realtime_workers=_read_int(
+                source, "WZB_EVENT_PROCESSOR_REALTIME_WORKERS", 4
             ),
             event_processor_realtime_window_seconds=_read_float(
                 source, "WZB_EVENT_PROCESSOR_REALTIME_WINDOW_SECONDS", 300.0
@@ -207,6 +214,9 @@ class Settings:
             ),
             event_processor_retry_cap_seconds=_read_float(
                 source, "WZB_EVENT_PROCESSOR_RETRY_CAP_SECONDS", 30.0
+            ),
+            event_processor_backlog_retry_cap_seconds=_read_float(
+                source, "WZB_EVENT_PROCESSOR_BACKLOG_RETRY_CAP_SECONDS", 300.0
             ),
             event_retention_seconds=_read_float(
                 source, "WZB_EVENT_RETENTION_SECONDS", 86400.0
@@ -357,6 +367,9 @@ class Settings:
             "WZB_EVENT_PROCESSOR_RETRY_CAP_SECONDS": (
                 self.event_processor_retry_cap_seconds
             ),
+            "WZB_EVENT_PROCESSOR_BACKLOG_RETRY_CAP_SECONDS": (
+                self.event_processor_backlog_retry_cap_seconds
+            ),
             "WZB_EVENT_RETENTION_SECONDS": self.event_retention_seconds,
             "WZB_EVENT_CLEANUP_INTERVAL_SECONDS": (self.event_cleanup_interval_seconds),
             "WZB_WORKSPACE_EVENT_FLUSH_SECONDS": self.workspace_event_flush_seconds,
@@ -408,10 +421,17 @@ class Settings:
             raise ValueError("WZB_ZULIP_MESSAGE_SCAN_CONCURRENCY must be positive")
         if self.zulip_history_concurrency < 1:
             raise ValueError("WZB_ZULIP_HISTORY_CONCURRENCY must be positive")
-        if self.zulip_history_concurrency >= self.db_pool_max_size:
+        realtime_pool_reserve = min(
+            self.event_processor_realtime_workers + 2,
+            max(1, self.db_pool_max_size // 2),
+        )
+        if (
+            self.zulip_history_concurrency + realtime_pool_reserve
+            > self.db_pool_max_size
+        ):
             raise ValueError(
-                "WZB_ZULIP_HISTORY_CONCURRENCY must be smaller than "
-                "WZB_DB_POOL_MAX_SIZE"
+                "WZB_ZULIP_HISTORY_CONCURRENCY must reserve database-pool "
+                "connections for realtime and general bridge work"
             )
         if not 1 <= self.zulip_message_page_size <= 5000:
             raise ValueError("WZB_ZULIP_MESSAGE_PAGE_SIZE must be between 1 and 5000")
@@ -422,6 +442,10 @@ class Settings:
         if not 1 <= self.event_processor_realtime_batch_size <= 10000:
             raise ValueError(
                 "WZB_EVENT_PROCESSOR_REALTIME_BATCH_SIZE must be between 1 and 10000"
+            )
+        if not 1 <= self.event_processor_realtime_workers <= 8:
+            raise ValueError(
+                "WZB_EVENT_PROCESSOR_REALTIME_WORKERS must be between 1 and 8"
             )
         if self.event_processor_realtime_window_seconds <= 0:
             raise ValueError(
@@ -435,6 +459,14 @@ class Settings:
         ):
             raise ValueError(
                 "WZB_EVENT_PROCESSOR_RETRY_CAP_SECONDS must be at least "
+                "WZB_EVENT_PROCESSOR_RETRY_BASE_SECONDS"
+            )
+        if (
+            self.event_processor_backlog_retry_cap_seconds
+            < self.event_processor_retry_base_seconds
+        ):
+            raise ValueError(
+                "WZB_EVENT_PROCESSOR_BACKLOG_RETRY_CAP_SECONDS must be at least "
                 "WZB_EVENT_PROCESSOR_RETRY_BASE_SECONDS"
             )
         if not 1 <= self.event_cleanup_batch_size <= 100000:

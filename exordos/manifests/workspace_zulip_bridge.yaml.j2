@@ -99,8 +99,12 @@ resources:
           WZB_DB_POOL_MAX_SIZE=16
           WZB_EVENT_PROCESSOR_BATCH_SIZE=128
           WZB_EVENT_PROCESSOR_REALTIME_BATCH_SIZE=16
+          WZB_EVENT_PROCESSOR_REALTIME_WORKERS=4
           WZB_EVENT_PROCESSOR_REALTIME_WINDOW_SECONDS=300
-          WZB_WORKSPACE_SYNC_WORKERS=8
+          WZB_EVENT_PROCESSOR_BACKLOG_RETRY_CAP_SECONDS=300
+          WZB_ZULIP_HISTORY_CONCURRENCY=4
+          WZB_ZULIP_MESSAGE_PAGE_SIZE=2000
+          WZB_WORKSPACE_SYNC_WORKERS=2
           WZB_ZULIP_CA_FILE=/var/lib/workspace_zulip_bridge/control/zulip-ca.pem
           WZB_WORKSPACE_WEBSOCKET_URL=ws://workspace-backend.{$workspace_zulip_bridge.imports.$core_local_domain:name}/api/workspace/v1/events/ws
           WZB_WORKSPACE_API_URL=http://workspace-backend.{$workspace_zulip_bridge.imports.$core_local_domain:name}/api/workspace/v1/messenger

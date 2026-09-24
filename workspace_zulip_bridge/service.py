@@ -64,12 +64,15 @@ class BridgeService:
                 self._settings,
                 claim_scope="backlog",
             )
-            realtime_event_processor = ZulipEventProcessor(
-                pool,
-                store,
-                self._settings,
-                claim_scope="realtime",
-            )
+            realtime_event_processors = [
+                ZulipEventProcessor(
+                    pool,
+                    store,
+                    self._settings,
+                    claim_scope="realtime",
+                )
+                for _ in range(self._settings.event_processor_realtime_workers)
+            ]
             probe_task = asyncio.create_task(
                 self._probe_loop(pool),
                 name="database-probe",
@@ -82,16 +85,19 @@ class BridgeService:
                 backlog_event_processor.run(),
                 name="zulip-event-processor-backlog",
             )
-            realtime_event_processor_task = asyncio.create_task(
-                realtime_event_processor.run(),
-                name="zulip-event-processor-realtime",
-            )
+            realtime_event_processor_tasks = [
+                asyncio.create_task(
+                    processor.run(),
+                    name=f"zulip-event-processor-realtime-{index}",
+                )
+                for index, processor in enumerate(realtime_event_processors)
+            ]
             stop_task = asyncio.create_task(stop.wait(), name="stop-signal")
             supervised_tasks = [
                 probe_task,
                 supervisor_task,
                 backlog_event_processor_task,
-                realtime_event_processor_task,
+                *realtime_event_processor_tasks,
                 stop_task,
             ]
             if self._settings.workspace_control_enabled:
@@ -154,14 +160,53 @@ class BridgeService:
                             )
                         )
                     ]
-                    workspace_realtime_drainer = WorkspaceDiffWorker(
+                    workspace_realtime_catalog_drainer = WorkspaceDiffWorker(
+                        pool,
+                        self._settings,
+                        plan_enabled=False,
+                        partition=0,
+                        partition_count=content_partition_count,
+                        scope="unpartitioned",
+                        delivery_priority=0,
+                        tokens=tokens,
+                    )
+                    workspace_realtime_message_drainers = [
+                        WorkspaceDiffWorker(
+                            pool,
+                            self._settings,
+                            plan_enabled=False,
+                            partition=partition,
+                            partition_count=content_partition_count,
+                            scope="partitioned",
+                            delivery_priority=0,
+                            entity_types=frozenset({"messages"}),
+                            tokens=tokens,
+                        )
+                        for partition in range(content_partition_count)
+                    ]
+                    workspace_realtime_flag_drainers = [
+                        WorkspaceDiffWorker(
+                            pool,
+                            self._settings,
+                            plan_enabled=False,
+                            partition=partition,
+                            partition_count=content_partition_count,
+                            scope="partitioned",
+                            delivery_priority=0,
+                            entity_types=frozenset({"message_flags"}),
+                            tokens=tokens,
+                        )
+                        for partition in range(content_partition_count)
+                    ]
+                    workspace_realtime_reaction_drainer = WorkspaceDiffWorker(
                         pool,
                         self._settings,
                         plan_enabled=False,
                         partition=0,
                         partition_count=1,
-                        scope="both",
+                        scope="partitioned",
                         delivery_priority=0,
+                        entity_types=frozenset({"message_reactions"}),
                         tokens=tokens,
                     )
                     workspace_reaction_drainer = WorkspaceDiffWorker(
@@ -217,11 +262,33 @@ class BridgeService:
                         )
                         for index, worker in enumerate(workspace_unpartitioned_drainers)
                     )
-                    supervised_tasks.append(
-                        asyncio.create_task(
-                            workspace_realtime_drainer.run(),
-                            name="workspace-diff-realtime",
+                    supervised_tasks.extend(
+                        (
+                            asyncio.create_task(
+                                workspace_realtime_catalog_drainer.run(),
+                                name="workspace-diff-realtime-catalog",
+                            ),
+                            asyncio.create_task(
+                                workspace_realtime_reaction_drainer.run(),
+                                name="workspace-diff-realtime-reactions",
+                            ),
                         )
+                    )
+                    supervised_tasks.extend(
+                        asyncio.create_task(
+                            worker.run(),
+                            name=f"workspace-diff-realtime-message-{index}",
+                        )
+                        for index, worker in enumerate(
+                            workspace_realtime_message_drainers
+                        )
+                    )
+                    supervised_tasks.extend(
+                        asyncio.create_task(
+                            worker.run(),
+                            name=f"workspace-diff-realtime-flag-{index}",
+                        )
+                        for index, worker in enumerate(workspace_realtime_flag_drainers)
                     )
             LOG.info("bridge daemon is ready")
             try:

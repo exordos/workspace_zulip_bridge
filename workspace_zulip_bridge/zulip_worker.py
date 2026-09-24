@@ -17,6 +17,7 @@ from typing import Any
 from typing import Protocol
 from uuid import UUID
 
+import asyncpg
 import httpx
 
 from workspace_zulip_bridge.chat_catalog import ChatCatalogBuilder
@@ -170,6 +171,8 @@ class ZulipEventThread(threading.Thread):
         self._allowed_chat_keys: set[str] = set()
         self._catalog_builder: ChatCatalogBuilder | None = None
         self._recent_private_conversations: tuple[RecentPrivateConversation, ...] = ()
+        self._complete_private_conversations: tuple[RecentPrivateConversation, ...] = ()
+        self._private_conversations_queue_id: str | None = None
         self._bootstrap_user_topics: tuple[ZulipUserTopic, ...] = ()
         self._bootstrap_user_presences: tuple[ZulipUserPresence, ...] = ()
         self._bootstrap_user_statuses: tuple[ZulipUserProfileStatus, ...] = ()
@@ -332,6 +335,8 @@ class ZulipEventThread(threading.Thread):
                 self._allowed_chat_keys.clear()
                 self._catalog_builder = None
                 self._recent_private_conversations = ()
+                self._complete_private_conversations = ()
+                self._private_conversations_queue_id = None
                 self._bootstrap_user_topics = ()
                 self._bootstrap_user_presences = ()
                 self._bootstrap_user_statuses = ()
@@ -550,8 +555,19 @@ class ZulipEventThread(threading.Thread):
             subscriptions,
             first_visible_message_ids=first_visible_message_ids,
         )
+        if self._private_conversations_queue_id != queue_id:
+            with self._message_scan_gate:
+                discovered_conversations = self._discover_private_conversations(
+                    client,
+                    identity.user_id,
+                )
+            self._complete_private_conversations = _merge_private_conversations(
+                self._recent_private_conversations,
+                discovered_conversations,
+            )
+            self._private_conversations_queue_id = queue_id
         direct_chats = builder.add_recent_direct_conversations(
-            self._recent_private_conversations,
+            self._complete_private_conversations,
             user_names={user.user_id: user.full_name for user in directory},
         )
         stream_ids_by_name: dict[str, int] = {}
@@ -621,6 +637,62 @@ class ZulipEventThread(threading.Thread):
             elapsed,
         )
         return True
+
+    def _discover_private_conversations(
+        self,
+        client: ZulipApiClient,
+        own_user_id: int,
+    ) -> tuple[RecentPrivateConversation, ...]:
+        """Enumerate every accessible DM thread before scheduling history."""
+        conversations: dict[tuple[int, ...], int] = {}
+        anchor: str | int = "newest"
+        include_anchor = True
+        while not self._stop_requested.is_set():
+            page = client.get_messages_page(
+                anchor,
+                include_anchor=include_anchor,
+                narrow=[{"operator": "is", "operand": "dm"}],
+            )
+            message_ids: list[int] = []
+            for message in page.messages:
+                message_id = message.get("id")
+                recipients = message.get("display_recipient")
+                if not isinstance(message_id, int) or not isinstance(recipients, list):
+                    continue
+                participant_ids: set[int] = set()
+                for recipient in recipients:
+                    if not isinstance(recipient, Mapping):
+                        continue
+                    participant_id = recipient.get("id")
+                    if isinstance(participant_id, int):
+                        participant_ids.add(participant_id)
+                if own_user_id not in participant_ids:
+                    continue
+                other_user_ids = tuple(sorted(participant_ids - {own_user_id}))
+                conversations[other_user_ids] = max(
+                    conversations.get(other_user_ids, 0),
+                    message_id,
+                )
+                message_ids.append(message_id)
+            if page.found_oldest:
+                break
+            if not message_ids:
+                raise ZulipApiError(
+                    "invalid_messages_pagination",
+                    retryable=True,
+                )
+            next_anchor = min(message_ids)
+            if isinstance(anchor, int) and next_anchor >= anchor:
+                raise ZulipApiError(
+                    "invalid_messages_pagination",
+                    retryable=True,
+                )
+            anchor = next_anchor
+            include_anchor = False
+        return tuple(
+            RecentPrivateConversation(user_ids, max_message_id)
+            for user_ids, max_message_id in sorted(conversations.items())
+        )
 
     def _load_scheduled_history(
         self,
@@ -935,6 +1007,23 @@ class ZulipEventThread(threading.Thread):
             LOG.debug("Zulip client close failed", exc_info=True)
 
 
+def _merge_private_conversations(
+    *groups: tuple[RecentPrivateConversation, ...],
+) -> tuple[RecentPrivateConversation, ...]:
+    merged: dict[tuple[int, ...], int] = {}
+    for conversations in groups:
+        for conversation in conversations:
+            user_ids = tuple(sorted(set(conversation.user_ids)))
+            merged[user_ids] = max(
+                merged.get(user_ids, 0),
+                conversation.max_message_id,
+            )
+    return tuple(
+        RecentPrivateConversation(user_ids, max_message_id)
+        for user_ids, max_message_id in sorted(merged.items())
+    )
+
+
 class ZulipThreadSupervisor:
     def __init__(
         self,
@@ -965,26 +1054,38 @@ class ZulipThreadSupervisor:
     async def run(self) -> None:
         try:
             while True:
-                await self.reconcile()
+                await self._reconcile_once()
                 await asyncio.sleep(self._settings.user_refresh_seconds)
         finally:
             await self._stop_workers([worker for _, worker in self._workers.values()])
             self._workers.clear()
 
-    async def reconcile(self) -> None:
-        await asyncio.to_thread(self._catalog_write_gate.acquire)
+    async def _reconcile_once(self) -> bool:
         try:
-            schedule = await self._store.reconcile_chat_schedules()
-        finally:
-            self._catalog_write_gate.release()
-        if schedule.invalidated or schedule.assigned or schedule.messages_deleted:
-            LOG.info(
-                "Zulip chat schedules reconciled invalidated=%s assigned=%s "
-                "messages_deleted=%s",
-                schedule.invalidated,
-                schedule.assigned,
-                schedule.messages_deleted,
+            await self.reconcile()
+        except (TimeoutError, asyncpg.PostgresError) as exc:
+            LOG.warning(
+                "Zulip supervisor reconciliation failed; retrying error=%s",
+                type(exc).__name__,
             )
+            return False
+        return True
+
+    async def reconcile(self) -> None:
+        if await self._store.chat_schedule_reconciliation_requested():
+            await asyncio.to_thread(self._catalog_write_gate.acquire)
+            try:
+                schedule = await self._store.reconcile_chat_schedules()
+            finally:
+                self._catalog_write_gate.release()
+            if schedule.invalidated or schedule.assigned or schedule.messages_deleted:
+                LOG.info(
+                    "Zulip chat schedules reconciled invalidated=%s assigned=%s "
+                    "messages_deleted=%s",
+                    schedule.invalidated,
+                    schedule.assigned,
+                    schedule.messages_deleted,
+                )
         users = {user.uuid: user for user in await self._store.list_users()}
         stale_ids = [
             user_uuid

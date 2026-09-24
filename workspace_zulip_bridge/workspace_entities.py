@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from typing import Any
 
 WORKSPACE_DESCRIPTION_MAX_LENGTH = 10_000
+WORKSPACE_STREAM_NAME_MAX_LENGTH = 255
 
 
 def validate_description(value: Any) -> str:
@@ -21,3 +22,10 @@ def validate_description(value: Any) -> str:
 def validate_entity(entity_type: str, data: Mapping[str, Any]) -> None:
     if entity_type == "streams":
         validate_description(data.get("description", ""))
+
+
+def project_entity(entity_type: str, data: Mapping[str, Any]) -> dict[str, Any]:
+    projected = dict(data)
+    if entity_type == "streams":
+        projected["name"] = str(projected["name"])[:WORKSPACE_STREAM_NAME_MAX_LENGTH]
+    return projected
