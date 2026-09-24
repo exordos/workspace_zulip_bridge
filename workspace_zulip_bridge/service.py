@@ -58,7 +58,18 @@ class BridgeService:
                 asyncio.get_running_loop(),
                 self._settings,
             )
-            event_processor = ZulipEventProcessor(pool, store, self._settings)
+            backlog_event_processor = ZulipEventProcessor(
+                pool,
+                store,
+                self._settings,
+                claim_scope="backlog",
+            )
+            realtime_event_processor = ZulipEventProcessor(
+                pool,
+                store,
+                self._settings,
+                claim_scope="realtime",
+            )
             probe_task = asyncio.create_task(
                 self._probe_loop(pool),
                 name="database-probe",
@@ -67,15 +78,20 @@ class BridgeService:
                 supervisor.run(),
                 name="zulip-thread-supervisor",
             )
-            event_processor_task = asyncio.create_task(
-                event_processor.run(),
-                name="zulip-event-processor",
+            backlog_event_processor_task = asyncio.create_task(
+                backlog_event_processor.run(),
+                name="zulip-event-processor-backlog",
+            )
+            realtime_event_processor_task = asyncio.create_task(
+                realtime_event_processor.run(),
+                name="zulip-event-processor-realtime",
             )
             stop_task = asyncio.create_task(stop.wait(), name="stop-signal")
             supervised_tasks = [
                 probe_task,
                 supervisor_task,
-                event_processor_task,
+                backlog_event_processor_task,
+                realtime_event_processor_task,
                 stop_task,
             ]
             if self._settings.workspace_control_enabled:

@@ -97,6 +97,9 @@ resources:
           WZB_DATABASE_DSN=postgresql:///workspace_zulip_bridge?host=/var/run/postgresql
           WZB_DB_POOL_MIN_SIZE=2
           WZB_DB_POOL_MAX_SIZE=16
+          WZB_EVENT_PROCESSOR_BATCH_SIZE=128
+          WZB_EVENT_PROCESSOR_REALTIME_BATCH_SIZE=16
+          WZB_EVENT_PROCESSOR_REALTIME_WINDOW_SECONDS=300
           WZB_WORKSPACE_SYNC_WORKERS=8
           WZB_ZULIP_CA_FILE=/var/lib/workspace_zulip_bridge/control/zulip-ca.pem
           WZB_WORKSPACE_WEBSOCKET_URL=ws://workspace-backend.{$workspace_zulip_bridge.imports.$core_local_domain:name}/api/workspace/v1/events/ws

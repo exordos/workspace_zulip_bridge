@@ -1357,7 +1357,11 @@ class EventStore:
     ) -> UserStatus | None:
         async with self._pool.acquire() as connection:
             value = await connection.fetchval(
-                "SELECT lifecycle_status FROM workspace_zulip_bridge.zulip_connections "
+                "SELECT CASE "
+                "WHEN catalog_completed_at IS NULL "
+                "AND lifecycle_status IN ('scheduling', 'backfilling', 'active') "
+                "THEN 'filling' ELSE lifecycle_status END "
+                "FROM workspace_zulip_bridge.zulip_connections "
                 "WHERE uuid = $1 AND queue_id = $2",
                 user_uuid,
                 queue_id,
@@ -2366,10 +2370,20 @@ class HistorySession:
                     ) AS pending
                 )
                 UPDATE workspace_zulip_bridge.zulip_connections AS connection
-                SET lifecycle_status = CASE WHEN remaining.pending
-                        THEN 'backfilling' ELSE 'active' END,
-                    reconcile_since = CASE WHEN remaining.pending
-                        THEN connection.reconcile_since ELSE NULL END
+                SET lifecycle_status = CASE
+                        WHEN connection.catalog_completed_at IS NULL
+                          OR connection.lifecycle_status = 'filling'
+                        THEN 'filling'
+                        WHEN remaining.pending THEN 'backfilling'
+                        ELSE 'active'
+                    END,
+                    reconcile_since = CASE
+                        WHEN connection.catalog_completed_at IS NULL
+                          OR connection.lifecycle_status = 'filling'
+                        THEN connection.reconcile_since
+                        WHEN remaining.pending THEN connection.reconcile_since
+                        ELSE NULL
+                    END
                 FROM remaining
                 WHERE connection.uuid = $1 AND connection.queue_id = $2
                 """,

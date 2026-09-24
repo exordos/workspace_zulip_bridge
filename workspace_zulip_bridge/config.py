@@ -61,7 +61,9 @@ class Settings:
     zulip_directory_cache_ttl_seconds: float = 60.0
     zulip_chat_fill_timeout_seconds: float = 120.0
     zulip_message_page_size: int = 5000
-    event_processor_batch_size: int = 1000
+    event_processor_batch_size: int = 128
+    event_processor_realtime_batch_size: int = 16
+    event_processor_realtime_window_seconds: float = 300.0
     event_processor_poll_seconds: float = 0.05
     event_processor_claim_timeout_seconds: float = 60.0
     event_processor_max_attempts: int = 8
@@ -183,7 +185,13 @@ class Settings:
                 source, "WZB_ZULIP_MESSAGE_PAGE_SIZE", 5000
             ),
             event_processor_batch_size=_read_int(
-                source, "WZB_EVENT_PROCESSOR_BATCH_SIZE", 1000
+                source, "WZB_EVENT_PROCESSOR_BATCH_SIZE", 128
+            ),
+            event_processor_realtime_batch_size=_read_int(
+                source, "WZB_EVENT_PROCESSOR_REALTIME_BATCH_SIZE", 16
+            ),
+            event_processor_realtime_window_seconds=_read_float(
+                source, "WZB_EVENT_PROCESSOR_REALTIME_WINDOW_SECONDS", 300.0
             ),
             event_processor_poll_seconds=_read_float(
                 source, "WZB_EVENT_PROCESSOR_POLL_SECONDS", 0.05
@@ -410,6 +418,14 @@ class Settings:
         if not 1 <= self.event_processor_batch_size <= 10000:
             raise ValueError(
                 "WZB_EVENT_PROCESSOR_BATCH_SIZE must be between 1 and 10000"
+            )
+        if not 1 <= self.event_processor_realtime_batch_size <= 10000:
+            raise ValueError(
+                "WZB_EVENT_PROCESSOR_REALTIME_BATCH_SIZE must be between 1 and 10000"
+            )
+        if self.event_processor_realtime_window_seconds <= 0:
+            raise ValueError(
+                "WZB_EVENT_PROCESSOR_REALTIME_WINDOW_SECONDS must be positive"
             )
         if self.event_processor_max_attempts < 1:
             raise ValueError("WZB_EVENT_PROCESSOR_MAX_ATTEMPTS must be positive")

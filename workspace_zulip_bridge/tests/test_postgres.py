@@ -6865,15 +6865,15 @@ async def _event_processor_dependency_deferrals_do_not_block_later_events(
                     "WZB_DATABASE_DSN": dsn,
                     "WZB_EVENT_PROCESSOR_BATCH_SIZE": "1",
                     "WZB_EVENT_PROCESSOR_MAX_ATTEMPTS": "2",
-                    "WZB_EVENT_PROCESSOR_RETRY_BASE_SECONDS": "0.001",
-                    "WZB_EVENT_PROCESSOR_RETRY_CAP_SECONDS": "0.001",
+                    "WZB_EVENT_PROCESSOR_RETRY_BASE_SECONDS": "0.05",
+                    "WZB_EVENT_PROCESSOR_RETRY_CAP_SECONDS": "0.05",
                 }
             ),
         )
         assert (await processor.process_once()).retried == 1
         second = await processor.process_once()
         assert (second.claimed, second.skipped) == (1, 1)
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(0.06)
         assert (await processor.process_once()).retried == 1
 
         rows = await pool.fetch(
@@ -6900,6 +6900,456 @@ async def _event_processor_dependency_deferrals_do_not_block_later_events(
                 "processed": True,
             },
         ]
+    finally:
+        await pool.close()
+
+
+def test_event_processor_retries_due_deferral_before_newer_events() -> None:
+    asyncio.run(_event_processor_retries_due_deferral_before_newer_events(_dsn()))
+
+
+def test_event_processor_bounds_each_queue_in_a_batch() -> None:
+    asyncio.run(_event_processor_bounds_each_queue_in_a_batch(_dsn()))
+
+
+def test_event_processor_reserves_capacity_for_live_queues() -> None:
+    asyncio.run(_event_processor_reserves_capacity_for_live_queues(_dsn()))
+
+
+def test_realtime_processor_bypasses_backlog_in_the_same_queue() -> None:
+    asyncio.run(_realtime_processor_bypasses_backlog_in_the_same_queue(_dsn()))
+
+
+def test_realtime_processor_does_not_overlap_an_inflight_backlog_queue() -> None:
+    asyncio.run(_realtime_processor_does_not_overlap_an_inflight_backlog_queue(_dsn()))
+
+
+def test_event_processor_recovers_expired_claims_on_startup() -> None:
+    asyncio.run(_event_processor_recovers_expired_claims_on_startup(_dsn()))
+
+
+async def _event_processor_recovers_expired_claims_on_startup(dsn: str) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            user_uuid = await _insert_user(
+                connection, 10, 100, queue_id="queue-owner", status="active"
+            )
+        assert await store.store_events(
+            user_uuid,
+            "queue-owner",
+            (
+                ZulipEvent(
+                    event_id=1,
+                    event_type="heartbeat",
+                    payload_json=json.dumps({"id": 1, "type": "heartbeat"}),
+                ),
+            ),
+            1,
+        ) == (1, True)
+        await pool.execute(
+            "UPDATE workspace_zulip_bridge.zulip_events "
+            "SET processing_status = 'processing', "
+            "claimed_at = clock_timestamp() - interval '2 minutes'"
+        )
+        processor = ZulipEventProcessor(
+            pool,
+            store,
+            Settings.from_env(
+                {
+                    "WZB_DATABASE_DSN": dsn,
+                    "WZB_EVENT_PROCESSOR_CLAIM_TIMEOUT_SECONDS": "60",
+                }
+            ),
+            claim_scope="backlog",
+        )
+
+        assert await processor._requeue_expired_claims() == 1
+        row = await pool.fetchrow(
+            "SELECT processing_status, claimed_at, outcome_reason "
+            "FROM workspace_zulip_bridge.zulip_events"
+        )
+        assert row is not None
+        assert tuple(row) == ("pending", None, "claim_expired")
+    finally:
+        await pool.close()
+
+
+async def _realtime_processor_does_not_overlap_an_inflight_backlog_queue(
+    dsn: str,
+) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            user_uuid = await _insert_user(
+                connection, 10, 100, queue_id="queue-owner", status="active"
+            )
+        assert await store.store_events(
+            user_uuid,
+            "queue-owner",
+            (
+                ZulipEvent(
+                    event_id=1,
+                    event_type="heartbeat",
+                    payload_json=json.dumps({"id": 1, "type": "heartbeat"}),
+                ),
+                ZulipEvent(
+                    event_id=2,
+                    event_type="heartbeat",
+                    payload_json=json.dumps({"id": 2, "type": "heartbeat"}),
+                ),
+            ),
+            2,
+        ) == (2, True)
+        await pool.execute(
+            "UPDATE workspace_zulip_bridge.zulip_events "
+            "SET created_at = clock_timestamp() - interval '10 minutes' "
+            "WHERE zulip_connection_uuid = $1 AND event_id = 1",
+            user_uuid,
+        )
+        settings = Settings.from_env(
+            {
+                "WZB_DATABASE_DSN": dsn,
+                "WZB_EVENT_PROCESSOR_BATCH_SIZE": "1",
+                "WZB_EVENT_PROCESSOR_REALTIME_BATCH_SIZE": "1",
+            }
+        )
+        backlog = ZulipEventProcessor(pool, store, settings, claim_scope="backlog")
+        realtime = ZulipEventProcessor(pool, store, settings, claim_scope="realtime")
+
+        assert len(await backlog._claim_events()) == 1
+        assert await realtime._claim_events() == []
+    finally:
+        await pool.close()
+
+
+async def _realtime_processor_bypasses_backlog_in_the_same_queue(dsn: str) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            user_uuid = await _insert_user(
+                connection, 10, 100, queue_id="queue-owner", status="active"
+            )
+        assert await store.store_events(
+            user_uuid,
+            "queue-owner",
+            (
+                ZulipEvent(
+                    event_id=1,
+                    event_type="heartbeat",
+                    payload_json=json.dumps({"id": 1, "type": "heartbeat"}),
+                ),
+                ZulipEvent(
+                    event_id=2,
+                    event_type="heartbeat",
+                    payload_json=json.dumps({"id": 2, "type": "heartbeat"}),
+                ),
+            ),
+            2,
+        ) == (2, True)
+        await pool.execute(
+            "UPDATE workspace_zulip_bridge.zulip_events "
+            "SET created_at = clock_timestamp() - interval '10 minutes' "
+            "WHERE zulip_connection_uuid = $1 AND event_id = 1",
+            user_uuid,
+        )
+        settings = Settings.from_env(
+            {
+                "WZB_DATABASE_DSN": dsn,
+                "WZB_EVENT_PROCESSOR_BATCH_SIZE": "1",
+                "WZB_EVENT_PROCESSOR_REALTIME_BATCH_SIZE": "1",
+                "WZB_EVENT_PROCESSOR_REALTIME_WINDOW_SECONDS": "300",
+            }
+        )
+
+        realtime = ZulipEventProcessor(pool, store, settings, claim_scope="realtime")
+        realtime_result = await realtime.process_once()
+        assert (realtime_result.claimed, realtime_result.skipped) == (1, 1)
+        assert [
+            tuple(row)
+            for row in await pool.fetch(
+                "SELECT event_id, processing_status "
+                "FROM workspace_zulip_bridge.zulip_events ORDER BY event_id"
+            )
+        ] == [(1, "pending"), (2, "skipped")]
+
+        backlog = ZulipEventProcessor(pool, store, settings, claim_scope="backlog")
+        backlog_result = await backlog.process_once()
+        assert (backlog_result.claimed, backlog_result.skipped) == (1, 1)
+        assert [
+            tuple(row)
+            for row in await pool.fetch(
+                "SELECT event_id, processing_status "
+                "FROM workspace_zulip_bridge.zulip_events ORDER BY event_id"
+            )
+        ] == [(1, "skipped"), (2, "skipped")]
+    finally:
+        await pool.close()
+
+
+async def _event_processor_reserves_capacity_for_live_queues(dsn: str) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            deferred_uuid = await _insert_user(
+                connection, 10, 100, queue_id="queue-deferred", status="active"
+            )
+            live_uuid = await _insert_user(
+                connection, 11, 100, queue_id="queue-live", status="active"
+            )
+        deferred_events = tuple(
+            ZulipEvent(
+                event_id=event_id,
+                event_type="update_message",
+                payload_json=json.dumps(
+                    {
+                        "id": event_id,
+                        "type": "update_message",
+                        "message_id": 900000 + event_id,
+                    }
+                ),
+            )
+            for event_id in range(1, 5)
+        )
+        assert await store.store_events(
+            deferred_uuid, "queue-deferred", deferred_events, 4
+        ) == (4, True)
+        await pool.execute(
+            "UPDATE workspace_zulip_bridge.zulip_events "
+            "SET outcome_reason = 'message_not_materialized', attempt_count = 1, "
+            "available_at = clock_timestamp() - interval '1 second' "
+            "WHERE zulip_connection_uuid = $1",
+            deferred_uuid,
+        )
+        assert await store.store_events(
+            live_uuid,
+            "queue-live",
+            (
+                ZulipEvent(
+                    event_id=1,
+                    event_type="heartbeat",
+                    payload_json=json.dumps({"id": 1, "type": "heartbeat"}),
+                ),
+            ),
+            1,
+        ) == (1, True)
+
+        processor = ZulipEventProcessor(
+            pool,
+            store,
+            Settings.from_env(
+                {
+                    "WZB_DATABASE_DSN": dsn,
+                    "WZB_EVENT_PROCESSOR_BATCH_SIZE": "4",
+                }
+            ),
+        )
+        processed = await processor.process_once()
+        assert (processed.claimed, processed.skipped, processed.retried) == (4, 1, 3)
+        assert (
+            await pool.fetchval(
+                "SELECT processing_status "
+                "FROM workspace_zulip_bridge.zulip_events "
+                "WHERE zulip_connection_uuid = $1 AND event_id = 1",
+                live_uuid,
+            )
+            == "skipped"
+        )
+    finally:
+        await pool.close()
+
+
+async def _event_processor_bounds_each_queue_in_a_batch(dsn: str) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            first_uuid = await _insert_user(
+                connection, 10, 100, queue_id="queue-first", status="active"
+            )
+            second_uuid = await _insert_user(
+                connection, 11, 100, queue_id="queue-second", status="active"
+            )
+        first_events = tuple(
+            ZulipEvent(
+                event_id=event_id,
+                event_type="heartbeat",
+                payload_json=json.dumps({"id": event_id, "type": "heartbeat"}),
+            )
+            for event_id in range(1, 130)
+        )
+        assert await store.store_events(
+            first_uuid, "queue-first", first_events, 129
+        ) == (129, True)
+        assert await store.store_events(
+            second_uuid,
+            "queue-second",
+            (
+                ZulipEvent(
+                    event_id=1,
+                    event_type="heartbeat",
+                    payload_json=json.dumps({"id": 1, "type": "heartbeat"}),
+                ),
+            ),
+            1,
+        ) == (1, True)
+
+        processor = ZulipEventProcessor(
+            pool,
+            store,
+            Settings.from_env(
+                {
+                    "WZB_DATABASE_DSN": dsn,
+                    "WZB_EVENT_PROCESSOR_BATCH_SIZE": "129",
+                }
+            ),
+        )
+        processed = await processor.process_once()
+        assert (processed.claimed, processed.skipped) == (9, 9)
+
+        rows = await pool.fetch(
+            "SELECT queue_id, processing_status, count(*) AS count "
+            "FROM workspace_zulip_bridge.zulip_events "
+            "GROUP BY queue_id, processing_status "
+            "ORDER BY queue_id, processing_status"
+        )
+        assert [dict(row) for row in rows] == [
+            {
+                "queue_id": "queue-first",
+                "processing_status": "pending",
+                "count": 121,
+            },
+            {
+                "queue_id": "queue-first",
+                "processing_status": "skipped",
+                "count": 8,
+            },
+            {
+                "queue_id": "queue-second",
+                "processing_status": "skipped",
+                "count": 1,
+            },
+        ]
+    finally:
+        await pool.close()
+
+
+async def _event_processor_retries_due_deferral_before_newer_events(
+    dsn: str,
+) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            owner_uuid = await _insert_user(
+                connection, 10, 100, queue_id="queue-owner", status="active"
+            )
+        deferred = {"id": 1, "type": "update_message", "message_id": 999999}
+        assert await store.store_events(
+            owner_uuid,
+            "queue-owner",
+            (
+                ZulipEvent(
+                    event_id=1,
+                    event_type="update_message",
+                    payload_json=json.dumps(deferred),
+                ),
+            ),
+            1,
+        ) == (1, True)
+        processor = ZulipEventProcessor(
+            pool,
+            store,
+            Settings.from_env(
+                {
+                    "WZB_DATABASE_DSN": dsn,
+                    "WZB_EVENT_PROCESSOR_BATCH_SIZE": "1",
+                    "WZB_EVENT_PROCESSOR_RETRY_BASE_SECONDS": "0.001",
+                    "WZB_EVENT_PROCESSOR_RETRY_CAP_SECONDS": "0.001",
+                }
+            ),
+        )
+        assert (await processor.process_once()).retried == 1
+        assert await store.store_events(
+            owner_uuid,
+            "queue-owner",
+            (
+                ZulipEvent(
+                    event_id=2,
+                    event_type="heartbeat",
+                    payload_json=json.dumps({"id": 2, "type": "heartbeat"}),
+                ),
+            ),
+            2,
+        ) == (1, True)
+
+        await asyncio.sleep(0.01)
+        retried = await processor.process_once()
+        assert (retried.claimed, retried.retried) == (1, 1)
+        rows = await pool.fetch(
+            "SELECT event_id, processing_status, attempt_count "
+            "FROM workspace_zulip_bridge.zulip_events ORDER BY event_id"
+        )
+        assert [dict(row) for row in rows] == [
+            {
+                "event_id": 1,
+                "processing_status": "pending",
+                "attempt_count": 2,
+            },
+            {
+                "event_id": 2,
+                "processing_status": "pending",
+                "attempt_count": 0,
+            },
+        ]
+    finally:
+        await pool.close()
+
+
+def test_history_finish_preserves_catalog_refresh() -> None:
+    asyncio.run(_history_finish_preserves_catalog_refresh(_dsn()))
+
+
+async def _history_finish_preserves_catalog_refresh(dsn: str) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            owner_uuid = await _insert_user(
+                connection, 10, 100, queue_id="queue-owner", status="filling"
+            )
+        assert (
+            await store.store_chat_catalog(
+                owner_uuid,
+                "queue-owner",
+                _catalog(10, [(7, "Shared")], {"channel:7": 0}),
+            )
+        ).activated
+        assert (await store.reconcile_chat_schedules()).assigned == 1
+
+        history = await store.begin_history(owner_uuid, "queue-owner")
+        try:
+            assert await store.request_catalog_refresh(owner_uuid, "queue-owner")
+            finished = await history.finish(["channel:7"])
+            assert finished.activated
+        finally:
+            await history.close()
+
+        row = await pool.fetchrow(
+            "SELECT lifecycle_status, catalog_completed_at "
+            "FROM workspace_zulip_bridge.zulip_connections WHERE uuid = $1",
+            owner_uuid,
+        )
+        assert row is not None
+        assert dict(row) == {
+            "lifecycle_status": "filling",
+            "catalog_completed_at": None,
+        }
+        assert await store.get_user_status(owner_uuid, "queue-owner") == "filling"
     finally:
         await pool.close()
 

@@ -10,6 +10,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import replace
 from typing import Any
+from typing import Literal
 from uuid import UUID
 
 import asyncpg
@@ -48,6 +49,10 @@ _DEPENDENCY_DEFERRAL_REASONS = frozenset(
         "message_not_materialized",
     }
 )
+# Preserve mutation batching without letting one recovered queue monopolize a pass.
+_EVENTS_PER_QUEUE_BATCH = 8
+_DEPENDENCY_RETRY_SHARE_DIVISOR = 4
+_ClaimScope = Literal["all", "backlog", "realtime"]
 _FLAG_FIELDS = {
     "read": "is_read",
     "starred": "is_starred",
@@ -153,29 +158,48 @@ class ZulipEventProcessor:
         pool: asyncpg.Pool,
         store: EventStore,
         settings: Settings,
+        *,
+        claim_scope: _ClaimScope = "all",
     ) -> None:
         self._pool = pool
         self._store = store
         self._settings = settings
+        self._claim_scope = claim_scope
+        self._batch_size = (
+            settings.event_processor_realtime_batch_size
+            if claim_scope == "realtime"
+            else settings.event_processor_batch_size
+        )
         self._next_cleanup_at = 0.0
         self._next_presence_expiry_at = 0.0
 
     async def run(self) -> None:
-        recovered = await self._requeue_preparation_deadlocks()
-        if recovered:
-            LOG.info(
-                "Recoverable Zulip event preparation failures requeued count=%s",
-                recovered,
-            )
+        if self._claim_scope != "realtime":
+            recovered_claims = await self._requeue_expired_claims()
+            if recovered_claims:
+                LOG.info(
+                    "Expired Zulip event claims requeued count=%s",
+                    recovered_claims,
+                )
+            recovered = await self._requeue_preparation_deadlocks()
+            if recovered:
+                LOG.info(
+                    "Recoverable Zulip event preparation failures requeued count=%s",
+                    recovered,
+                )
         while True:
-            deleted = await self._maybe_cleanup_expired_events()
-            expired_presences = await self._maybe_expire_user_presences()
+            deleted = 0
+            expired_presences = 0
+            if self._claim_scope != "realtime":
+                deleted = await self._maybe_cleanup_expired_events()
+                expired_presences = await self._maybe_expire_user_presences()
             stats = await self.process_once()
             if stats.claimed:
                 LOG.info(
-                    "Zulip event batch processed claimed=%s applied=%s skipped=%s "
+                    "Zulip event batch processed scope=%s claimed=%s applied=%s skipped=%s "
                     "failed=%s retried=%s message_changes=%s message_deletes=%s "
                     "chat_changes=%s elapsed_seconds=%.6f events_per_second=%.3f",
+                    self._claim_scope,
                     stats.claimed,
                     stats.applied,
                     stats.skipped,
@@ -213,6 +237,23 @@ class ZulipEventProcessor:
                       'preparation_error:DeadlockDetectedError'
                   )
             """
+        )
+        return int(result.rsplit(" ", 1)[-1])
+
+    async def _requeue_expired_claims(self) -> int:
+        result = await self._pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.zulip_events
+            SET processing_status = 'pending',
+                claimed_at = NULL,
+                outcome_reason = 'claim_expired'
+            WHERE processing_status = 'processing'
+              AND claimed_at < (
+                  clock_timestamp()
+                  - make_interval(secs => $1::double precision)
+              )
+            """,
+            self._settings.event_processor_claim_timeout_seconds,
         )
         return int(result.rsplit(" ", 1)[-1])
 
@@ -453,21 +494,9 @@ class ZulipEventProcessor:
         )
 
     async def _claim_events(self) -> list[_ClaimedEvent]:
+        if self._claim_scope == "all":
+            await self._requeue_expired_claims()
         async with self._pool.acquire() as connection, connection.transaction():
-            await connection.execute(
-                """
-                UPDATE workspace_zulip_bridge.zulip_events
-                SET processing_status = 'pending',
-                    claimed_at = NULL,
-                    outcome_reason = 'claim_expired'
-                WHERE processing_status = 'processing'
-                  AND claimed_at < (
-                      clock_timestamp()
-                      - make_interval(secs => $1::double precision)
-                  )
-                """,
-                self._settings.event_processor_claim_timeout_seconds,
-            )
             rows = await connection.fetch(
                 """
                 WITH queue_heads AS MATERIALIZED (
@@ -477,12 +506,36 @@ class ZulipEventProcessor:
                         event.zulip_connection_uuid,
                         event.queue_id,
                         event.processing_status,
-                        event.available_at
+                        event.available_at,
+                        event.created_at AS head_created_at,
+                        COALESCE(
+                            event.outcome_reason = ANY($2::text[]),
+                            false
+                        ) AS dependency_head
                     FROM workspace_zulip_bridge.zulip_events AS event
                     WHERE event.processing_status IN ('pending', 'processing')
+                      AND (
+                          event.processing_status = 'processing'
+                          OR $5::text = 'all'
+                          OR (
+                              $5::text = 'realtime'
+                              AND event.created_at >= (
+                                  clock_timestamp()
+                                  - make_interval(secs => $6::double precision)
+                              )
+                          )
+                          OR (
+                              $5::text = 'backlog'
+                              AND event.created_at < (
+                                  clock_timestamp()
+                                  - make_interval(secs => $6::double precision)
+                              )
+                          )
+                      )
                     ORDER BY event.zulip_connection_uuid, event.queue_id,
                              COALESCE(
-                                 event.outcome_reason = ANY($2::text[]),
+                                 event.outcome_reason = ANY($2::text[])
+                                 AND event.available_at > clock_timestamp(),
                                  false
                              ),
                              event.event_id
@@ -492,6 +545,24 @@ class ZulipEventProcessor:
                            min(event.event_id) AS first_blocking_event_id
                     FROM workspace_zulip_bridge.zulip_events AS event
                     WHERE event.processing_status IN ('pending', 'processing')
+                      AND (
+                          event.processing_status = 'processing'
+                          OR $5::text = 'all'
+                          OR (
+                              $5::text = 'realtime'
+                              AND event.created_at >= (
+                                  clock_timestamp()
+                                  - make_interval(secs => $6::double precision)
+                              )
+                          )
+                          OR (
+                              $5::text = 'backlog'
+                              AND event.created_at < (
+                                  clock_timestamp()
+                                  - make_interval(secs => $6::double precision)
+                              )
+                          )
+                      )
                       AND NOT COALESCE(
                           event.outcome_reason = ANY($2::text[]),
                           false
@@ -504,6 +575,8 @@ class ZulipEventProcessor:
                 ), claimable_queues AS MATERIALIZED (
                     SELECT head.zulip_connection_uuid,
                            head.queue_id,
+                           head.head_created_at,
+                           head.dependency_head,
                            blocker.first_blocking_event_id
                     FROM queue_heads AS head
                     LEFT JOIN queue_blockers AS blocker
@@ -519,8 +592,26 @@ class ZulipEventProcessor:
                               0
                           )
                       )
-                ), candidates AS MATERIALIZED (
-                    SELECT event.uuid
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM workspace_zulip_bridge.zulip_events AS inflight
+                          WHERE inflight.zulip_connection_uuid =
+                                head.zulip_connection_uuid
+                            AND inflight.queue_id = head.queue_id
+                            AND inflight.processing_status = 'processing'
+                      )
+                ), ranked_candidates AS MATERIALIZED (
+                    SELECT event.uuid,
+                           event.zulip_connection_uuid,
+                           event.queue_id,
+                           event.event_id,
+                           queue.head_created_at,
+                           queue.dependency_head,
+                           row_number() OVER (
+                               PARTITION BY event.zulip_connection_uuid,
+                                            event.queue_id
+                               ORDER BY event.event_id
+                           ) AS queue_position
                     FROM workspace_zulip_bridge.zulip_events AS event
                     JOIN claimable_queues AS queue
                       ON queue.zulip_connection_uuid =
@@ -529,19 +620,79 @@ class ZulipEventProcessor:
                     WHERE event.processing_status = 'pending'
                       AND event.available_at <= clock_timestamp()
                       AND (
+                          $5::text = 'all'
+                          OR (
+                              $5::text = 'realtime'
+                              AND event.created_at >= (
+                                  clock_timestamp()
+                                  - make_interval(secs => $6::double precision)
+                              )
+                          )
+                          OR (
+                              $5::text = 'backlog'
+                              AND event.created_at < (
+                                  clock_timestamp()
+                                  - make_interval(secs => $6::double precision)
+                              )
+                          )
+                      )
+                      AND (
                           queue.first_blocking_event_id IS NULL
                           OR event.event_id < queue.first_blocking_event_id
                       )
-                    ORDER BY COALESCE(
-                                 event.outcome_reason = ANY($2::text[]),
-                                 false
-                             ),
-                             event.created_at,
-                             event.zulip_connection_uuid,
-                             event.queue_id,
-                             event.event_id
+                ), prioritized_candidates AS MATERIALIZED (
+                    SELECT candidate.*,
+                           row_number() OVER (
+                               PARTITION BY candidate.dependency_head
+                               ORDER BY
+                                        CASE WHEN $5::text = 'realtime'
+                                             THEN candidate.head_created_at END DESC,
+                                        CASE WHEN $5::text <> 'realtime'
+                                             THEN candidate.head_created_at END,
+                                        candidate.zulip_connection_uuid,
+                                        candidate.queue_id,
+                                        candidate.event_id
+                           ) AS class_position
+                    FROM ranked_candidates AS candidate
+                    WHERE candidate.queue_position <= $3
+                ), candidates AS MATERIALIZED (
+                    SELECT event.uuid
+                    FROM prioritized_candidates AS candidate
+                    JOIN workspace_zulip_bridge.zulip_events AS event
+                      ON event.uuid = candidate.uuid
+                    ORDER BY CASE
+                                 WHEN NOT candidate.dependency_head
+                                  AND candidate.class_position <=
+                                      GREATEST(
+                                          1,
+                                          $1::integer - GREATEST(
+                                              1,
+                                              $1::integer / $4::integer
+                                          )
+                                      )
+                                 THEN 0
+                                 WHEN candidate.dependency_head
+                                  AND candidate.class_position <=
+                                      CASE
+                                          WHEN $1::integer > 1 THEN GREATEST(
+                                              1,
+                                              $1::integer / $4::integer
+                                          )
+                                          ELSE 0
+                                      END
+                                 THEN 0
+                                 ELSE 1
+                             END,
+                             candidate.dependency_head,
+                             CASE WHEN $5::text = 'realtime'
+                                  THEN candidate.head_created_at END DESC,
+                             CASE WHEN $5::text <> 'realtime'
+                                  THEN candidate.head_created_at END,
+                             candidate.zulip_connection_uuid,
+                             candidate.queue_id,
+                             candidate.event_id
                     LIMIT $1
-                    FOR UPDATE SKIP LOCKED
+                    FOR UPDATE OF event SKIP LOCKED
                 ),
                 claimed AS (
                     UPDATE workspace_zulip_bridge.zulip_events AS event
@@ -574,13 +725,16 @@ class ZulipEventProcessor:
                   ON zulip_user.uuid = connection.zulip_user_uuid
                 JOIN workspace_zulip_bridge.zulip_realms AS realm
                   ON realm.uuid = connection.realm_uuid
-                ORDER BY claimed.created_at,
-                         claimed.zulip_connection_uuid,
+                ORDER BY claimed.zulip_connection_uuid,
                          claimed.queue_id,
                          claimed.event_id
                 """,
-                self._settings.event_processor_batch_size,
+                self._batch_size,
                 list(_DEPENDENCY_DEFERRAL_REASONS),
+                _EVENTS_PER_QUEUE_BATCH,
+                _DEPENDENCY_RETRY_SHARE_DIVISOR,
+                self._claim_scope,
+                self._settings.event_processor_realtime_window_seconds,
             )
         events: list[_ClaimedEvent] = []
         for row in rows:

@@ -17,7 +17,9 @@ def test_defaults_use_local_postgresql_socket() -> None:
     assert settings.db_pool_max_size == 16
     assert settings.db_probe_seconds == 30.0
     assert settings.zulip_db_ack_timeout_seconds == 120.0
-    assert settings.event_processor_batch_size == 1000
+    assert settings.event_processor_batch_size == 128
+    assert settings.event_processor_realtime_batch_size == 16
+    assert settings.event_processor_realtime_window_seconds == 300.0
     assert settings.event_processor_poll_seconds == 0.05
     assert settings.event_processor_max_attempts == 8
     assert settings.event_processor_retry_base_seconds == 0.25
@@ -56,6 +58,8 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
             "WZB_ZULIP_CHAT_FILL_TIMEOUT_SECONDS": "240",
             "WZB_ZULIP_MESSAGE_PAGE_SIZE": "4000",
             "WZB_EVENT_PROCESSOR_BATCH_SIZE": "750",
+            "WZB_EVENT_PROCESSOR_REALTIME_BATCH_SIZE": "24",
+            "WZB_EVENT_PROCESSOR_REALTIME_WINDOW_SECONDS": "180",
             "WZB_EVENT_PROCESSOR_POLL_SECONDS": "0.1",
             "WZB_EVENT_PROCESSOR_CLAIM_TIMEOUT_SECONDS": "30",
             "WZB_EVENT_PROCESSOR_MAX_ATTEMPTS": "5",
@@ -95,6 +99,8 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
     assert settings.zulip_chat_fill_timeout_seconds == 240
     assert settings.zulip_message_page_size == 4000
     assert settings.event_processor_batch_size == 750
+    assert settings.event_processor_realtime_batch_size == 24
+    assert settings.event_processor_realtime_window_seconds == 180.0
     assert settings.event_processor_poll_seconds == 0.1
     assert settings.event_processor_claim_timeout_seconds == 30
     assert settings.event_processor_max_attempts == 5
@@ -131,6 +137,9 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
         ("WZB_ZULIP_MESSAGE_PAGE_SIZE", "5001"),
         ("WZB_EVENT_PROCESSOR_BATCH_SIZE", "0"),
         ("WZB_EVENT_PROCESSOR_BATCH_SIZE", "10001"),
+        ("WZB_EVENT_PROCESSOR_REALTIME_BATCH_SIZE", "0"),
+        ("WZB_EVENT_PROCESSOR_REALTIME_BATCH_SIZE", "10001"),
+        ("WZB_EVENT_PROCESSOR_REALTIME_WINDOW_SECONDS", "0"),
         ("WZB_EVENT_PROCESSOR_POLL_SECONDS", "0"),
         ("WZB_ZULIP_QUEUE_GAP_RECONCILIATION_SECONDS", "0"),
         ("WZB_WORKSPACE_DEPENDENCY_RETRY_BASE_SECONDS", "0"),

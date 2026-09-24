@@ -42,11 +42,19 @@ class FakeSupervisor:
 class FakeEventProcessor:
     calls: list[str]
 
-    def __init__(self, pool: object, store: object, settings: Settings) -> None:
-        self.calls.append("event-processor-init")
+    def __init__(
+        self,
+        pool: object,
+        store: object,
+        settings: Settings,
+        *,
+        claim_scope: str = "all",
+    ) -> None:
+        self.claim_scope = claim_scope
+        self.calls.append(f"event-processor-init-{claim_scope}")
 
     async def run(self) -> None:
-        self.calls.append("event-processor-run")
+        self.calls.append(f"event-processor-run-{self.claim_scope}")
         await asyncio.Future()
 
 
@@ -544,9 +552,11 @@ async def _run_daemon_lifecycle_test(monkeypatch: object) -> None:
         "prepare",
         "probe",
         "supervisor-init",
-        "event-processor-init",
+        "event-processor-init-backlog",
+        "event-processor-init-realtime",
         "supervisor-run",
-        "event-processor-run",
+        "event-processor-run-backlog",
+        "event-processor-run-realtime",
     ]
     assert pool.closed
 

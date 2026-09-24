@@ -222,7 +222,9 @@ deployment.
 | `WZB_ZULIP_DIRECTORY_CACHE_TTL_SECONDS` | `60` | Shared endpoint directory cache lifetime |
 | `WZB_ZULIP_CHAT_FILL_TIMEOUT_SECONDS` | `120` | Read timeout for a catalog API page |
 | `WZB_ZULIP_MESSAGE_PAGE_SIZE` | `5000` | Combined message-history page size |
-| `WZB_EVENT_PROCESSOR_BATCH_SIZE` | `1000` | Maximum events claimed per processor pass |
+| `WZB_EVENT_PROCESSOR_BATCH_SIZE` | `128` | Maximum events claimed per processor pass |
+| `WZB_EVENT_PROCESSOR_REALTIME_BATCH_SIZE` | `16` | Maximum recent events claimed by the dedicated realtime processor |
+| `WZB_EVENT_PROCESSOR_REALTIME_WINDOW_SECONDS` | `300` | Age window reserved for the realtime processor before events join backlog processing |
 | `WZB_EVENT_PROCESSOR_POLL_SECONDS` | `0.05` | Idle inbox polling interval |
 | `WZB_EVENT_PROCESSOR_CLAIM_TIMEOUT_SECONDS` | `60` | Stale processing-claim recovery threshold |
 | `WZB_EVENT_PROCESSOR_MAX_ATTEMPTS` | `8` | Attempts before a transient Zulip event failure becomes terminal |
