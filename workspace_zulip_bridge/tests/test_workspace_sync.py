@@ -166,6 +166,70 @@ def test_message_dependencies_include_container_and_author() -> None:
     )
 
 
+def test_topic_binding_waits_for_matching_stream_binding(tmp_path: Path) -> None:
+    asyncio.run(_topic_binding_waits_for_matching_stream_binding(tmp_path))
+
+
+async def _topic_binding_waits_for_matching_stream_binding(tmp_path: Path) -> None:
+    token_file = tmp_path / "workspace-dependencies.token"
+    token_file.write_text("integration-token")
+    settings = Settings.from_env(
+        {
+            "WZB_WORKSPACE_WEBSOCKET_URL": (
+                "ws://workspace.test/api/workspace/v1/events/ws"
+            ),
+            "WZB_WORKSPACE_PROJECT_ID": "10000000-0000-0000-0000-000000000001",
+            "WZB_WORKSPACE_PROVIDER_UUID": "10000000-0000-0000-0000-000000000002",
+            "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+        }
+    )
+    worker = WorkspaceDiffWorker(object(), settings)  # type: ignore[arg-type]
+    topic_binding_uuid = UUID("10000000-0000-0000-0000-000000000003")
+    stream_uuid = UUID("10000000-0000-0000-0000-000000000004")
+    topic_uuid = UUID("10000000-0000-0000-0000-000000000005")
+    user_uuid = UUID("10000000-0000-0000-0000-000000000006")
+    stream_binding_uuid = UUID("10000000-0000-0000-0000-000000000007")
+    row = {"entity_type": "topic_bindings", "entity_uuid": topic_binding_uuid}
+    candidate = (
+        row,
+        {
+            "stream_uuid": str(stream_uuid),
+            "topic_uuid": str(topic_uuid),
+            "user_uuid": str(user_uuid),
+        },
+        b"b" * 32,
+        {"action": "upsert"},
+    )
+    worker._load_message_flag_binding_ids = AsyncMock(  # type: ignore[method-assign]
+        return_value={}
+    )
+    worker._load_topic_binding_stream_binding_ids = AsyncMock(  # type: ignore[method-assign]
+        return_value={topic_binding_uuid: stream_binding_uuid}
+    )
+    worker._load_ready_dependency_ids = AsyncMock(  # type: ignore[method-assign]
+        return_value={
+            "streams": {stream_uuid},
+            "topics": {topic_uuid},
+            "users": {user_uuid},
+            "stream_bindings": set(),
+            "topic_bindings": set(),
+        }
+    )
+
+    ready, deferred = await worker._partition_dependency_ready([candidate])
+
+    assert ready == []
+    assert deferred == [row]
+
+    worker._load_ready_dependency_ids.return_value["stream_bindings"].add(  # type: ignore[attr-defined]
+        stream_binding_uuid
+    )
+    ready, deferred = await worker._partition_dependency_ready([candidate])
+
+    assert ready == [candidate]
+    assert deferred == []
+
+
 def test_reaction_equivalence_ignores_reload_timestamp() -> None:
     source = {
         "message_uuid": "10000000-0000-0000-0000-000000000001",

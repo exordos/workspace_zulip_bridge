@@ -116,6 +116,7 @@ class BridgeService:
                             partition_count=partition_count,
                             scope="partitioned",
                             delivery_priority=1,
+                            entity_types=frozenset({"messages", "message_flags"}),
                             tokens=tokens,
                         )
                         for partition, partition_count in content_worker_partitions
@@ -147,6 +148,17 @@ class BridgeService:
                         delivery_priority=0,
                         tokens=tokens,
                     )
+                    workspace_reaction_drainer = WorkspaceDiffWorker(
+                        pool,
+                        self._settings,
+                        plan_enabled=False,
+                        partition=0,
+                        partition_count=1,
+                        scope="partitioned",
+                        delivery_priority=1,
+                        entity_types=frozenset({"message_reactions"}),
+                        tokens=tokens,
+                    )
                     supervised_tasks.extend(
                         (
                             asyncio.create_task(
@@ -167,6 +179,12 @@ class BridgeService:
                         asyncio.create_task(
                             workspace_diff_planner.run(),
                             name="workspace-diff-planner",
+                        )
+                    )
+                    supervised_tasks.append(
+                        asyncio.create_task(
+                            workspace_reaction_drainer.run(),
+                            name="workspace-diff-reactions",
                         )
                     )
                     supervised_tasks.extend(

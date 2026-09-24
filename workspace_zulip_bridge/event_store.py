@@ -1963,7 +1963,7 @@ class HistorySession:
                     is_historical = EXCLUDED.is_historical,
                     flags_hash = EXCLUDED.flags_hash
                 WHERE zulip_message_flags.flags_hash IS DISTINCT FROM EXCLUDED.flags_hash
-                RETURNING 1
+                RETURNING uuid
             ), removed_reactions AS MATERIALIZED (
                 SELECT reaction.uuid, reaction.message_uuid,
                        message.zulip_stream_uuid
@@ -2021,7 +2021,7 @@ class HistorySession:
                        value.emoji_name, value.emoji_code, value.reaction_type
                 FROM changed
                 JOIN wzb_reaction_page AS value ON value.message_uuid = changed.uuid
-                ON CONFLICT (uuid) DO NOTHING RETURNING 1
+                ON CONFLICT (uuid) DO NOTHING RETURNING uuid
             ), old_links AS (
                 DELETE FROM workspace_zulip_bridge.zulip_message_files AS link
                 USING changed WHERE link.message_uuid = changed.uuid RETURNING 1
@@ -2050,6 +2050,10 @@ class HistorySession:
                 INSERT INTO workspace_zulip_bridge.workspace_outbox
                     (realm_uuid, entity_type, action, entity_uuid)
                 SELECT $2, 'message', 'upsert', uuid FROM changed
+                UNION ALL
+                SELECT $2, 'message_flag', 'upsert', uuid FROM flags
+                UNION ALL
+                SELECT $2, 'message_reaction', 'upsert', uuid FROM reactions
                 ON CONFLICT (realm_uuid, entity_type, entity_uuid)
                     WHERE delivery_status = 'pending'
                 DO UPDATE SET action = 'upsert', updated_at = clock_timestamp()

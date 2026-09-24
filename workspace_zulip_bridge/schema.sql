@@ -410,6 +410,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS workspace_outbox_pending_entity_idx
 CREATE INDEX IF NOT EXISTS workspace_outbox_claim_idx
     ON workspace_zulip_bridge.workspace_outbox (available_at, sequence)
     WHERE delivery_status IN ('pending', 'failed');
+CREATE INDEX IF NOT EXISTS workspace_outbox_source_claim_idx
+    ON workspace_zulip_bridge.workspace_outbox
+        (realm_uuid, entity_type, sequence)
+    WHERE delivery_status = 'pending' AND action = 'upsert';
 
 CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_sync_cursors (
     realm_uuid uuid PRIMARY KEY

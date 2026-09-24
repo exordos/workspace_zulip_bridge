@@ -90,11 +90,15 @@ class FakeWorkspaceWorker:
         partition_count: int = 1,
         scope: str = "both",
         delivery_priority: int | None = None,
+        entity_types: frozenset[str] | None = None,
         tokens: object | None = None,
     ) -> None:
+        entity_filter = (
+            "all" if entity_types is None else ",".join(sorted(entity_types))
+        )
         self.calls.append(
             f"{self.label}-init-{plan_enabled}-{partition}/{partition_count}-"
-            f"{scope}-{delivery_priority}"
+            f"{scope}-{delivery_priority}-{entity_filter}"
         )
 
     async def run(self) -> None:
@@ -253,6 +257,7 @@ def test_workspace_diff_worker_bounds_unpartitioned_batches(tmp_path: Path) -> N
         object(),  # type: ignore[arg-type]
         settings,
         scope="partitioned",
+        entity_types=frozenset({"messages", "message_flags"}),
     )
     live = WorkspaceDiffWorker(
         object(),  # type: ignore[arg-type]
@@ -265,9 +270,12 @@ def test_workspace_diff_worker_bounds_unpartitioned_batches(tmp_path: Path) -> N
     assert live._claim_batch_size == 50
     assert live._delivery_priority_filter == "delivery_priority = 0"
     assert partitioned._delivery_priority_filter == "TRUE"
+    assert partitioned._entity_type_filter == (
+        "entity_type IN ('message_flags', 'messages')"
+    )
 
 
-def test_workspace_diff_worker_plans_every_entity_without_starvation(
+def test_workspace_diff_worker_uses_outbox_for_journaled_entities(
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
@@ -294,7 +302,7 @@ async def _run_workspace_diff_worker_fair_plan_test(
             assert "active_generation" in query
             return {
                 "active_generation": UUID("20000000-0000-0000-0000-000000000001"),
-                "reconciliation_version": 6,
+                "reconciliation_version": 8,
             }
 
     worker = WorkspaceDiffWorker(PlanningPool(), settings)  # type: ignore[arg-type]
@@ -319,9 +327,17 @@ async def _run_workspace_diff_worker_fair_plan_test(
         calls.append(entity_type)
         return 1 if entity_type == "users" else 0
 
+    async def fake_plan_source_outbox(
+        realm_uuid: UUID,
+        generation: UUID,
+    ) -> int:
+        del realm_uuid, generation
+        return 0
+
     monkeypatch.setattr(worker, "_link_realm", fake_link_realm)
     monkeypatch.setattr(worker, "_ensure_direct_topics", fake_ensure_direct_topics)
     monkeypatch.setattr(worker, "_ensure_topic_bindings", fake_ensure_topic_bindings)
+    monkeypatch.setattr(worker, "_plan_source_outbox", fake_plan_source_outbox)
     monkeypatch.setattr(worker, "_plan_entity", fake_plan_entity)
 
     assert await worker.plan() == 1
@@ -331,9 +347,6 @@ async def _run_workspace_diff_worker_fair_plan_test(
         "stream_bindings",
         "topics",
         "topic_bindings",
-        "messages",
-        "message_flags",
-        "message_reactions",
     ]
 
 
@@ -669,10 +682,17 @@ async def _run_workspace_receiver_test(
     assert "workspace-receiver-run" in calls
     assert "workspace-bootstrap-ensure" in calls
     assert "workspace-event-processor-run" in calls
-    assert calls.count("workspace-diff-worker-run") == 5
-    assert "workspace-diff-worker-init-True-0/2-unpartitioned-None" in calls
-    assert "workspace-diff-worker-init-False-0/2-partitioned-1" in calls
-    assert "workspace-diff-worker-init-False-1/2-partitioned-1" in calls
-    assert "workspace-diff-worker-init-False-0/2-unpartitioned-1" in calls
-    assert "workspace-diff-worker-init-False-0/1-both-0" in calls
+    assert calls.count("workspace-diff-worker-run") == 6
+    assert "workspace-diff-worker-init-True-0/2-unpartitioned-None-all" in calls
+    assert (
+        "workspace-diff-worker-init-False-0/2-partitioned-1-message_flags,messages"
+    ) in calls
+    assert (
+        "workspace-diff-worker-init-False-1/2-partitioned-1-message_flags,messages"
+    ) in calls
+    assert "workspace-diff-worker-init-False-0/2-unpartitioned-1-all" in calls
+    assert "workspace-diff-worker-init-False-0/1-both-0-all" in calls
+    assert (
+        "workspace-diff-worker-init-False-0/1-partitioned-1-message_reactions"
+    ) in calls
     assert pool.closed
