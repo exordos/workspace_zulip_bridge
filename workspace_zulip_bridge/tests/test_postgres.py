@@ -970,7 +970,7 @@ async def _outbound_maps_every_topic_notification_mode() -> None:
     async def required_stream(_stream_uuid: UUID):
         return {"chat_key": "channel:7"}
 
-    async def target_or_source_topic(_topic_uuid: UUID):
+    async def ensure_topic(_topic_uuid: UUID, _stream_uuid: UUID):
         return {"name": "General"}
 
     async def actor(_user_uuid: UUID):
@@ -983,9 +983,7 @@ async def _outbound_maps_every_topic_notification_mode() -> None:
     )
     writer._pool = SimpleNamespace(execute=AsyncMock())
     writer._required_stream = required_stream  # type: ignore[method-assign]
-    writer._target_or_source_topic = (  # type: ignore[method-assign]
-        target_or_source_topic
-    )
+    writer._ensure_topic = ensure_topic  # type: ignore[method-assign]
     writer._actor = actor  # type: ignore[method-assign]
     writer._client = lambda _actor: client  # type: ignore[method-assign]
 
@@ -3314,6 +3312,16 @@ def test_workspace_diff_materializes_topic_bindings(tmp_path: Path) -> None:
     asyncio.run(_workspace_diff_materializes_topic_bindings(_dsn(), tmp_path))
 
 
+def test_workspace_diff_topic_binding_repair_survives_concurrent_topic_removal(
+    tmp_path: Path,
+) -> None:
+    asyncio.run(
+        _workspace_diff_topic_binding_repair_survives_concurrent_topic_removal(
+            _dsn(), tmp_path
+        )
+    )
+
+
 def test_workspace_bootstrap_activates_verified_generation(
     tmp_path: Path,
 ) -> None:
@@ -4314,6 +4322,170 @@ async def _workspace_diff_materializes_topic_bindings(dsn: str, tmp_path: Path) 
             == 1
         )
     finally:
+        await pool.close()
+
+
+async def _workspace_diff_topic_binding_repair_survives_concurrent_topic_removal(
+    dsn: str,
+    tmp_path: Path,
+) -> None:
+    pool = await _pool(dsn)
+    provider_uuid = UUID("10000000-0000-0000-0000-0000000000a1")
+    project_uuid = UUID("10000000-0000-0000-0000-0000000000a2")
+    token_file = tmp_path / "workspace-topic-binding-race.token"
+    token_file.write_text("integration-token")
+    locking_connection: asyncpg.Connection | None = None
+    deleting_connection: asyncpg.Connection | None = None
+    repair_task: asyncio.Task[bool] | None = None
+    delete_task: asyncio.Task[str] | None = None
+    advisory_locked = False
+    try:
+        async with pool.acquire() as connection:
+            user_uuid = await _insert_user(connection, 10, 400)
+            stream_uuid = stable_chat_uuid(ENDPOINT, "channel:7")
+            topic_uuid = stable_topic_uuid(stream_uuid, "General")
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_streams (
+                    uuid, realm_uuid, chat_type, chat_key, name,
+                    content_hash, source_connection_uuid
+                ) VALUES ($1, $2, 'channel', 'channel:7', 'Test', $3, $4)
+                """,
+                stream_uuid,
+                stable_realm_uuid(ENDPOINT),
+                b"s" * 32,
+                user_uuid,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_stream_bindings (
+                    uuid, zulip_stream_uuid, zulip_user_uuid, role,
+                    membership_kind, content_hash
+                ) VALUES ($1, $2, $3, 'member', 'subscriber', $4)
+                """,
+                stable_stream_binding_uuid(stream_uuid, user_uuid),
+                stream_uuid,
+                user_uuid,
+                b"b" * 32,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_topics (
+                    uuid, zulip_stream_uuid, name, content_hash
+                ) VALUES ($1, $2, 'General', $3)
+                """,
+                topic_uuid,
+                stream_uuid,
+                b"t" * 32,
+            )
+        settings = Settings.from_env(
+            {
+                "WZB_DATABASE_DSN": dsn,
+                "WZB_DB_POOL_MIN_SIZE": "1",
+                "WZB_DB_POOL_MAX_SIZE": "4",
+                "WZB_ZULIP_HISTORY_CONCURRENCY": "2",
+                "WZB_WORKSPACE_WEBSOCKET_URL": (
+                    "ws://workspace.test/api/workspace/v1/events/ws"
+                ),
+                "WZB_WORKSPACE_PROJECT_ID": str(project_uuid),
+                "WZB_WORKSPACE_PROVIDER_UUID": str(provider_uuid),
+                "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+            }
+        )
+        worker = WorkspaceDiffWorker(pool, settings)
+        async with pool.acquire() as connection:
+            await connection.execute(
+                """
+                CREATE OR REPLACE FUNCTION
+                    workspace_zulip_bridge.test_pause_topic_binding_insert()
+                RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                    PERFORM pg_advisory_xact_lock(938475);
+                    RETURN NEW;
+                END
+                $$;
+                CREATE TRIGGER test_pause_topic_binding_insert
+                BEFORE INSERT ON workspace_zulip_bridge.zulip_topic_bindings
+                FOR EACH ROW EXECUTE FUNCTION
+                    workspace_zulip_bridge.test_pause_topic_binding_insert()
+                """
+            )
+        locking_connection = await pool.acquire()
+        deleting_connection = await pool.acquire()
+        await locking_connection.execute("SELECT pg_advisory_lock(938475)")
+        advisory_locked = True
+
+        repair_task = asyncio.create_task(
+            worker._ensure_topic_bindings(stable_realm_uuid(ENDPOINT))
+        )
+        repair_waiting = False
+        for _ in range(50):
+            repair_waiting = bool(
+                await pool.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 FROM pg_stat_activity
+                        WHERE pid <> pg_backend_pid()
+                          AND wait_event = 'advisory'
+                    )
+                    """
+                )
+            )
+            if repair_waiting:
+                break
+            await asyncio.sleep(0.02)
+
+        delete_task = asyncio.create_task(
+            deleting_connection.execute(
+                "DELETE FROM workspace_zulip_bridge.zulip_topics WHERE uuid = $1",
+                topic_uuid,
+            )
+        )
+        await asyncio.sleep(0.1)
+        delete_waiting_for_topic_lock = not delete_task.done()
+        await locking_connection.execute("SELECT pg_advisory_unlock(938475)")
+        advisory_locked = False
+
+        assert repair_waiting
+        assert delete_waiting_for_topic_lock
+        assert await asyncio.wait_for(repair_task, timeout=2)
+        repair_task = None
+        assert await asyncio.wait_for(delete_task, timeout=2) == "DELETE 1"
+        delete_task = None
+        assert (
+            await pool.fetchval(
+                "SELECT count(*) FROM workspace_zulip_bridge.zulip_topic_bindings"
+            )
+            == 0
+        )
+    finally:
+        if advisory_locked and locking_connection is not None:
+            await locking_connection.execute("SELECT pg_advisory_unlock(938475)")
+        if repair_task is not None:
+            repair_task.cancel()
+            try:
+                await repair_task
+            except asyncio.CancelledError:
+                pass
+        if delete_task is not None:
+            delete_task.cancel()
+            try:
+                await delete_task
+            except asyncio.CancelledError:
+                pass
+        if locking_connection is not None:
+            await pool.release(locking_connection)
+        if deleting_connection is not None:
+            await pool.release(deleting_connection)
+        async with pool.acquire() as connection:
+            await connection.execute(
+                """
+                DROP TRIGGER IF EXISTS test_pause_topic_binding_insert
+                    ON workspace_zulip_bridge.zulip_topic_bindings;
+                DROP FUNCTION IF EXISTS
+                    workspace_zulip_bridge.test_pause_topic_binding_insert()
+                """
+            )
         await pool.close()
 
 

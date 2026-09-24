@@ -548,7 +548,8 @@ class ZulipOutboundWriter:
             raise ZulipOutboundError(
                 "direct-message topic preferences are not supported by Zulip"
             )
-        topic = await self._target_or_source_topic(UUID(str(data["topic_uuid"])))
+        topic_uuid = UUID(str(data["topic_uuid"]))
+        topic = await self._ensure_topic(topic_uuid, UUID(str(data["stream_uuid"])))
         actor = await self._actor(UUID(str(data["user_uuid"])))
         mode = target.get("notification_mode", "default") if target else "default"
         visibility_policy = {
@@ -588,7 +589,7 @@ class ZulipOutboundWriter:
             """,
             entity_uuid,
             UUID(str(target["stream_uuid"])),
-            UUID(str(target["topic_uuid"])),
+            topic_uuid,
             actor.user_uuid,
             str(target.get("notification_mode", "default")),
             _canonical_hash(target),

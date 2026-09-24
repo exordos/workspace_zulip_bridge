@@ -3372,6 +3372,7 @@ class WorkspaceDiffWorker:
                   )
                 ORDER BY topic.uuid, binding.zulip_user_uuid
                 LIMIT $2
+                FOR KEY SHARE OF topic
                 """,
                 realm_uuid,
                 self.TOPIC_BINDING_REPAIR_BATCH_SIZE,
