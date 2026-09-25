@@ -46,7 +46,7 @@ ENTITY_TYPES = (
     "message_reactions",
 )
 PRIORITY = {entity_type: index for index, entity_type in enumerate(ENTITY_TYPES)}
-RECONCILIATION_VERSION = 14
+RECONCILIATION_VERSION = 16
 
 
 class ProviderApiError(RuntimeError):
@@ -1703,6 +1703,10 @@ class WorkspaceDiffWorker:
                     return changed
                 realm_uuid = UUID(str(mirror["realm_uuid"]))
                 generation = UUID(str(mirror["active_generation"]))
+            changed += await self._requeue_missing_catalog_outbox(
+                realm_uuid,
+                generation,
+            )
             changed += await self._repair_missing_catalog_dependencies(
                 realm_uuid,
                 generation,
@@ -2099,6 +2103,93 @@ class WorkspaceDiffWorker:
             )
             changed += int(linked_users.rsplit(" ", 1)[-1])
             changed += int(ownerless_streams.rsplit(" ", 1)[-1])
+        if current_version < 15:
+            if realm_uuid is None or generation is None:
+                mirror = await self._pool.fetchrow(
+                    """
+                    SELECT realm.uuid AS realm_uuid, mirror.active_generation
+                    FROM workspace_zulip_bridge.zulip_realms AS realm
+                    JOIN workspace_zulip_bridge.workspace_mirror_state AS mirror
+                      ON mirror.provider_uuid = realm.workspace_provider_uuid
+                    WHERE realm.workspace_provider_uuid = $1
+                      AND mirror.bootstrap_status = 'ready'
+                      AND mirror.active_generation IS NOT NULL
+                    """,
+                    self._provider_uuid,
+                )
+                if mirror is None:
+                    return changed
+                realm_uuid = UUID(str(mirror["realm_uuid"]))
+                generation = UUID(str(mirror["active_generation"]))
+            if current_version >= 9:
+                changed += await self._requeue_missing_catalog_outbox(
+                    realm_uuid,
+                    generation,
+                )
+                changed += await self._repair_missing_catalog_dependencies(
+                    realm_uuid,
+                    generation,
+                )
+        if current_version < 16:
+            if realm_uuid is None or generation is None:
+                mirror = await self._pool.fetchrow(
+                    """
+                    SELECT realm.uuid AS realm_uuid, mirror.active_generation
+                    FROM workspace_zulip_bridge.zulip_realms AS realm
+                    JOIN workspace_zulip_bridge.workspace_mirror_state AS mirror
+                      ON mirror.provider_uuid = realm.workspace_provider_uuid
+                    WHERE realm.workspace_provider_uuid = $1
+                      AND mirror.bootstrap_status = 'ready'
+                      AND mirror.active_generation IS NOT NULL
+                    """,
+                    self._provider_uuid,
+                )
+                if mirror is None:
+                    return changed
+                realm_uuid = UUID(str(mirror["realm_uuid"]))
+                generation = UUID(str(mirror["active_generation"]))
+            changed += await self._repair_missing_reaction_diffs(
+                realm_uuid,
+                generation,
+            )
+        return changed
+
+    async def _requeue_missing_catalog_outbox(
+        self,
+        realm_uuid: UUID,
+        generation: UUID,
+    ) -> int:
+        """Restore journal entries consumed before their parents became ready."""
+        changed = 0
+        for entity_type, outbox_type in (
+            ("topics", "topic"),
+            ("topic_bindings", "topic_binding"),
+        ):
+            source = _SOURCE_TABLES[entity_type]
+            result = await self._pool.execute(
+                f"""
+                INSERT INTO workspace_zulip_bridge.workspace_outbox (
+                    realm_uuid, entity_type, action, entity_uuid
+                )
+                SELECT $1, $2, 'upsert', source.uuid
+                FROM {source["from"]} AS source
+                {source["joins"]}
+                LEFT JOIN workspace_zulip_bridge.workspace_{entity_type} AS target
+                  ON target.provider_uuid = $3
+                 AND target.snapshot_generation = $4
+                 AND target.uuid = source.uuid
+                WHERE parent.realm_uuid = $1
+                  AND target.uuid IS NULL
+                ON CONFLICT (realm_uuid, entity_type, entity_uuid)
+                    WHERE delivery_status = 'pending'
+                DO NOTHING
+                """,
+                realm_uuid,
+                outbox_type,
+                self._provider_uuid,
+                generation,
+            )
+            changed += int(result.rsplit(" ", 1)[-1])
         return changed
 
     async def _repair_missing_catalog_dependencies(
@@ -2145,6 +2236,16 @@ class WorkspaceDiffWorker:
                     processed_at = NULL,
                     last_error = 'requeued_missing_catalog_dependency',
                     updated_at = clock_timestamp()
+                WHERE sync_diffs.direction IS DISTINCT FROM 'to_workspace'
+                   OR sync_diffs.partition_key
+                      IS DISTINCT FROM EXCLUDED.partition_key
+                   OR sync_diffs.source_hash
+                      IS DISTINCT FROM EXCLUDED.source_hash
+                   OR sync_diffs.target_hash IS NOT NULL
+                   OR sync_diffs.source_updated_at
+                      IS DISTINCT FROM EXCLUDED.source_updated_at
+                   OR sync_diffs.target_updated_at IS NOT NULL
+                   OR sync_diffs.processing_status IS DISTINCT FROM 'pending'
                 """,
                 self._provider_uuid,
                 entity_type,
@@ -2153,6 +2254,44 @@ class WorkspaceDiffWorker:
             )
             changed += int(result.rsplit(" ", 1)[-1])
         return changed
+
+    async def _repair_missing_reaction_diffs(
+        self,
+        realm_uuid: UUID,
+        generation: UUID,
+    ) -> int:
+        """Repair reaction rows captured before their outbox journal existed."""
+        result = await self._pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.sync_diffs (
+                provider_uuid, entity_type, entity_uuid, realm_uuid,
+                partition_key, direction, source_hash, target_hash,
+                source_updated_at, target_updated_at
+            )
+            SELECT $1, 'message_reactions', reaction.uuid, $2,
+                   message.zulip_stream_uuid, 'to_workspace', NULL, NULL,
+                   reaction.updated_at, NULL
+            FROM workspace_zulip_bridge.zulip_message_reactions AS reaction
+            JOIN workspace_zulip_bridge.zulip_messages AS message
+              ON message.uuid = reaction.message_uuid
+            LEFT JOIN workspace_zulip_bridge.workspace_message_reactions AS target
+              ON target.provider_uuid = $1
+             AND target.snapshot_generation = $3
+             AND target.uuid = reaction.uuid
+            LEFT JOIN workspace_zulip_bridge.sync_diffs AS existing
+              ON existing.provider_uuid = $1
+             AND existing.entity_type = 'message_reactions'
+             AND existing.entity_uuid = reaction.uuid
+            WHERE reaction.realm_uuid = $2
+              AND target.uuid IS NULL
+              AND existing.entity_uuid IS NULL
+            ON CONFLICT (provider_uuid, entity_type, entity_uuid) DO NOTHING
+            """,
+            self._provider_uuid,
+            realm_uuid,
+            generation,
+        )
+        return int(result.rsplit(" ", 1)[-1])
 
     async def _plan_source_outbox(
         self,
@@ -2283,32 +2422,72 @@ class WorkspaceDiffWorker:
                     entity_uuids,
                 )
             sequences = [row["sequence"] for row in rows]
-            await connection.execute(
+            delivered = await connection.fetch(
                 """
-                UPDATE workspace_zulip_bridge.workspace_outbox
+                UPDATE workspace_zulip_bridge.workspace_outbox AS outbox
                 SET delivery_status = 'delivered', delivered_at = clock_timestamp(),
                     claimed_at = NULL, last_error = NULL,
                     updated_at = clock_timestamp()
+                WHERE outbox.sequence = ANY($1::bigint[])
+                  AND EXISTS (
+                      SELECT 1
+                      FROM workspace_zulip_bridge.sync_diffs AS diff
+                      WHERE diff.provider_uuid = $2
+                        AND diff.entity_uuid = outbox.entity_uuid
+                        AND diff.entity_type = CASE outbox.entity_type
+                            WHEN 'user' THEN 'users'
+                            WHEN 'stream' THEN 'streams'
+                            WHEN 'stream_binding' THEN 'stream_bindings'
+                            WHEN 'topic' THEN 'topics'
+                            WHEN 'topic_binding' THEN 'topic_bindings'
+                            WHEN 'message' THEN 'messages'
+                            WHEN 'message_flag' THEN 'message_flags'
+                            WHEN 'message_reaction' THEN 'message_reactions'
+                        END
+                  )
+                RETURNING outbox.sequence
+                """,
+                sequences,
+                self._provider_uuid,
+            )
+            delivered_sequences = [row["sequence"] for row in delivered]
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.workspace_outbox
+                SET attempt_count = attempt_count + 1,
+                    available_at = clock_timestamp() + make_interval(
+                        secs => LEAST(
+                            60::double precision,
+                            power(
+                                2::double precision,
+                                LEAST(attempt_count, 6)
+                            )
+                        )
+                    ),
+                    last_error = 'source_not_ready',
+                    updated_at = clock_timestamp()
                 WHERE sequence = ANY($1::bigint[])
+                  AND delivery_status = 'pending'
                 """,
                 sequences,
             )
-            await connection.execute(
-                """
-                INSERT INTO workspace_zulip_bridge.workspace_sync_cursors (
-                    realm_uuid, last_delivered_sequence
-                ) VALUES ($1, $2)
-                ON CONFLICT (realm_uuid) DO UPDATE
-                SET last_delivered_sequence = GREATEST(
-                        workspace_sync_cursors.last_delivered_sequence,
-                        EXCLUDED.last_delivered_sequence
-                    ),
-                    updated_at = clock_timestamp()
-                """,
-                realm_uuid,
-                max(sequences),
-            )
-            return len(rows)
+            if delivered_sequences:
+                await connection.execute(
+                    """
+                    INSERT INTO workspace_zulip_bridge.workspace_sync_cursors (
+                        realm_uuid, last_delivered_sequence
+                    ) VALUES ($1, $2)
+                    ON CONFLICT (realm_uuid) DO UPDATE
+                    SET last_delivered_sequence = GREATEST(
+                            workspace_sync_cursors.last_delivered_sequence,
+                            EXCLUDED.last_delivered_sequence
+                        ),
+                        updated_at = clock_timestamp()
+                    """,
+                    realm_uuid,
+                    max(delivered_sequences),
+                )
+            return len(delivered_sequences)
 
     async def _plan_target_only(
         self,

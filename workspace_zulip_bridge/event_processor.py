@@ -2036,6 +2036,23 @@ class ZulipEventProcessor:
     async def _finish_events(self, outcomes: list[_Outcome]) -> None:
         if not outcomes:
             return
+        ordered_outcomes = sorted(outcomes, key=lambda outcome: outcome.event_uuid)
+        for attempt in range(3):
+            try:
+                await self._finish_events_once(ordered_outcomes)
+                return
+            except asyncpg.DeadlockDetectedError:
+                if attempt == 2:
+                    raise
+                LOG.warning(
+                    "Retrying Zulip event completion after database deadlock "
+                    "events=%s attempt=%s",
+                    len(ordered_outcomes),
+                    attempt + 1,
+                )
+                await asyncio.sleep(0.01 * (2**attempt))
+
+    async def _finish_events_once(self, outcomes: list[_Outcome]) -> None:
         retry_cap_seconds = (
             self._settings.event_processor_backlog_retry_cap_seconds
             if self._claim_scope == "backlog"

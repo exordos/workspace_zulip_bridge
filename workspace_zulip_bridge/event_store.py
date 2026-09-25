@@ -828,7 +828,7 @@ class EventStore:
                                size_bytes, to_timestamp(source_created_at), message_ids,
                                metadata_hash
                         FROM incoming ORDER BY file_uuid
-                        ON CONFLICT (uuid) DO UPDATE SET
+                        ON CONFLICT (realm_uuid, source_path) DO UPDATE SET
                             owner_user_uuid = EXCLUDED.owner_user_uuid,
                             zulip_attachment_id = EXCLUDED.zulip_attachment_id,
                             name = EXCLUDED.name,
@@ -845,13 +845,25 @@ class EventStore:
                                EXCLUDED.zulip_attachment_id, EXCLUDED.name,
                                EXCLUDED.size_bytes, EXCLUDED.source_created_at,
                                EXCLUDED.message_ids, EXCLUDED.metadata_hash)
-                        RETURNING uuid
+                        RETURNING uuid, source_path
                     ), removed AS (
                         DELETE FROM workspace_zulip_bridge.zulip_files AS file
                         WHERE $12 AND file.realm_uuid = $2
                           AND file.owner_user_uuid = $3
-                          AND NOT (file.uuid = ANY($4::uuid[]))
+                          AND NOT (file.source_path = ANY($6::text[]))
                         RETURNING uuid
+                    ), stored_files AS (
+                        SELECT uuid, source_path FROM upserted
+                        UNION ALL
+                        SELECT file.uuid, file.source_path
+                        FROM incoming
+                        JOIN workspace_zulip_bridge.zulip_files AS file
+                          ON file.realm_uuid = $2
+                         AND file.source_path = incoming.source_path
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM upserted
+                            WHERE upserted.source_path = incoming.source_path
+                        )
                     ), changes AS (
                         SELECT uuid, 'upsert'::text AS action FROM upserted
                         UNION ALL SELECT uuid, 'delete'::text FROM removed
@@ -865,7 +877,17 @@ class EventStore:
                                       updated_at = clock_timestamp()
                         RETURNING 1
                     )
-                    SELECT (SELECT count(*) FROM changes) AS changed_count
+                    SELECT (SELECT count(*) FROM changes) AS changed_count,
+                           (
+                               SELECT COALESCE(
+                                   jsonb_object_agg(
+                                       stored_files.source_path,
+                                       stored_files.uuid::text
+                                   ),
+                                   '{}'::jsonb
+                               )
+                               FROM stored_files
+                           ) AS stored_file_uuids
                     FROM active_connection
                     """,
                     connection_uuid,
@@ -883,6 +905,13 @@ class EventStore:
                 )
             if row is None:
                 raise RuntimeError("attachment metadata query returned no row")
+            stored_file_uuids = row["stored_file_uuids"]
+            if isinstance(stored_file_uuids, str):
+                stored_file_uuids = json.loads(stored_file_uuids)
+            file_uuids = [
+                UUID(str(stored_file_uuids[attachment.source_path]))
+                for attachment in attachments
+            ]
             async with connection.transaction():
                 await connection.execute(
                     """
@@ -1295,18 +1324,45 @@ class EventStore:
                     $10::boolean[], $11::boolean[], $12::boolean[], $13::boolean[],
                     $14::bytea[]
                 )
-                ON CONFLICT (message_uuid, zulip_user_uuid) DO UPDATE SET
-                    is_read = EXCLUDED.is_read, is_starred = EXCLUDED.is_starred,
-                    is_collapsed = EXCLUDED.is_collapsed,
-                    is_mentioned = EXCLUDED.is_mentioned,
-                    is_stream_wildcard_mentioned = EXCLUDED.is_stream_wildcard_mentioned,
-                    is_topic_wildcard_mentioned = EXCLUDED.is_topic_wildcard_mentioned,
-                    has_alert_word = EXCLUDED.has_alert_word,
-                    is_historical = EXCLUDED.is_historical,
-                    flags_hash = EXCLUDED.flags_hash
+                ON CONFLICT DO NOTHING
                 """,
                 *([item[index] for item in changed] for index in range(14)),
             )
+            updated = await connection.fetch(
+                f"""
+                UPDATE workspace_zulip_bridge.zulip_message_flags AS flags
+                SET {field} = $3
+                FROM unnest($1::uuid[], $2::uuid[])
+                    AS incoming(message_uuid, zulip_user_uuid)
+                WHERE flags.message_uuid = incoming.message_uuid
+                  AND flags.zulip_user_uuid = incoming.zulip_user_uuid
+                  AND flags.{field} IS DISTINCT FROM $3
+                RETURNING flags.uuid, flags.is_read, flags.is_starred,
+                          flags.is_collapsed, flags.is_mentioned,
+                          flags.is_stream_wildcard_mentioned,
+                          flags.is_topic_wildcard_mentioned,
+                          flags.has_alert_word, flags.is_historical
+                """,
+                [item[3] for item in changed],
+                [item[4] for item in changed],
+                value,
+            )
+            if updated:
+                await connection.executemany(
+                    """
+                    UPDATE workspace_zulip_bridge.zulip_message_flags
+                    SET flags_hash = $2 WHERE uuid = $1
+                    """,
+                    [
+                        (
+                            row["uuid"],
+                            message_flags_hash(
+                                **{name: bool(row[name]) for name in allowed_fields}
+                            ),
+                        )
+                        for row in updated
+                    ],
+                )
         return len(changed)
 
     async def set_queue(
