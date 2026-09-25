@@ -46,7 +46,7 @@ ENTITY_TYPES = (
     "message_reactions",
 )
 PRIORITY = {entity_type: index for index, entity_type in enumerate(ENTITY_TYPES)}
-RECONCILIATION_VERSION = 11
+RECONCILIATION_VERSION = 14
 
 
 class ProviderApiError(RuntimeError):
@@ -1197,6 +1197,18 @@ class WorkspaceEventProcessor:
             FROM workspace_zulip_bridge.zulip_realms AS realm
             WHERE realm.workspace_provider_uuid = $1
               AND realm.workspace_project_id = $7
+              AND NOT (
+                  $2 = 'users'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM workspace_zulip_bridge.zulip_users AS linked_user
+                      WHERE linked_user.workspace_user_uuid IS NOT NULL
+                        AND (
+                            linked_user.uuid = $3
+                            OR linked_user.workspace_user_uuid = $3
+                        )
+                  )
+              )
               AND (
                   $2 = 'users'
                   OR EXISTS (
@@ -1790,6 +1802,303 @@ class WorkspaceDiffWorker:
                 self._provider_uuid,
             )
             changed += int(conflicted_rebinds.rsplit(" ", 1)[-1])
+        if current_version < 12:
+            repaired_messages = await self._pool.execute(
+                """
+                WITH candidates AS MATERIALIZED (
+                    SELECT message.uuid,
+                           GREATEST(
+                               message.source_updated_at + interval '1 microsecond',
+                               message.updated_at,
+                               COALESCE(
+                                   diff.target_updated_at + interval '1 microsecond',
+                                   message.source_updated_at
+                               )
+                           ) AS source_updated_at
+                    FROM workspace_zulip_bridge.sync_diffs AS diff
+                    JOIN workspace_zulip_bridge.zulip_messages AS message
+                      ON message.uuid = diff.entity_uuid
+                    WHERE diff.provider_uuid = $1
+                      AND diff.entity_type = 'messages'
+                      AND diff.direction = 'to_workspace'
+                      AND diff.processing_status = 'blocked'
+                      AND diff.last_error LIKE
+                        'Workspace Provider API returned 409 error='
+                        'entity_version_conflict%'
+                ), advanced AS (
+                    UPDATE workspace_zulip_bridge.zulip_messages AS message
+                    SET source_updated_at = candidate.source_updated_at
+                    FROM candidates AS candidate
+                    WHERE message.uuid = candidate.uuid
+                    RETURNING message.uuid, message.source_updated_at
+                )
+                UPDATE workspace_zulip_bridge.sync_diffs AS diff
+                SET delivery_priority = 0,
+                    processing_status = 'pending', attempt_count = 0,
+                    dependency_wait_count = 0,
+                    source_updated_at = advanced.source_updated_at,
+                    available_at = clock_timestamp(), claimed_at = NULL,
+                    processed_at = NULL,
+                    last_error = 'requeued_monotonic_message_version',
+                    updated_at = clock_timestamp()
+                FROM advanced
+                WHERE diff.provider_uuid = $1
+                  AND diff.entity_type = 'messages'
+                  AND diff.entity_uuid = advanced.uuid
+                """,
+                self._provider_uuid,
+            )
+            rebound_reactions = await self._pool.execute(
+                """
+                UPDATE workspace_zulip_bridge.sync_diffs
+                SET delivery_priority = 0,
+                    processing_status = 'pending', attempt_count = 0,
+                    dependency_wait_count = 0,
+                    source_updated_at = GREATEST(
+                        source_updated_at,
+                        COALESCE(target_updated_at, source_updated_at)
+                    ) + interval '1 microsecond',
+                    available_at = clock_timestamp(), claimed_at = NULL,
+                    processed_at = NULL,
+                    last_error = 'requeued_reaction_identity_rebind',
+                    updated_at = clock_timestamp()
+                WHERE provider_uuid = $1
+                  AND entity_type = 'message_reactions'
+                  AND direction = 'to_workspace'
+                  AND processing_status = 'blocked'
+                  AND last_error LIKE
+                    'Workspace Provider API returned 409 error='
+                    'entity_identity_conflict%'
+                """,
+                self._provider_uuid,
+            )
+            retried_bindings = await self._pool.execute(
+                """
+                UPDATE workspace_zulip_bridge.sync_diffs
+                SET delivery_priority = 0,
+                    processing_status = 'pending', attempt_count = 0,
+                    dependency_wait_count = 0,
+                    available_at = clock_timestamp(), claimed_at = NULL,
+                    processed_at = NULL,
+                    last_error = 'requeued_valid_topic_binding',
+                    updated_at = clock_timestamp()
+                WHERE provider_uuid = $1
+                  AND entity_type = 'topic_bindings'
+                  AND direction = 'to_workspace'
+                  AND processing_status = 'blocked'
+                  AND last_error LIKE
+                    'Workspace Provider API returned 422 error=invalid_entity%'
+                """,
+                self._provider_uuid,
+            )
+            outside_scope = await self._pool.execute(
+                """
+                UPDATE workspace_zulip_bridge.sync_diffs
+                SET processing_status = 'skipped',
+                    processed_at = clock_timestamp(),
+                    last_error = 'workspace_entity_outside_provider_scope',
+                    updated_at = clock_timestamp()
+                WHERE provider_uuid = $1
+                  AND entity_type IN ('message_flags', 'message_reactions')
+                  AND direction = 'to_workspace'
+                  AND processing_status = 'blocked'
+                  AND last_error LIKE
+                    'Workspace Provider API returned 409 error='
+                    'entity_not_provider_owned%'
+                """,
+                self._provider_uuid,
+            )
+            stale_dependencies = await self._pool.execute(
+                """
+                UPDATE workspace_zulip_bridge.sync_diffs AS diff
+                SET processing_status = 'skipped',
+                    processed_at = clock_timestamp(),
+                    last_error = 'workspace_dependency_no_longer_exists',
+                    updated_at = clock_timestamp()
+                FROM workspace_zulip_bridge.workspace_mirror_state AS mirror
+                WHERE diff.provider_uuid = $1
+                  AND mirror.provider_uuid = diff.provider_uuid
+                  AND mirror.active_generation IS NOT NULL
+                  AND diff.direction = 'to_zulip'
+                  AND diff.processing_status = 'blocked'
+                  AND (
+                    (
+                      diff.entity_type = 'topic_bindings'
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM workspace_zulip_bridge.zulip_topic_bindings AS source
+                        WHERE source.uuid = diff.entity_uuid
+                      )
+                      AND EXISTS (
+                        SELECT 1
+                        FROM workspace_zulip_bridge.workspace_topic_bindings AS target
+                        WHERE target.provider_uuid = diff.provider_uuid
+                          AND target.snapshot_generation = mirror.active_generation
+                          AND target.uuid = diff.entity_uuid
+                          AND NOT EXISTS (
+                            SELECT 1
+                            FROM workspace_zulip_bridge.workspace_topics AS parent
+                            WHERE parent.provider_uuid = target.provider_uuid
+                              AND parent.snapshot_generation =
+                                  target.snapshot_generation
+                              AND parent.uuid =
+                                  (target.data ->> 'topic_uuid')::uuid
+                          )
+                      )
+                    )
+                    OR (
+                      diff.entity_type = 'message_flags'
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM workspace_zulip_bridge.zulip_message_flags AS source
+                        WHERE source.uuid = diff.entity_uuid
+                      )
+                      AND EXISTS (
+                        SELECT 1
+                        FROM workspace_zulip_bridge.workspace_message_flags AS target
+                        WHERE target.provider_uuid = diff.provider_uuid
+                          AND target.snapshot_generation = mirror.active_generation
+                          AND target.uuid = diff.entity_uuid
+                          AND NOT EXISTS (
+                            SELECT 1
+                            FROM workspace_zulip_bridge.workspace_messages AS parent
+                            WHERE parent.provider_uuid = target.provider_uuid
+                              AND parent.snapshot_generation =
+                                  target.snapshot_generation
+                              AND parent.uuid =
+                                  (target.data ->> 'message_uuid')::uuid
+                          )
+                      )
+                    )
+                    OR (
+                      diff.entity_type = 'messages'
+                      AND diff.last_error =
+                          'Zulip topic identity is unavailable'
+                      AND EXISTS (
+                        SELECT 1
+                        FROM workspace_zulip_bridge.workspace_messages AS target
+                        WHERE target.provider_uuid = diff.provider_uuid
+                          AND target.snapshot_generation = mirror.active_generation
+                          AND target.uuid = diff.entity_uuid
+                          AND NOT EXISTS (
+                            SELECT 1
+                            FROM workspace_zulip_bridge.workspace_topics AS parent
+                            WHERE parent.provider_uuid = target.provider_uuid
+                              AND parent.snapshot_generation =
+                                  target.snapshot_generation
+                              AND parent.uuid =
+                                  (target.data ->> 'topic_uuid')::uuid
+                          )
+                          AND NOT EXISTS (
+                            SELECT 1
+                            FROM workspace_zulip_bridge.zulip_topics AS parent
+                            WHERE parent.uuid =
+                                  (target.data ->> 'topic_uuid')::uuid
+                          )
+                      )
+                    )
+                  )
+                """,
+                self._provider_uuid,
+            )
+            orphaned = await self._pool.execute(
+                """
+                UPDATE workspace_zulip_bridge.sync_diffs AS diff
+                SET processing_status = 'skipped',
+                    processed_at = clock_timestamp(),
+                    last_error = 'orphaned_sync_diff',
+                    updated_at = clock_timestamp()
+                FROM workspace_zulip_bridge.workspace_mirror_state AS mirror
+                WHERE diff.provider_uuid = $1
+                  AND mirror.provider_uuid = diff.provider_uuid
+                  AND mirror.active_generation IS NOT NULL
+                  AND diff.processing_status = 'blocked'
+                  AND (
+                    (
+                      diff.entity_type = 'message_reactions'
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM workspace_zulip_bridge.zulip_message_reactions AS source
+                        WHERE source.uuid = diff.entity_uuid
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM workspace_zulip_bridge.workspace_message_reactions AS target
+                        WHERE target.provider_uuid = diff.provider_uuid
+                          AND target.snapshot_generation = mirror.active_generation
+                          AND target.uuid = diff.entity_uuid
+                      )
+                    )
+                  )
+                """,
+                self._provider_uuid,
+            )
+            changed += sum(
+                int(result.rsplit(" ", 1)[-1])
+                for result in (
+                    repaired_messages,
+                    rebound_reactions,
+                    retried_bindings,
+                    outside_scope,
+                    stale_dependencies,
+                    orphaned,
+                )
+            )
+        if current_version < 14:
+            linked_users = await self._pool.execute(
+                """
+                UPDATE workspace_zulip_bridge.sync_diffs AS diff
+                SET processing_status = 'skipped',
+                    processed_at = clock_timestamp(),
+                    last_error = 'workspace_linked_user_projection',
+                    updated_at = clock_timestamp()
+                WHERE diff.provider_uuid = $1
+                  AND diff.entity_type = 'users'
+                  AND diff.processing_status IN ('pending', 'failed', 'blocked')
+                  AND EXISTS (
+                      SELECT 1
+                      FROM workspace_zulip_bridge.zulip_users AS linked_user
+                      WHERE linked_user.workspace_user_uuid IS NOT NULL
+                        AND (
+                            linked_user.uuid = diff.entity_uuid
+                            OR linked_user.workspace_user_uuid = diff.entity_uuid
+                        )
+                  )
+                """,
+                self._provider_uuid,
+            )
+            ownerless_streams = await self._pool.execute(
+                """
+                UPDATE workspace_zulip_bridge.sync_diffs AS diff
+                SET processing_status = 'skipped',
+                    processed_at = clock_timestamp(),
+                    last_error = 'ownerless_empty_stream',
+                    updated_at = clock_timestamp()
+                FROM workspace_zulip_bridge.zulip_streams AS stream
+                WHERE diff.provider_uuid = $1
+                  AND diff.entity_type = 'streams'
+                  AND diff.entity_uuid = stream.uuid
+                  AND diff.direction = 'to_workspace'
+                  AND diff.processing_status = 'blocked'
+                  AND diff.last_error LIKE
+                    'Workspace Provider API returned % error=invalid_uuid%'
+                  AND stream.source_connection_uuid IS NULL
+                  AND stream.owner_user_uuid IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM workspace_zulip_bridge.zulip_stream_bindings AS binding
+                      WHERE binding.zulip_stream_uuid = stream.uuid
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM workspace_zulip_bridge.zulip_messages AS message
+                      WHERE message.zulip_stream_uuid = stream.uuid
+                  )
+                """,
+                self._provider_uuid,
+            )
+            changed += int(linked_users.rsplit(" ", 1)[-1])
+            changed += int(ownerless_streams.rsplit(" ", 1)[-1])
         return changed
 
     async def _repair_missing_catalog_dependencies(
@@ -2064,7 +2373,11 @@ class WorkspaceDiffWorker:
                     OR NOT EXISTS (
                         SELECT 1
                         FROM workspace_zulip_bridge.zulip_users AS linked_user
-                        WHERE linked_user.workspace_user_uuid = target.uuid
+                        WHERE linked_user.workspace_user_uuid IS NOT NULL
+                          AND (
+                              linked_user.uuid = target.uuid
+                              OR linked_user.workspace_user_uuid = target.uuid
+                          )
                     )
               )
               AND NOT EXISTS (
@@ -2569,10 +2882,20 @@ class WorkspaceDiffWorker:
                         and item_index is not None
                         and item_index < len(records)
                     ):
+                        status = (
+                            "skipped"
+                            if error.error_code == "entity_not_provider_owned"
+                            else "blocked"
+                        )
+                        reason = (
+                            "workspace_entity_outside_provider_scope"
+                            if status == "skipped"
+                            else str(error)[:2048]
+                        )
                         await self._mark(
                             [records[item_index][0]],
-                            "blocked",
-                            str(error)[:2048],
+                            status,
+                            reason,
                         )
                         del remaining[item_index]
                         continue

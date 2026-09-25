@@ -147,6 +147,64 @@ async def _workspace_batch_continues_after_terminal_item_rejection(
     )
 
 
+def test_workspace_batch_skips_entities_outside_provider_scope(
+    tmp_path: Path,
+) -> None:
+    asyncio.run(_workspace_batch_skips_entities_outside_provider_scope(tmp_path))
+
+
+async def _workspace_batch_skips_entities_outside_provider_scope(
+    tmp_path: Path,
+) -> None:
+    token_file = tmp_path / "workspace-outside-scope.token"
+    token_file.write_text("integration-token")
+    settings = Settings.from_env(
+        {
+            "WZB_WORKSPACE_WEBSOCKET_URL": (
+                "ws://workspace.test/api/workspace/v1/events/ws"
+            ),
+            "WZB_WORKSPACE_PROJECT_ID": "10000000-0000-0000-0000-000000000001",
+            "WZB_WORKSPACE_PROVIDER_UUID": "10000000-0000-0000-0000-000000000002",
+            "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+        }
+    )
+    worker = WorkspaceDiffWorker(object(), settings)  # type: ignore[arg-type]
+    row = {
+        "entity_type": "message_flags",
+        "entity_uuid": UUID("10000000-0000-0000-0000-000000000003"),
+        "claimed_at": datetime(2026, 9, 25, tzinfo=UTC),
+    }
+    ready = [
+        (
+            row,
+            {"read": True},
+            b"f" * 32,
+            {
+                "action": "upsert",
+                "type": "message_flags",
+                "uuid": str(row["entity_uuid"]),
+            },
+        )
+    ]
+    worker._post = AsyncMock(  # type: ignore[method-assign]
+        return_value=httpx.Response(
+            409,
+            json={"error": "entity_not_provider_owned", "item_index": 0},
+        )
+    )
+    worker._mark = AsyncMock()  # type: ignore[method-assign]
+    worker._accept = AsyncMock()  # type: ignore[method-assign]
+
+    await worker._apply_workspace_batch(object(), "backfill", ready)  # type: ignore[arg-type]
+
+    worker._mark.assert_awaited_once_with(
+        [row],
+        "skipped",
+        "workspace_entity_outside_provider_scope",
+    )
+    worker._accept.assert_not_awaited()
+
+
 def test_message_dependencies_include_container_and_author() -> None:
     stream_uuid = UUID("10000000-0000-0000-0000-000000000001")
     topic_uuid = UUID("10000000-0000-0000-0000-000000000002")

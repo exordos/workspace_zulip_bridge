@@ -2458,6 +2458,76 @@ def test_workspace_identity_rebind_conflict_is_requeued_as_backfill(
     )
 
 
+def test_live_message_update_advances_source_version() -> None:
+    asyncio.run(_live_message_update_advances_source_version(_dsn()))
+
+
+async def _live_message_update_advances_source_version(dsn: str) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            owner_uuid = await _insert_user(
+                connection, 122, 100, queue_id="queue-version", status="filling"
+            )
+        catalog = _catalog(122, [(7, "Shared")], {"channel:7": 1})
+        assert (
+            await store.store_chat_catalog(owner_uuid, "queue-version", catalog)
+        ).activated
+        assert (await store.reconcile_chat_schedules()).assigned == 1
+        message = ZulipMessage(
+            message_id=12201,
+            chat_key="channel:7",
+            topic_name="Version",
+            sender_user_uuid=owner_uuid,
+            content="first",
+            is_read=False,
+            is_starred=False,
+            is_collapsed=False,
+            is_mentioned=False,
+            is_stream_wildcard_mentioned=False,
+            is_topic_wildcard_mentioned=False,
+            has_alert_word=False,
+            is_historical=False,
+            reactions_json="[]",
+            message_hash=b"a" * 32,
+            sent_at=1_700_000_000,
+        )
+        await _load_one_chat(store, pool, owner_uuid, "queue-version", message)
+        first_version = await pool.fetchval(
+            """
+            SELECT source_updated_at
+            FROM workspace_zulip_bridge.zulip_messages
+            WHERE zulip_message_id = 12201
+            """
+        )
+        changed = replace(
+            message,
+            content="second",
+            message_hash=b"b" * 32,
+        )
+        result = await store.apply_live_messages(
+            owner_uuid,
+            "queue-version",
+            (),
+            (changed,),
+            (),
+        )
+        assert result.messages_changed == 1
+        row = await pool.fetchrow(
+            """
+            SELECT content, source_updated_at
+            FROM workspace_zulip_bridge.zulip_messages
+            WHERE zulip_message_id = 12201
+            """
+        )
+        assert row is not None
+        assert row["content"] == "second"
+        assert row["source_updated_at"] > first_version
+    finally:
+        await pool.close()
+
+
 async def _workspace_identity_rebind_conflict_is_requeued_as_backfill(
     dsn: str,
     tmp_path: Path,
@@ -2607,6 +2677,7 @@ async def _workspace_identity_rebind_conflict_is_requeued_as_backfill(
             }
         )
         worker = WorkspaceDiffWorker(pool, settings)
+        event_worker = WorkspaceEventProcessor(pool, settings)
 
         assert await worker._apply_projection_upgrade(10, realm_uuid, generation) == 1
         repaired = await pool.fetchrow(
@@ -2630,7 +2701,190 @@ async def _workspace_identity_rebind_conflict_is_requeued_as_backfill(
         assert repaired["target_updated_at"] == source_version
         assert repaired["attempt_count"] == 0
         assert repaired["last_error"] == ("requeued_workspace_identity_rebind_version")
-        assert await worker._apply_projection_upgrade(11, realm_uuid, generation) == 0
+        reaction_uuid = UUID("10000000-0000-0000-0000-0000000000c8")
+        invalid_binding_uuid = UUID("10000000-0000-0000-0000-0000000000c9")
+        outside_scope_uuid = UUID("10000000-0000-0000-0000-0000000000ca")
+        orphaned_uuid = UUID("10000000-0000-0000-0000-0000000000cb")
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.sync_diffs
+            SET delivery_priority = 1, processing_status = 'blocked',
+                source_updated_at = $3, target_updated_at = $3,
+                attempt_count = 2,
+                last_error = 'Workspace Provider API returned 409 '
+                             'error=entity_version_conflict item_index=0'
+            WHERE provider_uuid = $1 AND entity_uuid = $2
+            """,
+            provider_uuid,
+            message_uuid,
+            source_version,
+        )
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.sync_diffs (
+                provider_uuid, entity_type, entity_uuid, realm_uuid,
+                partition_key, direction, delivery_priority,
+                processing_status, source_updated_at, target_updated_at,
+                attempt_count, last_error
+            ) VALUES
+                ($1, 'message_reactions', $2, $6, $7, 'to_workspace', 1,
+                 'blocked', $8, $8, 2,
+                 'Workspace Provider API returned 409 '
+                 'error=entity_identity_conflict item_index=0'),
+                ($1, 'topic_bindings', $3, $6, $7, 'to_workspace', 1,
+                 'blocked', $8, NULL, 2,
+                 'Workspace Provider API returned 422 '
+                 'error=invalid_entity item_index=0'),
+                ($1, 'message_flags', $4, $6, $7, 'to_workspace', 1,
+                 'blocked', $8, NULL, 2,
+                 'Workspace Provider API returned 409 '
+                 'error=entity_not_provider_owned item_index=0'),
+                ($1, 'message_reactions', $5, $6, $7, 'to_workspace', 1,
+                 'blocked', $8, NULL, 2, 'legacy orphan')
+            """,
+            provider_uuid,
+            reaction_uuid,
+            invalid_binding_uuid,
+            outside_scope_uuid,
+            orphaned_uuid,
+            realm_uuid,
+            stream_uuid,
+            source_version,
+        )
+
+        assert await worker._apply_projection_upgrade(11, realm_uuid, generation) == 5
+        version_twelve_rows = await pool.fetch(
+            """
+            SELECT entity_type, entity_uuid, delivery_priority,
+                   processing_status, source_updated_at, last_error
+            FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1
+            ORDER BY entity_uuid
+            """,
+            provider_uuid,
+        )
+        by_uuid = {row["entity_uuid"]: row for row in version_twelve_rows}
+        repaired_message = by_uuid[message_uuid]
+        assert repaired_message["processing_status"] == "pending"
+        assert repaired_message["delivery_priority"] == 0
+        assert repaired_message["source_updated_at"] > source_version
+        assert repaired_message["last_error"] == "requeued_monotonic_message_version"
+        assert by_uuid[reaction_uuid]["processing_status"] == "pending"
+        assert by_uuid[reaction_uuid]["delivery_priority"] == 0
+        assert by_uuid[reaction_uuid]["last_error"] == (
+            "requeued_reaction_identity_rebind"
+        )
+        assert by_uuid[invalid_binding_uuid]["processing_status"] == "pending"
+        assert by_uuid[invalid_binding_uuid]["last_error"] == (
+            "requeued_valid_topic_binding"
+        )
+        assert by_uuid[outside_scope_uuid]["processing_status"] == "skipped"
+        assert by_uuid[outside_scope_uuid]["last_error"] == (
+            "workspace_entity_outside_provider_scope"
+        )
+        assert by_uuid[orphaned_uuid]["processing_status"] == "skipped"
+        assert by_uuid[orphaned_uuid]["last_error"] == "orphaned_sync_diff"
+        assert await worker._apply_projection_upgrade(12, realm_uuid, generation) == 0
+
+        ownerless_stream_uuid = UUID("10000000-0000-0000-0000-0000000000cc")
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.workspace_users (
+                provider_uuid, snapshot_generation, uuid,
+                workspace_project_id, content_hash, source_updated_at, data
+            ) VALUES
+                ($1, $2, $3, $4, $5, $7, '{}'::jsonb),
+                ($1, $2, $6, $4, $5, $7, '{}'::jsonb)
+            """,
+            provider_uuid,
+            generation,
+            user_uuid,
+            project_uuid,
+            b"u" * 32,
+            workspace_user_uuid,
+            source_version,
+        )
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.zulip_streams (
+                uuid, realm_uuid, chat_type, chat_key, name,
+                private, content_hash
+            ) VALUES ($1, $2, 'channel', 'ownerless-empty',
+                      'Ownerless empty', true, $3)
+            """,
+            ownerless_stream_uuid,
+            realm_uuid,
+            b"e" * 32,
+        )
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.sync_diffs (
+                provider_uuid, entity_type, entity_uuid, realm_uuid,
+                direction, processing_status, source_updated_at,
+                target_updated_at, last_error
+            ) VALUES
+                ($1, 'users', $2, $5, 'to_workspace', 'blocked', $6, $6,
+                 'Workspace Provider API returned 409 '
+                 'error=provider_user_is_referenced item_index=0'),
+                ($1, 'users', $3, $5, 'to_zulip', 'blocked', $6, $6,
+                 'Workspace user profile writes are not supported'),
+                ($1, 'streams', $4, $5, 'to_workspace', 'blocked', $6, NULL,
+                 'Workspace Provider API returned 422 '
+                 'error=invalid_uuid item_index=0')
+            """,
+            provider_uuid,
+            user_uuid,
+            workspace_user_uuid,
+            ownerless_stream_uuid,
+            realm_uuid,
+            source_version,
+        )
+
+        assert await worker._apply_projection_upgrade(13, realm_uuid, generation) == 3
+        repaired_tail = await pool.fetch(
+            """
+            SELECT entity_uuid, processing_status, last_error
+            FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1
+              AND entity_uuid = ANY($2::uuid[])
+            ORDER BY entity_uuid
+            """,
+            provider_uuid,
+            [user_uuid, workspace_user_uuid, ownerless_stream_uuid],
+        )
+        repaired_tail_by_uuid = {row["entity_uuid"]: row for row in repaired_tail}
+        assert repaired_tail_by_uuid[user_uuid]["processing_status"] == "skipped"
+        assert repaired_tail_by_uuid[user_uuid]["last_error"] == (
+            "workspace_linked_user_projection"
+        )
+        assert repaired_tail_by_uuid[workspace_user_uuid]["processing_status"] == (
+            "skipped"
+        )
+        assert repaired_tail_by_uuid[workspace_user_uuid]["last_error"] == (
+            "workspace_linked_user_projection"
+        )
+        assert repaired_tail_by_uuid[ownerless_stream_uuid]["processing_status"] == (
+            "skipped"
+        )
+        assert repaired_tail_by_uuid[ownerless_stream_uuid]["last_error"] == (
+            "ownerless_empty_stream"
+        )
+        assert (
+            await worker._plan_target_only(
+                "users", _SOURCE_TABLES["users"], realm_uuid, generation
+            )
+            == 0
+        )
+        for linked_uuid in (user_uuid, workspace_user_uuid):
+            assert not await event_worker._upsert_diff(
+                "users",
+                linked_uuid,
+                None,
+                b"v" * 32,
+                source_version + timedelta(seconds=1),
+                project_uuid,
+            )
+        assert await worker._apply_projection_upgrade(14, realm_uuid, generation) == 0
     finally:
         await pool.close()
 
@@ -4846,7 +5100,7 @@ async def _workspace_diff_planner_schedules_unready_entity_graph(
                 """,
                 provider_uuid,
             )
-            == 11
+            == 14
         )
 
         late_message_uuid = UUID("10000000-0000-0000-0000-000000000091")
@@ -9213,7 +9467,7 @@ async def _event_processor_round_trip(dsn: str) -> None:
         assert final_message["created_at"] == datetime.fromtimestamp(
             1_700_000_000, tz=UTC
         )
-        assert final_message["source_updated_at"] == datetime.fromtimestamp(
+        assert final_message["source_updated_at"] > datetime.fromtimestamp(
             1_700_000_100, tz=UTC
         )
         assert final_message["updated_at"] >= processing_started_at

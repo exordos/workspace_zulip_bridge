@@ -2010,7 +2010,11 @@ class HistorySession:
                           AND link.entity_type = 'message'
                           AND link.workspace_uuid = EXCLUDED.uuid
                     ) THEN zulip_messages.created_at ELSE EXCLUDED.created_at END,
-                    source_updated_at = EXCLUDED.source_updated_at,
+                    source_updated_at = GREATEST(
+                        EXCLUDED.source_updated_at,
+                        zulip_messages.source_updated_at
+                            + interval '1 microsecond'
+                    ),
                     updated_at = clock_timestamp()
                 WHERE zulip_messages.message_hash IS DISTINCT FROM EXCLUDED.message_hash
                 RETURNING uuid, zulip_message_id
