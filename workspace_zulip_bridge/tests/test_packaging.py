@@ -83,7 +83,7 @@ def test_exordos_manifest_renders_without_implicit_values() -> None:
                 "image": "urn:images:00000000-0000-0000-0000-000000000000",
                 "label": "root",
             },
-            {"size": 64, "label": "data"},
+            {"size": 96, "label": "data"},
         ],
     }
     infrastructure_project_id = "12345678-c625-4fee-81d5-f691897b8142"
