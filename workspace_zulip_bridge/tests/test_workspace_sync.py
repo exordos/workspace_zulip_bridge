@@ -9,8 +9,10 @@ from unittest.mock import AsyncMock
 from uuid import UUID
 
 import httpx
+import pytest
 
 from workspace_zulip_bridge.config import Settings
+from workspace_zulip_bridge.workspace_sync import ProviderApiError
 from workspace_zulip_bridge.workspace_sync import WorkspaceDiffWorker
 from workspace_zulip_bridge.workspace_sync import _entity_dependencies
 from workspace_zulip_bridge.workspace_sync import _equivalent_entity
@@ -65,6 +67,91 @@ def test_provider_api_error_preserves_safe_item_index() -> None:
         "Workspace Provider API returned 422 error=invalid_entity item_index=17"
     )
     assert "private message content" not in str(error)
+
+
+def test_moved_flag_repair_reduces_batch_after_timeout(tmp_path: Path) -> None:
+    asyncio.run(_moved_flag_repair_reduces_batch_after_timeout(tmp_path))
+
+
+async def _moved_flag_repair_reduces_batch_after_timeout(
+    tmp_path: Path,
+) -> None:
+    class Transaction:
+        async def __aenter__(self) -> None:
+            return None
+
+        async def __aexit__(self, *args: object) -> bool:
+            return False
+
+    class Connection:
+        def __init__(self) -> None:
+            self.batch_sizes: list[int] = []
+
+        def transaction(self) -> Transaction:
+            return Transaction()
+
+        async def fetchrow(self, query: str, *args: object) -> dict[str, object]:
+            if "SELECT source_updated_at, entity_uuid" in query:
+                return {"source_updated_at": None, "entity_uuid": None}
+            batch_size = args[-1]
+            assert isinstance(batch_size, int)
+            self.batch_sizes.append(batch_size)
+            if len(self.batch_sizes) == 1:
+                raise TimeoutError
+            return {
+                "scanned": 0,
+                "repaired": 0,
+                "last_source_updated_at": None,
+                "last_uuid": None,
+                "requeued": 0,
+            }
+
+        async def execute(self, query: str, *args: object) -> str:
+            return "UPDATE 1"
+
+    class ConnectionContext:
+        def __init__(self, connection: Connection) -> None:
+            self.connection = connection
+
+        async def __aenter__(self) -> Connection:
+            return self.connection
+
+        async def __aexit__(self, *args: object) -> bool:
+            return False
+
+    class Pool:
+        def __init__(self) -> None:
+            self.connection = Connection()
+
+        async def execute(self, query: str, *args: object) -> str:
+            return "INSERT 0 1"
+
+        def acquire(self) -> ConnectionContext:
+            return ConnectionContext(self.connection)
+
+    token_file = tmp_path / "workspace-repair.token"
+    token_file.write_text("integration-token")
+    settings = Settings.from_env(
+        {
+            "WZB_WORKSPACE_WEBSOCKET_URL": (
+                "ws://workspace.test/api/workspace/v1/events/ws"
+            ),
+            "WZB_WORKSPACE_PROJECT_ID": "10000000-0000-0000-0000-000000000001",
+            "WZB_WORKSPACE_PROVIDER_UUID": "10000000-0000-0000-0000-000000000002",
+            "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+        }
+    )
+    pool = Pool()
+    worker = WorkspaceDiffWorker(pool, settings)  # type: ignore[arg-type]
+
+    assert (
+        await worker._repair_moved_message_flags(
+            UUID("10000000-0000-0000-0000-000000000003"),
+            UUID("10000000-0000-0000-0000-000000000004"),
+        )
+        == 0
+    )
+    assert pool.connection.batch_sizes == [10000, 5000]
 
 
 def test_workspace_batch_continues_after_terminal_item_rejection(
@@ -145,6 +232,182 @@ async def _workspace_batch_continues_after_terminal_item_rejection(
     worker._accept.assert_awaited_once_with(
         [(accepted_row, {"name": "accepted"}, b"a" * 32)]
     )
+
+
+def test_workspace_batch_bisects_repeated_server_failure(tmp_path: Path) -> None:
+    asyncio.run(_workspace_batch_bisects_repeated_server_failure(tmp_path))
+
+
+async def _workspace_batch_bisects_repeated_server_failure(
+    tmp_path: Path,
+) -> None:
+    worker, ready = _server_failure_worker(tmp_path, 4)
+    worker._post = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[
+            httpx.Response(500, json={"error": "unknown"}),
+            httpx.Response(500, json={"error": "unknown"}),
+            httpx.Response(200, json={"results": [{}]}),
+            httpx.Response(200, json={"results": [{}]}),
+            httpx.Response(200, json={"results": [{}, {}]}),
+        ]
+    )
+    worker._mark = AsyncMock()  # type: ignore[method-assign]
+    worker._accept = AsyncMock()  # type: ignore[method-assign]
+
+    await worker._apply_workspace_batch(object(), "backfill", ready)  # type: ignore[arg-type]
+
+    assert worker._post.await_count == 5
+    worker._mark.assert_not_awaited()
+    accepted = {
+        record[0]["entity_uuid"]
+        for call in worker._accept.await_args_list
+        for record in call.args[0]
+    }
+    assert accepted == {item[0]["entity_uuid"] for item in ready}
+
+
+def test_workspace_batch_bounds_split_during_server_outage(tmp_path: Path) -> None:
+    asyncio.run(_workspace_batch_bounds_split_during_server_outage(tmp_path))
+
+
+async def _workspace_batch_bounds_split_during_server_outage(
+    tmp_path: Path,
+) -> None:
+    worker, ready = _server_failure_worker(tmp_path, 8)
+    worker._post = AsyncMock(  # type: ignore[method-assign]
+        return_value=httpx.Response(500, json={"error": "unknown"})
+    )
+    worker._mark = AsyncMock()  # type: ignore[method-assign]
+    worker._accept = AsyncMock()  # type: ignore[method-assign]
+
+    with pytest.raises(ProviderApiError, match="Provider API returned 500"):
+        await worker._apply_workspace_batch(  # type: ignore[arg-type]
+            object(),
+            "backfill",
+            ready,
+        )
+
+    assert worker._post.await_count == 7
+    worker._accept.assert_not_awaited()
+    marked = {
+        row["entity_uuid"]
+        for call in worker._mark.await_args_list
+        for row in call.args[0]
+    }
+    assert marked == {item[0]["entity_uuid"] for item in ready}
+
+
+def test_workspace_batch_falls_back_to_single_entity_put(tmp_path: Path) -> None:
+    asyncio.run(_workspace_batch_falls_back_to_single_entity_put(tmp_path))
+
+
+async def _workspace_batch_falls_back_to_single_entity_put(
+    tmp_path: Path,
+) -> None:
+    worker, ready = _server_failure_worker(tmp_path, 1)
+    worker._post = AsyncMock(  # type: ignore[method-assign]
+        return_value=httpx.Response(500, json={"error": "unknown"})
+    )
+    worker._put = AsyncMock(  # type: ignore[method-assign]
+        return_value=httpx.Response(200, json={"status": "created"})
+    )
+    worker._mark = AsyncMock()  # type: ignore[method-assign]
+    worker._accept = AsyncMock()  # type: ignore[method-assign]
+
+    await worker._apply_workspace_batch(object(), "backfill", ready)  # type: ignore[arg-type]
+
+    worker._post.assert_awaited_once()
+    worker._put.assert_awaited_once()
+    assert worker._put.await_args.args[1].endswith(
+        f"/provider/entities/message_flags/{ready[0][0]['entity_uuid']}"
+    )
+    assert worker._put.await_args.kwargs["json"] == {
+        "content_hash": ready[0][3]["content_hash"],
+        "source_updated_at": ready[0][3]["source_updated_at"],
+        "data": ready[0][3]["data"],
+    }
+    worker._mark.assert_not_awaited()
+    worker._accept.assert_awaited_once_with([ready[0][:3]])
+
+
+def test_workspace_entity_fallback_keeps_server_failure_retryable(
+    tmp_path: Path,
+) -> None:
+    asyncio.run(_workspace_entity_fallback_keeps_server_failure_retryable(tmp_path))
+
+
+async def _workspace_entity_fallback_keeps_server_failure_retryable(
+    tmp_path: Path,
+) -> None:
+    worker, ready = _server_failure_worker(tmp_path, 1)
+    worker._post = AsyncMock(  # type: ignore[method-assign]
+        return_value=httpx.Response(500, json={"error": "unknown"})
+    )
+    worker._put = AsyncMock(  # type: ignore[method-assign]
+        return_value=httpx.Response(503, json={"error": "unavailable"})
+    )
+    worker._mark = AsyncMock()  # type: ignore[method-assign]
+    worker._accept = AsyncMock()  # type: ignore[method-assign]
+
+    with pytest.raises(ProviderApiError, match="Provider API returned 503"):
+        await worker._apply_workspace_batch(  # type: ignore[arg-type]
+            object(),
+            "backfill",
+            ready,
+        )
+
+    worker._post.assert_awaited_once()
+    worker._put.assert_awaited_once()
+    worker._mark.assert_awaited_once_with(
+        [ready[0][0]],
+        "failed",
+        "Workspace Provider API returned 503 error=unavailable",
+    )
+    worker._accept.assert_not_awaited()
+
+
+def _server_failure_worker(
+    tmp_path: Path,
+    count: int,
+) -> tuple[WorkspaceDiffWorker, list[tuple[dict, dict, bytes, dict]]]:
+    token_file = tmp_path / "workspace-server-failure.token"
+    token_file.write_text("integration-token")
+    settings = Settings.from_env(
+        {
+            "WZB_WORKSPACE_WEBSOCKET_URL": (
+                "ws://workspace.test/api/workspace/v1/events/ws"
+            ),
+            "WZB_WORKSPACE_PROJECT_ID": "10000000-0000-0000-0000-000000000001",
+            "WZB_WORKSPACE_PROVIDER_UUID": "10000000-0000-0000-0000-000000000002",
+            "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+        }
+    )
+    worker = WorkspaceDiffWorker(object(), settings)  # type: ignore[arg-type]
+    ready = []
+    for index in range(count):
+        entity_uuid = UUID(f"10000000-0000-0000-0000-{index + 10:012d}")
+        row = {
+            "entity_type": "message_flags",
+            "entity_uuid": entity_uuid,
+            "claimed_at": datetime(2026, 9, 25, tzinfo=UTC),
+            "attempt_count": 3,
+        }
+        ready.append(
+            (
+                row,
+                {"read": True},
+                b"f" * 32,
+                {
+                    "action": "upsert",
+                    "type": "message_flags",
+                    "uuid": str(entity_uuid),
+                    "content_hash": (b"f" * 32).hex(),
+                    "source_updated_at": "2026-09-25T00:00:00Z",
+                    "data": {"read": True},
+                },
+            )
+        )
+    return worker, ready
 
 
 def test_workspace_batch_skips_entities_outside_provider_scope(

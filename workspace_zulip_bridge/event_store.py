@@ -1363,6 +1363,21 @@ class EventStore:
                         for row in updated
                     ],
                 )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.workspace_outbox (
+                    realm_uuid, entity_type, action, entity_uuid
+                )
+                SELECT changed.realm_uuid, 'message_flag', 'upsert', changed.uuid
+                FROM unnest($1::uuid[], $2::uuid[])
+                    AS changed(realm_uuid, uuid)
+                ON CONFLICT (realm_uuid, entity_type, entity_uuid)
+                    WHERE delivery_status = 'pending'
+                DO UPDATE SET action = 'upsert', updated_at = clock_timestamp()
+                """,
+                [item[1] for item in changed],
+                [item[0] for item in changed],
+            )
         return len(changed)
 
     async def set_queue(
@@ -2090,6 +2105,7 @@ class HistorySession:
                 FROM resolved
                 WHERE resolved.write_flags
                 ON CONFLICT (message_uuid, zulip_user_uuid) DO UPDATE SET
+                    zulip_stream_uuid = EXCLUDED.zulip_stream_uuid,
                     is_read = EXCLUDED.is_read, is_starred = EXCLUDED.is_starred,
                     is_collapsed = EXCLUDED.is_collapsed,
                     is_mentioned = EXCLUDED.is_mentioned,
@@ -2099,6 +2115,8 @@ class HistorySession:
                     is_historical = EXCLUDED.is_historical,
                     flags_hash = EXCLUDED.flags_hash
                 WHERE zulip_message_flags.flags_hash IS DISTINCT FROM EXCLUDED.flags_hash
+                   OR zulip_message_flags.zulip_stream_uuid
+                      IS DISTINCT FROM EXCLUDED.zulip_stream_uuid
                 RETURNING uuid
             ), removed_reactions AS MATERIALIZED (
                 SELECT reaction.uuid, reaction.message_uuid,

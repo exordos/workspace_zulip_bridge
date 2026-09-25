@@ -1298,6 +1298,291 @@ def test_reaction_removal_enqueues_workspace_tombstone() -> None:
     asyncio.run(_reaction_removal_enqueues_workspace_tombstone(_dsn()))
 
 
+def test_message_move_rehomes_personal_flags() -> None:
+    asyncio.run(_message_move_rehomes_personal_flags(_dsn()))
+
+
+async def _message_move_rehomes_personal_flags(dsn: str) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            connection_uuid = await _insert_user(
+                connection,
+                66,
+                400,
+                queue_id="queue-66",
+                status="filling",
+            )
+        catalog = _catalog(
+            66,
+            [(66, "Before move"), (67, "After move")],
+            {"channel:66": 1, "channel:67": 1},
+        )
+        assert (
+            await store.store_chat_catalog(connection_uuid, "queue-66", catalog)
+        ).activated
+        assert (await store.reconcile_chat_schedules()).assigned == 2
+        user_uuid = stable_user_uuid(ENDPOINT, 66)
+        message_uuid = stable_message_uuid(ENDPOINT, 660)
+        flag_uuid = stable_message_flag_uuid(message_uuid, user_uuid)
+        first_stream_uuid = stable_chat_uuid(ENDPOINT, "channel:66")
+        second_stream_uuid = stable_chat_uuid(ENDPOINT, "channel:67")
+        message = ZulipMessage(
+            message_id=660,
+            chat_key="channel:66",
+            topic_name="General",
+            sender_user_uuid=user_uuid,
+            content="before move",
+            is_read=True,
+            is_starred=True,
+            is_collapsed=False,
+            is_mentioned=False,
+            is_stream_wildcard_mentioned=False,
+            is_topic_wildcard_mentioned=False,
+            has_alert_word=False,
+            is_historical=False,
+            reactions_json="[]",
+            content_hash=b"a" * 32,
+            message_hash=b"b" * 32,
+            sent_at=1_700_000_000,
+        )
+        history = await store.begin_history(connection_uuid, "queue-66")
+        try:
+            assert (await history.store_page([message])).flags_changed == 1
+        finally:
+            await history.close()
+        assert (
+            await pool.fetchval(
+                "SELECT zulip_stream_uuid FROM "
+                "workspace_zulip_bridge.zulip_message_flags WHERE uuid = $1",
+                flag_uuid,
+            )
+            == first_stream_uuid
+        )
+
+        moved = replace(
+            message,
+            chat_key="channel:67",
+            content_hash=b"c" * 32,
+            message_hash=b"d" * 32,
+            source_updated_at=1_700_000_001,
+        )
+        history = await store.begin_history(connection_uuid, "queue-66")
+        try:
+            write = await history.store_page([moved])
+            assert (write.changed, write.flags_changed) == (1, 1)
+        finally:
+            await history.close()
+        row = await pool.fetchrow(
+            """
+            SELECT message.zulip_stream_uuid AS message_stream_uuid,
+                   flag.zulip_stream_uuid AS flag_stream_uuid
+            FROM workspace_zulip_bridge.zulip_messages AS message
+            JOIN workspace_zulip_bridge.zulip_message_flags AS flag
+              ON flag.message_uuid = message.uuid
+            WHERE message.uuid = $1
+            """,
+            message_uuid,
+        )
+        assert row is not None
+        assert tuple(row) == (second_stream_uuid, second_stream_uuid)
+    finally:
+        await pool.close()
+
+
+def test_projection_upgrade_repairs_moved_message_flags(tmp_path: Path) -> None:
+    asyncio.run(_projection_upgrade_repairs_moved_message_flags(_dsn(), tmp_path))
+
+
+async def _projection_upgrade_repairs_moved_message_flags(
+    dsn: str,
+    tmp_path: Path,
+) -> None:
+    pool = await _pool(dsn)
+    provider_uuid = UUID("10000000-0000-0000-0000-0000000000d1")
+    project_uuid = UUID("10000000-0000-0000-0000-0000000000d2")
+    generation = UUID("10000000-0000-0000-0000-0000000000d3")
+    old_stream_uuid = UUID("10000000-0000-0000-0000-0000000000d4")
+    new_stream_uuid = UUID("10000000-0000-0000-0000-0000000000d5")
+    message_uuid = UUID("10000000-0000-0000-0000-0000000000d6")
+    token_file = tmp_path / "moved-message-flags.token"
+    token_file.write_text("integration-token")
+    try:
+        async with pool.acquire() as connection:
+            owner_connection_uuid = await _insert_user(connection, 68, 400)
+            guest_connection_uuid = await _insert_user(connection, 69, 400)
+            owner_uuid = stable_user_uuid(ENDPOINT, 68)
+            guest_uuid = stable_user_uuid(ENDPOINT, 69)
+            realm_uuid = stable_realm_uuid(ENDPOINT)
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_realms
+                SET workspace_project_id = $2, workspace_provider_uuid = $3
+                WHERE uuid = $1
+                """,
+                realm_uuid,
+                project_uuid,
+                provider_uuid,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.workspace_mirror_state (
+                    provider_uuid, workspace_project_id, active_generation,
+                    bootstrap_status, reconciliation_version
+                ) VALUES ($1, $2, $3, 'ready', 17)
+                """,
+                provider_uuid,
+                project_uuid,
+                generation,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_streams (
+                    uuid, realm_uuid, chat_type, chat_key, name,
+                    content_hash, source_connection_uuid
+                ) VALUES
+                    ($1, $3, 'channel', 'channel:68', 'Before', $4, $5),
+                    ($2, $3, 'channel', 'channel:69', 'After', $4, $5)
+                """,
+                old_stream_uuid,
+                new_stream_uuid,
+                realm_uuid,
+                b"s" * 32,
+                owner_connection_uuid,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_stream_bindings (
+                    uuid, zulip_stream_uuid, zulip_user_uuid, role,
+                    membership_kind, notification_mode, content_hash
+                ) VALUES
+                    ($1, $3, $5, 'member', 'subscriber', 'all_messages', $7),
+                    ($2, $3, $6, 'member', 'subscriber', 'all_messages', $7),
+                    ($4, $8, $5, 'member', 'subscriber', 'all_messages', $7)
+                """,
+                stable_stream_binding_uuid(old_stream_uuid, owner_uuid),
+                stable_stream_binding_uuid(old_stream_uuid, guest_uuid),
+                old_stream_uuid,
+                stable_stream_binding_uuid(new_stream_uuid, owner_uuid),
+                owner_uuid,
+                guest_uuid,
+                b"b" * 32,
+                new_stream_uuid,
+            )
+            topic_uuid = stable_topic_uuid(new_stream_uuid, "General")
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_topics (
+                    uuid, zulip_stream_uuid, name, content_hash
+                ) VALUES ($1, $2, 'General', $3)
+                """,
+                topic_uuid,
+                new_stream_uuid,
+                b"t" * 32,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_messages (
+                    uuid, realm_uuid, source_connection_uuid, zulip_stream_uuid,
+                    topic_uuid, sender_user_uuid, zulip_message_id, content,
+                    content_hash, message_hash, created_at, source_updated_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, 680, 'moved', $7, $8,
+                          clock_timestamp(), clock_timestamp())
+                """,
+                message_uuid,
+                realm_uuid,
+                owner_connection_uuid,
+                new_stream_uuid,
+                topic_uuid,
+                owner_uuid,
+                b"m" * 32,
+                b"n" * 32,
+            )
+            owner_flag_uuid = stable_message_flag_uuid(message_uuid, owner_uuid)
+            guest_flag_uuid = stable_message_flag_uuid(message_uuid, guest_uuid)
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_message_flags (
+                    uuid, realm_uuid, zulip_stream_uuid, message_uuid,
+                    zulip_user_uuid, is_read, flags_hash
+                ) VALUES
+                    ($1, $3, $4, $5, $6, true, $8),
+                    ($2, $3, $4, $5, $7, true, $8)
+                """,
+                owner_flag_uuid,
+                guest_flag_uuid,
+                realm_uuid,
+                old_stream_uuid,
+                message_uuid,
+                owner_uuid,
+                guest_uuid,
+                b"f" * 32,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.sync_diffs (
+                    provider_uuid, entity_type, entity_uuid, realm_uuid,
+                    partition_key, direction, processing_status,
+                    source_hash, source_updated_at, attempt_count, last_error
+                ) VALUES
+                    ($1, 'message_flags', $2, $4, $5, 'to_workspace',
+                     'failed', $6, clock_timestamp(), 3, 'error=unknown'),
+                    ($1, 'message_flags', $3, $4, $5, 'to_workspace',
+                     'failed', $6, clock_timestamp(), 3, 'error=unknown')
+                """,
+                provider_uuid,
+                owner_flag_uuid,
+                guest_flag_uuid,
+                realm_uuid,
+                old_stream_uuid,
+                b"f" * 32,
+            )
+        settings = Settings.from_env(
+            {
+                "WZB_DATABASE_DSN": dsn,
+                "WZB_WORKSPACE_WEBSOCKET_URL": (
+                    "ws://workspace.test/api/workspace/v1/events/ws"
+                ),
+                "WZB_WORKSPACE_PROJECT_ID": str(project_uuid),
+                "WZB_WORKSPACE_PROVIDER_UUID": str(provider_uuid),
+                "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+            }
+        )
+        worker = WorkspaceDiffWorker(pool, settings)
+        assert await worker._repair_moved_message_flags(realm_uuid, generation) == 2
+        flags = await pool.fetch(
+            """
+            SELECT uuid, zulip_stream_uuid
+            FROM workspace_zulip_bridge.zulip_message_flags
+            ORDER BY uuid
+            """
+        )
+        assert [(row["uuid"], row["zulip_stream_uuid"]) for row in flags] == [
+            (owner_flag_uuid, new_stream_uuid)
+        ]
+        diffs = await pool.fetch(
+            """
+            SELECT entity_uuid, partition_key, source_hash,
+                   processing_status, attempt_count, last_error
+            FROM workspace_zulip_bridge.sync_diffs
+            ORDER BY entity_uuid
+            """
+        )
+        by_uuid = {row["entity_uuid"]: row for row in diffs}
+        assert by_uuid[owner_flag_uuid]["partition_key"] == new_stream_uuid
+        assert by_uuid[owner_flag_uuid]["source_hash"] == b"f" * 32
+        assert by_uuid[guest_flag_uuid]["partition_key"] == new_stream_uuid
+        assert by_uuid[guest_flag_uuid]["source_hash"] is None
+        for row in by_uuid.values():
+            assert row["processing_status"] == "pending"
+            assert row["attempt_count"] == 0
+            assert row["last_error"] == "requeued_moved_message_flag"
+        assert guest_connection_uuid != owner_connection_uuid
+    finally:
+        await pool.close()
+
+
 async def _reaction_removal_enqueues_workspace_tombstone(dsn: str) -> None:
     pool = await _pool(dsn)
     provider_uuid = UUID("10000000-0000-0000-0000-0000000000c1")
@@ -3749,6 +4034,14 @@ def test_workspace_projection_upgrade_restores_missing_topic_journal(
     )
 
 
+def test_workspace_projection_upgrade_repairs_recent_flag_journal_gap(
+    tmp_path: Path,
+) -> None:
+    asyncio.run(
+        _workspace_projection_upgrade_repairs_recent_flag_journal_gap(_dsn(), tmp_path)
+    )
+
+
 def test_workspace_sync_scopes_provider_realm_to_project(tmp_path: Path) -> None:
     asyncio.run(_workspace_sync_scopes_provider_realm_to_project(_dsn(), tmp_path))
 
@@ -5099,6 +5392,181 @@ async def _workspace_outbox_waits_until_source_becomes_eligible(
         await pool.close()
 
 
+async def _workspace_projection_upgrade_repairs_recent_flag_journal_gap(
+    dsn: str,
+    tmp_path: Path,
+) -> None:
+    pool = await _pool(dsn)
+    provider_uuid = UUID("10000000-0000-0000-0000-0000000000e1")
+    project_uuid = UUID("10000000-0000-0000-0000-0000000000e2")
+    generation = UUID("10000000-0000-0000-0000-0000000000e3")
+    old_repair_generation = UUID("10000000-0000-0000-0000-0000000000e4")
+    stream_uuid = UUID("10000000-0000-0000-0000-0000000000e5")
+    message_uuid = UUID("10000000-0000-0000-0000-0000000000e6")
+    flag_uuid = UUID("10000000-0000-0000-0000-0000000000e7")
+    token_file = tmp_path / "workspace-recent-flag-repair.token"
+    token_file.write_text("integration-token")
+    try:
+        async with pool.acquire() as connection:
+            connection_uuid = await _insert_user(connection, 84, 400)
+            realm_uuid = stable_realm_uuid(ENDPOINT)
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_realms
+                SET workspace_project_id = $2, workspace_provider_uuid = $3
+                WHERE uuid = $1
+                """,
+                realm_uuid,
+                project_uuid,
+                provider_uuid,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.workspace_mirror_state (
+                    provider_uuid, workspace_project_id, active_generation,
+                    bootstrap_status, reconciliation_version,
+                    initial_sync_completed_at
+                ) VALUES ($1, $2, $3, 'ready', 18, clock_timestamp())
+                """,
+                provider_uuid,
+                project_uuid,
+                generation,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_streams (
+                    uuid, realm_uuid, chat_type, chat_key, name, content_hash,
+                    source_connection_uuid
+                ) VALUES ($1, $2, 'channel', '84', 'Recent flag gap', $3, $4)
+                """,
+                stream_uuid,
+                realm_uuid,
+                b"s" * 32,
+                connection_uuid,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_stream_bindings (
+                    uuid, zulip_stream_uuid, zulip_user_uuid, role,
+                    membership_kind, content_hash
+                ) VALUES ($1, $2, $3, 'member', 'subscriber', $4)
+                """,
+                stable_stream_binding_uuid(stream_uuid, connection_uuid),
+                stream_uuid,
+                connection_uuid,
+                b"b" * 32,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_messages (
+                    uuid, realm_uuid, source_connection_uuid,
+                    zulip_stream_uuid, sender_user_uuid, zulip_message_id,
+                    content, content_hash, message_hash, created_at,
+                    source_updated_at
+                ) VALUES ($1, $2, $3, $4, $3, 8401, 'recent flag gap',
+                          $5, $6, clock_timestamp(), clock_timestamp())
+                """,
+                message_uuid,
+                realm_uuid,
+                connection_uuid,
+                stream_uuid,
+                b"m" * 32,
+                b"h" * 32,
+            )
+            flag_timestamp = await connection.fetchval("SELECT clock_timestamp()")
+            assert isinstance(flag_timestamp, datetime)
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_message_flags (
+                    uuid, realm_uuid, zulip_stream_uuid, message_uuid,
+                    zulip_user_uuid, is_read, flags_hash, updated_at
+                ) VALUES ($1, $2, $3, $4, $5, true, $6, $7)
+                """,
+                flag_uuid,
+                realm_uuid,
+                stream_uuid,
+                message_uuid,
+                connection_uuid,
+                b"f" * 32,
+                flag_timestamp,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.sync_repair_cursors (
+                    provider_uuid, entity_type, snapshot_generation,
+                    source_updated_at, entity_uuid
+                ) VALUES ($1, 'message_flags', $2, $3, $4)
+                """,
+                provider_uuid,
+                old_repair_generation,
+                flag_timestamp + timedelta(hours=1),
+                UUID("ffffffff-ffff-ffff-ffff-ffffffffffff"),
+            )
+        worker = WorkspaceDiffWorker(
+            pool,
+            Settings.from_env(
+                {
+                    "WZB_DATABASE_DSN": dsn,
+                    "WZB_WORKSPACE_WEBSOCKET_URL": (
+                        "ws://workspace.test/api/workspace/v1/events/ws"
+                    ),
+                    "WZB_WORKSPACE_PROJECT_ID": str(project_uuid),
+                    "WZB_WORKSPACE_PROVIDER_UUID": str(provider_uuid),
+                    "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+                }
+            ),
+        )
+        worker.FLAG_REPAIR_SCAN_BATCH_SIZE = 1
+
+        assert await worker.plan() >= 1
+        assert (
+            await pool.fetchval(
+                """
+                SELECT reconciliation_version
+                FROM workspace_zulip_bridge.workspace_mirror_state
+                WHERE provider_uuid = $1
+                """,
+                provider_uuid,
+            )
+            == 19
+        )
+        assert not await pool.fetchval(
+            """
+            SELECT initial_sync_completed_at IS NOT NULL
+            FROM workspace_zulip_bridge.workspace_mirror_state
+            WHERE provider_uuid = $1
+            """,
+            provider_uuid,
+        )
+        assert (
+            await pool.fetchval(
+                """
+                SELECT processing_status
+                FROM workspace_zulip_bridge.sync_diffs
+                WHERE provider_uuid = $1 AND entity_type = 'message_flags'
+                  AND entity_uuid = $2
+                """,
+                provider_uuid,
+                flag_uuid,
+            )
+            == "pending"
+        )
+        repair_cursor = await pool.fetchrow(
+            """
+            SELECT source_updated_at, entity_uuid, snapshot_generation
+            FROM workspace_zulip_bridge.sync_repair_cursors
+            WHERE provider_uuid = $1 AND entity_type = 'message_flags'
+            """,
+            provider_uuid,
+        )
+        assert repair_cursor is not None
+        assert repair_cursor["source_updated_at"] == flag_timestamp
+        assert repair_cursor["entity_uuid"] == flag_uuid
+        assert repair_cursor["snapshot_generation"] != old_repair_generation
+    finally:
+        await pool.close()
+
+
 async def _workspace_projection_upgrade_restores_missing_topic_journal(
     dsn: str,
     tmp_path: Path,
@@ -5111,6 +5579,8 @@ async def _workspace_projection_upgrade_restores_missing_topic_journal(
     topic_uuid = UUID("10000000-0000-0000-0000-0000000000c5")
     message_uuid = UUID("10000000-0000-0000-0000-0000000000c6")
     reaction_uuid = UUID("10000000-0000-0000-0000-0000000000c7")
+    flag_uuid = UUID("10000000-0000-0000-0000-0000000000c8")
+    stream_binding_uuid = UUID("10000000-0000-0000-0000-0000000000c9")
     token_file = tmp_path / "workspace-topic-journal-repair.token"
     token_file.write_text("integration-token")
     try:
@@ -5131,8 +5601,9 @@ async def _workspace_projection_upgrade_restores_missing_topic_journal(
                 """
                 INSERT INTO workspace_zulip_bridge.workspace_mirror_state (
                     provider_uuid, workspace_project_id, active_generation,
-                    bootstrap_status, reconciliation_version
-                ) VALUES ($1, $2, $3, 'ready', 14)
+                    bootstrap_status, reconciliation_version,
+                    initial_sync_completed_at
+                ) VALUES ($1, $2, $3, 'ready', 14, clock_timestamp())
                 """,
                 provider_uuid,
                 project_uuid,
@@ -5149,6 +5620,18 @@ async def _workspace_projection_upgrade_restores_missing_topic_journal(
                 realm_uuid,
                 b"s" * 32,
                 connection_uuid,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_stream_bindings (
+                    uuid, zulip_stream_uuid, zulip_user_uuid, role,
+                    membership_kind, content_hash
+                ) VALUES ($1, $2, $3, 'member', 'subscriber', $4)
+                """,
+                stream_binding_uuid,
+                stream_uuid,
+                connection_uuid,
+                b"b" * 32,
             )
             await connection.execute(
                 """
@@ -5192,6 +5675,32 @@ async def _workspace_projection_upgrade_restores_missing_topic_journal(
             )
             await connection.execute(
                 """
+                INSERT INTO workspace_zulip_bridge.zulip_message_flags (
+                    uuid, realm_uuid, zulip_stream_uuid, message_uuid,
+                    zulip_user_uuid, flags_hash
+                ) VALUES ($1, $2, $3, $4, $5, $6)
+                """,
+                flag_uuid,
+                realm_uuid,
+                stream_uuid,
+                message_uuid,
+                connection_uuid,
+                b"f" * 32,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.sync_repair_cursors (
+                    provider_uuid, entity_type, snapshot_generation,
+                    source_updated_at, entity_uuid
+                ) VALUES ($1, 'message_flags', $2,
+                          clock_timestamp() + interval '1 day', $3)
+                """,
+                provider_uuid,
+                generation,
+                UUID("10000000-0000-0000-0000-0000000000ca"),
+            )
+            await connection.execute(
+                """
                 INSERT INTO workspace_zulip_bridge.zulip_message_reactions (
                     uuid, realm_uuid, message_uuid, zulip_user_uuid,
                     emoji_name, emoji_code, reaction_type
@@ -5216,7 +5725,8 @@ async def _workspace_projection_upgrade_restores_missing_topic_journal(
                 }
             ),
         )
-        assert await worker.plan() >= 2
+        worker.FLAG_REPAIR_SCAN_BATCH_SIZE = 1
+        assert await worker.plan() >= 3
         assert (
             await pool.fetchval(
                 """
@@ -5226,7 +5736,7 @@ async def _workspace_projection_upgrade_restores_missing_topic_journal(
             """,
                 provider_uuid,
             )
-            == 16
+            == 19
         )
         assert (
             await pool.fetchval(
@@ -5241,6 +5751,40 @@ async def _workspace_projection_upgrade_restores_missing_topic_journal(
             )
             == "pending"
         )
+        assert (
+            await pool.fetchval(
+                """
+            SELECT processing_status
+            FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1 AND entity_type = 'message_flags'
+              AND entity_uuid = $2
+            """,
+                provider_uuid,
+                flag_uuid,
+            )
+            == "pending"
+        )
+        assert not await pool.fetchval(
+            """
+            SELECT initial_sync_completed_at IS NOT NULL
+            FROM workspace_zulip_bridge.workspace_mirror_state
+            WHERE provider_uuid = $1
+            """,
+            provider_uuid,
+        )
+        repair_cursor = await pool.fetchrow(
+            """
+            SELECT source_updated_at IS NOT NULL AS advanced, entity_uuid,
+                   snapshot_generation
+            FROM workspace_zulip_bridge.sync_repair_cursors
+            WHERE provider_uuid = $1 AND entity_type = 'message_flags'
+            """,
+            provider_uuid,
+        )
+        assert repair_cursor is not None
+        assert repair_cursor["advanced"]
+        assert repair_cursor["entity_uuid"] == flag_uuid
+        assert repair_cursor["snapshot_generation"] != generation
         assert (
             await pool.fetchval(
                 """
@@ -5442,7 +5986,7 @@ async def _workspace_diff_planner_schedules_unready_entity_graph(
                 """,
                 provider_uuid,
             )
-            == 16
+            == 19
         )
 
         late_message_uuid = UUID("10000000-0000-0000-0000-000000000091")
@@ -6232,6 +6776,14 @@ async def _concurrent_message_flag_events_merge_independent_fields(
         )
         assert len(rows) == len(message_ids)
         assert all(row["is_read"] and row["is_starred"] for row in rows)
+        assert await pool.fetchval(
+            """
+                SELECT count(*)
+                FROM workspace_zulip_bridge.workspace_outbox
+                WHERE entity_type = 'message_flag'
+                  AND delivery_status = 'pending'
+                """
+        ) == len(message_ids)
     finally:
         await pool.close()
 

@@ -17,6 +17,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 from urllib.parse import urlunsplit
 from uuid import UUID
+from uuid import uuid5
 
 import asyncpg
 import httpx
@@ -46,7 +47,7 @@ ENTITY_TYPES = (
     "message_reactions",
 )
 PRIORITY = {entity_type: index for index, entity_type in enumerate(ENTITY_TYPES)}
-RECONCILIATION_VERSION = 16
+RECONCILIATION_VERSION = 19
 
 
 class ProviderApiError(RuntimeError):
@@ -1269,6 +1270,12 @@ class WorkspaceDiffWorker:
     LIVE_BATCH_SIZE = 50
     DIRECT_TOPIC_REPAIR_BATCH_SIZE = 10000
     TOPIC_BINDING_REPAIR_BATCH_SIZE = 10000
+    FLAG_REPAIR_SCAN_BATCH_SIZE = 100000
+    MOVED_FLAG_REPAIR_MESSAGE_BATCH_SIZE = 10000
+    MOVED_FLAG_REPAIR_MIN_BATCH_SIZE = 100
+    PROVIDER_BATCH_SPLIT_AFTER_ATTEMPTS = 3
+    PROVIDER_BATCH_SPLIT_MAX_DEPTH = 2
+    PROVIDER_ENTITY_FALLBACK_AFTER_ATTEMPTS = 3
 
     def __init__(
         self,
@@ -1310,6 +1317,7 @@ class WorkspaceDiffWorker:
         self._unmapped_cleanup_done = False
         self._direct_topics_repair_done = False
         self._topic_bindings_repair_done = False
+        self._moved_flag_repair_batch_size = self.MOVED_FLAG_REPAIR_MESSAGE_BATCH_SIZE
         self._zulip_writer = ZulipOutboundWriter(pool, settings)
 
     @property
@@ -2152,6 +2160,103 @@ class WorkspaceDiffWorker:
                 realm_uuid,
                 generation,
             )
+        if current_version < 17:
+            if realm_uuid is None or generation is None:
+                mirror = await self._pool.fetchrow(
+                    """
+                    SELECT realm.uuid AS realm_uuid, mirror.active_generation
+                    FROM workspace_zulip_bridge.zulip_realms AS realm
+                    JOIN workspace_zulip_bridge.workspace_mirror_state AS mirror
+                      ON mirror.provider_uuid = realm.workspace_provider_uuid
+                    WHERE realm.workspace_provider_uuid = $1
+                      AND mirror.bootstrap_status = 'ready'
+                      AND mirror.active_generation IS NOT NULL
+                    """,
+                    self._provider_uuid,
+                )
+                if mirror is None:
+                    return changed
+                realm_uuid = UUID(str(mirror["realm_uuid"]))
+                generation = UUID(str(mirror["active_generation"]))
+            await self._pool.execute(
+                """
+                UPDATE workspace_zulip_bridge.workspace_mirror_state
+                SET initial_sync_completed_at = NULL,
+                    updated_at = clock_timestamp()
+                WHERE provider_uuid = $1
+                  AND initial_sync_completed_at IS NOT NULL
+                """,
+                self._provider_uuid,
+            )
+            changed += await self._repair_missing_flag_diffs(
+                realm_uuid,
+                generation,
+            )
+        if current_version < 18:
+            if realm_uuid is None or generation is None:
+                mirror = await self._pool.fetchrow(
+                    """
+                    SELECT realm.uuid AS realm_uuid, mirror.active_generation
+                    FROM workspace_zulip_bridge.zulip_realms AS realm
+                    JOIN workspace_zulip_bridge.workspace_mirror_state AS mirror
+                      ON mirror.provider_uuid = realm.workspace_provider_uuid
+                    WHERE realm.workspace_provider_uuid = $1
+                      AND mirror.bootstrap_status = 'ready'
+                      AND mirror.active_generation IS NOT NULL
+                    """,
+                    self._provider_uuid,
+                )
+                if mirror is None:
+                    return changed
+                realm_uuid = UUID(str(mirror["realm_uuid"]))
+                generation = UUID(str(mirror["active_generation"]))
+            await self._pool.execute(
+                """
+                UPDATE workspace_zulip_bridge.workspace_mirror_state
+                SET initial_sync_completed_at = NULL,
+                    updated_at = clock_timestamp()
+                WHERE provider_uuid = $1
+                  AND initial_sync_completed_at IS NOT NULL
+                """,
+                self._provider_uuid,
+            )
+            changed += await self._repair_moved_message_flags(
+                realm_uuid,
+                generation,
+            )
+        if current_version < 19:
+            if realm_uuid is None or generation is None:
+                mirror = await self._pool.fetchrow(
+                    """
+                    SELECT realm.uuid AS realm_uuid, mirror.active_generation
+                    FROM workspace_zulip_bridge.zulip_realms AS realm
+                    JOIN workspace_zulip_bridge.workspace_mirror_state AS mirror
+                      ON mirror.provider_uuid = realm.workspace_provider_uuid
+                    WHERE realm.workspace_provider_uuid = $1
+                      AND mirror.bootstrap_status = 'ready'
+                      AND mirror.active_generation IS NOT NULL
+                    """,
+                    self._provider_uuid,
+                )
+                if mirror is None:
+                    return changed
+                realm_uuid = UUID(str(mirror["realm_uuid"]))
+                generation = UUID(str(mirror["active_generation"]))
+            await self._pool.execute(
+                """
+                UPDATE workspace_zulip_bridge.workspace_mirror_state
+                SET initial_sync_completed_at = NULL,
+                    updated_at = clock_timestamp()
+                WHERE provider_uuid = $1
+                  AND initial_sync_completed_at IS NOT NULL
+                """,
+                self._provider_uuid,
+            )
+            changed += await self._repair_missing_flag_diffs(
+                realm_uuid,
+                generation,
+                rewind_existing_cursor=True,
+            )
         return changed
 
     async def _requeue_missing_catalog_outbox(
@@ -2292,6 +2397,343 @@ class WorkspaceDiffWorker:
             generation,
         )
         return int(result.rsplit(" ", 1)[-1])
+
+    async def _repair_missing_flag_diffs(
+        self,
+        realm_uuid: UUID,
+        generation: UUID,
+        *,
+        rewind_existing_cursor: bool = False,
+    ) -> int:
+        """Repair flag rows captured before their outbox journal existed."""
+        repair_generation = uuid5(
+            generation,
+            f"message_flags_repair_v{RECONCILIATION_VERSION}",
+        )
+        await self._pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.sync_repair_cursors (
+                provider_uuid, entity_type, snapshot_generation
+            ) VALUES ($1, 'message_flags', $2)
+            ON CONFLICT (provider_uuid, entity_type) DO UPDATE
+            SET snapshot_generation = EXCLUDED.snapshot_generation,
+                source_updated_at = CASE
+                    WHEN sync_repair_cursors.snapshot_generation
+                         IS DISTINCT FROM EXCLUDED.snapshot_generation
+                         AND $3
+                         AND sync_repair_cursors.source_updated_at IS NOT NULL
+                    THEN sync_repair_cursors.source_updated_at - interval '6 hours'
+                    WHEN sync_repair_cursors.snapshot_generation
+                         IS DISTINCT FROM EXCLUDED.snapshot_generation
+                    THEN NULL
+                    ELSE sync_repair_cursors.source_updated_at
+                END,
+                entity_uuid = CASE
+                    WHEN sync_repair_cursors.snapshot_generation
+                         IS DISTINCT FROM EXCLUDED.snapshot_generation
+                         AND $3
+                         AND sync_repair_cursors.source_updated_at IS NOT NULL
+                    THEN '00000000-0000-0000-0000-000000000000'::uuid
+                    WHEN sync_repair_cursors.snapshot_generation
+                         IS DISTINCT FROM EXCLUDED.snapshot_generation
+                    THEN NULL
+                    ELSE sync_repair_cursors.entity_uuid
+                END,
+                next_run_at = clock_timestamp(),
+                updated_at = clock_timestamp()
+            """,
+            self._provider_uuid,
+            repair_generation,
+            rewind_existing_cursor,
+        )
+        changed = 0
+        while True:
+            async with self._pool.acquire() as connection, connection.transaction():
+                cursor = await connection.fetchrow(
+                    """
+                    SELECT source_updated_at, entity_uuid
+                    FROM workspace_zulip_bridge.sync_repair_cursors
+                    WHERE provider_uuid = $1 AND entity_type = 'message_flags'
+                    FOR UPDATE
+                    """,
+                    self._provider_uuid,
+                )
+                assert cursor is not None
+                batch = await connection.fetchrow(
+                    """
+                    WITH candidates AS MATERIALIZED (
+                        SELECT flag.uuid, flag.zulip_stream_uuid,
+                               flag.flags_hash, flag.updated_at
+                        FROM workspace_zulip_bridge.zulip_message_flags AS flag
+                        WHERE flag.realm_uuid = $2
+                          AND (
+                              $4::timestamptz IS NULL
+                              OR (flag.updated_at, flag.uuid) > ($4, $5)
+                          )
+                        ORDER BY flag.updated_at, flag.uuid
+                        LIMIT $6
+                    ), inserted AS (
+                        INSERT INTO workspace_zulip_bridge.sync_diffs (
+                            provider_uuid, entity_type, entity_uuid, realm_uuid,
+                            partition_key, direction, source_hash, target_hash,
+                            source_updated_at, target_updated_at
+                        )
+                        SELECT $1, 'message_flags', flag.uuid, $2,
+                               flag.zulip_stream_uuid, 'to_workspace',
+                               flag.flags_hash, NULL, flag.updated_at, NULL
+                        FROM candidates AS flag
+                        LEFT JOIN workspace_zulip_bridge.workspace_message_flags
+                            AS target
+                          ON target.provider_uuid = $1
+                         AND target.snapshot_generation = $3
+                         AND target.uuid = flag.uuid
+                        LEFT JOIN workspace_zulip_bridge.sync_diffs AS existing
+                          ON existing.provider_uuid = $1
+                         AND existing.entity_type = 'message_flags'
+                         AND existing.entity_uuid = flag.uuid
+                        WHERE target.uuid IS NULL
+                          AND existing.entity_uuid IS NULL
+                        ON CONFLICT (
+                            provider_uuid, entity_type, entity_uuid
+                        ) DO NOTHING
+                        RETURNING 1
+                    )
+                    SELECT
+                        (SELECT count(*) FROM candidates) AS scanned,
+                        (SELECT count(*) FROM inserted) AS inserted,
+                        (
+                            SELECT updated_at FROM candidates
+                            ORDER BY updated_at DESC, uuid DESC LIMIT 1
+                        ) AS last_updated_at,
+                        (
+                            SELECT uuid FROM candidates
+                            ORDER BY updated_at DESC, uuid DESC LIMIT 1
+                        ) AS last_uuid
+                    """,
+                    self._provider_uuid,
+                    realm_uuid,
+                    generation,
+                    cursor["source_updated_at"],
+                    cursor["entity_uuid"],
+                    self.FLAG_REPAIR_SCAN_BATCH_SIZE,
+                )
+                assert batch is not None
+                scanned = int(batch["scanned"])
+                changed += int(batch["inserted"])
+                if scanned == 0:
+                    return changed
+                await connection.execute(
+                    """
+                    UPDATE workspace_zulip_bridge.sync_repair_cursors
+                    SET source_updated_at = $3, entity_uuid = $4,
+                        next_run_at = clock_timestamp(),
+                        updated_at = clock_timestamp()
+                    WHERE provider_uuid = $1 AND entity_type = $2
+                    """,
+                    self._provider_uuid,
+                    "message_flags",
+                    batch["last_updated_at"],
+                    batch["last_uuid"],
+                )
+                if scanned < self.FLAG_REPAIR_SCAN_BATCH_SIZE:
+                    return changed
+
+    async def _repair_moved_message_flags(
+        self,
+        realm_uuid: UUID,
+        generation: UUID,
+    ) -> int:
+        """Move personal flags with their message or retire invisible flags."""
+        repair_generation = uuid5(
+            generation,
+            f"moved_message_flags_repair_v{RECONCILIATION_VERSION}",
+        )
+        await self._pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.sync_repair_cursors (
+                provider_uuid, entity_type, snapshot_generation
+            ) VALUES ($1, 'messages', $2)
+            ON CONFLICT (provider_uuid, entity_type) DO UPDATE
+            SET snapshot_generation = EXCLUDED.snapshot_generation,
+                source_updated_at = CASE
+                    WHEN sync_repair_cursors.snapshot_generation
+                         IS DISTINCT FROM EXCLUDED.snapshot_generation
+                    THEN NULL ELSE sync_repair_cursors.source_updated_at END,
+                entity_uuid = CASE
+                    WHEN sync_repair_cursors.snapshot_generation
+                         IS DISTINCT FROM EXCLUDED.snapshot_generation
+                    THEN NULL ELSE sync_repair_cursors.entity_uuid END,
+                next_run_at = clock_timestamp(),
+                updated_at = clock_timestamp()
+            """,
+            self._provider_uuid,
+            repair_generation,
+        )
+        changed = 0
+        while True:
+            try:
+                async with (
+                    self._pool.acquire() as connection,
+                    connection.transaction(),
+                ):
+                    cursor = await connection.fetchrow(
+                        """
+                        SELECT source_updated_at, entity_uuid
+                        FROM workspace_zulip_bridge.sync_repair_cursors
+                        WHERE provider_uuid = $1 AND entity_type = 'messages'
+                        FOR UPDATE
+                        """,
+                        self._provider_uuid,
+                    )
+                    assert cursor is not None
+                    batch = await connection.fetchrow(
+                        """
+                    WITH candidates AS MATERIALIZED (
+                        SELECT message.uuid, message.zulip_stream_uuid,
+                               message.source_updated_at
+                        FROM workspace_zulip_bridge.zulip_messages AS message
+                        WHERE message.realm_uuid = $2
+                          AND (
+                              $4::timestamptz IS NULL
+                              OR (message.source_updated_at, message.uuid) >
+                                 ($4, $5)
+                          )
+                        ORDER BY message.source_updated_at, message.uuid
+                        LIMIT $6
+                    ), moved AS MATERIALIZED (
+                        SELECT flag.uuid, flag.realm_uuid,
+                               message.zulip_stream_uuid,
+                               flag.flags_hash,
+                               binding.uuid IS NOT NULL AS visible
+                        FROM candidates AS message
+                        JOIN workspace_zulip_bridge.zulip_message_flags AS flag
+                          ON flag.message_uuid = message.uuid
+                        LEFT JOIN workspace_zulip_bridge.zulip_stream_bindings
+                            AS binding
+                          ON binding.zulip_stream_uuid =
+                             message.zulip_stream_uuid
+                         AND binding.zulip_user_uuid = flag.zulip_user_uuid
+                        WHERE flag.zulip_stream_uuid IS DISTINCT FROM
+                              message.zulip_stream_uuid
+                    ), rebound AS (
+                        UPDATE workspace_zulip_bridge.zulip_message_flags AS flag
+                        SET zulip_stream_uuid = moved.zulip_stream_uuid,
+                            updated_at = clock_timestamp()
+                        FROM moved
+                        WHERE moved.visible AND flag.uuid = moved.uuid
+                        RETURNING flag.uuid, flag.realm_uuid,
+                                  flag.zulip_stream_uuid, flag.flags_hash,
+                                  flag.updated_at
+                    ), orphaned AS (
+                        DELETE FROM workspace_zulip_bridge.zulip_message_flags AS flag
+                        USING moved
+                        WHERE NOT moved.visible AND flag.uuid = moved.uuid
+                        RETURNING flag.uuid, flag.realm_uuid,
+                                  moved.zulip_stream_uuid,
+                                  clock_timestamp() AS updated_at
+                    ), repaired AS MATERIALIZED (
+                        SELECT rebound.uuid, rebound.realm_uuid,
+                               rebound.zulip_stream_uuid,
+                               rebound.flags_hash AS source_hash,
+                               rebound.updated_at AS source_updated_at
+                        FROM rebound
+                        UNION ALL
+                        SELECT orphaned.uuid, orphaned.realm_uuid,
+                               orphaned.zulip_stream_uuid,
+                               NULL::bytea AS source_hash,
+                               orphaned.updated_at AS source_updated_at
+                        FROM orphaned
+                    ), requeued AS (
+                        INSERT INTO workspace_zulip_bridge.sync_diffs (
+                            provider_uuid, entity_type, entity_uuid, realm_uuid,
+                            partition_key, direction, delivery_priority,
+                            source_hash, target_hash, source_updated_at,
+                            target_updated_at
+                        )
+                        SELECT $1, 'message_flags', repaired.uuid,
+                               repaired.realm_uuid,
+                               repaired.zulip_stream_uuid, 'to_workspace', 1,
+                               repaired.source_hash, target.content_hash,
+                               repaired.source_updated_at,
+                               target.source_updated_at
+                        FROM repaired
+                        LEFT JOIN workspace_zulip_bridge.workspace_message_flags
+                            AS target
+                          ON target.provider_uuid = $1
+                         AND target.snapshot_generation = $3
+                         AND target.uuid = repaired.uuid
+                        ON CONFLICT (
+                            provider_uuid, entity_type, entity_uuid
+                        ) DO UPDATE SET
+                            direction = 'to_workspace',
+                            delivery_priority = 1,
+                            partition_key = EXCLUDED.partition_key,
+                            source_hash = EXCLUDED.source_hash,
+                            target_hash = EXCLUDED.target_hash,
+                            source_updated_at = EXCLUDED.source_updated_at,
+                            target_updated_at = EXCLUDED.target_updated_at,
+                            processing_status = 'pending',
+                            attempt_count = 0,
+                            dependency_wait_count = 0,
+                            available_at = clock_timestamp(),
+                            claimed_at = NULL,
+                            processed_at = NULL,
+                            last_error = 'requeued_moved_message_flag',
+                            updated_at = clock_timestamp()
+                        RETURNING 1
+                    )
+                    SELECT
+                        (SELECT count(*) FROM candidates) AS scanned,
+                        (SELECT count(*) FROM repaired) AS repaired,
+                        (
+                            SELECT source_updated_at FROM candidates
+                            ORDER BY source_updated_at DESC, uuid DESC LIMIT 1
+                        ) AS last_source_updated_at,
+                        (
+                            SELECT uuid FROM candidates
+                            ORDER BY source_updated_at DESC, uuid DESC LIMIT 1
+                        ) AS last_uuid,
+                        (SELECT count(*) FROM requeued) AS requeued
+                    """,
+                        self._provider_uuid,
+                        realm_uuid,
+                        generation,
+                        cursor["source_updated_at"],
+                        cursor["entity_uuid"],
+                        self._moved_flag_repair_batch_size,
+                    )
+                    assert batch is not None
+                    scanned = int(batch["scanned"])
+                    changed += int(batch["repaired"])
+                    if scanned == 0:
+                        return changed
+                    await connection.execute(
+                        """
+                        UPDATE workspace_zulip_bridge.sync_repair_cursors
+                        SET source_updated_at = $3, entity_uuid = $4,
+                            next_run_at = clock_timestamp(),
+                            updated_at = clock_timestamp()
+                        WHERE provider_uuid = $1 AND entity_type = $2
+                        """,
+                        self._provider_uuid,
+                        "messages",
+                        batch["last_source_updated_at"],
+                        batch["last_uuid"],
+                    )
+                    if scanned < self._moved_flag_repair_batch_size:
+                        return changed
+            except TimeoutError:
+                reduced_batch_size = max(
+                    self.MOVED_FLAG_REPAIR_MIN_BATCH_SIZE,
+                    self._moved_flag_repair_batch_size // 2,
+                )
+                if reduced_batch_size == self._moved_flag_repair_batch_size:
+                    raise
+                self._moved_flag_repair_batch_size = reduced_batch_size
+                LOG.warning(
+                    "Moved message flag repair timed out; reducing batch size to %d",
+                    reduced_batch_size,
+                )
 
     async def _plan_source_outbox(
         self,
@@ -3078,6 +3520,22 @@ class WorkspaceDiffWorker:
                         )
                         del remaining[item_index]
                         continue
+                    if self._should_use_provider_entity_fallback(remaining, error):
+                        await self._apply_provider_entity_fallback(
+                            client,
+                            remaining[0],
+                        )
+                        return
+                    if self._should_split_provider_failure(records, error):
+                        still_failed = await self._split_provider_failure(
+                            client,
+                            delivery_class,
+                            remaining,
+                            error,
+                        )
+                        if still_failed:
+                            raise error
+                        return
                     await self._isolate_provider_failure(records, error)
                     raise error
                 results = response.json()["results"]
@@ -3094,6 +3552,168 @@ class WorkspaceDiffWorker:
                     str(exc)[:2048],
                 )
                 raise
+
+    def _should_use_provider_entity_fallback(
+        self,
+        ready: list[tuple[asyncpg.Record, dict[str, Any], bytes, dict[str, Any]]],
+        error: ProviderApiError,
+    ) -> bool:
+        if len(ready) != 1:
+            return False
+        row, _, _, operation = ready[0]
+        return (
+            error.status_code >= 500
+            and error.item_index is None
+            and row["entity_type"] == "message_flags"
+            and operation.get("action") == "upsert"
+            and int(row.get("attempt_count", 0) or 0)
+            >= self.PROVIDER_ENTITY_FALLBACK_AFTER_ATTEMPTS
+        )
+
+    async def _apply_provider_entity_fallback(
+        self,
+        client: httpx.AsyncClient,
+        item: tuple[asyncpg.Record, dict[str, Any], bytes, dict[str, Any]],
+    ) -> None:
+        """Bypass a repeatedly failing bulk fast path for one flag."""
+        row, data, content_hash, operation = item
+        payload = {
+            "content_hash": operation["content_hash"],
+            "source_updated_at": operation["source_updated_at"],
+            "data": operation["data"],
+        }
+        if "rebind_identity" in operation:
+            payload["rebind_identity"] = operation["rebind_identity"]
+        response = await self._put(
+            client,
+            f"{workspace_api_url(self._settings)}/provider/entities/"
+            f"{operation['type']}/{operation['uuid']}",
+            json=payload,
+        )
+        if response.is_error:
+            error = _provider_api_error(response)
+            status = (
+                "skipped"
+                if error.error_code == "entity_not_provider_owned"
+                else "blocked"
+                if 400 <= error.status_code < 500
+                else "failed"
+            )
+            reason = (
+                "workspace_entity_outside_provider_scope"
+                if status == "skipped"
+                else str(error)[:2048]
+            )
+            await self._mark([row], status, reason)
+            if status == "failed":
+                raise error
+            return
+        await self._accept([(row, data, content_hash)])
+
+    def _should_split_provider_failure(
+        self,
+        records: list[tuple[asyncpg.Record, dict[str, Any], bytes]],
+        error: ProviderApiError,
+    ) -> bool:
+        return (
+            error.status_code >= 500
+            and error.item_index is None
+            and len(records) > 1
+            and min(int(record[0].get("attempt_count", 0) or 0) for record in records)
+            >= self.PROVIDER_BATCH_SPLIT_AFTER_ATTEMPTS
+        )
+
+    async def _split_provider_failure(
+        self,
+        client: httpx.AsyncClient,
+        delivery_class: str,
+        ready: list[tuple[asyncpg.Record, dict[str, Any], bytes, dict[str, Any]]],
+        error: ProviderApiError,
+        *,
+        depth: int = 0,
+    ) -> bool:
+        """Bound retries while narrowing one repeatedly rejected server batch."""
+        if len(ready) == 1 or depth >= self.PROVIDER_BATCH_SPLIT_MAX_DEPTH:
+            await self._mark(
+                [item[0] for item in ready],
+                "failed",
+                str(error)[:2048],
+            )
+            return True
+        midpoint = len(ready) // 2
+        still_failed = False
+        for subset in (ready[:midpoint], ready[midpoint:]):
+            failure = await self._try_provider_sub_batch(
+                client,
+                delivery_class,
+                subset,
+            )
+            if failure is None:
+                continue
+            failed_subset, subset_error = failure
+            still_failed = (
+                await self._split_provider_failure(
+                    client,
+                    delivery_class,
+                    failed_subset,
+                    subset_error,
+                    depth=depth + 1,
+                )
+                or still_failed
+            )
+        return still_failed
+
+    async def _try_provider_sub_batch(
+        self,
+        client: httpx.AsyncClient,
+        delivery_class: str,
+        ready: list[tuple[asyncpg.Record, dict[str, Any], bytes, dict[str, Any]]],
+    ) -> (
+        tuple[
+            list[tuple[asyncpg.Record, dict[str, Any], bytes, dict[str, Any]]],
+            ProviderApiError,
+        ]
+        | None
+    ):
+        remaining = list(ready)
+        while remaining:
+            response = await self._post(
+                client,
+                f"{workspace_api_url(self._settings)}"
+                "/provider/entities/actions/apply/invoke",
+                json={
+                    "delivery_class": delivery_class,
+                    "operations": [item[3] for item in remaining],
+                },
+            )
+            if response.is_error:
+                error = _provider_api_error(response)
+                item_index = error.item_index
+                if (
+                    400 <= error.status_code < 500
+                    and item_index is not None
+                    and item_index < len(remaining)
+                ):
+                    status = (
+                        "skipped"
+                        if error.error_code == "entity_not_provider_owned"
+                        else "blocked"
+                    )
+                    reason = (
+                        "workspace_entity_outside_provider_scope"
+                        if status == "skipped"
+                        else str(error)[:2048]
+                    )
+                    await self._mark([remaining[item_index][0]], status, reason)
+                    del remaining[item_index]
+                    continue
+                return remaining, error
+            results = response.json()["results"]
+            if len(results) != len(remaining):
+                raise RuntimeError("Workspace batch result length mismatch")
+            await self._accept([item[:3] for item in remaining])
+            return None
+        return None
 
     async def _partition_dependency_ready(
         self,
@@ -3596,6 +4216,22 @@ class WorkspaceDiffWorker:
             f"Bearer {await self._tokens.access_token(force_refresh=True)}"
         )
         return await client.post(url, json=json)
+
+    async def _put(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        *,
+        json: dict[str, Any],
+    ) -> httpx.Response:
+        client.headers["Authorization"] = f"Bearer {await self._tokens.access_token()}"
+        response = await client.put(url, json=json)
+        if response.status_code != 401:
+            return response
+        client.headers["Authorization"] = (
+            f"Bearer {await self._tokens.access_token(force_refresh=True)}"
+        )
+        return await client.put(url, json=json)
 
     async def _complete_initial_sync(self) -> bool:
         result = await self._pool.execute(
