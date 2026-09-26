@@ -1,64 +1,105 @@
 #!/usr/bin/env bash
 
-set -eu
-set -o pipefail
+# Copyright 2026 Genesis Corporation
+# Licensed under the Apache License, Version 2.0 (the "License").
 
+set -euo pipefail
+
+# shellcheck disable=SC1091
 source /usr/local/lib/exordos/lib_bootstrap.sh
-source /usr/local/lib/workspace-zulip-bridge/bootstrap-persistence.sh
 
-CONFIG=/etc/workspace-zulip-bridge/bridge.conf
-RUN_DIR=/run/workspace-zulip-bridge
-SOURCE=/opt/workspace-zulip-bridge
-VENV=/opt/workspace-zulip-bridge-venv
-DATABASE_ROLE=workspace-zulip
-DATABASE_NAME=workspace_zulip_bridge
+PG_VERSION="18"
+SERVICE_NAME="workspace-zulip-bridge"
+DATABASE_NAME="workspace_zulip_bridge"
+DATABASE_ROLE="workspace_zulip_bridge"
+PERSISTENT_POSTGRESQL_DIR="${PERSISTENT_MOUNT}/var/lib/postgresql"
+PERSISTENT_RUNTIME_DIR="${PERSISTENT_MOUNT}/var/lib/workspace_zulip_bridge"
 
-install -d -m 0755 -o workspace-zulip -g workspace-zulip "$RUN_DIR"
-exec 9>"$RUN_DIR/bootstrap.lock"
-flock -x 9
-
-if [ ! -s "$CONFIG" ]; then
-    echo "Workspace Zulip bridge configuration is not available; deferring."
-    exit 0
+PERSISTENT_DISK=""
+for _ in {1..300}; do
+    if PERSISTENT_DISK=$(find_persistent_disk); then
+        break
+    fi
+    sleep 1
+done
+if [[ -z "$PERSISTENT_DISK" ]]; then
+    echo "workspace-zulip-bridge requires a persistent data disk" >&2
+    exit 1
 fi
 
-bridge_prepare_persistent_mount "$PERSISTENT_MOUNT"
-bridge_make_persistent_mount_private "$PERSISTENT_MOUNT"
+prepare_persistent_disk "$PERSISTENT_DISK" "$PERSISTENT_MOUNT"
 
-# Exordos runs this entrypoint both as the enabled bootstrap service and as the
-# worker's before hook.  A later, serialized invocation must not stop the
-# database underneath a worker that has already started.
-if bridge_persistence_migration_is_required \
-    /var/lib/postgresql \
-    "$PERSISTENT_MOUNT/var/lib/postgresql" \
-    /var/lib/workspace-zulip-bridge \
-    "$PERSISTENT_MOUNT/var/lib/workspace-zulip-bridge"; then
-    systemctl stop postgresql.service || true
-    bridge_migrate_to_persistent \
-        /var/lib/postgresql \
-        "$PERSISTENT_MOUNT/var/lib/postgresql"
-    bridge_migrate_to_persistent \
-        /var/lib/workspace-zulip-bridge \
-        "$PERSISTENT_MOUNT/var/lib/workspace-zulip-bridge"
-    persist_migrate_complete
+# Core grows the backing volume when the element raises its requested data
+# size, but an existing GPT partition and ext4 filesystem retain their old
+# boundary.  Grow both in place before PostgreSQL starts using the mount.
+PERSISTENT_PARTITION="$(get_partition_name "$PERSISTENT_DISK")"
+GROWPART_OUTPUT=""
+if ! GROWPART_OUTPUT="$(growpart "$PERSISTENT_DISK" 1 2>&1)"; then
+    if [[ "$GROWPART_OUTPUT" != *NOCHANGE* ]]; then
+        echo "$GROWPART_OUTPUT" >&2
+        exit 1
+    fi
 fi
-chown -R postgres:postgres /var/lib/postgresql
-chown -R workspace-zulip:workspace-zulip /var/lib/workspace-zulip-bridge
-systemctl start postgresql.service
-bridge_wait_for_postgresql
+partprobe "$PERSISTENT_DISK" 2>/dev/null || true
+resize2fs "$PERSISTENT_PARTITION"
 
-runuser -u workspace-zulip -- "$VENV/bin/workspace-zulip-bridge-enroll" \
-    --config "$CONFIG"
-if ! runuser -u postgres -- psql -tAc \
-    "SELECT 1 FROM pg_roles WHERE rolname='$DATABASE_ROLE'" | grep -qx 1; then
-    runuser -u postgres -- createuser "$DATABASE_ROLE"
-fi
-if ! runuser -u postgres -- psql -tAc \
-    "SELECT 1 FROM pg_database WHERE datname='$DATABASE_NAME'" | grep -qx 1; then
-    runuser -u postgres -- createdb -O "$DATABASE_ROLE" "$DATABASE_NAME"
-fi
-runuser -u workspace-zulip -- "$VENV/bin/ra-apply-migration" \
-    --config-file "$CONFIG" \
-    --path "$SOURCE/migrations"
+postgres_cluster_valid() {
+    local data_root="$1"
+    local cluster_dir="${data_root}/${PG_VERSION}/main"
 
-echo "Workspace Zulip bridge bootstrap completed."
+    [[ "$(cat "${cluster_dir}/PG_VERSION" 2>/dev/null || true)" == "$PG_VERSION" ]] \
+        && [[ -s "${cluster_dir}/global/pg_control" ]] \
+        && [[ -d "${cluster_dir}/base" ]]
+}
+
+rebuild_image_postgres_cluster() {
+    systemctl stop "postgresql@${PG_VERSION}-main" 2>/dev/null || true
+    pg_dropcluster --stop "$PG_VERSION" main 2>/dev/null || true
+    rm -rf -- "/var/lib/postgresql/${PG_VERSION}/main"
+    pg_createcluster "$PG_VERSION" main --start-conf=auto
+}
+
+# The marker is written after both migrations complete.  A reset in that small
+# window has two valid recovery states: the persistent cluster may already be
+# complete, or it may be partial.  Never delete the only valid cluster merely
+# because the marker is missing.  Rebuild from the image only after validating
+# the destination and, if necessary, detaching an interrupted bind mount.
+if [[ ! -f "$PERSIST_MIGRATE_MARKER" ]] \
+    && ! postgres_cluster_valid "$PERSISTENT_POSTGRESQL_DIR"; then
+    systemctl stop "postgresql@${PG_VERSION}-main" 2>/dev/null || true
+    if mountpoint -q "/var/lib/postgresql"; then
+        umount "/var/lib/postgresql"
+    fi
+    rm -rf -- "$PERSISTENT_POSTGRESQL_DIR"
+    if ! postgres_cluster_valid "/var/lib/postgresql"; then
+        rebuild_image_postgres_cluster
+    fi
+fi
+
+migrate_to_persistent_stop_start \
+    "/var/lib/postgresql" \
+    "$PERSISTENT_POSTGRESQL_DIR" \
+    "postgresql@${PG_VERSION}-main"
+install -d -o "$DATABASE_ROLE" -g "$DATABASE_ROLE" -m 0700 \
+    "/var/lib/workspace_zulip_bridge"
+migrate_to_persistent \
+    "/var/lib/workspace_zulip_bridge" \
+    "$PERSISTENT_RUNTIME_DIR" \
+    "$DATABASE_ROLE" \
+    "$DATABASE_ROLE"
+persist_migrate_complete
+
+sudo systemctl enable --now postgresql
+
+if ! sudo -u postgres psql -tAc \
+    "SELECT 1 FROM pg_roles WHERE rolname = '${DATABASE_ROLE}'" | grep -qx 1; then
+    sudo -u postgres createuser --no-createdb --no-createrole --no-superuser \
+        "$DATABASE_ROLE"
+fi
+
+if ! sudo -u postgres psql -tAc \
+    "SELECT 1 FROM pg_database WHERE datname = '${DATABASE_NAME}'" | grep -qx 1; then
+    sudo -u postgres createdb --owner "$DATABASE_ROLE" "$DATABASE_NAME"
+fi
+
+sudo systemctl enable --now "$SERVICE_NAME"

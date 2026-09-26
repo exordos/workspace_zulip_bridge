@@ -21,6 +21,7 @@ on:
 env:
   ARTIFACTS_PATH: output
   EXORDOS_CFG: exordos/exordos.yaml
+  PACKER_VERSION: "1.9.2"
 
 jobs:
   build:
@@ -68,6 +69,37 @@ jobs:
             >> "${GITHUB_ENV}"
           "${exordos_bin}" version
 
+      - name: Install Packer
+        env:
+          PACKER_RELEASE_URL: >-
+            https://hashicorp-releases.yandexcloud.net/packer/1.9.2/packer_1.9.2_linux_amd64.zip
+          PACKER_RELEASE_SHA256: >-
+            34fe48d0d5f99670af15d8a3b581db7ce9d08093ce37240d7c7b996de7947275
+        run: |
+          set -euo pipefail
+
+          command -v curl >/dev/null
+          command -v sha256sum >/dev/null
+          command -v unzip >/dev/null
+          packer_archive="${RUNNER_TEMP}/packer-${PACKER_VERSION}.zip"
+          packer_dir="${RUNNER_TEMP}/packer-${PACKER_VERSION}"
+          curl --fail --location --silent --show-error \
+            --connect-timeout 30 \
+            --max-time 180 \
+            --retry 4 \
+            --retry-all-errors \
+            --retry-delay 5 \
+            --retry-max-time 600 \
+            "${PACKER_RELEASE_URL}" \
+            --output "${packer_archive}"
+          printf "%s  %s\n" "${PACKER_RELEASE_SHA256}" "${packer_archive}" \
+            | sha256sum --check --status -
+          mkdir -p "${packer_dir}"
+          unzip -q -o "${packer_archive}" -d "${packer_dir}"
+          chmod 0755 "${packer_dir}/packer"
+          printf "%s\n" "${packer_dir}" >> "${GITHUB_PATH}"
+          "${packer_dir}/packer" version
+
       - name: Check Exordos build prerequisites
         run: |
           set -euo pipefail
@@ -77,6 +109,10 @@ jobs:
           command -v qemu-img >/dev/null
           command -v qemu-system-x86_64 >/dev/null
           command -v mkisofs >/dev/null
+
+          ./scripts/stage_element_source.sh
+          test "$(cat .build-source/workspace_zulip_bridge/.source-commit)" \
+            = "$(git rev-parse HEAD)"
 
       - name: Build element
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.profile != 'production_release' }}
