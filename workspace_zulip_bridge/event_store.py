@@ -15,6 +15,7 @@ from asyncpg.pool import PoolConnectionProxy
 
 from workspace_zulip_bridge.chat_catalog import ChatCatalogBuilder
 from workspace_zulip_bridge.message_history import message_flags_hash
+from workspace_zulip_bridge.models import NOTIFICATION_SETTINGS_GENERATION
 from workspace_zulip_bridge.models import ChatCatalogWrite
 from workspace_zulip_bridge.models import ChatScheduleReconcile
 from workspace_zulip_bridge.models import HistoryWrite
@@ -62,6 +63,8 @@ class EventStore:
                        realm.identity_key AS endpoint, connection.login,
                        connection.api_key, connection.queue_id,
                        connection.last_event_id,
+                       connection.notification_settings_generation,
+                       connection.enable_stream_desktop_notifications,
                        connection.lifecycle_status AS status,
                        connection.streams_hash AS chats_hash,
                        zulip_user.zulip_user_id, zulip_user.full_name,
@@ -98,6 +101,12 @@ class EventStore:
                 role=row["role"],
                 disabled=row["disabled"],
                 has_pending_history=row["has_pending_history"],
+                notification_settings_generation=row[
+                    "notification_settings_generation"
+                ],
+                enable_stream_desktop_notifications=row[
+                    "enable_stream_desktop_notifications"
+                ],
             )
             for row in rows
         ]
@@ -178,6 +187,113 @@ class EventStore:
                 queue_id,
             )
         return status == "UPDATE 1"
+
+    async def get_stream_notification_default(
+        self,
+        connection_uuid: UUID,
+        queue_id: str,
+    ) -> bool | None:
+        async with self._pool.acquire() as connection:
+            value = await connection.fetchval(
+                "SELECT enable_stream_desktop_notifications "
+                "FROM workspace_zulip_bridge.zulip_connections "
+                "WHERE uuid = $1 AND queue_id = $2 AND sync_enabled",
+                connection_uuid,
+                queue_id,
+            )
+        return value if isinstance(value, bool) else None
+
+    async def store_user_notification_setting(
+        self,
+        connection_uuid: UUID,
+        queue_id: str,
+        *,
+        enable_stream_desktop_notifications: bool,
+    ) -> bool:
+        async with self._pool.acquire() as connection:
+            status = await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_connections
+                SET enable_stream_desktop_notifications = $3,
+                    notification_settings_updated_at = clock_timestamp(),
+                    updated_at = clock_timestamp()
+                WHERE uuid = $1 AND queue_id = $2 AND sync_enabled
+                  AND enable_stream_desktop_notifications IS DISTINCT FROM $3
+                """,
+                connection_uuid,
+                queue_id,
+                enable_stream_desktop_notifications,
+            )
+        return status == "UPDATE 1"
+
+    async def store_notification_snapshot(
+        self,
+        connection_uuid: UUID,
+        queue_id: str,
+        channel_chats: Sequence[ZulipChat],
+        topics: Sequence[ZulipUserTopic],
+        *,
+        enable_stream_desktop_notifications: bool,
+        observed_at: datetime,
+    ) -> int | None:
+        async with self._pool.acquire() as connection, connection.transaction():
+            owner = await connection.fetchrow(
+                """
+                SELECT realm_uuid, zulip_user_uuid,
+                       notification_settings_generation,
+                       notification_settings_updated_at
+                FROM workspace_zulip_bridge.zulip_connections
+                WHERE uuid = $1 AND queue_id = $2 AND sync_enabled
+                FOR UPDATE
+                """,
+                connection_uuid,
+                queue_id,
+            )
+            if owner is None:
+                return None
+            if (
+                owner["notification_settings_generation"]
+                >= NOTIFICATION_SETTINGS_GENERATION
+            ):
+                return 0
+            changed = await _store_channel_notification_modes(
+                connection,
+                owner["realm_uuid"],
+                owner["zulip_user_uuid"],
+                channel_chats,
+                observed_at=observed_at,
+            )
+            topic_changes = await _store_user_topics(
+                connection,
+                owner["realm_uuid"],
+                owner["zulip_user_uuid"],
+                topics,
+                replace_all=True,
+                snapshot_observed_at=observed_at,
+            )
+            if topic_changes is None:
+                return None
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_connections
+                SET enable_stream_desktop_notifications = CASE
+                        WHEN notification_settings_updated_at <= $3 THEN $4
+                        ELSE enable_stream_desktop_notifications
+                    END,
+                    notification_settings_updated_at = GREATEST(
+                        notification_settings_updated_at, $3
+                    ),
+                    notification_settings_generation = $5,
+                    updated_at = clock_timestamp()
+                WHERE uuid = $1 AND queue_id = $2
+                """,
+                connection_uuid,
+                queue_id,
+                observed_at,
+                enable_stream_desktop_notifications,
+                NOTIFICATION_SETTINGS_GENERATION,
+            )
+            return changed + topic_changes
 
     async def store_direct_message_chat(
         self,
@@ -1558,12 +1674,16 @@ class EventStore:
         catalog: ZulipChatCatalog,
         *,
         bootstrap_user_topics: Sequence[ZulipUserTopic] | None = None,
+        notification_snapshot_at: datetime | None = None,
+        enable_stream_desktop_notifications: bool = True,
     ) -> ChatCatalogWrite:
         return await self._store_chat_catalog(
             user_uuid,
             queue_id,
             catalog,
             bootstrap_user_topics=bootstrap_user_topics,
+            notification_snapshot_at=notification_snapshot_at,
+            enable_stream_desktop_notifications=(enable_stream_desktop_notifications),
         )
 
     async def _store_chat_catalog(
@@ -1573,6 +1693,8 @@ class EventStore:
         catalog: ZulipChatCatalog,
         *,
         bootstrap_user_topics: Sequence[ZulipUserTopic] | None = None,
+        notification_snapshot_at: datetime | None = None,
+        enable_stream_desktop_notifications: bool = True,
     ) -> ChatCatalogWrite:
         async with self._pool.acquire() as connection, connection.transaction():
             owner = await connection.fetchrow(
@@ -1591,6 +1713,7 @@ class EventStore:
             if owner is None:
                 return ChatCatalogWrite(False, False, 0, 0)
             topic_changes = 0
+            snapshot_at = notification_snapshot_at or datetime.now(UTC)
             if owner["streams_hash"] == catalog.content_hash:
                 if bootstrap_user_topics is not None:
                     stored = await _store_user_topics(
@@ -1599,10 +1722,18 @@ class EventStore:
                         owner["zulip_user_uuid"],
                         bootstrap_user_topics,
                         replace_all=True,
+                        snapshot_observed_at=snapshot_at,
                     )
                     if stored is None:
                         return ChatCatalogWrite(False, True, 0, 0)
                     topic_changes = stored
+                    await _mark_notification_snapshot(
+                        connection,
+                        user_uuid,
+                        queue_id,
+                        enable_stream_desktop_notifications,
+                        snapshot_at,
+                    )
                 await connection.execute(
                     "UPDATE workspace_zulip_bridge.zulip_connections "
                     "SET lifecycle_status = 'scheduling', "
@@ -1628,10 +1759,18 @@ class EventStore:
                     owner["zulip_user_uuid"],
                     bootstrap_user_topics,
                     replace_all=True,
+                    snapshot_observed_at=snapshot_at,
                 )
                 if stored is None:
                     return ChatCatalogWrite(False, False, upserted, deleted)
                 topic_changes = stored
+                await _mark_notification_snapshot(
+                    connection,
+                    user_uuid,
+                    queue_id,
+                    enable_stream_desktop_notifications,
+                    snapshot_at,
+                )
             await connection.execute(
                 """
                 UPDATE workspace_zulip_bridge.zulip_connections
@@ -1966,27 +2105,50 @@ class HistorySession:
     async def _reuse_topic_identities(self) -> None:
         await self._connection.execute(
             """
+            WITH matched AS (
+                SELECT DISTINCT ON (page.uuid)
+                       page.uuid AS page_uuid, topic.uuid, topic.name,
+                       topic.content_hash
+                FROM wzb_message_page AS page
+                JOIN workspace_zulip_bridge.zulip_topic_aliases AS alias
+                  ON alias.zulip_stream_uuid = page.stream_uuid
+                 AND lower(alias.alias) = lower(page.topic_name)
+                 AND alias.active
+                JOIN workspace_zulip_bridge.zulip_topics AS topic
+                  ON topic.uuid = alias.topic_uuid
+                ORDER BY page.uuid,
+                         (alias.alias = page.topic_name) DESC,
+                         topic.created_at,
+                         topic.uuid
+            )
             UPDATE wzb_message_page AS page
-            SET topic_uuid = topic.uuid,
-                topic_name = topic.name,
-                topic_hash = topic.content_hash
-            FROM workspace_zulip_bridge.zulip_topic_aliases AS alias
-            JOIN workspace_zulip_bridge.zulip_topics AS topic
-              ON topic.uuid = alias.topic_uuid
-            WHERE alias.zulip_stream_uuid = page.stream_uuid
-              AND alias.alias = page.topic_name
-              AND alias.active
-              AND page.topic_uuid IS DISTINCT FROM topic.uuid
+            SET topic_uuid = matched.uuid,
+                topic_name = matched.name,
+                topic_hash = matched.content_hash
+            FROM matched
+            WHERE matched.page_uuid = page.uuid
+              AND page.topic_uuid IS DISTINCT FROM matched.uuid
             """
         )
         await self._connection.execute(
             """
+            WITH matched AS (
+                SELECT DISTINCT ON (page.uuid)
+                       page.uuid AS page_uuid, topic.uuid
+                FROM wzb_message_page AS page
+                JOIN workspace_zulip_bridge.zulip_topics AS topic
+                  ON topic.zulip_stream_uuid = page.stream_uuid
+                 AND lower(topic.name) = lower(page.topic_name)
+                ORDER BY page.uuid,
+                         (topic.name = page.topic_name) DESC,
+                         topic.created_at,
+                         topic.uuid
+            )
             UPDATE wzb_message_page AS page
-            SET topic_uuid = topic.uuid
-            FROM workspace_zulip_bridge.zulip_topics AS topic
-            WHERE topic.zulip_stream_uuid = page.stream_uuid
-              AND topic.name = page.topic_name
-              AND page.topic_uuid IS DISTINCT FROM topic.uuid
+            SET topic_uuid = matched.uuid
+            FROM matched
+            WHERE matched.page_uuid = page.uuid
+              AND page.topic_uuid IS DISTINCT FROM matched.uuid
             """
         )
 
@@ -2660,6 +2822,99 @@ async def _enqueue_workspace_upserts(
     )
 
 
+async def _store_channel_notification_modes(
+    connection: asyncpg.Connection | PoolConnectionProxy,
+    realm_uuid: UUID,
+    user_uuid: UUID,
+    chats: Sequence[ZulipChat],
+    *,
+    observed_at: datetime,
+) -> int:
+    channels = [chat for chat in chats if chat.chat_type == "channel"]
+    if not channels:
+        return 0
+    rows = await connection.fetch(
+        """
+        WITH incoming AS MATERIALIZED (
+            SELECT *
+            FROM unnest(
+                $3::text[], $4::text[], $5::jsonb[], $6::bytea[]
+            ) AS candidate(
+                chat_key, notification_mode, membership_parameters,
+                membership_hash
+            )
+        ), changed AS (
+            UPDATE workspace_zulip_bridge.zulip_stream_bindings AS binding
+            SET notification_mode = incoming.notification_mode,
+                membership_parameters = incoming.membership_parameters,
+                content_hash = incoming.membership_hash,
+                source_updated_at = $7,
+                updated_at = clock_timestamp()
+            FROM workspace_zulip_bridge.zulip_streams AS stream
+            JOIN incoming ON incoming.chat_key = stream.chat_key
+            WHERE stream.realm_uuid = $1
+              AND binding.zulip_stream_uuid = stream.uuid
+              AND binding.zulip_user_uuid = $2
+              AND binding.source_updated_at <= $7
+              AND (
+                  binding.notification_mode,
+                  binding.membership_parameters,
+                  binding.content_hash
+              ) IS DISTINCT FROM (
+                  incoming.notification_mode,
+                  incoming.membership_parameters,
+                  incoming.membership_hash
+              )
+            RETURNING binding.uuid
+        )
+        SELECT uuid FROM changed
+        """,
+        realm_uuid,
+        user_uuid,
+        [chat.chat_key for chat in channels],
+        [chat.notification_mode for chat in channels],
+        [chat.membership_parameters_json for chat in channels],
+        [chat.membership_hash for chat in channels],
+        observed_at,
+    )
+    await _enqueue_workspace_upserts(
+        connection,
+        realm_uuid,
+        "stream_binding",
+        [UUID(str(row["uuid"])) for row in rows],
+    )
+    return len(rows)
+
+
+async def _mark_notification_snapshot(
+    connection: asyncpg.Connection | PoolConnectionProxy,
+    connection_uuid: UUID,
+    queue_id: str,
+    enable_stream_desktop_notifications: bool,
+    observed_at: datetime,
+) -> None:
+    await connection.execute(
+        """
+        UPDATE workspace_zulip_bridge.zulip_connections
+        SET enable_stream_desktop_notifications = CASE
+                WHEN notification_settings_updated_at <= $3 THEN $4
+                ELSE enable_stream_desktop_notifications
+            END,
+            notification_settings_updated_at = GREATEST(
+                notification_settings_updated_at, $3
+            ),
+            notification_settings_generation = $5,
+            updated_at = clock_timestamp()
+        WHERE uuid = $1 AND queue_id = $2
+        """,
+        connection_uuid,
+        queue_id,
+        observed_at,
+        enable_stream_desktop_notifications,
+        NOTIFICATION_SETTINGS_GENERATION,
+    )
+
+
 async def _store_user_topics(
     connection: asyncpg.Connection | PoolConnectionProxy,
     realm_uuid: UUID,
@@ -2667,15 +2922,34 @@ async def _store_user_topics(
     topics: Sequence[ZulipUserTopic],
     *,
     replace_all: bool,
+    snapshot_observed_at: datetime | None = None,
 ) -> int | None:
     changed = 0
+    reset_observed_at = snapshot_observed_at or datetime.now(UTC)
+    retained_binding_uuids: list[UUID] = []
+    for topic in topics:
+        topic_result = await _store_user_topic(
+            connection,
+            realm_uuid,
+            user_uuid,
+            topic,
+        )
+        if topic_result is None:
+            if not replace_all:
+                return None
+            continue
+        topic_change, binding_uuid = topic_result
+        changed += topic_change
+        retained_binding_uuids.append(binding_uuid)
+
     reset_binding_uuids: list[UUID] = []
     if replace_all:
         rows = await connection.fetch(
             """
             SELECT topic_binding.uuid, topic_binding.zulip_stream_uuid,
                    topic_binding.topic_uuid, topic_binding.zulip_user_uuid,
-                   topic_binding.created_at
+                   topic_binding.created_at,
+                   topic_binding.source_updated_at
             FROM workspace_zulip_bridge.zulip_topic_bindings AS topic_binding
             JOIN workspace_zulip_bridge.zulip_streams AS stream
               ON stream.uuid = topic_binding.zulip_stream_uuid
@@ -2691,8 +2965,11 @@ async def _store_user_topics(
                 """
                 UPDATE workspace_zulip_bridge.zulip_topic_bindings
                 SET notification_mode = 'default', content_hash = $2,
+                    source_updated_at = $3,
                     updated_at = clock_timestamp()
                 WHERE uuid = $1 AND notification_mode <> 'default'
+                  AND NOT (uuid = ANY($4::uuid[]))
+                  AND ($3::timestamptz IS NULL OR source_updated_at <= $3)
                 """,
                 row["uuid"],
                 _topic_binding_hash(
@@ -2702,6 +2979,8 @@ async def _store_user_topics(
                     "default",
                     row["created_at"],
                 ),
+                reset_observed_at,
+                retained_binding_uuids,
             )
             changed += status == "UPDATE 1"
             if status == "UPDATE 1":
@@ -2712,18 +2991,6 @@ async def _store_user_topics(
             "topic_binding",
             reset_binding_uuids,
         )
-    for topic in topics:
-        topic_change = await _store_user_topic(
-            connection,
-            realm_uuid,
-            user_uuid,
-            topic,
-        )
-        if topic_change is None:
-            if not replace_all:
-                return None
-            continue
-        changed += topic_change
     return changed
 
 
@@ -2732,7 +2999,7 @@ async def _store_user_topic(
     realm_uuid: UUID,
     user_uuid: UUID,
     topic: ZulipUserTopic,
-) -> int | None:
+) -> tuple[int, UUID] | None:
     stream = await connection.fetchrow(
         """
         SELECT stream.uuid
@@ -2749,7 +3016,36 @@ async def _store_user_topic(
     if stream is None:
         return None
     stream_uuid = UUID(str(stream["uuid"]))
-    topic_uuid = stable_topic_uuid(stream_uuid, topic.topic_name)
+    existing_topic = await connection.fetchrow(
+        """
+        SELECT topic.uuid, topic.name
+        FROM workspace_zulip_bridge.zulip_topics AS topic
+        LEFT JOIN workspace_zulip_bridge.zulip_topic_aliases AS alias
+          ON alias.topic_uuid = topic.uuid
+         AND alias.zulip_stream_uuid = topic.zulip_stream_uuid
+         AND alias.active
+        WHERE topic.zulip_stream_uuid = $1
+          AND (
+              lower(topic.name) = lower($2)
+              OR lower(alias.alias) = lower($2)
+          )
+        ORDER BY (topic.name = $2) DESC,
+                 (alias.alias = $2) DESC,
+                 topic.created_at,
+                 topic.uuid
+        LIMIT 1
+        """,
+        stream_uuid,
+        topic.topic_name,
+    )
+    topic_uuid = (
+        UUID(str(existing_topic["uuid"]))
+        if existing_topic is not None
+        else stable_topic_uuid(stream_uuid, topic.topic_name)
+    )
+    canonical_topic_name = (
+        str(existing_topic["name"]) if existing_topic is not None else topic.topic_name
+    )
     topic_created_at = datetime.fromtimestamp(topic.last_updated, UTC)
     stored_topic_uuid = await connection.fetchval(
         """
@@ -2764,8 +3060,8 @@ async def _store_user_topic(
         """,
         topic_uuid,
         stream_uuid,
-        topic.topic_name,
-        hashlib.sha256(topic.topic_name.encode("utf-8")).digest(),
+        canonical_topic_name,
+        hashlib.sha256(canonical_topic_name.encode("utf-8")).digest(),
         topic_created_at,
     )
     if stored_topic_uuid is not None:
@@ -2789,6 +3085,7 @@ async def _store_user_topic(
         topic_uuid,
     )
     mode = {0: "default", 1: "mute", 2: "unmute", 3: "follow"}[topic.visibility_policy]
+    source_updated_at = datetime.fromtimestamp(topic.last_updated, UTC)
     created_at = await connection.fetchval(
         """
         SELECT created_at
@@ -2811,16 +3108,18 @@ async def _store_user_topic(
         """
         INSERT INTO workspace_zulip_bridge.zulip_topic_bindings (
             uuid, zulip_stream_uuid, topic_uuid, zulip_user_uuid,
-            notification_mode, content_hash, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            notification_mode, content_hash, source_updated_at, created_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         ON CONFLICT (uuid) DO UPDATE
         SET notification_mode = EXCLUDED.notification_mode,
             content_hash = EXCLUDED.content_hash,
+            source_updated_at = EXCLUDED.source_updated_at,
             updated_at = clock_timestamp()
-        WHERE zulip_topic_bindings.notification_mode
+        WHERE zulip_topic_bindings.source_updated_at <= EXCLUDED.source_updated_at
+          AND (zulip_topic_bindings.notification_mode
                   IS DISTINCT FROM EXCLUDED.notification_mode
            OR zulip_topic_bindings.content_hash
-                  IS DISTINCT FROM EXCLUDED.content_hash
+                  IS DISTINCT FROM EXCLUDED.content_hash)
         RETURNING uuid
         """,
         stable_topic_binding_uuid(topic_uuid, user_uuid),
@@ -2829,17 +3128,18 @@ async def _store_user_topic(
         user_uuid,
         mode,
         content_hash,
+        source_updated_at,
         created_at,
     )
     if stored_binding_uuid is None:
-        return 0
+        return 0, stable_topic_binding_uuid(topic_uuid, user_uuid)
     await _enqueue_workspace_upserts(
         connection,
         realm_uuid,
         "topic_binding",
         [UUID(str(stored_binding_uuid))],
     )
-    return 1
+    return 1, UUID(str(stored_binding_uuid))
 
 
 async def _store_chats(
@@ -3006,7 +3306,9 @@ async def _store_chats(
                     ELSE zulip_stream_bindings.available_message_count END,
                 first_visible_message_id = CASE WHEN $17
                     THEN EXCLUDED.first_visible_message_id
-                    ELSE zulip_stream_bindings.first_visible_message_id END
+                    ELSE zulip_stream_bindings.first_visible_message_id END,
+                source_updated_at = clock_timestamp(),
+                updated_at = clock_timestamp()
             WHERE zulip_stream_bindings.content_hash IS DISTINCT FROM
                   EXCLUDED.content_hash
                OR ($17 AND (

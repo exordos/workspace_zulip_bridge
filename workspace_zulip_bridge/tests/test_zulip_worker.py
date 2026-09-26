@@ -170,11 +170,32 @@ class FakeStore:
         self.catalog_stored = asyncio.Event()
         self.presence_thresholds: list[tuple[str, int]] = []
         self.schedule_reconciliation_requested = False
+        self.notification_snapshots: list[tuple[UUID, str, bool]] = []
 
     async def set_presence_offline_threshold(
         self, endpoint: str, threshold_seconds: int
     ) -> None:
         self.presence_thresholds.append((endpoint, threshold_seconds))
+
+    async def get_stream_notification_default(
+        self, user_uuid: UUID, queue_id: str
+    ) -> bool | None:
+        return True
+
+    async def store_notification_snapshot(
+        self,
+        user_uuid: UUID,
+        queue_id: str,
+        channel_chats: object,
+        topics: object,
+        *,
+        enable_stream_desktop_notifications: bool,
+        observed_at: datetime,
+    ) -> int | None:
+        self.notification_snapshots.append(
+            (user_uuid, queue_id, enable_stream_desktop_notifications)
+        )
+        return 0
 
     async def set_user_identity(
         self,
@@ -271,6 +292,8 @@ class FakeStore:
         catalog: ZulipChatCatalog,
         *,
         bootstrap_user_topics: object = None,
+        notification_snapshot_at: object = None,
+        enable_stream_desktop_notifications: bool = True,
     ) -> ChatCatalogWrite:
         self.catalogs.append((user_uuid, queue_id, catalog))
         self.statuses.append((user_uuid, "scheduling"))
@@ -303,8 +326,10 @@ class FakeApi:
     def __init__(self) -> None:
         self.closed = threading.Event()
         self.polls = 0
+        self.registrations = 0
 
     def register(self) -> RegisteredQueue:
+        self.registrations += 1
         return RegisteredQueue(
             "queue-1",
             -1,
@@ -313,6 +338,7 @@ class FakeApi:
                 RecentPrivateConversation((12,), 100),
                 RecentPrivateConversation((99,), 101),
             ),
+            enable_stream_desktop_notifications=False,
         )
 
     def get_own_user(self) -> ZulipIdentity:
@@ -433,6 +459,35 @@ class AllDirectConversationsApi(FakeApi):
 
 def test_private_conversation_discovery_pages_through_complete_history() -> None:
     asyncio.run(_private_conversation_discovery_pages_through_complete_history())
+
+
+def test_existing_queue_loads_one_time_notification_snapshot() -> None:
+    asyncio.run(_existing_queue_loads_one_time_notification_snapshot())
+
+
+async def _existing_queue_loads_one_time_notification_snapshot() -> None:
+    user = ZulipUser(
+        USER_ONE.uuid,
+        USER_ONE.endpoint,
+        USER_ONE.login,
+        "not-a-real-api-key",
+        queue_id="existing-queue",
+        last_event_id=17,
+    )
+    store = FakeStore()
+    api = FakeApi()
+    worker = ZulipEventThread(
+        user,
+        store,  # type: ignore[arg-type]
+        asyncio.get_running_loop(),
+        Settings(database_dsn="postgresql:///test"),
+        threading.BoundedSemaphore(1),
+        api_factory=lambda current_user: api,  # type: ignore[arg-type]
+    )
+
+    assert await asyncio.to_thread(worker._restore_runtime_state, api)
+    assert api.registrations == 1
+    assert store.notification_snapshots == [(user.uuid, "existing-queue", False)]
 
 
 async def _private_conversation_discovery_pages_through_complete_history() -> None:

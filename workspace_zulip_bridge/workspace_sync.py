@@ -47,6 +47,16 @@ ENTITY_TYPES = (
     "message_reactions",
 )
 PRIORITY = {entity_type: index for index, entity_type in enumerate(ENTITY_TYPES)}
+WORKSPACE_EVENT_PRIORITY = {
+    "message": 0,
+    "message_flag": 1,
+    "message_reaction": 2,
+    "user": 3,
+    "stream_binding": 4,
+    "topic_binding": 5,
+    "stream": 6,
+    "topic": 7,
+}
 RECONCILIATION_VERSION = 19
 
 
@@ -914,14 +924,14 @@ class WorkspaceEventProcessor:
                     WHERE provider_uuid = $1 AND processing_status = 'pending'
                       AND available_at <= clock_timestamp()
                     ORDER BY CASE object_type
-                        WHEN 'user' THEN 0
-                        WHEN 'stream' THEN 1
-                        WHEN 'stream_binding' THEN 2
-                        WHEN 'topic' THEN 3
-                        WHEN 'topic_binding' THEN 4
-                        WHEN 'message' THEN 5
-                        WHEN 'message_flag' THEN 6
-                        WHEN 'message_reaction' THEN 7
+                        WHEN 'message' THEN 0
+                        WHEN 'message_flag' THEN 1
+                        WHEN 'message_reaction' THEN 2
+                        WHEN 'user' THEN 3
+                        WHEN 'stream_binding' THEN 4
+                        WHEN 'topic_binding' THEN 5
+                        WHEN 'stream' THEN 6
+                        WHEN 'topic' THEN 7
                         ELSE 8
                     END,
                     sequence
@@ -939,7 +949,13 @@ class WorkspaceEventProcessor:
             )
         if not rows:
             return 0
-        rows = sorted(rows, key=lambda row: (row["epoch_version"], row["sequence"]))
+        rows = sorted(
+            rows,
+            key=lambda row: (
+                WORKSPACE_EVENT_PRIORITY.get(str(row["object_type"]), 8),
+                row["sequence"],
+            ),
+        )
         for row in rows:
             try:
                 applied = await self._apply(row)
@@ -2306,7 +2322,11 @@ class WorkspaceDiffWorker:
         changed = 0
         for entity_type in ("topics", "topic_bindings"):
             source = _SOURCE_TABLES[entity_type]
-            source_timestamp_column = "source.updated_at"
+            source_timestamp_column = (
+                "source.source_updated_at"
+                if entity_type == "topic_bindings"
+                else "source.updated_at"
+            )
             result = await self._pool.execute(
                 f"""
                 INSERT INTO workspace_zulip_bridge.sync_diffs (
@@ -2784,7 +2804,7 @@ class WorkspaceDiffWorker:
                 source = _SOURCE_TABLES[entity_type]
                 source_timestamp_column = (
                     "source.source_updated_at"
-                    if entity_type == "messages"
+                    if entity_type in {"stream_bindings", "topic_bindings", "messages"}
                     else "source.updated_at"
                 )
                 await connection.execute(
@@ -2893,6 +2913,32 @@ class WorkspaceDiffWorker:
                 self._provider_uuid,
             )
             delivered_sequences = [row["sequence"] for row in delivered]
+            stale_sequences: list[int] = []
+            for outbox_type, table_name in _OUTBOX_SOURCE_BASE_TABLES.items():
+                candidate_sequences = [
+                    row["sequence"] for row in rows if row["entity_type"] == outbox_type
+                ]
+                if not candidate_sequences:
+                    continue
+                stale = await connection.fetch(
+                    f"""
+                    UPDATE workspace_zulip_bridge.workspace_outbox AS outbox
+                    SET delivery_status = 'delivered',
+                        delivered_at = clock_timestamp(), claimed_at = NULL,
+                        last_error = 'source_absent',
+                        updated_at = clock_timestamp()
+                    WHERE outbox.sequence = ANY($1::bigint[])
+                      AND outbox.delivery_status = 'pending'
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM workspace_zulip_bridge.{table_name} AS source
+                          WHERE source.uuid = outbox.entity_uuid
+                      )
+                    RETURNING outbox.sequence
+                    """,
+                    candidate_sequences,
+                )
+                stale_sequences.extend(row["sequence"] for row in stale)
             await connection.execute(
                 """
                 UPDATE workspace_zulip_bridge.workspace_outbox
@@ -2913,7 +2959,8 @@ class WorkspaceDiffWorker:
                 """,
                 sequences,
             )
-            if delivered_sequences:
+            completed_sequences = delivered_sequences + stale_sequences
+            if completed_sequences:
                 await connection.execute(
                     """
                     INSERT INTO workspace_zulip_bridge.workspace_sync_cursors (
@@ -2927,9 +2974,9 @@ class WorkspaceDiffWorker:
                         updated_at = clock_timestamp()
                     """,
                     realm_uuid,
-                    max(delivered_sequences),
+                    max(completed_sequences),
                 )
-            return len(delivered_sequences)
+            return len(completed_sequences)
 
     async def _plan_target_only(
         self,
@@ -3158,7 +3205,7 @@ class WorkspaceDiffWorker:
     ) -> int:
         source_timestamp_column = (
             "source.source_updated_at"
-            if entity_type == "messages"
+            if entity_type in {"stream_bindings", "topic_bindings", "messages"}
             else "source.updated_at"
         )
         cursor_timestamp_column = "source.updated_at"
@@ -5049,6 +5096,14 @@ _OUTBOX_SOURCE_TYPES = {
     "message_reaction": "message_reactions",
     "message_flag": "message_flags",
     "message": "messages",
+}
+
+_OUTBOX_SOURCE_BASE_TABLES = {
+    "topic": "zulip_topics",
+    "topic_binding": "zulip_topic_bindings",
+    "message_reaction": "zulip_message_reactions",
+    "message_flag": "zulip_message_flags",
+    "message": "zulip_messages",
 }
 
 _OUTBOX_SOURCE_VERSIONS = {

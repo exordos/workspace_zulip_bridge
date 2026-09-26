@@ -99,6 +99,41 @@ def test_channel_description_rejects_more_than_ten_thousand_characters() -> None
         )
 
 
+def test_channel_notification_mode_respects_override_and_global_default() -> None:
+    builder = ChatCatalogBuilder(10, "Current User")
+
+    builder.add_subscriptions(
+        [
+            {"stream_id": 1, "name": "Inherited"},
+            {
+                "stream_id": 2,
+                "name": "Explicit all",
+                "desktop_notifications": True,
+            },
+            {
+                "stream_id": 3,
+                "name": "Explicit mentions",
+                "desktop_notifications": False,
+            },
+            {
+                "stream_id": 4,
+                "name": "Muted",
+                "desktop_notifications": True,
+                "is_muted": True,
+            },
+        ],
+        desktop_notifications_default=False,
+    )
+
+    modes = {chat.name: chat.notification_mode for chat in builder.build().chats}
+    assert modes == {
+        "Inherited": "mentions_only",
+        "Explicit all": "all_messages",
+        "Explicit mentions": "mentions_only",
+        "Muted": "muted",
+    }
+
+
 def test_direct_conversations_are_deduplicated_by_sorted_participants() -> None:
     builder = ChatCatalogBuilder(10, "Current User")
     builder.add_direct_messages(

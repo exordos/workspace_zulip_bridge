@@ -56,6 +56,7 @@ class ChatCatalogBuilder:
         subscriptions: list[Mapping[str, Any]],
         *,
         first_visible_message_ids: Mapping[int, int | None] | None = None,
+        desktop_notifications_default: bool = True,
     ) -> tuple[ZulipChat, ...]:
         added: list[ZulipChat] = []
         visible_message_ids = first_visible_message_ids or {}
@@ -76,15 +77,30 @@ class ChatCatalogBuilder:
                 for key, value in subscription.items()
                 if key not in _CHANNEL_MEMBERSHIP_FIELDS and key != "name"
             }
+            desktop_notifications = membership_parameters.get("desktop_notifications")
+            if desktop_notifications is None:
+                desktop_notifications = desktop_notifications_default
+            elif isinstance(desktop_notifications, int) and desktop_notifications in {
+                0,
+                1,
+            }:
+                desktop_notifications = bool(desktop_notifications)
+            if not isinstance(desktop_notifications, bool):
+                raise ValueError("invalid Zulip subscription notification setting")
+            notification_mode = (
+                "muted"
+                if membership_parameters.get("is_muted")
+                else "all_messages"
+                if desktop_notifications
+                else "mentions_only"
+            )
             chat = _make_chat(
                 chat_type="channel",
                 chat_key=chat_key,
                 name=name,
                 role=self._identity_role,
                 membership_kind="subscriber",
-                notification_mode=(
-                    "muted" if membership_parameters.get("is_muted") else "all_messages"
-                ),
+                notification_mode=notification_mode,
                 chat_parameters=chat_parameters,
                 membership_parameters=membership_parameters,
                 first_visible_message_id=visible_message_ids.get(stream_id),

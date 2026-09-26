@@ -37,12 +37,13 @@ def test_register_and_get_events() -> None:
             assert json.loads(form["fetch_event_types"][0]) == [
                 "recent_private_conversations",
                 "presence",
+                "user_settings",
                 "user_status",
                 "user_topic",
             ]
             assert form["slim_presence"] == ["true"]
             assert json.loads(form["client_capabilities"][0]) == {
-                "notification_settings_null": False,
+                "notification_settings_null": True,
                 "simplified_presence_events": True,
             }
             assert form["idle_queue_timeout"] == ["3600"]
@@ -78,6 +79,9 @@ def test_register_and_get_events() -> None:
                             "emoji_name": "eyes",
                         }
                     },
+                    "user_settings": {
+                        "enable_stream_desktop_notifications": False,
+                    },
                 },
             )
         assert request.url.path.endswith("/events")
@@ -103,6 +107,7 @@ def test_register_and_get_events() -> None:
         assert queue.user_presences[0].status == "active"
         assert queue.presence_offline_threshold_seconds == 200
         assert queue.user_statuses[0].status_emoji == "eyes"
+        assert queue.enable_stream_desktop_notifications is False
         assert client.get_events("queue-1", -1, 90) == [{"id": 1, "type": "heartbeat"}]
     finally:
         client.close()

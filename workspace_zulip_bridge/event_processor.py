@@ -999,6 +999,7 @@ class ZulipEventProcessor:
             "realm_bot",
             "presence",
             "user_status",
+            "user_settings",
             "user_topic",
         }:
             return _RoutedEvent(event, skip_reason="unsupported_event_type")
@@ -1014,6 +1015,7 @@ class ZulipEventProcessor:
             "realm_bot",
             "presence",
             "user_status",
+            "user_settings",
         }:
             return _RoutedEvent(event)
         if event.event_type == "stream":
@@ -1214,7 +1216,29 @@ class ZulipEventProcessor:
             return await self._apply_presence(item)
         if event_type == "user_status":
             return await self._apply_user_status(item)
+        if event_type == "user_settings":
+            return await self._apply_user_settings(item)
         return _Outcome(item.event.uuid, "skipped", "unsupported_event_type")
+
+    async def _apply_user_settings(self, item: _RoutedEvent) -> _Outcome:
+        if item.event.payload.get("property") != (
+            "enable_stream_desktop_notifications"
+        ):
+            return _Outcome(item.event.uuid, "skipped", "unrelated_user_setting")
+        value = item.event.payload.get("value")
+        if not isinstance(value, bool):
+            return _Outcome(item.event.uuid, "failed", "invalid_user_setting_event")
+        changed = await self._store.store_user_notification_setting(
+            item.event.user_uuid,
+            item.event.queue_id,
+            enable_stream_desktop_notifications=value,
+        )
+        if changed:
+            await self._store.request_catalog_refresh(
+                item.event.user_uuid,
+                item.event.queue_id,
+            )
+        return _Outcome(item.event.uuid, "applied", "user_notification_setting")
 
     async def _apply_user_topic(self, item: _RoutedEvent) -> _Outcome:
         change = _user_topic_change(item.event.payload)

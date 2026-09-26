@@ -66,6 +66,8 @@ def test_schema_normalizes_workspace_like_entities_and_personal_state() -> None:
     assert "UNIQUE (zulip_stream_uuid, zulip_user_uuid)" in schema
     assert "first_visible_message_id bigint" in schema
     assert "UNIQUE (zulip_stream_uuid, name)" in schema
+    assert "zulip_topics_casefold_name_idx" in schema
+    assert "zulip_topic_aliases_casefold_idx" in schema
     assert "reaction_users jsonb NOT NULL DEFAULT '{}'::jsonb" in schema
     assert "flags_hash bytea NOT NULL" in schema
     assert "source_path text NOT NULL" in schema
@@ -125,7 +127,7 @@ def test_schema_contains_event_retention_and_workspace_outbox_state() -> None:
     assert "workspace_event_cursors" in schema
     assert "workspace_events" in schema
     assert "workspace_events_pending_idx" in schema
-    assert "workspace_events_priority_pending_idx" in schema
+    assert "workspace_events_realtime_priority_pending_idx" in schema
     assert "workspace_events_terminal_retention_idx" in schema
     assert "available_at timestamptz NOT NULL DEFAULT clock_timestamp()" in schema
     assert "recovery_required boolean NOT NULL DEFAULT false" in schema
@@ -148,6 +150,7 @@ def test_schema_upgrades_preserve_older_persistent_volumes() -> None:
     assert "ADD COLUMN available_at timestamptz" in upgrades
     assert "DROP INDEX IF EXISTS" in upgrades
     assert "workspace_events_pending_idx" in upgrades
+    assert "workspace_events_realtime_priority_pending_idx" in upgrades
     assert "zulip_users" in upgrades
     assert "workspace_mirror_state" in upgrades
     assert "sync_diffs" in upgrades

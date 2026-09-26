@@ -926,13 +926,69 @@ async def _outbound_rejects_unrepresentable_channel_binding_changes() -> None:
             {**source, "role": "administrator"},
             None,
         )
-    with pytest.raises(ZulipOutboundError, match="mentions-only"):
+    with pytest.raises(ZulipOutboundError, match="unsupported channel"):
         await writer._apply_stream_bindings(
             UUID("10000000-0000-0000-0000-000000000014"),
             source,
-            {**source, "notification_mode": "mentions_only"},
+            {**source, "notification_mode": "unsupported"},
             None,
         )
+
+
+def test_outbound_maps_every_channel_notification_mode() -> None:
+    asyncio.run(_outbound_maps_every_channel_notification_mode())
+
+
+async def _outbound_maps_every_channel_notification_mode() -> None:
+    writer = ZulipOutboundWriter.__new__(ZulipOutboundWriter)
+    stream_uuid = UUID("10000000-0000-0000-0000-000000000003")
+    user_uuid = UUID("10000000-0000-0000-0000-000000000005")
+    calls: list[tuple[object, ...]] = []
+
+    async def required_stream(_stream_uuid: UUID):
+        return {"chat_key": "channel:7", "name": "General"}
+
+    async def actor(_user_uuid: UUID):
+        return SimpleNamespace(user_uuid=user_uuid, role=400)
+
+    client = SimpleNamespace(
+        update_subscription=lambda name, *, enabled: calls.append(
+            ("subscription", name, enabled)
+        ),
+        update_subscription_property=lambda stream_id, property_name, value: (
+            calls.append(("property", stream_id, property_name, value))
+        ),
+    )
+    writer._pool = SimpleNamespace(execute=AsyncMock())
+    writer._required_stream = required_stream  # type: ignore[method-assign]
+    writer._actor = actor  # type: ignore[method-assign]
+    writer._client = lambda _actor: client  # type: ignore[method-assign]
+
+    for offset, mode in enumerate(("all_messages", "mentions_only", "muted")):
+        target = {
+            "stream_uuid": str(stream_uuid),
+            "user_uuid": str(user_uuid),
+            "role": "member",
+            "notification_mode": mode,
+            "created_at": "2026-09-21T08:00:00Z",
+        }
+        await writer._apply_stream_bindings(
+            UUID(int=offset + 20),
+            None,
+            target,
+            datetime(2026, 9, 21, 8, tzinfo=UTC),
+        )
+
+    assert calls == [
+        ("subscription", "General", True),
+        ("property", 7, "desktop_notifications", True),
+        ("property", 7, "is_muted", False),
+        ("subscription", "General", True),
+        ("property", 7, "desktop_notifications", False),
+        ("property", 7, "is_muted", False),
+        ("subscription", "General", True),
+        ("property", 7, "is_muted", True),
+    ]
 
 
 def test_outbound_rejects_unsupported_message_flag_changes() -> None:
@@ -1137,6 +1193,199 @@ def test_catalog_removal_enqueues_workspace_binding_tombstone() -> None:
 
 def test_catalog_applies_registration_topic_snapshot_before_activation() -> None:
     asyncio.run(_catalog_applies_registration_topic_snapshot_before_activation(_dsn()))
+
+
+def test_notification_snapshot_does_not_overwrite_newer_live_state() -> None:
+    asyncio.run(_notification_snapshot_does_not_overwrite_newer_live_state(_dsn()))
+
+
+async def _notification_snapshot_does_not_overwrite_newer_live_state(
+    dsn: str,
+) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            connection_uuid = await _insert_user(
+                connection,
+                79,
+                400,
+                queue_id="queue-notification-race",
+                status="active",
+            )
+        catalog = _catalog(79, [(7, "Shared")], {"channel:7": 1})
+        assert (
+            await store.store_chat_catalog(
+                connection_uuid,
+                "queue-notification-race",
+                catalog,
+            )
+        ).activated
+        live_updated_at = int(datetime.now(UTC).timestamp())
+        assert (
+            await store.store_user_topics(
+                connection_uuid,
+                "queue-notification-race",
+                (ZulipUserTopic(7, "Race", 3, live_updated_at),),
+                replace_all=False,
+            )
+            == 1
+        )
+        assert await store.store_user_notification_setting(
+            connection_uuid,
+            "queue-notification-race",
+            enable_stream_desktop_notifications=False,
+        )
+        snapshot_at = datetime.now(UTC) - timedelta(seconds=10)
+
+        assert (
+            await store.store_notification_snapshot(
+                connection_uuid,
+                "queue-notification-race",
+                catalog.chats,
+                (ZulipUserTopic(7, "Race", 1, live_updated_at - 20),),
+                enable_stream_desktop_notifications=True,
+                observed_at=snapshot_at,
+            )
+            == 0
+        )
+        state = await pool.fetchrow(
+            """
+            SELECT connection.notification_settings_generation,
+                   connection.enable_stream_desktop_notifications,
+                   binding.notification_mode
+            FROM workspace_zulip_bridge.zulip_connections AS connection
+            JOIN workspace_zulip_bridge.zulip_topic_bindings AS binding
+              ON binding.zulip_user_uuid = connection.zulip_user_uuid
+            WHERE connection.uuid = $1
+            """,
+            connection_uuid,
+        )
+        assert tuple(state) == (1, False, "follow")
+    finally:
+        await pool.close()
+
+
+def test_notification_snapshot_collapses_case_only_topic_overrides() -> None:
+    asyncio.run(_notification_snapshot_collapses_case_only_topic_overrides(_dsn()))
+
+
+async def _notification_snapshot_collapses_case_only_topic_overrides(
+    dsn: str,
+) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            connection_uuid = await _insert_user(
+                connection,
+                80,
+                400,
+                queue_id="queue-topic-case",
+                status="active",
+            )
+        catalog = _catalog(80, [(7, "Shared")], {"channel:7": 1})
+        assert (
+            await store.store_chat_catalog(
+                connection_uuid,
+                "queue-topic-case",
+                catalog,
+            )
+        ).activated
+        assert (
+            await store.store_user_topics(
+                connection_uuid,
+                "queue-topic-case",
+                (ZulipUserTopic(7, "Review", 1, 1_700_000_000),),
+                replace_all=False,
+            )
+            == 1
+        )
+        stream_uuid = stable_chat_uuid(ENDPOINT, "channel:7")
+        user_uuid = stable_user_uuid(ENDPOINT, 80)
+        canonical_topic_uuid = stable_topic_uuid(stream_uuid, "Review")
+        duplicate_topic_uuid = stable_topic_uuid(stream_uuid, "review")
+        duplicate_binding_uuid = stable_topic_binding_uuid(
+            duplicate_topic_uuid,
+            user_uuid,
+        )
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.zulip_topics (
+                uuid, zulip_stream_uuid, name, content_hash, created_at
+            ) VALUES ($1, $2, 'review', $3, clock_timestamp() + interval '1 hour')
+            """,
+            duplicate_topic_uuid,
+            stream_uuid,
+            b"t" * 32,
+        )
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.zulip_topic_aliases (
+                zulip_stream_uuid, alias, topic_uuid
+            ) VALUES ($1, 'review', $2)
+            """,
+            stream_uuid,
+            duplicate_topic_uuid,
+        )
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.zulip_topic_bindings (
+                uuid, zulip_stream_uuid, topic_uuid, zulip_user_uuid,
+                notification_mode, content_hash, source_updated_at
+            ) VALUES ($1, $2, $3, $4, 'follow', $5, to_timestamp(1700000001))
+            """,
+            duplicate_binding_uuid,
+            stream_uuid,
+            duplicate_topic_uuid,
+            user_uuid,
+            b"b" * 32,
+        )
+        observed_at = datetime.now(UTC)
+        assert (
+            await store.store_notification_snapshot(
+                connection_uuid,
+                "queue-topic-case",
+                catalog.chats,
+                (
+                    ZulipUserTopic(
+                        7,
+                        "REVIEW",
+                        3,
+                        int(observed_at.timestamp()),
+                    ),
+                ),
+                enable_stream_desktop_notifications=True,
+                observed_at=observed_at,
+            )
+            == 2
+        )
+        bindings = await pool.fetch(
+            """
+            SELECT topic_uuid, notification_mode
+            FROM workspace_zulip_bridge.zulip_topic_bindings
+            WHERE zulip_user_uuid = $1
+            ORDER BY topic_uuid
+            """,
+            user_uuid,
+        )
+        assert {tuple(row) for row in bindings} == {
+            (canonical_topic_uuid, "follow"),
+            (duplicate_topic_uuid, "default"),
+        }
+        assert (
+            await pool.fetchval(
+                """
+                SELECT topic_uuid
+                FROM workspace_zulip_bridge.zulip_topic_aliases
+                WHERE zulip_stream_uuid = $1 AND alias = 'REVIEW'
+                """,
+                stream_uuid,
+            )
+            == canonical_topic_uuid
+        )
+    finally:
+        await pool.close()
 
 
 async def _catalog_applies_registration_topic_snapshot_before_activation(
@@ -2397,6 +2646,14 @@ async def _workspace_event_processor_prioritizes_live_messages(dsn: str) -> None
             """,
             [
                 (
+                    UUID("10000000-0000-0000-0000-000000000097"),
+                    provider_uuid,
+                    project_uuid,
+                    0,
+                    "topic",
+                    UUID("10000000-0000-0000-0000-000000000098"),
+                ),
+                (
                     UUID("10000000-0000-0000-0000-000000000093"),
                     provider_uuid,
                     project_uuid,
@@ -2418,14 +2675,22 @@ async def _workspace_event_processor_prioritizes_live_messages(dsn: str) -> None
         processor._pool = pool
         processor._provider_uuid = provider_uuid
         processor._settings = SimpleNamespace(
-            workspace_event_batch_size=1,
+            workspace_event_batch_size=2,
             event_processor_claim_timeout_seconds=60.0,
             workspace_event_max_attempts=8,
             workspace_retry_base_seconds=0.25,
             workspace_retry_cap_seconds=30.0,
         )
+        processed_types: list[str] = []
 
-        assert await processor.process_once() == 1
+        async def apply(row: asyncpg.Record) -> bool:
+            processed_types.append(str(row["object_type"]))
+            return False
+
+        processor._apply = AsyncMock(side_effect=apply)
+
+        assert await processor.process_once() == 2
+        assert processed_types == ["message", "message_reaction"]
         rows = await pool.fetch(
             """
             SELECT object_type, processing_status
@@ -2436,7 +2701,8 @@ async def _workspace_event_processor_prioritizes_live_messages(dsn: str) -> None
             provider_uuid,
         )
         assert [tuple(row) for row in rows] == [
-            ("message_reaction", "pending"),
+            ("topic", "pending"),
+            ("message_reaction", "skipped"),
             ("message", "skipped"),
         ]
     finally:
@@ -4026,6 +4292,10 @@ def test_workspace_outbox_waits_until_source_becomes_eligible(
     asyncio.run(_workspace_outbox_waits_until_source_becomes_eligible(_dsn(), tmp_path))
 
 
+def test_workspace_outbox_retires_permanently_missing_source(tmp_path: Path) -> None:
+    asyncio.run(_workspace_outbox_retires_permanently_missing_source(_dsn(), tmp_path))
+
+
 def test_workspace_projection_upgrade_restores_missing_topic_journal(
     tmp_path: Path,
 ) -> None:
@@ -5388,6 +5658,80 @@ async def _workspace_outbox_waits_until_source_becomes_eligible(
             )
             == "pending"
         )
+    finally:
+        await pool.close()
+
+
+async def _workspace_outbox_retires_permanently_missing_source(
+    dsn: str,
+    tmp_path: Path,
+) -> None:
+    pool = await _pool(dsn)
+    provider_uuid = UUID("10000000-0000-0000-0000-0000000000c1")
+    project_uuid = UUID("10000000-0000-0000-0000-0000000000c2")
+    generation = UUID("10000000-0000-0000-0000-0000000000c3")
+    missing_binding_uuid = UUID("10000000-0000-0000-0000-0000000000c4")
+    token_file = tmp_path / "workspace-missing-source.token"
+    token_file.write_text("integration-token")
+    try:
+        async with pool.acquire() as connection:
+            await _insert_user(connection, 83, 400)
+            realm_uuid = stable_realm_uuid(ENDPOINT)
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_realms
+                SET workspace_project_id = $2, workspace_provider_uuid = $3
+                WHERE uuid = $1
+                """,
+                realm_uuid,
+                project_uuid,
+                provider_uuid,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.workspace_mirror_state (
+                    provider_uuid, workspace_project_id, active_generation,
+                    bootstrap_status, reconciliation_version
+                ) VALUES ($1, $2, $3, 'ready', 15)
+                """,
+                provider_uuid,
+                project_uuid,
+                generation,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.workspace_outbox (
+                    realm_uuid, entity_type, action, entity_uuid
+                ) VALUES ($1, 'topic_binding', 'upsert', $2)
+                """,
+                realm_uuid,
+                missing_binding_uuid,
+            )
+        worker = WorkspaceDiffWorker(
+            pool,
+            Settings.from_env(
+                {
+                    "WZB_DATABASE_DSN": dsn,
+                    "WZB_WORKSPACE_WEBSOCKET_URL": (
+                        "ws://workspace.test/api/workspace/v1/events/ws"
+                    ),
+                    "WZB_WORKSPACE_PROJECT_ID": str(project_uuid),
+                    "WZB_WORKSPACE_PROVIDER_UUID": str(provider_uuid),
+                    "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+                }
+            ),
+        )
+
+        assert await worker._plan_source_outbox(realm_uuid, generation) == 1
+        outbox = await pool.fetchrow(
+            """
+            SELECT delivery_status, last_error
+            FROM workspace_zulip_bridge.workspace_outbox
+            WHERE entity_uuid = $1
+            """,
+            missing_binding_uuid,
+        )
+        assert tuple(outbox) == ("delivered", "source_absent")
     finally:
         await pool.close()
 
@@ -8692,6 +9036,67 @@ def test_event_processor_dependency_deferrals_do_not_block_later_events() -> Non
 
 def test_event_processor_retires_missing_user_topic_after_history() -> None:
     asyncio.run(_event_processor_retires_missing_user_topic_after_history(_dsn()))
+
+
+def test_event_processor_refreshes_catalog_for_global_notification_change() -> None:
+    asyncio.run(
+        _event_processor_refreshes_catalog_for_global_notification_change(_dsn())
+    )
+
+
+async def _event_processor_refreshes_catalog_for_global_notification_change(
+    dsn: str,
+) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            connection_uuid = await _insert_user(
+                connection,
+                81,
+                400,
+                queue_id="queue-user-setting",
+                status="active",
+            )
+        event = {
+            "id": 1,
+            "type": "user_settings",
+            "property": "enable_stream_desktop_notifications",
+            "value": False,
+        }
+        assert await store.store_events(
+            connection_uuid,
+            "queue-user-setting",
+            (
+                ZulipEvent(
+                    event_id=1,
+                    event_type="user_settings",
+                    payload_json=json.dumps(event),
+                ),
+            ),
+            1,
+        ) == (1, True)
+        processor = ZulipEventProcessor(
+            pool,
+            store,
+            Settings.from_env({"WZB_DATABASE_DSN": dsn}),
+        )
+
+        processed = await processor.process_once()
+
+        assert (processed.claimed, processed.applied, processed.retried) == (1, 1, 0)
+        state = await pool.fetchrow(
+            """
+            SELECT enable_stream_desktop_notifications, lifecycle_status,
+                   streams_hash
+            FROM workspace_zulip_bridge.zulip_connections
+            WHERE uuid = $1
+            """,
+            connection_uuid,
+        )
+        assert tuple(state) == (False, "filling", None)
+    finally:
+        await pool.close()
 
 
 def test_backlog_dependency_deferrals_use_slow_retry_cap() -> None:

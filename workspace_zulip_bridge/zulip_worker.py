@@ -13,6 +13,8 @@ from collections.abc import Callable
 from collections.abc import Coroutine
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC
+from datetime import datetime
 from typing import Any
 from typing import Protocol
 from uuid import UUID
@@ -24,7 +26,9 @@ from workspace_zulip_bridge.chat_catalog import ChatCatalogBuilder
 from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.event_store import EventStore
 from workspace_zulip_bridge.message_history import build_message_page
+from workspace_zulip_bridge.models import NOTIFICATION_SETTINGS_GENERATION
 from workspace_zulip_bridge.models import RecentPrivateConversation
+from workspace_zulip_bridge.models import RegisteredQueue
 from workspace_zulip_bridge.models import ScheduledChat
 from workspace_zulip_bridge.models import UserDirectoryWrite
 from workspace_zulip_bridge.models import ZulipDirectoryUser
@@ -177,6 +181,13 @@ class ZulipEventThread(threading.Thread):
         self._bootstrap_user_presences: tuple[ZulipUserPresence, ...] = ()
         self._bootstrap_user_statuses: tuple[ZulipUserProfileStatus, ...] = ()
         self._bootstrap_state_pending = False
+        self._bootstrap_notification_snapshot_at: datetime | None = None
+        self._stream_desktop_notifications_default = (
+            user.enable_stream_desktop_notifications
+        )
+        self._notification_snapshot_needed = (
+            user.notification_settings_generation < NOTIFICATION_SETTINGS_GENERATION
+        )
 
     def stop(self) -> None:
         self._stop_requested.set()
@@ -269,6 +280,7 @@ class ZulipEventThread(threading.Thread):
                 with self._registration_gate:
                     if self._stop_requested.is_set():
                         return
+                    notification_snapshot_at = datetime.now(UTC)
                     registered = client.register()
                 if not self._submit(
                     self._store.set_queue(
@@ -295,6 +307,10 @@ class ZulipEventThread(threading.Thread):
                 self._bootstrap_user_presences = registered.user_presences
                 self._bootstrap_user_statuses = registered.user_statuses
                 self._bootstrap_state_pending = True
+                self._bootstrap_notification_snapshot_at = notification_snapshot_at
+                self._stream_desktop_notifications_default = (
+                    registered.enable_stream_desktop_notifications
+                )
                 longpoll_timeout = registered.longpoll_timeout_seconds
                 LOG.info(
                     "Zulip queue registered user_uuid=%s",
@@ -341,6 +357,7 @@ class ZulipEventThread(threading.Thread):
                 self._bootstrap_user_presences = ()
                 self._bootstrap_user_statuses = ()
                 self._bootstrap_state_pending = False
+                self._bootstrap_notification_snapshot_at = None
                 self._wait_before_retry(attempt)
                 attempt += 1
                 continue
@@ -531,6 +548,16 @@ class ZulipEventThread(threading.Thread):
             )
         )
         subscriptions = client.get_subscriptions()
+        if not self._bootstrap_state_pending:
+            notification_default = self._submit(
+                self._store.get_stream_notification_default(
+                    self.user.uuid,
+                    queue_id,
+                )
+            )
+            if notification_default is None:
+                return False
+            self._stream_desktop_notifications_default = notification_default
         first_visible_message_ids: dict[int, int | None] = {}
         visibility_probes = 0
         for subscription in subscriptions:
@@ -554,6 +581,7 @@ class ZulipEventThread(threading.Thread):
         channel_chats = builder.add_subscriptions(
             subscriptions,
             first_visible_message_ids=first_visible_message_ids,
+            desktop_notifications_default=(self._stream_desktop_notifications_default),
         )
         if self._private_conversations_queue_id != queue_id:
             with self._message_scan_gate:
@@ -592,6 +620,14 @@ class ZulipEventThread(threading.Thread):
                         if self._bootstrap_state_pending
                         else None
                     ),
+                    notification_snapshot_at=(
+                        self._bootstrap_notification_snapshot_at
+                        if self._bootstrap_state_pending
+                        else None
+                    ),
+                    enable_stream_desktop_notifications=(
+                        self._stream_desktop_notifications_default
+                    ),
                 )
             )
         if not result.activated:
@@ -612,6 +648,8 @@ class ZulipEventThread(threading.Thread):
             )
             bootstrap_changes += result.bootstrap_topic_changes
             self._bootstrap_state_pending = False
+            self._bootstrap_notification_snapshot_at = None
+            self._notification_snapshot_needed = False
         elapsed = time.monotonic() - started_at
         self._identity = identity
         self._user_uuids = user_uuids
@@ -869,6 +907,24 @@ class ZulipEventThread(threading.Thread):
             raise RuntimeError("current Zulip user is missing from user directory")
         if self.user.queue_id is None:
             return False
+        registered: RegisteredQueue | None = None
+        snapshot_at: datetime | None = None
+        if self._notification_snapshot_needed:
+            snapshot_at = datetime.now(UTC)
+            registered = client.register()
+            self._stream_desktop_notifications_default = (
+                registered.enable_stream_desktop_notifications
+            )
+        else:
+            notification_default = self._submit(
+                self._store.get_stream_notification_default(
+                    self.user.uuid,
+                    self.user.queue_id,
+                )
+            )
+            if notification_default is None:
+                return False
+            self._stream_desktop_notifications_default = notification_default
         self._submit(
             self._store.store_user_attachments(
                 self.user.uuid,
@@ -881,7 +937,26 @@ class ZulipEventThread(threading.Thread):
         builder = ChatCatalogBuilder(
             identity.user_id, identity.full_name, identity.role
         )
-        channel_chats = builder.add_subscriptions(subscriptions)
+        channel_chats = builder.add_subscriptions(
+            subscriptions,
+            desktop_notifications_default=(self._stream_desktop_notifications_default),
+        )
+        if registered is not None and snapshot_at is not None:
+            snapshot_changes = self._submit(
+                self._store.store_notification_snapshot(
+                    self.user.uuid,
+                    self.user.queue_id,
+                    channel_chats,
+                    registered.user_topics,
+                    enable_stream_desktop_notifications=(
+                        self._stream_desktop_notifications_default
+                    ),
+                    observed_at=snapshot_at,
+                )
+            )
+            if snapshot_changes is None:
+                return False
+            self._notification_snapshot_needed = False
         allowed_chat_keys = self._submit(
             self._store.list_user_chat_keys(self.user.uuid)
         )

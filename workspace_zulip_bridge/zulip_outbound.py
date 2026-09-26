@@ -317,7 +317,7 @@ class ZulipOutboundWriter:
         entity_uuid: UUID,
         source: dict[str, Any] | None,
         target: dict[str, Any] | None,
-        _target_updated_at: datetime | None,
+        target_updated_at: datetime | None,
     ) -> None:
         data = target or source
         if data is None:
@@ -338,11 +338,8 @@ class ZulipOutboundWriter:
         notification_mode = (
             target.get("notification_mode") if target is not None else None
         )
-        if notification_mode == "mentions_only":
-            raise ZulipOutboundError(
-                "mentions-only channel notifications cannot be represented "
-                "without changing independent Zulip notification settings"
-            )
+        if notification_mode not in {None, "all_messages", "mentions_only", "muted"}:
+            raise ZulipOutboundError("unsupported channel notification mode")
         actor = await self._actor(UUID(str(data["user_uuid"])))
         target_role = str(data.get("role", "member"))
         if target is not None and target_role != _binding_role(actor.role):
@@ -355,9 +352,17 @@ class ZulipOutboundWriter:
             enabled=target is not None,
         )
         if target is not None:
+            stream_id = int(str(stream["chat_key"]).removeprefix("channel:"))
+            if notification_mode in {"all_messages", "mentions_only"}:
+                await asyncio.to_thread(
+                    self._client(actor).update_subscription_property,
+                    stream_id,
+                    "desktop_notifications",
+                    notification_mode == "all_messages",
+                )
             await asyncio.to_thread(
                 self._client(actor).update_subscription_property,
-                int(str(stream["chat_key"]).removeprefix("channel:")),
+                stream_id,
                 "is_muted",
                 notification_mode == "muted",
             )
@@ -375,12 +380,14 @@ class ZulipOutboundWriter:
             """
             INSERT INTO workspace_zulip_bridge.zulip_stream_bindings (
                 uuid, zulip_stream_uuid, zulip_user_uuid, role,
-                membership_kind, notification_mode, content_hash, created_at
-            ) VALUES ($1, $2, $3, $4, 'subscriber', $5, $6, $7)
+                membership_kind, notification_mode, content_hash,
+                source_updated_at, created_at
+            ) VALUES ($1, $2, $3, $4, 'subscriber', $5, $6, $7, $8)
             ON CONFLICT (uuid) DO UPDATE SET
                 role = EXCLUDED.role,
                 notification_mode = EXCLUDED.notification_mode,
                 content_hash = EXCLUDED.content_hash,
+                source_updated_at = EXCLUDED.source_updated_at,
                 updated_at = clock_timestamp()
             """,
             entity_uuid,
@@ -389,6 +396,7 @@ class ZulipOutboundWriter:
             str(target.get("role", "member")),
             str(target.get("notification_mode", "all_messages")),
             _canonical_hash(target),
+            target_updated_at or datetime.now(UTC),
             created_at,
         )
 
@@ -426,7 +434,9 @@ class ZulipOutboundWriter:
         conflicting_topic_uuid = await self._pool.fetchval(
             """
             SELECT uuid FROM workspace_zulip_bridge.zulip_topics
-            WHERE zulip_stream_uuid = $1 AND name = $2 AND uuid <> $3
+            WHERE zulip_stream_uuid = $1
+              AND lower(name) = lower($2)
+              AND uuid <> $3
             """,
             row["stream_uuid"],
             desired_name,
@@ -472,7 +482,9 @@ class ZulipOutboundWriter:
             conflict = await connection.fetchval(
                 """
                 SELECT uuid FROM workspace_zulip_bridge.zulip_topics
-                WHERE zulip_stream_uuid = $1 AND name = $2 AND uuid <> $3
+                WHERE zulip_stream_uuid = $1
+                  AND lower(name) = lower($2)
+                  AND uuid <> $3
                 """,
                 stream_uuid,
                 desired_name,
@@ -536,7 +548,7 @@ class ZulipOutboundWriter:
         entity_uuid: UUID,
         source: dict[str, Any] | None,
         target: dict[str, Any] | None,
-        _target_updated_at: datetime | None,
+        target_updated_at: datetime | None,
     ) -> None:
         data = target or source
         if data is None:
@@ -580,11 +592,12 @@ class ZulipOutboundWriter:
             """
             INSERT INTO workspace_zulip_bridge.zulip_topic_bindings (
                 uuid, zulip_stream_uuid, topic_uuid, zulip_user_uuid,
-                notification_mode, content_hash, created_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                notification_mode, content_hash, source_updated_at, created_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             ON CONFLICT (uuid) DO UPDATE SET
                 notification_mode = EXCLUDED.notification_mode,
                 content_hash = EXCLUDED.content_hash,
+                source_updated_at = EXCLUDED.source_updated_at,
                 updated_at = clock_timestamp()
             """,
             entity_uuid,
@@ -593,6 +606,7 @@ class ZulipOutboundWriter:
             actor.user_uuid,
             str(target.get("notification_mode", "default")),
             _canonical_hash(target),
+            target_updated_at or datetime.now(UTC),
             created_at,
         )
 

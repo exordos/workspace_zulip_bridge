@@ -65,6 +65,10 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_connections (
     last_event_id bigint,
     last_event_cursor_at timestamptz,
     reconcile_since timestamptz,
+    notification_settings_generation smallint NOT NULL DEFAULT 0
+        CHECK (notification_settings_generation >= 0),
+    enable_stream_desktop_notifications boolean NOT NULL DEFAULT true,
+    notification_settings_updated_at timestamptz NOT NULL DEFAULT 'epoch',
     lifecycle_status text NOT NULL DEFAULT 'init'
         CHECK (lifecycle_status IN (
             'init', 'streaming', 'filling', 'scheduling', 'backfilling', 'active'
@@ -154,6 +158,7 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_stream_bindings (
         first_visible_message_id IS NULL OR first_visible_message_id >= 0
     ),
     personal_state_loaded_at timestamptz,
+    source_updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     UNIQUE (zulip_stream_uuid, zulip_user_uuid)
@@ -174,6 +179,8 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_topics (
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     UNIQUE (zulip_stream_uuid, name)
 );
+CREATE INDEX IF NOT EXISTS zulip_topics_casefold_name_idx
+    ON workspace_zulip_bridge.zulip_topics (zulip_stream_uuid, lower(name));
 
 CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_topic_aliases (
     zulip_stream_uuid uuid NOT NULL
@@ -188,6 +195,10 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_topic_aliases (
 );
 CREATE INDEX IF NOT EXISTS zulip_topic_aliases_topic_idx
     ON workspace_zulip_bridge.zulip_topic_aliases (topic_uuid, active);
+CREATE INDEX IF NOT EXISTS zulip_topic_aliases_casefold_idx
+    ON workspace_zulip_bridge.zulip_topic_aliases (
+        zulip_stream_uuid, lower(alias)
+    ) WHERE active;
 
 CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_topic_bindings (
     uuid uuid PRIMARY KEY,
@@ -199,6 +210,7 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_topic_bindings (
     notification_mode text NOT NULL DEFAULT 'default'
         CHECK (notification_mode IN ('default', 'mute', 'follow', 'unmute')),
     content_hash bytea NOT NULL CHECK (octet_length(content_hash) = 32),
+    source_updated_at timestamptz NOT NULL DEFAULT 'epoch',
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     UNIQUE (topic_uuid, zulip_user_uuid),
@@ -519,17 +531,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS workspace_events_epoch_idx
 CREATE INDEX IF NOT EXISTS workspace_events_pending_idx
     ON workspace_zulip_bridge.workspace_events (available_at, sequence)
     WHERE processing_status = 'pending';
-CREATE INDEX IF NOT EXISTS workspace_events_priority_pending_idx
+CREATE INDEX IF NOT EXISTS workspace_events_realtime_priority_pending_idx
     ON workspace_zulip_bridge.workspace_events (
         (CASE object_type
-            WHEN 'user' THEN 0
-            WHEN 'stream' THEN 1
-            WHEN 'stream_binding' THEN 2
-            WHEN 'topic' THEN 3
-            WHEN 'topic_binding' THEN 4
-            WHEN 'message' THEN 5
-            WHEN 'message_flag' THEN 6
-            WHEN 'message_reaction' THEN 7
+            WHEN 'message' THEN 0
+            WHEN 'message_flag' THEN 1
+            WHEN 'message_reaction' THEN 2
+            WHEN 'user' THEN 3
+            WHEN 'stream_binding' THEN 4
+            WHEN 'topic_binding' THEN 5
+            WHEN 'stream' THEN 6
+            WHEN 'topic' THEN 7
             ELSE 8
         END),
         sequence

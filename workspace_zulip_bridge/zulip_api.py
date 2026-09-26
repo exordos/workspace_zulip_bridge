@@ -237,6 +237,7 @@ class ZulipApiClient:
                     [
                         "recent_private_conversations",
                         "presence",
+                        "user_settings",
                         "user_status",
                         "user_topic",
                     ],
@@ -245,7 +246,7 @@ class ZulipApiClient:
                 "slim_presence": "true",
                 "client_capabilities": json.dumps(
                     {
-                        "notification_settings_null": False,
+                        "notification_settings_null": True,
                         "simplified_presence_events": True,
                     },
                     separators=(",", ":"),
@@ -300,6 +301,15 @@ class ZulipApiClient:
             offline_threshold_seconds=presence_threshold,
         )
         user_statuses = _parse_user_statuses(payload.get("user_status", {}))
+        raw_user_settings = payload.get("user_settings", {})
+        if not isinstance(raw_user_settings, Mapping):
+            raise ZulipApiError("invalid_register_response", retryable=True)
+        enable_stream_desktop_notifications = raw_user_settings.get(
+            "enable_stream_desktop_notifications",
+            True,
+        )
+        if not isinstance(enable_stream_desktop_notifications, bool):
+            raise ZulipApiError("invalid_register_response", retryable=True)
         return RegisteredQueue(
             queue_id,
             last_event_id,
@@ -309,6 +319,7 @@ class ZulipApiClient:
             user_presences,
             user_statuses,
             presence_threshold,
+            enable_stream_desktop_notifications,
         )
 
     def get_events(

@@ -39,6 +39,15 @@ BEGIN
             ADD COLUMN IF NOT EXISTS last_event_cursor_at timestamptz;
         ALTER TABLE workspace_zulip_bridge.zulip_connections
             ADD COLUMN IF NOT EXISTS reconcile_since timestamptz;
+        ALTER TABLE workspace_zulip_bridge.zulip_connections
+            ADD COLUMN IF NOT EXISTS notification_settings_generation smallint
+            NOT NULL DEFAULT 0;
+        ALTER TABLE workspace_zulip_bridge.zulip_connections
+            ADD COLUMN IF NOT EXISTS enable_stream_desktop_notifications boolean
+            NOT NULL DEFAULT true;
+        ALTER TABLE workspace_zulip_bridge.zulip_connections
+            ADD COLUMN IF NOT EXISTS notification_settings_updated_at timestamptz
+            NOT NULL DEFAULT 'epoch';
         UPDATE workspace_zulip_bridge.zulip_connections
         SET last_event_cursor_at = updated_at
         WHERE queue_id IS NOT NULL AND last_event_cursor_at IS NULL;
@@ -58,12 +67,51 @@ BEGIN
             FROM pg_constraint
             WHERE conrelid =
                     'workspace_zulip_bridge.zulip_connections'::regclass
+              AND conname =
+                    'zulip_connections_notification_settings_generation_check'
+        ) THEN
+            ALTER TABLE workspace_zulip_bridge.zulip_connections
+                ADD CONSTRAINT
+                    zulip_connections_notification_settings_generation_check
+                CHECK (notification_settings_generation >= 0);
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1
+            FROM pg_constraint
+            WHERE conrelid =
+                    'workspace_zulip_bridge.zulip_connections'::regclass
               AND conname = 'zulip_connections_desired_generation_check'
         ) THEN
             ALTER TABLE workspace_zulip_bridge.zulip_connections
                 ADD CONSTRAINT zulip_connections_desired_generation_check
                 CHECK (desired_generation IS NULL OR desired_generation > 0);
         END IF;
+    END IF;
+
+    IF to_regclass('workspace_zulip_bridge.zulip_topic_bindings') IS NOT NULL THEN
+        ALTER TABLE workspace_zulip_bridge.zulip_topic_bindings
+            ADD COLUMN IF NOT EXISTS source_updated_at timestamptz;
+        UPDATE workspace_zulip_bridge.zulip_topic_bindings
+        SET source_updated_at = updated_at
+        WHERE source_updated_at IS NULL;
+        ALTER TABLE workspace_zulip_bridge.zulip_topic_bindings
+            ALTER COLUMN source_updated_at SET DEFAULT 'epoch';
+        ALTER TABLE workspace_zulip_bridge.zulip_topic_bindings
+            ALTER COLUMN source_updated_at SET NOT NULL;
+    END IF;
+
+    IF to_regclass('workspace_zulip_bridge.zulip_topics') IS NOT NULL THEN
+        CREATE INDEX IF NOT EXISTS zulip_topics_casefold_name_idx
+            ON workspace_zulip_bridge.zulip_topics (
+                zulip_stream_uuid, lower(name)
+            );
+    END IF;
+
+    IF to_regclass('workspace_zulip_bridge.zulip_topic_aliases') IS NOT NULL THEN
+        CREATE INDEX IF NOT EXISTS zulip_topic_aliases_casefold_idx
+            ON workspace_zulip_bridge.zulip_topic_aliases (
+                zulip_stream_uuid, lower(alias)
+            ) WHERE active;
     END IF;
 
     IF to_regclass('workspace_zulip_bridge.zulip_streams') IS NOT NULL THEN
@@ -79,6 +127,15 @@ BEGIN
     IF to_regclass('workspace_zulip_bridge.zulip_stream_bindings') IS NOT NULL THEN
         ALTER TABLE workspace_zulip_bridge.zulip_stream_bindings
             ADD COLUMN IF NOT EXISTS first_visible_message_id bigint;
+        ALTER TABLE workspace_zulip_bridge.zulip_stream_bindings
+            ADD COLUMN IF NOT EXISTS source_updated_at timestamptz;
+        UPDATE workspace_zulip_bridge.zulip_stream_bindings
+        SET source_updated_at = updated_at
+        WHERE source_updated_at IS NULL;
+        ALTER TABLE workspace_zulip_bridge.zulip_stream_bindings
+            ALTER COLUMN source_updated_at SET DEFAULT clock_timestamp();
+        ALTER TABLE workspace_zulip_bridge.zulip_stream_bindings
+            ALTER COLUMN source_updated_at SET NOT NULL;
         IF NOT EXISTS (
             SELECT 1
             FROM pg_constraint
@@ -192,3 +249,29 @@ BEGIN
     END IF;
 END;
 $upgrade$;
+DO $upgrade$
+BEGIN
+    IF to_regclass('workspace_zulip_bridge.workspace_events') IS NOT NULL THEN
+        EXECUTE $index$
+            CREATE INDEX IF NOT EXISTS
+                workspace_events_realtime_priority_pending_idx
+            ON workspace_zulip_bridge.workspace_events (
+                (CASE object_type
+                    WHEN 'message' THEN 0
+                    WHEN 'message_flag' THEN 1
+                    WHEN 'message_reaction' THEN 2
+                    WHEN 'user' THEN 3
+                    WHEN 'stream_binding' THEN 4
+                    WHEN 'topic_binding' THEN 5
+                    WHEN 'stream' THEN 6
+                    WHEN 'topic' THEN 7
+                    ELSE 8
+                END),
+                sequence
+            )
+            WHERE processing_status = 'pending'
+        $index$;
+    END IF;
+END;
+$upgrade$;
+DROP INDEX IF EXISTS workspace_zulip_bridge.workspace_events_priority_pending_idx;

@@ -21,6 +21,8 @@ ChatType = Literal["channel", "direct", "group_direct"]
 MembershipKind = Literal["subscriber", "participant"]
 BindingRole = Literal["owner", "administrator", "moderator", "member", "guest"]
 
+NOTIFICATION_SETTINGS_GENERATION = 1
+
 
 @dataclass(frozen=True, slots=True)
 class ZulipUser:
@@ -38,6 +40,8 @@ class ZulipUser:
     disabled: bool = False
     has_pending_history: bool = False
     realm_uuid: UUID = UUID(int=0)
+    notification_settings_generation: int = 0
+    enable_stream_desktop_notifications: bool = True
 
     def connection_signature(self) -> tuple[str, str, str]:
         return self.endpoint, self.login, self.api_key
@@ -60,6 +64,7 @@ class RegisteredQueue:
     user_presences: tuple["ZulipUserPresence", ...] = ()
     user_statuses: tuple["ZulipUserProfileStatus", ...] = ()
     presence_offline_threshold_seconds: int = 200
+    enable_stream_desktop_notifications: bool = True
 
 
 @dataclass(frozen=True, slots=True)
