@@ -3774,6 +3774,7 @@ class WorkspaceDiffWorker:
         list[asyncpg.Record],
     ]:
         dependencies: dict[str, set[UUID]] = defaultdict(set)
+        file_ready_message_ids = await self._load_file_ready_message_ids(candidates)
         message_flag_binding_ids = await self._load_message_flag_binding_ids(candidates)
         topic_binding_stream_binding_ids = (
             await self._load_topic_binding_stream_binding_ids(candidates)
@@ -3821,6 +3822,12 @@ class WorkspaceDiffWorker:
                     deferred.append(row)
                     continue
                 required.append(("stream_bindings", binding_uuid))
+            if (
+                row["entity_type"] == "messages"
+                and row["entity_uuid"] not in file_ready_message_ids
+            ):
+                deferred.append(row)
+                continue
             if all(
                 dependency_uuid in ready_ids[dependency_type]
                 for dependency_type, dependency_uuid in required
@@ -3831,6 +3838,39 @@ class WorkspaceDiffWorker:
             else:
                 deferred.append(row)
         return ready, deferred
+
+    async def _load_file_ready_message_ids(
+        self,
+        candidates: list[tuple[asyncpg.Record, dict[str, Any], bytes, dict[str, Any]]],
+    ) -> set[UUID]:
+        message_uuids = [
+            UUID(str(row["entity_uuid"]))
+            for row, _, _, operation in candidates
+            if row["entity_type"] == "messages" and operation.get("action") != "delete"
+        ]
+        if not message_uuids:
+            return set()
+        rows = await self._pool.fetch(
+            """
+            SELECT candidate.uuid
+            FROM unnest($1::uuid[]) AS candidate(uuid)
+            LEFT JOIN workspace_zulip_bridge.zulip_messages AS message
+              ON message.uuid = candidate.uuid
+            WHERE message.uuid IS NULL OR NOT EXISTS (
+                  SELECT 1
+                  FROM workspace_zulip_bridge.zulip_message_files AS link
+                  LEFT JOIN workspace_zulip_bridge.workspace_file_projections
+                    AS projection
+                    ON projection.file_uuid = link.file_uuid
+                   AND projection.zulip_stream_uuid = message.zulip_stream_uuid
+                   AND projection.processing_status = 'finalized'
+                  WHERE link.message_uuid = message.uuid
+                    AND projection.uuid IS NULL
+              )
+            """,
+            message_uuids,
+        )
+        return {UUID(str(row["uuid"])) for row in rows}
 
     async def _load_message_flag_binding_ids(
         self,
@@ -5059,6 +5099,18 @@ _SOURCE_TABLES = {
         """,
         "where": """
             source.realm_uuid = $3
+            AND NOT EXISTS (
+                SELECT 1
+                FROM workspace_zulip_bridge.zulip_message_files AS file_link
+                LEFT JOIN workspace_zulip_bridge.workspace_file_projections
+                    AS file_projection
+                  ON file_projection.file_uuid = file_link.file_uuid
+                 AND file_projection.zulip_stream_uuid =
+                        source.zulip_stream_uuid
+                 AND file_projection.processing_status = 'finalized'
+                WHERE file_link.message_uuid = source.uuid
+                  AND file_projection.uuid IS NULL
+            )
         """,
         "hash": "source.content_hash",
         "partition": "source.zulip_stream_uuid",

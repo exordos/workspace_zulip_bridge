@@ -282,3 +282,19 @@ BEGIN
 END;
 $upgrade$;
 DROP INDEX IF EXISTS workspace_zulip_bridge.workspace_events_priority_pending_idx;
+
+DO $upgrade$
+BEGIN
+    IF to_regclass(
+        'workspace_zulip_bridge.workspace_file_projections'
+    ) IS NOT NULL THEN
+        ALTER TABLE workspace_zulip_bridge.workspace_file_projections
+            ADD COLUMN IF NOT EXISTS delivery_priority smallint
+            NOT NULL DEFAULT 1;
+        UPDATE workspace_zulip_bridge.workspace_file_projections
+        SET processing_status = 'pending', claimed_at = NULL,
+            available_at = clock_timestamp(), updated_at = clock_timestamp()
+        WHERE processing_status = 'processing';
+    END IF;
+END;
+$upgrade$;

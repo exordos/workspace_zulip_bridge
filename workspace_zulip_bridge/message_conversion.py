@@ -18,7 +18,6 @@ import re
 from collections.abc import Callable
 from collections.abc import Mapping
 from urllib.parse import parse_qs
-from urllib.parse import quote
 from urllib.parse import unquote
 from urllib.parse import urljoin
 from urllib.parse import urlsplit
@@ -53,11 +52,11 @@ _SEMANTIC_QUOTE = re.compile(
 )
 _QUOTE_FENCE = re.compile(r"```quote\r?\n(?P<body>.*?)\r?\n```", re.DOTALL)
 _URN = re.compile(
-    r"^urn:(?P<kind>user|stream|topic|message|file|quote):"
+    r"^urn:(?P<kind>user|stream|topic|message|file|image|video|quote):"
     r"(?P<uuid>[0-9a-fA-F-]{36})(?P<query>\?.*)?$"
 )
 _WORKSPACE_URN_REFERENCE = re.compile(
-    r"urn:(?P<kind>user|stream|topic|message|file|quote):"
+    r"urn:(?P<kind>user|stream|topic|message|file|image|video|quote):"
     r"(?P<uuid>[0-9a-fA-F-]{36})"
 )
 
@@ -451,11 +450,15 @@ def _render_zulip(content: str, context: ZulipToWorkspaceContext) -> str:
         if message_id is None:
             lossy = True
             return match.group(0)
-        message_uuid = _message_uuid(context, message_id)
         quoted = match.group("quoted")
-        known = context.message_contents.get(message_id)
-        selected = "" if known == quoted else f"?text={quote(quoted, safe='')}"
-        return f"[{match.group('name')}](urn:quote:{message_uuid}{selected})\n\n"
+        user_id = match.group("user_id")
+        user_uuid = context.user_uuids.get(int(user_id)) if user_id else None
+        author = match.group("name")
+        if user_uuid is not None:
+            author = f"[{author}](urn:user:{user_uuid})"
+        source = f"[said](urn:url:{match.group('link')})"
+        body = "\n".join(f"> {line}" for line in quoted.splitlines())
+        return f"{author} {source}:\n{body}\n\n"
 
     content = _SEMANTIC_QUOTE.sub(semantic_quote, content)
 
@@ -636,7 +639,7 @@ def _render_workspace(content: str, context: WorkspaceToZulipContext) -> str:
             if stream.chat_key.startswith("channel:") and message.topic_name:
                 return f"#**{stream.name}>{message.topic_name}@{message.zulip_message_id}**"
             return f"[{label}]({_provider_url(context, 'narrow/near/' + str(message.zulip_message_id))})"
-        if kind == "file":
+        if kind in {"file", "image", "video"}:
             source_path = context.files.get(entity_uuid)
             return label if source_path is None else f"{marker}[{label}]({source_path})"
         if kind == "quote":

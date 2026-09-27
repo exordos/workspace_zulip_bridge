@@ -142,7 +142,9 @@ def test_unchanged_projection_round_trips_exact_utf8(content: str) -> None:
             "@_**Other User|2** "
             "[said](https://zulip.example.invalid/#narrow/near/99):\n"
             "```quote\noriginal text\n```\n\nreply",
-            f"[Other User](urn:quote:{MESSAGE_UUID})\n\nreply",
+            f"[Other User](urn:user:{OTHER_USER_UUID}) "
+            "[said](urn:url:https://zulip.example.invalid/#narrow/near/99):\n"
+            "> original text\n\nreply",
         ),
         ("```quote\nordinary quote\n```", "> ordinary quote"),
         (
@@ -193,6 +195,10 @@ def test_zulip_differences_are_projected_in_bridge(
         (
             f"[report.pdf](urn:file:{FILE_UUID})",
             "[report.pdf](/user_uploads/a/report.pdf)",
+        ),
+        (
+            f"![report](urn:image:{FILE_UUID})",
+            "![report](/user_uploads/a/report.pdf)",
         ),
         (
             f"[Other User](urn:quote:{MESSAGE_UUID})\n\nreply",

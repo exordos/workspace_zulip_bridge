@@ -79,6 +79,12 @@ def stable_file_uuid(endpoint: str, source_path: str) -> UUID:
     return _stable_uuid(endpoint, "file", source_path)
 
 
+def stable_file_projection_uuid(file_uuid: UUID, stream_uuid: UUID) -> UUID:
+    """Return the immutable Workspace file identity for one stream ACL."""
+
+    return uuid5(file_uuid, f"workspace-file\0{stream_uuid}")
+
+
 def _stable_uuid(endpoint: str, entity_type: str, provider_key: str) -> UUID:
     name = "\0".join((canonical_endpoint(endpoint), entity_type, provider_key))
     return uuid5(_BRIDGE_NAMESPACE, name)

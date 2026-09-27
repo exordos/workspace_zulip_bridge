@@ -1328,13 +1328,25 @@ class ZulipOutboundWriter:
             }
 
         files: dict[UUID, str] = {}
-        file_uuids = set(references.get("file", ()))
+        file_uuids = (
+            set(references.get("file", ()))
+            | set(references.get("image", ()))
+            | set(references.get("video", ()))
+        )
         if file_uuids:
             rows = await self._pool.fetch(
                 """
-                SELECT uuid, source_path
-                FROM workspace_zulip_bridge.zulip_files
-                WHERE realm_uuid = $1 AND uuid = ANY($2::uuid[])
+                SELECT file.uuid, file.source_path
+                FROM workspace_zulip_bridge.zulip_files AS file
+                WHERE file.realm_uuid = $1 AND file.uuid = ANY($2::uuid[])
+                UNION ALL
+                SELECT projection.uuid, file.source_path
+                FROM workspace_zulip_bridge.workspace_file_projections AS projection
+                JOIN workspace_zulip_bridge.zulip_files AS file
+                  ON file.uuid = projection.file_uuid
+                WHERE file.realm_uuid = $1
+                  AND projection.processing_status = 'finalized'
+                  AND projection.uuid = ANY($2::uuid[])
                 """,
                 actor.realm_uuid,
                 list(file_uuids),

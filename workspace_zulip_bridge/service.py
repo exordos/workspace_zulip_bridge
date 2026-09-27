@@ -17,6 +17,7 @@ from workspace_zulip_bridge.event_store import EventStore
 from workspace_zulip_bridge.workspace_auth import WorkspaceTokenManager
 from workspace_zulip_bridge.workspace_control import WorkspaceControlWorker
 from workspace_zulip_bridge.workspace_events import WorkspaceEventReceiver
+from workspace_zulip_bridge.workspace_file_transfer import WorkspaceFileTransferWorker
 from workspace_zulip_bridge.workspace_sync import WorkspaceBootstrapper
 from workspace_zulip_bridge.workspace_sync import WorkspaceDiffWorker
 from workspace_zulip_bridge.workspace_sync import WorkspaceEventProcessor
@@ -112,6 +113,13 @@ class BridgeService:
                         control_worker.run(),
                         name="workspace-control",
                     )
+                )
+                supervised_tasks.extend(
+                    asyncio.create_task(
+                        WorkspaceFileTransferWorker(pool, self._settings).run(),
+                        name=f"workspace-file-transfer-{index}",
+                    )
+                    for index in range(self._settings.workspace_file_transfer_workers)
                 )
             if self._settings.workspace_events_enabled:
                 content_worker_partitions = self.content_worker_partitions(

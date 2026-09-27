@@ -65,6 +65,10 @@ _CAPABILITIES = {
         "messenger.topic.rename",
     )
 }
+_CAPABILITIES["messenger.file.transfer"] = {
+    "revision": 1,
+    "limits": {"max_file_bytes": 50 * 1024 * 1024},
+}
 
 
 class _DesiredResourceError(ValueError):

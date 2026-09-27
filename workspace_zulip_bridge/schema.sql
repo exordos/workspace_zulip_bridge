@@ -287,6 +287,9 @@ CREATE INDEX IF NOT EXISTS zulip_messages_sync_plan_idx
 CREATE INDEX IF NOT EXISTS zulip_messages_projection_upgrade_idx
     ON workspace_zulip_bridge.zulip_messages (uuid)
     WHERE converter_version < 1 OR workspace_content IS NULL;
+CREATE INDEX IF NOT EXISTS zulip_messages_unsupported_quote_projection_idx
+    ON workspace_zulip_bridge.zulip_messages (uuid)
+    WHERE workspace_content LIKE '%urn:quote:%';
 CREATE INDEX IF NOT EXISTS zulip_messages_missing_topic_idx
     ON workspace_zulip_bridge.zulip_messages
         (realm_uuid, zulip_stream_uuid, uuid)
@@ -395,6 +398,46 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_message_files (
 CREATE INDEX IF NOT EXISTS zulip_message_files_file_idx
     ON workspace_zulip_bridge.zulip_message_files (file_uuid, message_uuid);
 
+CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_file_projections (
+    uuid uuid PRIMARY KEY,
+    file_uuid uuid NOT NULL
+        REFERENCES workspace_zulip_bridge.zulip_files (uuid) ON DELETE CASCADE,
+    zulip_stream_uuid uuid NOT NULL
+        REFERENCES workspace_zulip_bridge.zulip_streams (uuid) ON DELETE CASCADE,
+    operation_uuid uuid NOT NULL,
+    delivery_priority smallint NOT NULL DEFAULT 1
+        CHECK (delivery_priority IN (0, 1)),
+    processing_status text NOT NULL DEFAULT 'pending'
+        CHECK (processing_status IN (
+            'pending', 'processing', 'finalized', 'failed', 'blocked'
+        )),
+    workspace_urn text,
+    content_type text,
+    size_bytes bigint CHECK (size_bytes IS NULL OR size_bytes >= 0),
+    sha256 text CHECK (sha256 IS NULL OR sha256 ~ '^[0-9a-f]{64}$'),
+    attempt_count integer NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    available_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    claimed_at timestamptz,
+    finalized_at timestamptz,
+    last_error text,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    UNIQUE (file_uuid, zulip_stream_uuid),
+    CHECK (
+        processing_status <> 'finalized'
+        OR (
+            workspace_urn ~ '^urn:(file|image|video):[0-9a-f-]{36}$'
+            AND content_type IS NOT NULL
+            AND size_bytes IS NOT NULL
+            AND sha256 IS NOT NULL
+        )
+    )
+);
+CREATE INDEX IF NOT EXISTS workspace_file_projections_pending_idx
+    ON workspace_zulip_bridge.workspace_file_projections
+        (delivery_priority, available_at, created_at, uuid)
+    WHERE processing_status IN ('pending', 'failed');
+
 CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_events (
     uuid uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     zulip_connection_uuid uuid NOT NULL
@@ -484,6 +527,9 @@ CREATE INDEX IF NOT EXISTS workspace_outbox_source_claim_idx
     ON workspace_zulip_bridge.workspace_outbox
         (realm_uuid, entity_type, sequence)
     WHERE delivery_status = 'pending' AND action = 'upsert';
+CREATE INDEX IF NOT EXISTS workspace_outbox_file_pending_idx
+    ON workspace_zulip_bridge.workspace_outbox (sequence)
+    WHERE delivery_status IN ('pending', 'failed') AND entity_type = 'file';
 
 CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_sync_cursors (
     realm_uuid uuid PRIMARY KEY
@@ -772,7 +818,8 @@ BEGIN
         'zulip_realms', 'zulip_users', 'zulip_connections', 'zulip_streams',
         'zulip_stream_bindings', 'zulip_topics', 'zulip_topic_aliases',
         'zulip_topic_bindings', 'zulip_messages', 'zulip_message_flags',
-        'zulip_message_reactions', 'zulip_files', 'zulip_entity_links',
+        'zulip_message_reactions', 'zulip_files', 'workspace_file_projections',
+        'zulip_entity_links',
         'workspace_outbox',
         'workspace_event_cursors', 'workspace_events', 'workspace_mirror_state',
         'workspace_users', 'workspace_streams', 'workspace_stream_bindings',

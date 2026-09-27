@@ -7,6 +7,7 @@ import pytest
 
 from workspace_zulip_bridge.stable_ids import canonical_endpoint
 from workspace_zulip_bridge.stable_ids import stable_chat_uuid
+from workspace_zulip_bridge.stable_ids import stable_file_projection_uuid
 from workspace_zulip_bridge.stable_ids import stable_file_uuid
 from workspace_zulip_bridge.stable_ids import stable_message_flag_uuid
 from workspace_zulip_bridge.stable_ids import stable_message_uuid
@@ -74,6 +75,11 @@ def test_relationship_and_file_ids_are_stable() -> None:
         == 5
     )
     assert stable_file_uuid(endpoint, "/user_uploads/a/report.csv").version == 5
+    source_file_uuid = stable_file_uuid(endpoint, "/user_uploads/a/report.csv")
+    assert stable_file_projection_uuid(source_file_uuid, stream_uuid).version == 5
+    assert stable_file_projection_uuid(
+        source_file_uuid, stream_uuid
+    ) != stable_file_projection_uuid(source_file_uuid, uuid4())
 
 
 @pytest.mark.parametrize(

@@ -49,6 +49,7 @@ from workspace_zulip_bridge.stable_ids import stable_stream_binding_uuid
 from workspace_zulip_bridge.stable_ids import stable_topic_binding_uuid
 from workspace_zulip_bridge.stable_ids import stable_topic_uuid
 from workspace_zulip_bridge.stable_ids import stable_user_uuid
+from workspace_zulip_bridge.workspace_file_transfer import replace_source_file_urn
 
 
 class EventStore:
@@ -93,6 +94,7 @@ class EventStore:
                 WHERE (
                     message.converter_version < $1
                     OR message.workspace_content IS NULL
+                    OR message.workspace_content LIKE '%urn:quote:%'
                 )
                   AND ($2::uuid IS NULL OR message.uuid > $2)
                 ORDER BY message.uuid
@@ -142,6 +144,28 @@ class EventStore:
                 message_contents.setdefault(row["realm_uuid"], {})[
                     row["zulip_message_id"]
                 ] = row["content"]
+            file_rows = await connection.fetch(
+                """
+                SELECT link.message_uuid, link.file_uuid,
+                       projection.workspace_urn
+                FROM workspace_zulip_bridge.zulip_message_files AS link
+                JOIN workspace_zulip_bridge.zulip_messages AS message
+                  ON message.uuid = link.message_uuid
+                JOIN workspace_zulip_bridge.workspace_file_projections
+                    AS projection
+                  ON projection.file_uuid = link.file_uuid
+                 AND projection.zulip_stream_uuid = message.zulip_stream_uuid
+                 AND projection.processing_status = 'finalized'
+                WHERE link.message_uuid = ANY($1::uuid[])
+                ORDER BY link.message_uuid, link.position, link.file_uuid
+                """,
+                [row["uuid"] for row in rows],
+            )
+            finalized_files: dict[UUID, list[tuple[UUID, str]]] = {}
+            for file_row in file_rows:
+                finalized_files.setdefault(file_row["message_uuid"], []).append(
+                    (file_row["file_uuid"], file_row["workspace_urn"])
+                )
 
             records: list[tuple[UUID, str, bytes, bool]] = []
             for row in rows:
@@ -155,6 +179,12 @@ class EventStore:
                         message_contents=message_contents.get(row["realm_uuid"], {}),
                     ),
                 ).content
+                for source_uuid, workspace_urn in finalized_files.get(row["uuid"], ()):
+                    workspace_content = replace_source_file_urn(
+                        workspace_content,
+                        source_uuid,
+                        workspace_urn,
+                    )
                 content_hash = message_content_hash(
                     sender_user_uuid=row["sender_user_uuid"],
                     chat_key=row["chat_key"],
@@ -210,6 +240,7 @@ class EventStore:
                       AND (
                           message.converter_version < $1
                           OR message.workspace_content IS NULL
+                          OR message.workspace_content LIKE '%urn:quote:%'
                       )
                     RETURNING message.uuid, message.realm_uuid,
                               projection.projection_changed
@@ -1241,10 +1272,22 @@ class EventStore:
                          AND message.zulip_message_id = ANY(incoming.message_ids)
                         ORDER BY message.uuid, incoming.file_uuid
                         ON CONFLICT (message_uuid, file_uuid) DO NOTHING
+                        RETURNING file_uuid
+                    ), file_outbox AS (
+                        INSERT INTO workspace_zulip_bridge.workspace_outbox
+                            (realm_uuid, entity_type, action, entity_uuid)
+                        SELECT DISTINCT $3, 'file', 'upsert', file_uuid
+                        FROM links
+                        ON CONFLICT (realm_uuid, entity_type, entity_uuid)
+                            WHERE delivery_status = 'pending'
+                        DO UPDATE SET action = 'upsert',
+                                      available_at = clock_timestamp(),
+                                      updated_at = clock_timestamp()
                         RETURNING 1
                     )
                     SELECT (SELECT count(*) FROM removed_links)
                          + (SELECT count(*) FROM links)
+                         + 0 * (SELECT count(*) FROM file_outbox)
                     """,
                     connection_uuid,
                     queue_id,
@@ -2557,7 +2600,7 @@ class HistorySession:
                 FROM link_candidates
                 ORDER BY message_uuid, file_uuid, priority
                 ON CONFLICT (message_uuid, file_uuid) DO UPDATE
-                SET position = EXCLUDED.position RETURNING 1
+                SET position = EXCLUDED.position RETURNING file_uuid
             ), outbox AS (
                 INSERT INTO workspace_zulip_bridge.workspace_outbox
                     (realm_uuid, entity_type, action, entity_uuid)
@@ -2569,6 +2612,8 @@ class HistorySession:
                 SELECT $2, 'message_flag', 'upsert', uuid FROM flags
                 UNION ALL
                 SELECT $2, 'message_reaction', 'upsert', uuid FROM reactions
+                UNION ALL
+                SELECT DISTINCT $2, 'file', 'upsert', file_uuid FROM file_links
                 ON CONFLICT (realm_uuid, entity_type, entity_uuid)
                     WHERE delivery_status = 'pending'
                 DO UPDATE SET action = 'upsert', updated_at = clock_timestamp()

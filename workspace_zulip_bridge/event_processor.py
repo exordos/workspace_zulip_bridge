@@ -30,6 +30,7 @@ from workspace_zulip_bridge.models import ZulipUserProfileStatus
 from workspace_zulip_bridge.models import ZulipUserTopic
 from workspace_zulip_bridge.stable_ids import stable_chat_uuid
 from workspace_zulip_bridge.workspace_entities import validate_description
+from workspace_zulip_bridge.workspace_file_transfer import replace_source_file_urn
 from workspace_zulip_bridge.zulip_api import ZulipApiError
 from workspace_zulip_bridge.zulip_api import parse_attachment
 
@@ -158,6 +159,8 @@ class _Outcome:
 
 
 class ZulipEventProcessor:
+    MIN_CLEANUP_BATCH_SIZE = 100
+
     def __init__(
         self,
         pool: asyncpg.Pool,
@@ -183,6 +186,7 @@ class ZulipEventProcessor:
         self._next_claim_recovery_at = 0.0
         self._next_cleanup_at = 0.0
         self._next_presence_expiry_at = 0.0
+        self._cleanup_batch_size = settings.event_cleanup_batch_size
 
     async def run(self) -> None:
         if self._claim_scope != "realtime":
@@ -219,7 +223,7 @@ class ZulipEventProcessor:
                     stats.events_per_second,
                 )
                 continue
-            if deleted == self._settings.event_cleanup_batch_size:
+            if deleted == self._cleanup_batch_size:
                 continue
             if expired_presences == self._settings.event_cleanup_batch_size:
                 continue
@@ -325,15 +329,44 @@ class ZulipEventProcessor:
                 FROM deleted
                 """,
                 self._settings.event_retention_seconds,
-                self._settings.event_cleanup_batch_size,
+                self._cleanup_batch_size,
             )
         return int(deleted)
 
     async def _maybe_cleanup_expired_events(self) -> int:
         if time.monotonic() < self._next_cleanup_at:
             return 0
-        deleted = await self.cleanup_expired_events()
-        if deleted == self._settings.event_cleanup_batch_size:
+        try:
+            deleted = await self.cleanup_expired_events()
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            reduced = max(
+                self.MIN_CLEANUP_BATCH_SIZE,
+                self._cleanup_batch_size // 2,
+            )
+            self._cleanup_batch_size = reduced
+            self._next_cleanup_at = time.monotonic() + max(
+                1.0,
+                min(60.0, self._settings.event_cleanup_interval_seconds),
+            )
+            LOG.warning(
+                "Zulip event cleanup timed out; keeping event processing alive "
+                "and reducing batch size to %s",
+                reduced,
+            )
+            return 0
+        except asyncpg.PostgresError as error:
+            self._next_cleanup_at = time.monotonic() + max(
+                1.0,
+                min(60.0, self._settings.event_cleanup_interval_seconds),
+            )
+            LOG.warning(
+                "Zulip event cleanup failed; keeping event processing alive error=%s",
+                type(error).__name__,
+            )
+            return 0
+        if deleted == self._cleanup_batch_size:
             self._next_cleanup_at = 0.0
         else:
             self._next_cleanup_at = (
@@ -1742,6 +1775,11 @@ class ZulipEventProcessor:
                     str(changes["content"]),
                     context=projection_context,
                 ).content
+                workspace_content = await self._replace_finalized_file_urns(
+                    item.event.endpoint,
+                    snapshot.message_id,
+                    workspace_content,
+                )
             messages.append(
                 _snapshot_message(
                     snapshot,
@@ -2086,6 +2124,38 @@ class ZulipEventProcessor:
                 )
             )
         return snapshots
+
+    async def _replace_finalized_file_urns(
+        self,
+        endpoint: str,
+        message_id: int,
+        workspace_content: str,
+    ) -> str:
+        rows = await self._pool.fetch(
+            """
+            SELECT link.file_uuid, projection.workspace_urn
+            FROM workspace_zulip_bridge.zulip_messages AS message
+            JOIN workspace_zulip_bridge.zulip_realms AS realm
+              ON realm.uuid = message.realm_uuid
+            JOIN workspace_zulip_bridge.zulip_message_files AS link
+              ON link.message_uuid = message.uuid
+            JOIN workspace_zulip_bridge.workspace_file_projections AS projection
+              ON projection.file_uuid = link.file_uuid
+             AND projection.zulip_stream_uuid = message.zulip_stream_uuid
+             AND projection.processing_status = 'finalized'
+            WHERE realm.identity_key = $1 AND message.zulip_message_id = $2
+            ORDER BY link.position, link.file_uuid
+            """,
+            endpoint,
+            message_id,
+        )
+        for row in rows:
+            workspace_content = replace_source_file_urn(
+                workspace_content,
+                UUID(str(row["file_uuid"])),
+                str(row["workspace_urn"]),
+            )
+        return workspace_content
 
     async def _load_user_message_ids(self, user_uuid: UUID) -> tuple[int, ...]:
         async with self._pool.acquire() as connection:
