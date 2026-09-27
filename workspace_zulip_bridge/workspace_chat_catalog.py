@@ -220,19 +220,6 @@ class WorkspaceChatCatalogWorker:
               AND connection.desired_generation IS NOT NULL
               AND realm.workspace_project_id IS NOT NULL
               AND NOT owner.disabled
-              AND EXISTS (
-                  SELECT 1
-                  FROM workspace_zulip_bridge.workspace_file_projections
-                      AS file_projection
-                  WHERE file_projection.zulip_stream_uuid = stream.uuid
-                    AND file_projection.processing_status IN (
-                        'pending', 'processing', 'failed'
-                    )
-                    AND (
-                        file_projection.delivery_priority = 0
-                        OR file_projection.last_error = 'workspace_file_http_403'
-                    )
-              )
               AND (
                   report.external_account_uuid IS NULL
                   OR report.observed_generation <> connection.desired_generation
@@ -256,6 +243,7 @@ class WorkspaceChatCatalogWorker:
               )
             ORDER BY has_live_file_work DESC,
                      newest_live_file_at DESC NULLS LAST,
+                     source_updated_at DESC,
                      connection.external_account_uuid, stream.uuid
             LIMIT 20
             """
@@ -295,58 +283,49 @@ class WorkspaceChatCatalogWorker:
                 available_at = clock_timestamp(), claimed_at = NULL,
                 last_error = NULL, updated_at = clock_timestamp()
             WHERE report.processing_status = 'blocked'
-              AND report.last_error = 'catalog_not_required_for_file_transfer'
+              AND report.last_error IN (
+                  'catalog_not_required_for_file_transfer',
+                  'catalog_source_inactive'
+              )
               AND EXISTS (
                   SELECT 1
-                  FROM workspace_zulip_bridge.workspace_file_projections
-                      AS file_projection
-                  JOIN workspace_zulip_bridge.zulip_streams AS stream
-                    ON stream.uuid = file_projection.zulip_stream_uuid
+                  FROM workspace_zulip_bridge.zulip_streams AS stream
                   JOIN workspace_zulip_bridge.zulip_connections AS connection
                     ON connection.uuid = stream.source_connection_uuid
-                  WHERE file_projection.zulip_stream_uuid = report.zulip_stream_uuid
+                  JOIN workspace_zulip_bridge.zulip_users AS zulip_user
+                    ON zulip_user.uuid = connection.zulip_user_uuid
+                  WHERE stream.uuid = report.zulip_stream_uuid
                     AND connection.external_account_uuid =
                         report.external_account_uuid
-                    AND file_projection.processing_status IN (
-                        'pending', 'processing', 'failed'
-                    )
-                    AND (
-                        file_projection.delivery_priority = 0
-                        OR file_projection.last_error = 'workspace_file_http_403'
-                    )
+                    AND connection.sync_enabled
+                    AND NOT zulip_user.disabled
               )
             """
         )
         return int(result.rsplit(" ", 1)[-1])
 
     async def _retire_unneeded_reports(self) -> int:
-        """Stop queued reports that cannot authorize an active file transfer."""
+        """Stop queued reports that no longer belong to the stream supplier."""
 
         result = await self._pool.execute(
             """
             UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports AS report
             SET processing_status = 'blocked', claimed_at = NULL,
-                last_error = 'catalog_not_required_for_file_transfer',
+                last_error = 'catalog_source_inactive',
                 updated_at = clock_timestamp()
             WHERE report.processing_status IN ('pending', 'processing', 'failed')
               AND NOT EXISTS (
                   SELECT 1
-                  FROM workspace_zulip_bridge.workspace_file_projections
-                      AS file_projection
-                  JOIN workspace_zulip_bridge.zulip_streams AS stream
-                    ON stream.uuid = file_projection.zulip_stream_uuid
+                  FROM workspace_zulip_bridge.zulip_streams AS stream
                   JOIN workspace_zulip_bridge.zulip_connections AS connection
                     ON connection.uuid = stream.source_connection_uuid
-                  WHERE file_projection.zulip_stream_uuid = report.zulip_stream_uuid
+                  JOIN workspace_zulip_bridge.zulip_users AS zulip_user
+                    ON zulip_user.uuid = connection.zulip_user_uuid
+                  WHERE stream.uuid = report.zulip_stream_uuid
                     AND connection.external_account_uuid =
                         report.external_account_uuid
-                    AND file_projection.processing_status IN (
-                        'pending', 'processing', 'failed'
-                    )
-                    AND (
-                        file_projection.delivery_priority = 0
-                        OR file_projection.last_error = 'workspace_file_http_403'
-                    )
+                    AND connection.sync_enabled
+                    AND NOT zulip_user.disabled
               )
             """
         )

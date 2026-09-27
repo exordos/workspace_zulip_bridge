@@ -1159,6 +1159,31 @@ async def _file_stage_controls_the_shared_history_pause() -> None:
     assert not supervisor._bulk_history_pause.is_set()
 
 
+def test_file_stage_does_not_pause_chat_schedule_reconciliation() -> None:
+    asyncio.run(_file_stage_does_not_pause_chat_schedule_reconciliation())
+
+
+async def _file_stage_does_not_pause_chat_schedule_reconciliation() -> None:
+    store = ScheduleTrackingStore()
+    store.file_transfer_active = True
+    supervisor = ZulipThreadSupervisor(
+        store,  # type: ignore[arg-type]
+        asyncio.get_running_loop(),
+        Settings(
+            database_dsn="postgresql:///test",
+            workspace_control_url="https://control.example.test",
+        ),
+        worker_factory=lambda user, gate: FakeWorker(user),  # type: ignore[arg-type]
+    )
+
+    await supervisor._refresh_bulk_stage()
+    assert supervisor._bulk_history_pause.is_set()
+
+    await supervisor.reconcile()
+
+    assert store.schedule_reconciliations == 1
+
+
 def test_schedule_reconciliation_deadlock_does_not_stop_supervisor() -> None:
     asyncio.run(_schedule_reconciliation_deadlock_test())
 

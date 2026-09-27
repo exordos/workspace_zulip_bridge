@@ -1204,10 +1204,7 @@ class ZulipThreadSupervisor:
         # A large chat schedule reconciliation can time out while adopting
         # historical messages; running it before worker ownership used to leave
         # every dead long-poll thread offline until that maintenance completed.
-        if (
-            not self._bulk_history_pause.is_set()
-            and await self._store.chat_schedule_reconciliation_requested()
-        ):
+        if await self._store.chat_schedule_reconciliation_requested():
             await asyncio.to_thread(self._catalog_write_gate.acquire)
             try:
                 schedule = await self._store.reconcile_chat_schedules()

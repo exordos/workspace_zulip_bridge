@@ -7500,9 +7500,9 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
             control_semaphore=control_semaphore,
         )
 
-        # Historical files optimistically use an existing Workspace assignment,
-        # but live files publish their chat authorization before transfer.
-        assert await worker._refresh_catalogs() == 0
+        # Chat catalogs are the source of Workspace channel discovery and must
+        # be published even when a chat has no files waiting for transfer.
+        assert await worker._refresh_catalogs() == 1
         await pool.execute(
             """
             INSERT INTO workspace_zulip_bridge.zulip_files (
@@ -7527,7 +7527,7 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
             file_uuid,
             stream_uuid,
         )
-        assert await worker._refresh_catalogs() == 1
+        assert await worker._refresh_catalogs() == 0
         assert await transfer_worker._claim_job() is None
         assert (
             await pool.fetchval(
@@ -7571,8 +7571,8 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
         assert await transfer_worker._claim_job() is None
 
         # Simulate rows produced by the earlier all-members implementation.
-        # The worker must retire them instead of replaying a full account/chat
-        # cross product into Workspace.
+        # The worker must retire reports that no longer belong to the selected
+        # stream supplier instead of replaying a full account/chat cross product.
         await pool.execute(
             """
             INSERT INTO workspace_zulip_bridge.workspace_chat_catalog_reports (
@@ -7671,7 +7671,7 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
             """,
             stream_uuid,
         )
-        assert await worker._refresh_catalogs() == 0
+        assert await worker._refresh_catalogs() == 1
         unchanged = await pool.fetchrow(
             """
             SELECT report, processing_status
@@ -7703,13 +7703,13 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
             """,
             stream_uuid,
         )
-        assert await worker._refresh_catalogs() == 0
+        assert await worker._refresh_catalogs() == 1
         await transfer_worker._fail_job(
             file_job,
             "workspace_file_http_403",
             retryable=True,
         )
-        assert await worker._refresh_catalogs() == 1
+        assert await worker._refresh_catalogs() == 0
         changed = await pool.fetchrow(
             """
             SELECT catalog, processing_status
@@ -7742,7 +7742,7 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
             """,
             projection_uuid,
         )
-        assert await worker._retire_unneeded_reports() == 1
+        assert await worker._retire_unneeded_reports() == 0
         await pool.execute(
             """
             UPDATE workspace_zulip_bridge.workspace_file_projections
@@ -7752,7 +7752,7 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
             """,
             projection_uuid,
         )
-        assert await worker._refresh_catalogs() >= 1
+        assert await worker._refresh_catalogs() == 0
         assert (
             await pool.fetchval(
                 """
