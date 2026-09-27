@@ -683,13 +683,7 @@ class WorkspaceChatCatalogWorker:
                          IS DISTINCT FROM EXCLUDED.observed_generation
                     THEN NULL ELSE workspace_chat_catalog_reports.claimed_at
                 END,
-                reported_at = CASE
-                    WHEN workspace_chat_catalog_reports.catalog_hash
-                         IS DISTINCT FROM EXCLUDED.catalog_hash
-                      OR workspace_chat_catalog_reports.observed_generation
-                         IS DISTINCT FROM EXCLUDED.observed_generation
-                    THEN NULL ELSE workspace_chat_catalog_reports.reported_at
-                END,
+                reported_at = workspace_chat_catalog_reports.reported_at,
                 last_error = CASE
                     WHEN workspace_chat_catalog_reports.catalog_hash
                          IS DISTINCT FROM EXCLUDED.catalog_hash
@@ -747,12 +741,29 @@ class WorkspaceChatCatalogWorker:
             ), candidate AS (
                 SELECT report.external_account_uuid, report.zulip_stream_uuid
                 FROM workspace_zulip_bridge.workspace_chat_catalog_reports AS report
+                JOIN workspace_zulip_bridge.zulip_streams AS source_stream
+                  ON source_stream.uuid = report.zulip_stream_uuid
                 LEFT JOIN active_file_work AS file_work
                   ON file_work.external_account_uuid = report.external_account_uuid
                  AND file_work.zulip_stream_uuid = report.zulip_stream_uuid
                 WHERE report.processing_status IN ('pending', 'failed')
                   AND report.available_at <= clock_timestamp()
-                ORDER BY (
+                ORDER BY CASE
+                             WHEN report.reported_at IS NULL
+                              AND source_stream.created_at >=
+                                  clock_timestamp() - interval '1 day'
+                             THEN 0
+                             WHEN report.source_updated_at >= clock_timestamp()
+                                  - make_interval(secs => $1::double precision)
+                             THEN 1
+                             WHEN report.reported_at IS NULL THEN 2
+                             ELSE 3
+                         END,
+                         CASE
+                             WHEN report.reported_at IS NULL
+                             THEN source_stream.created_at
+                         END DESC NULLS LAST,
+                         (
                              report.source_updated_at >= clock_timestamp()
                              - make_interval(secs => $1::double precision)
                          ) DESC,
