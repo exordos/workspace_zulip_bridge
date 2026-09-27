@@ -15,6 +15,7 @@ from workspace_zulip_bridge.database import probe_database
 from workspace_zulip_bridge.event_processor import ZulipEventProcessor
 from workspace_zulip_bridge.event_store import EventStore
 from workspace_zulip_bridge.workspace_auth import WorkspaceTokenManager
+from workspace_zulip_bridge.workspace_chat_catalog import WorkspaceChatCatalogWorker
 from workspace_zulip_bridge.workspace_control import WorkspaceControlWorker
 from workspace_zulip_bridge.workspace_events import WorkspaceEventReceiver
 from workspace_zulip_bridge.workspace_file_transfer import WorkspaceFileTransferWorker
@@ -112,6 +113,12 @@ class BridgeService:
                     asyncio.create_task(
                         control_worker.run(),
                         name="workspace-control",
+                    )
+                )
+                supervised_tasks.append(
+                    asyncio.create_task(
+                        WorkspaceChatCatalogWorker(pool, self._settings).run(),
+                        name="workspace-chat-catalog",
                     )
                 )
                 supervised_tasks.extend(

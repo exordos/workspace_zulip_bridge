@@ -55,6 +55,7 @@ def test_schema_normalizes_workspace_like_entities_and_personal_state() -> None:
         "zulip_files",
         "zulip_message_files",
         "workspace_file_projections",
+        "workspace_chat_catalog_reports",
     ):
         assert f"workspace_zulip_bridge.{table}" in schema
     assert "source_connection_uuid uuid" in schema
@@ -75,6 +76,8 @@ def test_schema_normalizes_workspace_like_entities_and_personal_state() -> None:
     assert "message_ids bigint[] NOT NULL DEFAULT '{}'::bigint[]" in schema
     assert "zulip_files_message_ids_idx" in schema
     assert "workspace_file_projections_pending_idx" in schema
+    assert "workspace_file_projections_pending_stream_idx" in schema
+    assert "workspace_chat_catalog_reports_pending_idx" in schema
     assert "zulip_message_flags_history_cleanup_idx" in schema
     assert "bytea" not in schema[
         schema.index(

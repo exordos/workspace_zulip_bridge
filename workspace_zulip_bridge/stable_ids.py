@@ -13,6 +13,11 @@ _BRIDGE_NAMESPACE = uuid5(
     "https://exordos.com/workspace-zulip-bridge/entities/v1",
 )
 
+# Workspace already persists catalog identities produced by the previous
+# bridge generation.  Keep this namespace stable while the v3 bridge takes
+# ownership of catalog reporting and native file transfer.
+_EXTERNAL_CHAT_NAMESPACE = UUID("9a1d0e75-50a5-413c-b3e8-d070232ef57f")
+
 
 def canonical_endpoint(endpoint: str) -> str:
     parsed = urlsplit(endpoint.strip())
@@ -83,6 +88,15 @@ def stable_file_projection_uuid(file_uuid: UUID, stream_uuid: UUID) -> UUID:
     """Return the immutable Workspace file identity for one stream ACL."""
 
     return uuid5(file_uuid, f"workspace-file\0{stream_uuid}")
+
+
+def stable_external_chat_uuid(account_uuid: UUID, chat_key: str) -> UUID:
+    """Return the account-scoped identity used by Workspace control state."""
+
+    return uuid5(
+        _EXTERNAL_CHAT_NAMESPACE,
+        f"zulip:{account_uuid}:external_chat:{chat_key}",
+    )
 
 
 def _stable_uuid(endpoint: str, entity_type: str, provider_key: str) -> UUID:

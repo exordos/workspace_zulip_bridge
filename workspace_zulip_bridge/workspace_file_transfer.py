@@ -22,6 +22,7 @@ import httpx
 
 from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.message_history import message_content_hash
+from workspace_zulip_bridge.stable_ids import stable_external_chat_uuid
 from workspace_zulip_bridge.stable_ids import stable_file_projection_uuid
 
 LOG = logging.getLogger(__name__)
@@ -47,6 +48,7 @@ class _Job:
     stream_uuid: UUID
     realm_uuid: UUID
     external_account_uuid: UUID
+    external_chat_uuid: UUID
     endpoint: str
     login: str
     api_key: str
@@ -306,6 +308,7 @@ class WorkspaceFileTransferWorker:
             SELECT claimed.uuid AS projection_uuid, claimed.operation_uuid,
                    file.uuid AS file_uuid, stream.uuid AS stream_uuid,
                    file.realm_uuid, connection.external_account_uuid,
+                   stream.chat_key,
                    realm.endpoint, connection.login, connection.api_key,
                    file.source_path, file.name
             FROM claimed
@@ -330,6 +333,10 @@ class WorkspaceFileTransferWorker:
             stream_uuid=UUID(str(row["stream_uuid"])),
             realm_uuid=UUID(str(row["realm_uuid"])),
             external_account_uuid=UUID(str(row["external_account_uuid"])),
+            external_chat_uuid=stable_external_chat_uuid(
+                UUID(str(row["external_account_uuid"])),
+                str(row["chat_key"]),
+            ),
             endpoint=str(row["endpoint"]),
             login=str(row["login"]),
             api_key=str(row["api_key"]),
@@ -407,7 +414,7 @@ class WorkspaceFileTransferWorker:
         request = {
             "operation_uuid": str(job.operation_uuid),
             "external_account_uuid": str(job.external_account_uuid),
-            "external_chat_uuid": str(job.stream_uuid),
+            "external_chat_uuid": str(job.external_chat_uuid),
             "name": workspace_file_name(job.name),
             "size_bytes": descriptor.size_bytes,
             "content_type": descriptor.content_type,

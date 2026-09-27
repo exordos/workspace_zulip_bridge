@@ -9,12 +9,20 @@ import pytest
 
 from workspace_zulip_bridge import workspace_file_transfer
 from workspace_zulip_bridge.config import Settings
+from workspace_zulip_bridge.stable_ids import stable_external_chat_uuid
 from workspace_zulip_bridge.workspace_file_transfer import WorkspaceFileTransferWorker
 from workspace_zulip_bridge.workspace_file_transfer import replace_source_file_urn
 from workspace_zulip_bridge.workspace_file_transfer import workspace_file_name
 
 SOURCE_UUID = UUID("10000000-0000-0000-0000-000000000001")
 TARGET_UUID = UUID("20000000-0000-0000-0000-000000000002")
+
+
+def test_external_chat_identity_stays_compatible_with_existing_catalogs() -> None:
+    assert stable_external_chat_uuid(
+        UUID("10000000-0000-0000-0000-000000000003"),
+        "channel:42",
+    ) == UUID("2a239a52-7e3f-5db9-9631-996c5d7581c4")
 
 
 @pytest.mark.parametrize("kind", ("file", "image", "video"))
