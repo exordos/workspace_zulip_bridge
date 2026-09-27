@@ -4402,6 +4402,46 @@ async def _workspace_diff_completion_requires_current_claim(dsn: str) -> None:
             )
             == "skipped"
         )
+
+        retry_claim = datetime(2026, 1, 1, 0, 0, 2, tzinfo=UTC)
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.sync_diffs
+            SET processing_status = 'processing', claimed_at = $4,
+                attempt_count = 100000
+            WHERE provider_uuid = $1 AND entity_type = $2 AND entity_uuid = $3
+            """,
+            provider_uuid,
+            "users",
+            entity_uuid,
+            retry_claim,
+        )
+        retry_row = await pool.fetchrow(
+            "SELECT * FROM workspace_zulip_bridge.sync_diffs "
+            "WHERE provider_uuid = $1 AND entity_type = 'users' "
+            "AND entity_uuid = $2",
+            provider_uuid,
+            entity_uuid,
+        )
+        assert retry_row is not None
+        await worker._mark([retry_row], "failed", "retry safely")
+        retry_result = await pool.fetchrow(
+            """
+            SELECT processing_status, last_error,
+                   available_at <= clock_timestamp() + interval '61 seconds'
+                       AS retry_is_capped
+            FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1 AND entity_type = 'users' AND entity_uuid = $2
+            """,
+            provider_uuid,
+            entity_uuid,
+        )
+        assert retry_result is not None
+        assert dict(retry_result) == {
+            "processing_status": "failed",
+            "last_error": "retry safely",
+            "retry_is_capped": True,
+        }
     finally:
         await pool.close()
 

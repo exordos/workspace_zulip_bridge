@@ -4549,7 +4549,10 @@ class WorkspaceDiffWorker:
                                 $8::double precision,
                                 $7::double precision * power(
                                     2::double precision,
-                                    GREATEST(attempt_count - 1, 0)
+                                    LEAST(
+                                        GREATEST(attempt_count - 1, 0),
+                                        16
+                                    )
                                 )
                             )
                         )
