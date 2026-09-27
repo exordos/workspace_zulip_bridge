@@ -60,12 +60,16 @@ class BridgeService:
                 asyncio.get_running_loop(),
                 self._settings,
             )
-            backlog_event_processor = ZulipEventProcessor(
-                pool,
-                store,
-                self._settings,
-                claim_scope="backlog",
-            )
+            backlog_event_processors = [
+                ZulipEventProcessor(
+                    pool,
+                    store,
+                    self._settings,
+                    claim_scope="backlog",
+                    run_maintenance=index == 0,
+                )
+                for index in range(self._settings.event_processor_backlog_workers)
+            ]
             realtime_event_processors = [
                 ZulipEventProcessor(
                     pool,
@@ -87,10 +91,13 @@ class BridgeService:
                 supervisor.run(),
                 name="zulip-thread-supervisor",
             )
-            backlog_event_processor_task = asyncio.create_task(
-                backlog_event_processor.run(),
-                name="zulip-event-processor-backlog",
-            )
+            backlog_event_processor_tasks = [
+                asyncio.create_task(
+                    processor.run(),
+                    name=f"zulip-event-processor-backlog-{index}",
+                )
+                for index, processor in enumerate(backlog_event_processors)
+            ]
             realtime_event_processor_tasks = [
                 asyncio.create_task(
                     processor.run(),
@@ -103,7 +110,7 @@ class BridgeService:
                 probe_task,
                 projection_task,
                 supervisor_task,
-                backlog_event_processor_task,
+                *backlog_event_processor_tasks,
                 *realtime_event_processor_tasks,
                 stop_task,
             ]

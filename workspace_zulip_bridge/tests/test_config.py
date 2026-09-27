@@ -20,6 +20,7 @@ def test_defaults_use_local_postgresql_socket() -> None:
     assert settings.zulip_history_concurrency == 4
     assert settings.zulip_message_page_size == 2000
     assert settings.event_processor_batch_size == 128
+    assert settings.event_processor_backlog_workers == 4
     assert settings.event_processor_realtime_batch_size == 16
     assert settings.event_processor_realtime_workers == 4
     assert settings.event_processor_realtime_window_seconds == 300.0
@@ -63,6 +64,7 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
             "WZB_ZULIP_CHAT_FILL_TIMEOUT_SECONDS": "240",
             "WZB_ZULIP_MESSAGE_PAGE_SIZE": "4000",
             "WZB_EVENT_PROCESSOR_BATCH_SIZE": "750",
+            "WZB_EVENT_PROCESSOR_BACKLOG_WORKERS": "5",
             "WZB_EVENT_PROCESSOR_REALTIME_BATCH_SIZE": "24",
             "WZB_EVENT_PROCESSOR_REALTIME_WORKERS": "6",
             "WZB_EVENT_PROCESSOR_REALTIME_WINDOW_SECONDS": "180",
@@ -107,6 +109,7 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
     assert settings.zulip_chat_fill_timeout_seconds == 240
     assert settings.zulip_message_page_size == 4000
     assert settings.event_processor_batch_size == 750
+    assert settings.event_processor_backlog_workers == 5
     assert settings.event_processor_realtime_batch_size == 24
     assert settings.event_processor_realtime_workers == 6
     assert settings.event_processor_realtime_window_seconds == 180.0
@@ -148,6 +151,8 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
         ("WZB_ZULIP_MESSAGE_PAGE_SIZE", "5001"),
         ("WZB_EVENT_PROCESSOR_BATCH_SIZE", "0"),
         ("WZB_EVENT_PROCESSOR_BATCH_SIZE", "10001"),
+        ("WZB_EVENT_PROCESSOR_BACKLOG_WORKERS", "0"),
+        ("WZB_EVENT_PROCESSOR_BACKLOG_WORKERS", "9"),
         ("WZB_EVENT_PROCESSOR_REALTIME_BATCH_SIZE", "0"),
         ("WZB_EVENT_PROCESSOR_REALTIME_BATCH_SIZE", "10001"),
         ("WZB_EVENT_PROCESSOR_REALTIME_WORKERS", "0"),
@@ -195,7 +200,7 @@ def test_pool_maximum_cannot_be_smaller_than_minimum() -> None:
 
 
 def test_history_concurrency_reserves_pool_connections() -> None:
-    with pytest.raises(ValueError, match="realtime"):
+    with pytest.raises(ValueError, match="event processors"):
         Settings.from_env(
             {
                 "WZB_DB_POOL_MAX_SIZE": "16",

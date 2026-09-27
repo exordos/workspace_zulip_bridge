@@ -223,6 +223,7 @@ deployment.
 | `WZB_ZULIP_CHAT_FILL_TIMEOUT_SECONDS` | `120` | Read timeout for a catalog API page |
 | `WZB_ZULIP_MESSAGE_PAGE_SIZE` | `2000` | Combined message-history page size; bounds each history write transaction |
 | `WZB_EVENT_PROCESSOR_BATCH_SIZE` | `128` | Maximum events claimed per processor pass |
+| `WZB_EVENT_PROCESSOR_BACKLOG_WORKERS` | `4` | Concurrent historical processors; queue claims remain mutually exclusive |
 | `WZB_EVENT_PROCESSOR_REALTIME_BATCH_SIZE` | `16` | Maximum recent events claimed by the dedicated realtime processor |
 | `WZB_EVENT_PROCESSOR_REALTIME_WORKERS` | `4` | Concurrent realtime processors; queue claims remain mutually exclusive |
 | `WZB_EVENT_PROCESSOR_REALTIME_WINDOW_SECONDS` | `300` | Age window reserved for the realtime processor before events join backlog processing |

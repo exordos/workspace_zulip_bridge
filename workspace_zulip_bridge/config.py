@@ -64,6 +64,7 @@ class Settings:
     zulip_chat_fill_timeout_seconds: float = 120.0
     zulip_message_page_size: int = 2000
     event_processor_batch_size: int = 128
+    event_processor_backlog_workers: int = 4
     event_processor_realtime_batch_size: int = 16
     event_processor_realtime_workers: int = 4
     event_processor_realtime_window_seconds: float = 300.0
@@ -191,6 +192,9 @@ class Settings:
             ),
             event_processor_batch_size=_read_int(
                 source, "WZB_EVENT_PROCESSOR_BATCH_SIZE", 128
+            ),
+            event_processor_backlog_workers=_read_int(
+                source, "WZB_EVENT_PROCESSOR_BACKLOG_WORKERS", 4
             ),
             event_processor_realtime_batch_size=_read_int(
                 source, "WZB_EVENT_PROCESSOR_REALTIME_BATCH_SIZE", 16
@@ -425,23 +429,29 @@ class Settings:
             raise ValueError("WZB_ZULIP_MESSAGE_SCAN_CONCURRENCY must be positive")
         if self.zulip_history_concurrency < 1:
             raise ValueError("WZB_ZULIP_HISTORY_CONCURRENCY must be positive")
-        realtime_pool_reserve = min(
-            self.event_processor_realtime_workers + 2,
+        event_processor_pool_reserve = min(
+            self.event_processor_backlog_workers
+            + self.event_processor_realtime_workers
+            + 2,
             max(1, self.db_pool_max_size // 2),
         )
         if (
-            self.zulip_history_concurrency + realtime_pool_reserve
+            self.zulip_history_concurrency + event_processor_pool_reserve
             > self.db_pool_max_size
         ):
             raise ValueError(
                 "WZB_ZULIP_HISTORY_CONCURRENCY must reserve database-pool "
-                "connections for realtime and general bridge work"
+                "connections for event processors and general bridge work"
             )
         if not 1 <= self.zulip_message_page_size <= 5000:
             raise ValueError("WZB_ZULIP_MESSAGE_PAGE_SIZE must be between 1 and 5000")
         if not 1 <= self.event_processor_batch_size <= 10000:
             raise ValueError(
                 "WZB_EVENT_PROCESSOR_BATCH_SIZE must be between 1 and 10000"
+            )
+        if not 1 <= self.event_processor_backlog_workers <= 8:
+            raise ValueError(
+                "WZB_EVENT_PROCESSOR_BACKLOG_WORKERS must be between 1 and 8"
             )
         if not 1 <= self.event_processor_realtime_batch_size <= 10000:
             raise ValueError(

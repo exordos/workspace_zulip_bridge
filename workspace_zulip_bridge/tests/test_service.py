@@ -41,6 +41,7 @@ class FakeSupervisor:
 
 class FakeEventProcessor:
     calls: list[str]
+    backlog_maintenance: list[bool] = []
 
     def __init__(
         self,
@@ -49,8 +50,11 @@ class FakeEventProcessor:
         settings: Settings,
         *,
         claim_scope: str = "all",
+        run_maintenance: bool = True,
     ) -> None:
         self.claim_scope = claim_scope
+        if claim_scope == "backlog":
+            self.backlog_maintenance.append(run_maintenance)
         self.calls.append(f"event-processor-init-{claim_scope}")
 
     async def run(self) -> None:
@@ -548,6 +552,7 @@ async def _run_daemon_lifecycle_test(monkeypatch: object) -> None:
     FakeSupervisor.stop = stop
     FakeSupervisor.calls = calls
     FakeEventProcessor.calls = calls
+    FakeEventProcessor.backlog_maintenance = []
     monkeypatch.setattr(  # type: ignore[attr-defined]
         service_module, "ZulipThreadSupervisor", FakeSupervisor
     )
@@ -563,17 +568,24 @@ async def _run_daemon_lifecycle_test(monkeypatch: object) -> None:
         "probe",
         "supervisor-init",
         "event-processor-init-backlog",
+        "event-processor-init-backlog",
+        "event-processor-init-backlog",
+        "event-processor-init-backlog",
         "event-processor-init-realtime",
         "event-processor-init-realtime",
         "event-processor-init-realtime",
         "event-processor-init-realtime",
         "supervisor-run",
         "event-processor-run-backlog",
+        "event-processor-run-backlog",
+        "event-processor-run-backlog",
+        "event-processor-run-backlog",
         "event-processor-run-realtime",
         "event-processor-run-realtime",
         "event-processor-run-realtime",
         "event-processor-run-realtime",
     ]
+    assert FakeEventProcessor.backlog_maintenance == [True, False, False, False]
     assert pool.closed
 
 

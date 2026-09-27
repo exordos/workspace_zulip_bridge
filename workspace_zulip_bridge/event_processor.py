@@ -160,6 +160,7 @@ class _Outcome:
 
 class ZulipEventProcessor:
     MIN_CLEANUP_BATCH_SIZE = 100
+    MAX_REDUNDANT_UPDATE_BATCH_SIZE = 5000
 
     def __init__(
         self,
@@ -168,11 +169,13 @@ class ZulipEventProcessor:
         settings: Settings,
         *,
         claim_scope: _ClaimScope = "all",
+        run_maintenance: bool = True,
     ) -> None:
         self._pool = pool
         self._store = store
         self._settings = settings
         self._claim_scope = claim_scope
+        self._run_maintenance = run_maintenance
         self._batch_size = (
             settings.event_processor_realtime_batch_size
             if claim_scope == "realtime"
@@ -185,8 +188,13 @@ class ZulipEventProcessor:
         self._queue_batch_size = self._batch_size
         self._next_claim_recovery_at = 0.0
         self._next_cleanup_at = 0.0
+        self._next_redundant_update_skip_at = 0.0
         self._next_presence_expiry_at = 0.0
         self._cleanup_batch_size = settings.event_cleanup_batch_size
+        self._redundant_update_batch_size = min(
+            self.MAX_REDUNDANT_UPDATE_BATCH_SIZE,
+            settings.event_cleanup_batch_size,
+        )
 
     def _claim_scope_clause(self, alias: str) -> str:
         if self._claim_scope == "all":
@@ -200,7 +208,7 @@ class ZulipEventProcessor:
         )
 
     async def run(self) -> None:
-        if self._claim_scope != "realtime":
+        if self._claim_scope != "realtime" and self._run_maintenance:
             await self._maybe_requeue_expired_claims()
             recovered = await self._requeue_preparation_deadlocks()
             if recovered:
@@ -211,9 +219,13 @@ class ZulipEventProcessor:
         while True:
             try:
                 deleted = 0
+                redundant_updates_skipped = 0
                 expired_presences = 0
-                if self._claim_scope != "realtime":
+                if self._claim_scope != "realtime" and self._run_maintenance:
                     await self._maybe_requeue_expired_claims()
+                    redundant_updates_skipped = (
+                        await self._maybe_skip_redundant_update_events()
+                    )
                     deleted = await self._maybe_cleanup_expired_events()
                     expired_presences = await self._maybe_expire_user_presences()
                 stats = await self.process_once()
@@ -247,11 +259,81 @@ class ZulipEventProcessor:
                     stats.events_per_second,
                 )
                 continue
+            if redundant_updates_skipped == self._redundant_update_batch_size:
+                continue
             if deleted == self._cleanup_batch_size:
                 continue
             if expired_presences == self._settings.event_cleanup_batch_size:
                 continue
             await asyncio.sleep(self._settings.event_processor_poll_seconds)
+
+    async def _maybe_skip_redundant_update_events(self) -> int:
+        if time.monotonic() < self._next_redundant_update_skip_at:
+            return 0
+        try:
+            async with self._pool.acquire() as connection, connection.transaction():
+                skipped = await connection.fetchval(
+                    """
+                    WITH candidates AS MATERIALIZED (
+                        SELECT event.uuid
+                        FROM workspace_zulip_bridge.zulip_events AS event
+                        JOIN workspace_zulip_bridge.zulip_connections AS connection
+                          ON connection.uuid = event.zulip_connection_uuid
+                        JOIN workspace_zulip_bridge.zulip_messages AS message
+                          ON message.realm_uuid = connection.realm_uuid
+                         AND message.zulip_message_id = CASE
+                             WHEN jsonb_typeof(event.payload->'message_id') =
+                                  'number'
+                             THEN (event.payload->>'message_id')::bigint
+                             ELSE NULL
+                         END
+                        WHERE event.processing_status = 'pending'
+                          AND event.event_type = 'update_message'
+                          AND NOT event.payload ? 'new_stream_id'
+                          AND message.source_connection_uuid IS NOT NULL
+                          AND message.source_connection_uuid <>
+                              event.zulip_connection_uuid
+                        ORDER BY event.available_at, event.created_at, event.uuid
+                        LIMIT $1
+                        FOR UPDATE OF event SKIP LOCKED
+                    ), updated AS (
+                        UPDATE workspace_zulip_bridge.zulip_events AS event
+                        SET processing_status = 'skipped', claimed_at = NULL,
+                            processed_at = clock_timestamp(),
+                            outcome_reason = 'not_chat_supplier'
+                        FROM candidates
+                        WHERE event.uuid = candidates.uuid
+                        RETURNING 1
+                    )
+                    SELECT count(*)::bigint FROM updated
+                    """,
+                    self._redundant_update_batch_size,
+                )
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            self._redundant_update_batch_size = max(
+                self.MIN_CLEANUP_BATCH_SIZE,
+                self._redundant_update_batch_size // 2,
+            )
+            self._next_redundant_update_skip_at = time.monotonic() + 1.0
+            LOG.warning(
+                "Redundant Zulip message update compaction timed out; "
+                "reducing batch size to %s",
+                self._redundant_update_batch_size,
+            )
+            return 0
+        skipped_count = int(skipped)
+        if skipped_count == self._redundant_update_batch_size:
+            self._next_redundant_update_skip_at = 0.0
+        else:
+            self._next_redundant_update_skip_at = time.monotonic() + 60.0
+        if skipped_count:
+            LOG.info(
+                "Redundant Zulip message update events compacted count=%s",
+                skipped_count,
+            )
+        return skipped_count
 
     async def _maybe_requeue_expired_claims(self) -> int:
         if self._claim_scope == "realtime":

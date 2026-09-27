@@ -2035,7 +2035,8 @@ class EventStore:
             row = await connection.fetchrow(
                 """
                 WITH active AS MATERIALIZED (
-                    SELECT uuid FROM workspace_zulip_bridge.zulip_connections
+                    SELECT uuid, realm_uuid
+                    FROM workspace_zulip_bridge.zulip_connections
                     WHERE uuid = $1 AND queue_id = $2 FOR UPDATE
                 ), registered_queue AS (
                     INSERT INTO workspace_zulip_bridge.zulip_event_queues
@@ -2047,12 +2048,37 @@ class EventStore:
                     SELECT event_id, event_type, payload::jsonb
                     FROM unnest($3::bigint[], $4::text[], $5::text[])
                       AS event(event_id, event_type, payload)
+                ), classified AS (
+                    SELECT incoming.*,
+                           COALESCE(
+                               incoming.event_type = 'update_message'
+                               AND NOT incoming.payload ? 'new_stream_id'
+                               AND message.source_connection_uuid IS NOT NULL
+                               AND message.source_connection_uuid <> active.uuid,
+                               false
+                           ) AS redundant_update
+                    FROM incoming CROSS JOIN active
+                    LEFT JOIN workspace_zulip_bridge.zulip_messages AS message
+                      ON message.realm_uuid = active.realm_uuid
+                     AND message.zulip_message_id = CASE
+                         WHEN jsonb_typeof(incoming.payload->'message_id') =
+                              'number'
+                         THEN (incoming.payload->>'message_id')::bigint
+                         ELSE NULL
+                     END
                 ), inserted AS (
                     INSERT INTO workspace_zulip_bridge.zulip_events
-                        (zulip_connection_uuid, queue_id, event_id, event_type, payload)
-                    SELECT active.uuid, $2, incoming.event_id, incoming.event_type,
-                           incoming.payload
-                    FROM incoming CROSS JOIN active
+                        (zulip_connection_uuid, queue_id, event_id, event_type,
+                         payload, processing_status, processed_at, outcome_reason)
+                    SELECT active.uuid, $2, classified.event_id,
+                           classified.event_type, classified.payload,
+                           CASE WHEN classified.redundant_update
+                                THEN 'skipped' ELSE 'pending' END,
+                           CASE WHEN classified.redundant_update
+                                THEN clock_timestamp() ELSE NULL END,
+                           CASE WHEN classified.redundant_update
+                                THEN 'not_chat_supplier' ELSE NULL END
+                    FROM classified CROSS JOIN active
                     LEFT JOIN registered_queue ON true
                     ON CONFLICT (zulip_connection_uuid, queue_id, event_id) DO NOTHING
                     RETURNING 1

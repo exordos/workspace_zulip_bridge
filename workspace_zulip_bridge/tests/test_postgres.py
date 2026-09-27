@@ -9151,6 +9151,10 @@ def test_event_processor_applies_only_the_selected_chat_supplier() -> None:
     asyncio.run(_event_processor_round_trip(_dsn()))
 
 
+def test_redundant_message_updates_are_skipped_before_processing() -> None:
+    asyncio.run(_redundant_message_updates_are_skipped_before_processing(_dsn()))
+
+
 def test_event_processor_materializes_live_catalog_changes() -> None:
     asyncio.run(_event_processor_materializes_live_catalog_changes(_dsn()))
 
@@ -10023,6 +10027,10 @@ def test_realtime_processors_claim_distinct_queues_concurrently() -> None:
     asyncio.run(_realtime_processors_claim_distinct_queues_concurrently(_dsn()))
 
 
+def test_backlog_processors_claim_distinct_queues_concurrently() -> None:
+    asyncio.run(_backlog_processors_claim_distinct_queues_concurrently(_dsn()))
+
+
 def test_realtime_processor_claims_oldest_recent_queue_first() -> None:
     asyncio.run(_realtime_processor_claims_oldest_recent_queue_first(_dsn()))
 
@@ -10130,6 +10138,58 @@ async def _realtime_processors_claim_distinct_queues_concurrently(dsn: str) -> N
         )
         processors = [
             ZulipEventProcessor(pool, store, settings, claim_scope="realtime")
+            for _ in range(2)
+        ]
+
+        claims = await asyncio.gather(
+            *(processor._claim_events() for processor in processors)
+        )
+
+        assert sorted(len(batch) for batch in claims) == [1, 1]
+        assert {batch[0].user_uuid for batch in claims} == {first_uuid, second_uuid}
+    finally:
+        await pool.close()
+
+
+async def _backlog_processors_claim_distinct_queues_concurrently(dsn: str) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            first_uuid = await _insert_user(
+                connection, 10, 100, queue_id="queue-first", status="active"
+            )
+            second_uuid = await _insert_user(
+                connection, 11, 100, queue_id="queue-second", status="active"
+            )
+        for user_uuid, queue_id in (
+            (first_uuid, "queue-first"),
+            (second_uuid, "queue-second"),
+        ):
+            assert await store.store_events(
+                user_uuid,
+                queue_id,
+                (
+                    ZulipEvent(
+                        event_id=1,
+                        event_type="heartbeat",
+                        payload_json=json.dumps({"id": 1, "type": "heartbeat"}),
+                    ),
+                ),
+                1,
+            ) == (1, True)
+        await pool.execute(
+            "UPDATE workspace_zulip_bridge.zulip_events "
+            "SET created_at = clock_timestamp() - interval '10 minutes'"
+        )
+        settings = Settings.from_env(
+            {
+                "WZB_DATABASE_DSN": dsn,
+                "WZB_EVENT_PROCESSOR_BATCH_SIZE": "1",
+            }
+        )
+        processors = [
+            ZulipEventProcessor(pool, store, settings, claim_scope="backlog")
             for _ in range(2)
         ]
 
@@ -11042,6 +11102,124 @@ async def _workspace_event_retention_round_trip(dsn: str) -> None:
             (205, "processing"),
             (206, "applied"),
         ]
+    finally:
+        await pool.close()
+
+
+async def _redundant_message_updates_are_skipped_before_processing(
+    dsn: str,
+) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            owner_uuid = await _insert_user(
+                connection, 10, 100, queue_id="queue-owner", status="filling"
+            )
+            member_uuid = await _insert_user(
+                connection, 20, 400, queue_id="queue-member", status="filling"
+            )
+        assert (
+            await store.store_chat_catalog(
+                owner_uuid,
+                "queue-owner",
+                _catalog(10, [(7, "Shared")], {"channel:7": 1}),
+            )
+        ).activated
+        assert (
+            await store.store_chat_catalog(
+                member_uuid,
+                "queue-member",
+                _catalog(20, [(7, "Shared")], {"channel:7": 1}),
+            )
+        ).activated
+        assert (await store.reconcile_chat_schedules()).assigned == 1
+        await _load_one_chat(
+            store,
+            pool,
+            owner_uuid,
+            "queue-owner",
+            ZulipMessage(
+                message_id=123,
+                chat_key="channel:7",
+                topic_name="Performance",
+                sender_user_uuid=owner_uuid,
+                content="first",
+                is_read=False,
+                is_starred=False,
+                is_collapsed=False,
+                is_mentioned=False,
+                is_stream_wildcard_mentioned=False,
+                is_topic_wildcard_mentioned=False,
+                has_alert_word=False,
+                is_historical=False,
+                reactions_json="[]",
+                message_hash=b"a" * 32,
+                sent_at=1_700_000_000,
+            ),
+        )
+        update = {
+            "id": 1,
+            "type": "update_message",
+            "message_id": 123,
+            "content": "second",
+            "edit_timestamp": 1_700_000_100,
+        }
+        move = {**update, "id": 2, "new_stream_id": 8}
+        assert await store.store_events(
+            member_uuid,
+            "queue-member",
+            (
+                ZulipEvent(1, "update_message", json.dumps(update)),
+                ZulipEvent(2, "update_message", json.dumps(move)),
+            ),
+            2,
+        ) == (2, True)
+        assert await store.store_events(
+            owner_uuid,
+            "queue-owner",
+            (ZulipEvent(1, "update_message", json.dumps(update)),),
+            1,
+        ) == (1, True)
+        rows = await pool.fetch(
+            "SELECT zulip_connection_uuid, event_id, processing_status, "
+            "outcome_reason FROM workspace_zulip_bridge.zulip_events "
+            "ORDER BY zulip_connection_uuid, event_id"
+        )
+        assert {
+            (row["zulip_connection_uuid"], row["event_id"]): (
+                row["processing_status"],
+                row["outcome_reason"],
+            )
+            for row in rows
+        } == {
+            (member_uuid, 1): ("skipped", "not_chat_supplier"),
+            (member_uuid, 2): ("pending", None),
+            (owner_uuid, 1): ("pending", None),
+        }
+
+        await pool.execute(
+            "UPDATE workspace_zulip_bridge.zulip_events "
+            "SET processing_status='pending', processed_at=NULL, outcome_reason=NULL "
+            "WHERE zulip_connection_uuid=$1 AND event_id=1",
+            member_uuid,
+        )
+        processor = ZulipEventProcessor(
+            pool,
+            store,
+            Settings.from_env({"WZB_DATABASE_DSN": dsn}),
+            claim_scope="backlog",
+        )
+        assert await processor._maybe_skip_redundant_update_events() == 1
+        assert (
+            await pool.fetchval(
+                "SELECT processing_status "
+                "FROM workspace_zulip_bridge.zulip_events "
+                "WHERE zulip_connection_uuid=$1 AND event_id=1",
+                member_uuid,
+            )
+            == "skipped"
+        )
     finally:
         await pool.close()
 

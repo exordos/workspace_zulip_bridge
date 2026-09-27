@@ -114,6 +114,7 @@ def test_exordos_manifest_renders_without_implicit_values() -> None:
     ]["body"]["content"]
     assert "WZB_WORKSPACE_CONTROL_URL=" in config
     assert "WZB_EVENT_PROCESSOR_BATCH_SIZE=128" in config
+    assert "WZB_EVENT_PROCESSOR_BACKLOG_WORKERS=4" in config
     assert "WZB_EVENT_PROCESSOR_REALTIME_BATCH_SIZE=16" in config
     assert "WZB_EVENT_PROCESSOR_REALTIME_WORKERS=4" in config
     assert "WZB_EVENT_PROCESSOR_REALTIME_WINDOW_SECONDS=300" in config
