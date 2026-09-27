@@ -2852,6 +2852,34 @@ async def _stored_messages_are_reprojected_in_bounded_batches(dsn: str) -> None:
             )
             == 0
         )
+
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.zulip_messages
+            SET content = '```quote\nordinary quote\n```',
+                workspace_content = $2,
+                converter_version = $3,
+                content_hash = $4
+            WHERE uuid = $1
+            """,
+            message_uuid,
+            f"[User 10](urn:quote:{message_uuid})",
+            CONVERTER_VERSION,
+            b"q" * 32,
+        )
+        quote_projector = EventStore(pool)
+        assert await quote_projector.reproject_message_batch(limit=1) == 1
+        assert (
+            await pool.fetchval(
+                """
+                SELECT workspace_content
+                FROM workspace_zulip_bridge.zulip_messages
+                WHERE uuid = $1
+                """,
+                message_uuid,
+            )
+            == "> ordinary quote"
+        )
     finally:
         await pool.close()
 

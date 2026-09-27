@@ -68,8 +68,37 @@ class EventStore:
         if self._projection_complete:
             return 0
         async with self._pool.acquire() as connection, connection.transaction():
+            # Keep the predicates separate so PostgreSQL can use both partial
+            # projection indexes even after an in-memory cursor reset.
             rows = await connection.fetch(
-                """
+                f"""
+                WITH candidates AS MATERIALIZED (
+                    SELECT candidate.uuid
+                    FROM (
+                        (
+                            SELECT uuid
+                            FROM workspace_zulip_bridge.zulip_messages
+                            WHERE (
+                                converter_version < {CONVERTER_VERSION}
+                                OR workspace_content IS NULL
+                            )
+                              AND ($1::uuid IS NULL OR uuid > $1)
+                            ORDER BY uuid
+                            LIMIT $2
+                        )
+                        UNION
+                        (
+                            SELECT uuid
+                            FROM workspace_zulip_bridge.zulip_messages
+                            WHERE workspace_content LIKE '%urn:quote:%'
+                              AND ($1::uuid IS NULL OR uuid > $1)
+                            ORDER BY uuid
+                            LIMIT $2
+                        )
+                    ) AS candidate
+                    ORDER BY candidate.uuid
+                    LIMIT $2
+                )
                 SELECT message.uuid, message.realm_uuid,
                        message.zulip_message_id, message.sender_user_uuid,
                        message.content, message.workspace_content,
@@ -77,7 +106,9 @@ class EventStore:
                        stream.chat_key, topic.name AS topic_name,
                        realm.identity_key AS endpoint,
                        owner.zulip_user_id AS own_user_id
-                FROM workspace_zulip_bridge.zulip_messages AS message
+                FROM candidates AS candidate
+                JOIN workspace_zulip_bridge.zulip_messages AS message
+                  ON message.uuid = candidate.uuid
                 JOIN workspace_zulip_bridge.zulip_streams AS stream
                   ON stream.uuid = message.zulip_stream_uuid
                 JOIN workspace_zulip_bridge.zulip_realms AS realm
@@ -91,17 +122,9 @@ class EventStore:
                   )
                 JOIN workspace_zulip_bridge.zulip_users AS owner
                   ON owner.uuid = connection.zulip_user_uuid
-                WHERE (
-                    message.converter_version < $1
-                    OR message.workspace_content IS NULL
-                    OR message.workspace_content LIKE '%urn:quote:%'
-                )
-                  AND ($2::uuid IS NULL OR message.uuid > $2)
                 ORDER BY message.uuid
-                LIMIT $3
                 FOR UPDATE OF message SKIP LOCKED
                 """,
-                CONVERTER_VERSION,
                 self._projection_cursor,
                 limit,
             )
