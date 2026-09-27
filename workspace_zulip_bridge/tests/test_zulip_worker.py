@@ -171,6 +171,10 @@ class FakeStore:
         self.presence_thresholds: list[tuple[str, int]] = []
         self.schedule_reconciliation_requested = False
         self.notification_snapshots: list[tuple[UUID, str, bool]] = []
+        self.file_transfer_active = False
+
+    async def file_transfer_stage_active(self) -> bool:
+        return self.file_transfer_active
 
     async def set_presence_offline_threshold(
         self, endpoint: str, threshold_seconds: int
@@ -590,6 +594,39 @@ class DirectHistoryApi(FakeApi):
         assert chat_key == "direct:10,12"
         assert own_user_id == 10
         return self.get_messages_page(anchor, include_anchor=include_anchor)
+
+
+def test_file_stage_pauses_scheduled_history_before_it_opens_a_session() -> None:
+    asyncio.run(_file_stage_pauses_scheduled_history())
+
+
+async def _file_stage_pauses_scheduled_history() -> None:
+    store = FakeStore()
+    api = DirectHistoryApi()
+    pause = threading.Event()
+    pause.set()
+    worker = ZulipEventThread(
+        USER_ONE,
+        store,  # type: ignore[arg-type]
+        asyncio.get_running_loop(),
+        Settings(database_dsn="postgresql:///test"),
+        threading.BoundedSemaphore(1),
+        bulk_history_pause=pause,
+        api_factory=lambda user: api,  # type: ignore[arg-type]
+    )
+    worker._identity = ZulipIdentity(10, "Current User", 400)
+    worker._queue_id = "queue-1"
+    worker._user_uuids = {10: USER_ONE.uuid, 12: USER_TWO.uuid}
+
+    loaded = await asyncio.to_thread(
+        worker._load_scheduled_history,
+        api,
+        "queue-1",
+        [ScheduledChat("direct:10,12", 1)],
+    )
+
+    assert loaded
+    assert store.history_begins == 0
 
 
 def test_history_finalization_uses_catalog_write_gate() -> None:
@@ -1095,6 +1132,31 @@ async def _schedule_reconciliation_skip_test() -> None:
     await supervisor.reconcile()
 
     assert store.schedule_reconciliations == 0
+
+
+def test_file_stage_controls_the_shared_history_pause() -> None:
+    asyncio.run(_file_stage_controls_the_shared_history_pause())
+
+
+async def _file_stage_controls_the_shared_history_pause() -> None:
+    store = FakeStore()
+    store.file_transfer_active = True
+    supervisor = ZulipThreadSupervisor(
+        store,  # type: ignore[arg-type]
+        asyncio.get_running_loop(),
+        Settings(
+            database_dsn="postgresql:///test",
+            workspace_control_url="https://control.example.test",
+        ),
+        worker_factory=lambda user, gate: FakeWorker(user),  # type: ignore[arg-type]
+    )
+
+    await supervisor._refresh_bulk_stage()
+    assert supervisor._bulk_history_pause.is_set()
+
+    store.file_transfer_active = False
+    await supervisor._refresh_bulk_stage()
+    assert not supervisor._bulk_history_pause.is_set()
 
 
 def test_schedule_reconciliation_deadlock_does_not_stop_supervisor() -> None:

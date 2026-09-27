@@ -65,6 +65,24 @@ class EventStore:
         self._projection_cursor: UUID | None = None
         self._projection_complete = False
 
+    async def file_transfer_stage_active(self) -> bool:
+        """Return whether historical file delivery still owns the bulk lane."""
+
+        return bool(
+            await self._pool.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM workspace_zulip_bridge.workspace_outbox
+                    WHERE entity_type = 'file'
+                      AND action = 'upsert'
+                      AND delivery_status IN ('pending', 'failed')
+                    LIMIT 1
+                )
+                """
+            )
+        )
+
     async def reproject_message_batch(self, limit: int = 1000) -> int:
         """Upgrade stored message projections without a table-wide rewrite."""
 

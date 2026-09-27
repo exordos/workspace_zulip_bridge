@@ -77,7 +77,13 @@ class _CatalogSource:
 class WorkspaceChatCatalogWorker:
     """Keep Workspace control assignments aligned with bridge chat state."""
 
-    def __init__(self, pool: asyncpg.Pool, settings: Settings) -> None:
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        settings: Settings,
+        *,
+        control_semaphore: asyncio.Semaphore | None = None,
+    ) -> None:
         if settings.workspace_control_url is None:
             raise ValueError("Workspace control must be configured")
         if settings.workspace_bridge_instance_uuid is None:
@@ -87,6 +93,9 @@ class WorkspaceChatCatalogWorker:
         self._control_url = settings.workspace_control_url.rstrip("/")
         self._bridge_uuid = settings.workspace_bridge_instance_uuid
         self._state = settings.workspace_control_state_dir
+        self._control_semaphore = control_semaphore or asyncio.Semaphore(
+            settings.workspace_file_control_concurrency
+        )
 
     async def run(self) -> None:
         while True:
@@ -152,6 +161,28 @@ class WorkspaceChatCatalogWorker:
                    stream.chat_type, stream.chat_key,
                    stream.name AS display_name, stream.description,
                    stream.chat_parameters,
+                   EXISTS (
+                       SELECT 1
+                       FROM workspace_zulip_bridge.workspace_file_projections
+                           AS live_projection
+                       WHERE live_projection.zulip_stream_uuid = stream.uuid
+                         AND live_projection.delivery_priority = 0
+                         AND live_projection.processing_status IN (
+                             'pending', 'processing', 'failed'
+                         )
+                   ) AS has_live_file_work,
+                   (
+                       SELECT max(live_file.source_created_at)
+                       FROM workspace_zulip_bridge.workspace_file_projections
+                           AS live_projection
+                       JOIN workspace_zulip_bridge.zulip_files AS live_file
+                         ON live_file.uuid = live_projection.file_uuid
+                       WHERE live_projection.zulip_stream_uuid = stream.uuid
+                         AND live_projection.delivery_priority = 0
+                         AND live_projection.processing_status IN (
+                             'pending', 'processing', 'failed'
+                         )
+                   ) AS newest_live_file_at,
                    GREATEST(
                        stream.updated_at,
                        owner_binding.updated_at,
@@ -197,7 +228,10 @@ class WorkspaceChatCatalogWorker:
                     AND file_projection.processing_status IN (
                         'pending', 'processing', 'failed'
                     )
-                    AND file_projection.last_error = 'workspace_file_http_403'
+                    AND (
+                        file_projection.delivery_priority = 0
+                        OR file_projection.last_error = 'workspace_file_http_403'
+                    )
               )
               AND (
                   report.external_account_uuid IS NULL
@@ -220,7 +254,9 @@ class WorkspaceChatCatalogWorker:
                        ), '-infinity'::timestamptz)
                   )
               )
-            ORDER BY connection.external_account_uuid, stream.uuid
+            ORDER BY has_live_file_work DESC,
+                     newest_live_file_at DESC NULLS LAST,
+                     connection.external_account_uuid, stream.uuid
             LIMIT 20
             """
         )
@@ -274,7 +310,10 @@ class WorkspaceChatCatalogWorker:
                     AND file_projection.processing_status IN (
                         'pending', 'processing', 'failed'
                     )
-                    AND file_projection.last_error = 'workspace_file_http_403'
+                    AND (
+                        file_projection.delivery_priority = 0
+                        OR file_projection.last_error = 'workspace_file_http_403'
+                    )
               )
             """
         )
@@ -304,7 +343,10 @@ class WorkspaceChatCatalogWorker:
                     AND file_projection.processing_status IN (
                         'pending', 'processing', 'failed'
                     )
-                    AND file_projection.last_error = 'workspace_file_http_403'
+                    AND (
+                        file_projection.delivery_priority = 0
+                        OR file_projection.last_error = 'workspace_file_http_403'
+                    )
               )
             """
         )
@@ -583,7 +625,29 @@ class WorkspaceChatCatalogWorker:
     async def _claim_report(self) -> asyncpg.Record | None:
         return await self._pool.fetchrow(
             """
-            WITH expired AS (
+            WITH active_file_work AS (
+                SELECT connection.external_account_uuid,
+                       projection.zulip_stream_uuid,
+                       min(projection.delivery_priority) AS delivery_priority,
+                       max(file.source_created_at) AS newest_file_at
+                FROM workspace_zulip_bridge.workspace_file_projections AS projection
+                JOIN workspace_zulip_bridge.zulip_files AS file
+                  ON file.uuid = projection.file_uuid
+                JOIN workspace_zulip_bridge.zulip_streams AS stream
+                  ON stream.uuid = projection.zulip_stream_uuid
+                JOIN workspace_zulip_bridge.zulip_connections AS connection
+                  ON connection.uuid = stream.source_connection_uuid
+                WHERE projection.processing_status IN (
+                          'pending', 'processing', 'failed'
+                      )
+                  AND (
+                      projection.delivery_priority = 0
+                      OR projection.last_error = 'workspace_file_http_403'
+                  )
+                  AND connection.external_account_uuid IS NOT NULL
+                GROUP BY connection.external_account_uuid,
+                         projection.zulip_stream_uuid
+            ), expired AS (
                 UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports
                 SET processing_status = 'failed', claimed_at = NULL,
                     available_at = clock_timestamp(), last_error = 'claim_expired',
@@ -591,12 +655,17 @@ class WorkspaceChatCatalogWorker:
                 WHERE processing_status = 'processing'
                   AND claimed_at < clock_timestamp() - interval '5 minutes'
             ), candidate AS (
-                SELECT external_account_uuid, zulip_stream_uuid
-                FROM workspace_zulip_bridge.workspace_chat_catalog_reports
-                WHERE processing_status IN ('pending', 'failed')
-                  AND available_at <= clock_timestamp()
-                ORDER BY available_at, updated_at,
-                         external_account_uuid, zulip_stream_uuid
+                SELECT report.external_account_uuid, report.zulip_stream_uuid
+                FROM workspace_zulip_bridge.workspace_chat_catalog_reports AS report
+                LEFT JOIN active_file_work AS file_work
+                  ON file_work.external_account_uuid = report.external_account_uuid
+                 AND file_work.zulip_stream_uuid = report.zulip_stream_uuid
+                WHERE report.processing_status IN ('pending', 'failed')
+                  AND report.available_at <= clock_timestamp()
+                ORDER BY coalesce(file_work.delivery_priority, 1),
+                         file_work.newest_file_at DESC NULLS LAST,
+                         report.available_at, report.updated_at,
+                         report.external_account_uuid, report.zulip_stream_uuid
                 LIMIT 1 FOR UPDATE SKIP LOCKED
             )
             UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports AS report
@@ -629,11 +698,12 @@ class WorkspaceChatCatalogWorker:
         )
 
     async def _send_report(self, report: dict[str, object]) -> str:
-        async with self._client() as client:
-            response = await client.post(
-                "/v1/observed-state/reports",
-                json={"reports": [report]},
-            )
+        async with self._control_semaphore:
+            async with self._client() as client:
+                response = await client.post(
+                    "/v1/observed-state/reports",
+                    json={"reports": [report]},
+                )
         if response.is_error:
             raise CatalogReportError(
                 f"workspace_catalog_http_{response.status_code}",

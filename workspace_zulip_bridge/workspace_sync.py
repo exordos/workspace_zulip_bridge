@@ -1465,6 +1465,8 @@ class WorkspaceDiffWorker:
         # planner must never wait for a slow Provider API batch: doing so stalls
         # every source cursor and turns a handful of rejected legacy entities
         # into a global synchronization pause.
+        if await self._historical_file_work_pending():
+            return 0
         planned = await self.plan()
         if planned is None:
             return 0
@@ -1473,10 +1475,52 @@ class WorkspaceDiffWorker:
         return planned
 
     async def _drain(self, client: httpx.AsyncClient) -> int:
+        if (
+            getattr(self, "_delivery_priority", None) == 1
+            and await self._historical_file_work_pending()
+        ):
+            return 0
         processed = 0
         while changed := await self.process_once(client):
             processed += changed
         return processed
+
+    async def _historical_file_work_pending(self) -> bool:
+        """Keep historical delivery on the file stage until it is drained."""
+
+        return bool(
+            await self._pool.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM workspace_zulip_bridge.workspace_file_projections
+                    WHERE delivery_priority = 1
+                      AND processing_status IN (
+                          'pending', 'processing', 'failed'
+                      )
+                    LIMIT 1
+                ) OR EXISTS (
+                    SELECT 1
+                    FROM workspace_zulip_bridge.workspace_outbox AS outbox
+                    JOIN workspace_zulip_bridge.zulip_message_files AS link
+                      ON link.file_uuid = outbox.entity_uuid
+                    JOIN workspace_zulip_bridge.zulip_messages AS message
+                      ON message.uuid = link.message_uuid
+                     AND message.workspace_content IS NOT NULL
+                    LEFT JOIN workspace_zulip_bridge.workspace_file_projections
+                        AS projection
+                      ON projection.file_uuid = link.file_uuid
+                     AND projection.zulip_stream_uuid =
+                            message.zulip_stream_uuid
+                    WHERE outbox.entity_type = 'file'
+                      AND outbox.action = 'upsert'
+                      AND outbox.delivery_status IN ('pending', 'failed')
+                      AND projection.uuid IS NULL
+                    LIMIT 1
+                )
+                """
+            )
+        )
 
     async def plan(self) -> int | None:
         realm_uuid = await self._link_realm()
@@ -2804,32 +2848,38 @@ class WorkspaceDiffWorker:
         """Turn committed Zulip changes into diffs without a cursor race."""
         async with self._pool.acquire() as connection, connection.transaction():
             rows = []
-            remaining = self._settings.workspace_sync_plan_batch_size
-            outbox_types = tuple(_OUTBOX_SOURCE_TYPES)
-            for index, outbox_type in enumerate(outbox_types):
-                if remaining <= 0:
-                    break
-                remaining_types = len(outbox_types) - index
-                type_limit = max(1, remaining // remaining_types)
+            for outbox_type, entity_type in _OUTBOX_SOURCE_TYPES.items():
+                source_table = _OUTBOX_SOURCE_BASE_TABLES[outbox_type]
+                source_timestamp = (
+                    "source.source_updated_at"
+                    if entity_type in {"topic_bindings", "messages"}
+                    else "source.updated_at"
+                )
                 selected = await connection.fetch(
-                    """
-                    SELECT sequence, entity_type, entity_uuid
-                    FROM workspace_zulip_bridge.workspace_outbox
-                    WHERE realm_uuid = $1
-                      AND delivery_status = 'pending'
-                      AND action = 'upsert'
-                      AND entity_type = $2
-                      AND available_at <= clock_timestamp()
-                    ORDER BY sequence
+                    f"""
+                    SELECT outbox.sequence, outbox.entity_type,
+                           outbox.entity_uuid
+                    FROM workspace_zulip_bridge.workspace_outbox AS outbox
+                    LEFT JOIN workspace_zulip_bridge.{source_table} AS source
+                      ON source.uuid = outbox.entity_uuid
+                    WHERE outbox.realm_uuid = $1
+                      AND outbox.delivery_status = 'pending'
+                      AND outbox.action = 'upsert'
+                      AND outbox.entity_type = $2
+                      AND outbox.available_at <= clock_timestamp()
+                    ORDER BY {source_timestamp} DESC NULLS LAST,
+                             source.uuid DESC NULLS LAST,
+                             outbox.sequence DESC
                     LIMIT $3
-                    FOR UPDATE SKIP LOCKED
+                    FOR UPDATE OF outbox SKIP LOCKED
                     """,
                     realm_uuid,
                     outbox_type,
-                    type_limit,
+                    self._settings.workspace_sync_plan_batch_size,
                 )
-                rows.extend(selected)
-                remaining -= len(selected)
+                if selected:
+                    rows.extend(selected)
+                    break
             if not rows:
                 return 0
             if any(row["entity_type"] == "topic" for row in rows):
@@ -3435,9 +3485,27 @@ class WorkspaceDiffWorker:
                 )
             if delivery_priority is None:
                 return 0
+            source_order = (
+                "DESC" if getattr(self, "_delivery_priority", None) == 1 else "ASC"
+            )
             rows = await connection.fetch(
                 f"""
-                WITH claim AS (
+                WITH selected_type AS MATERIALIZED (
+                    SELECT entity_type
+                    FROM workspace_zulip_bridge.sync_diffs
+                    WHERE provider_uuid = $1
+                      AND processing_status IN ('pending', 'failed')
+                      AND available_at <= clock_timestamp()
+                      AND delivery_priority = $3
+                      AND {self._entity_type_filter}
+                      AND {self._partition_filter}
+                    ORDER BY CASE entity_type
+                        WHEN 'users' THEN 0 WHEN 'streams' THEN 1
+                        WHEN 'stream_bindings' THEN 2 WHEN 'topics' THEN 3
+                        WHEN 'topic_bindings' THEN 4 WHEN 'messages' THEN 5
+                        WHEN 'message_flags' THEN 6 ELSE 7 END
+                    LIMIT 1
+                ), claim AS (
                     SELECT provider_uuid, entity_type, entity_uuid
                     FROM workspace_zulip_bridge.sync_diffs
                     WHERE provider_uuid = $1
@@ -3446,13 +3514,9 @@ class WorkspaceDiffWorker:
                       AND delivery_priority = $3
                       AND {self._entity_type_filter}
                       AND {self._partition_filter}
-                    ORDER BY delivery_priority,
-                        CASE entity_type
-                        WHEN 'users' THEN 0 WHEN 'streams' THEN 1
-                        WHEN 'stream_bindings' THEN 2 WHEN 'topics' THEN 3
-                        WHEN 'topic_bindings' THEN 4 WHEN 'messages' THEN 5
-                        WHEN 'message_flags' THEN 6 ELSE 7 END,
-                        source_updated_at, entity_uuid
+                      AND entity_type = (SELECT entity_type FROM selected_type)
+                    ORDER BY source_updated_at {source_order},
+                             entity_uuid {source_order}
                     FOR UPDATE SKIP LOCKED LIMIT $2
                 )
                 UPDATE workspace_zulip_bridge.sync_diffs AS diff
@@ -4032,7 +4096,10 @@ class WorkspaceDiffWorker:
                 dependency_wait_count = dependency_wait_count + 1,
                 available_at = clock_timestamp() + make_interval(
                     secs => LEAST(
-                        $6::double precision,
+                        CASE WHEN delivery_priority = 0
+                            THEN 5::double precision
+                            ELSE $6::double precision
+                        END,
                         $5::double precision * power(
                             2::double precision,
                             LEAST(dependency_wait_count, 16)
@@ -5184,14 +5251,14 @@ _SOURCE_TABLES = {
 }
 
 _OUTBOX_SOURCE_TYPES = {
-    # Dependencies must be planned before their consumers. Any unused share
-    # then flows into the remaining high-volume types instead of wasting the
-    # batch.
+    # Drain exactly one historical type per pass. Dependencies precede their
+    # consumers; messages precede the personal flags and reactions that refer
+    # to them. Each selected type is processed newest-first.
     "topic": "topics",
     "topic_binding": "topic_bindings",
-    "message_reaction": "message_reactions",
-    "message_flag": "message_flags",
     "message": "messages",
+    "message_flag": "message_flags",
+    "message_reaction": "message_reactions",
 }
 
 _OUTBOX_SOURCE_BASE_TABLES = {

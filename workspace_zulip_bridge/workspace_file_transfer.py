@@ -11,9 +11,11 @@ import logging
 import mimetypes
 import re
 import ssl
+import tempfile
 import unicodedata
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from typing import IO
 from typing import Any
 from uuid import UUID
 
@@ -29,6 +31,9 @@ LOG = logging.getLogger(__name__)
 MAX_FILE_BYTES = 50 * 1024 * 1024
 _CONTENT_TYPE = re.compile(r"^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$")
 _WORKSPACE_URN = re.compile(r"^urn:(?:file|image|video):[0-9a-f-]{36}$")
+_BACKFILL_CANDIDATE_BATCH_SIZE = 20_000
+_BACKFILL_LOW_WATERMARK = 1_000
+_CONTROL_MAX_CONNECTIONS = 2
 
 
 class FileTransferError(RuntimeError):
@@ -54,6 +59,7 @@ class _Job:
     api_key: str
     source_path: str
     name: str
+    delivery_priority: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +67,12 @@ class _Descriptor:
     size_bytes: int
     content_type: str
     sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _StagedSource:
+    descriptor: _Descriptor
+    content: IO[bytes]
 
 
 def replace_source_file_urn(content: str, source_uuid: UUID, target_urn: str) -> str:
@@ -94,47 +106,78 @@ def workspace_file_name(name: str) -> str:
 class WorkspaceFileTransferWorker:
     """Move provider bytes directly into Workspace object storage."""
 
-    def __init__(self, pool: asyncpg.Pool, settings: Settings) -> None:
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        settings: Settings,
+        *,
+        coordinate: bool = True,
+        control_semaphore: asyncio.Semaphore | None = None,
+    ) -> None:
         if settings.workspace_control_url is None:
             raise ValueError("Workspace control must be configured")
         self._pool = pool
         self._settings = settings
         self._control_url = settings.workspace_control_url.rstrip("/")
         self._state = settings.workspace_control_state_dir
+        self._coordinate = coordinate
+        self._control_semaphore = control_semaphore or asyncio.Semaphore(
+            settings.workspace_file_control_concurrency
+        )
+        self._source_http: httpx.AsyncClient | None = None
+        self._control_http: httpx.AsyncClient | None = None
+        self._upload_http: httpx.AsyncClient | None = None
 
     async def run(self) -> None:
-        while True:
-            try:
-                await self.process_once()
-            except asyncio.CancelledError:
-                raise
-            except (TimeoutError, asyncpg.PostgresError, httpx.HTTPError) as error:
-                LOG.warning(
-                    "Workspace file transfer pass failed error=%s",
-                    type(error).__name__,
+        try:
+            while True:
+                changed = 0
+                try:
+                    changed = await self.process_once()
+                except asyncio.CancelledError:
+                    raise
+                except (
+                    TimeoutError,
+                    asyncpg.PostgresError,
+                    httpx.HTTPError,
+                ) as error:
+                    LOG.warning(
+                        "Workspace file transfer pass failed error=%s",
+                        type(error).__name__,
+                    )
+                # Network and database awaits already provide cooperative
+                # scheduling while backlog work is available.  Only poll-sleep
+                # when the worker is idle or a pass failed; sleeping after every
+                # successful file capped each worker below one file per second.
+                await asyncio.sleep(
+                    0 if changed else self._settings.workspace_control_poll_seconds
                 )
-            # A finalized transfer performs allocation and finalization against
-            # Workspace control state. Pace every pass, including successful
-            # backlog work, so small files cannot saturate the control service's
-            # database pool while realtime synchronization is active.
-            await asyncio.sleep(self._settings.workspace_control_poll_seconds)
+        finally:
+            await self._close_clients()
 
     async def process_once(self) -> int:
-        seeded = await self._seed_projection_jobs()
-        await self._complete_file_outbox()
+        seeded = 0
+        completed = 0
+        if self._coordinate:
+            seeded = await self._seed_projection_jobs()
+            completed = await self._complete_file_outbox()
         job = await self._claim_job()
         if job is None:
-            return seeded
+            return seeded + completed
+        staged: _StagedSource | None = None
         try:
-            descriptor = await self._probe_source(job)
-            file_urn = await self._transfer(job, descriptor)
-            await self._finalize_job(job, descriptor, file_urn)
+            staged = await self._stage_source(job)
+            file_urn = await self._transfer(job, staged)
+            await self._finalize_job(job, staged.descriptor, file_urn)
         except asyncio.CancelledError:
             raise
         except FileTransferError as error:
             await self._fail_job(job, error.code, retryable=error.retryable)
         except (TimeoutError, httpx.HTTPError) as error:
             await self._fail_job(job, type(error).__name__, retryable=True)
+        finally:
+            if staged is not None:
+                staged.content.close()
         await self._complete_file_outbox(job.file_uuid)
         return seeded + 1
 
@@ -143,7 +186,8 @@ class WorkspaceFileTransferWorker:
             """
             SELECT DISTINCT file.uuid AS file_uuid,
                    message.zulip_stream_uuid AS stream_uuid,
-                   0::smallint AS delivery_priority
+                   0::smallint AS delivery_priority,
+                   file.source_created_at
             FROM workspace_zulip_bridge.sync_diffs AS diff
             JOIN workspace_zulip_bridge.zulip_messages AS message
               ON message.uuid = diff.entity_uuid
@@ -165,31 +209,36 @@ class WorkspaceFileTransferWorker:
               AND (
                   projection.uuid IS NULL OR projection.delivery_priority > 0
               )
-            ORDER BY file.uuid, message.zulip_stream_uuid
+            ORDER BY file.source_created_at DESC, file.uuid DESC,
+                     message.zulip_stream_uuid
             LIMIT 100
             """
         )
         remaining = 100 - len(live_rows)
         backfill_rows = []
-        if remaining:
+        if remaining and not await self._has_backfill_reserve():
             backfill_rows = await self._pool.fetch(
                 """
             WITH candidate_files AS MATERIALIZED (
-                SELECT entity_uuid
-                FROM workspace_zulip_bridge.workspace_outbox
-                WHERE entity_type = 'file'
-                  AND action = 'upsert'
-                  AND delivery_status IN ('pending', 'failed')
-                  AND available_at <= clock_timestamp()
-                ORDER BY sequence
-                LIMIT 500
+                SELECT file.uuid, file.source_created_at
+                FROM workspace_zulip_bridge.zulip_files AS file
+                JOIN workspace_zulip_bridge.workspace_outbox AS outbox
+                  ON outbox.realm_uuid = file.realm_uuid
+                 AND outbox.entity_uuid = file.uuid
+                WHERE outbox.entity_type = 'file'
+                  AND outbox.action = 'upsert'
+                  AND outbox.delivery_status IN ('pending', 'failed')
+                  AND outbox.available_at <= clock_timestamp()
+                ORDER BY file.source_created_at DESC, file.uuid DESC
+                LIMIT $1
             )
             SELECT DISTINCT file.uuid AS file_uuid,
                    message.zulip_stream_uuid AS stream_uuid,
-                   1::smallint AS delivery_priority
+                   1::smallint AS delivery_priority,
+                   file.source_created_at
             FROM candidate_files AS candidate
             JOIN workspace_zulip_bridge.zulip_files AS file
-              ON file.uuid = candidate.entity_uuid
+              ON file.uuid = candidate.uuid
             JOIN workspace_zulip_bridge.zulip_message_files AS link
               ON link.file_uuid = file.uuid
             JOIN workspace_zulip_bridge.zulip_messages AS message
@@ -203,10 +252,10 @@ class WorkspaceFileTransferWorker:
                     AND projection.zulip_stream_uuid =
                         message.zulip_stream_uuid
             )
-            ORDER BY file.uuid, message.zulip_stream_uuid
-            LIMIT $1
+            ORDER BY file.source_created_at DESC, file.uuid DESC,
+                     message.zulip_stream_uuid
                 """,
-                remaining,
+                _BACKFILL_CANDIDATE_BATCH_SIZE,
             )
         rows_by_key: dict[tuple[UUID, UUID], asyncpg.Record] = {}
         for row in (*live_rows, *backfill_rows):
@@ -274,6 +323,41 @@ class WorkspaceFileTransferWorker:
             )
         return len(inserted)
 
+    async def _has_backfill_reserve(self) -> bool:
+        return bool(
+            await self._pool.fetchval(
+                """
+                SELECT count(*) >= $1
+                FROM (
+                    SELECT 1
+                    FROM workspace_zulip_bridge.workspace_file_projections
+                        AS projection
+                    JOIN workspace_zulip_bridge.zulip_streams AS stream
+                      ON stream.uuid = projection.zulip_stream_uuid
+                    JOIN workspace_zulip_bridge.zulip_connections AS connection
+                      ON connection.uuid = stream.source_connection_uuid
+                    LEFT JOIN workspace_zulip_bridge.workspace_chat_catalog_reports
+                        AS catalog
+                      ON catalog.external_account_uuid =
+                         connection.external_account_uuid
+                     AND catalog.zulip_stream_uuid = stream.uuid
+                    WHERE projection.delivery_priority = 1
+                      AND projection.processing_status IN ('pending', 'failed')
+                      AND projection.available_at <= clock_timestamp()
+                      AND connection.external_account_uuid IS NOT NULL
+                      AND connection.sync_enabled
+                      AND (
+                          projection.last_error IS DISTINCT FROM
+                              'workspace_file_http_403'
+                          OR catalog.processing_status = 'reported'
+                      )
+                    LIMIT $1
+                ) AS ready
+                """,
+                _BACKFILL_LOW_WATERMARK,
+            )
+        )
+
     async def _claim_job(self) -> _Job | None:
         row = await self._pool.fetchrow(
             """
@@ -287,6 +371,8 @@ class WorkspaceFileTransferWorker:
             ), candidate AS (
                 SELECT projection.uuid
                 FROM workspace_zulip_bridge.workspace_file_projections AS projection
+                JOIN workspace_zulip_bridge.zulip_files AS file
+                  ON file.uuid = projection.file_uuid
                 JOIN workspace_zulip_bridge.zulip_streams AS stream
                   ON stream.uuid = projection.zulip_stream_uuid
                 JOIN workspace_zulip_bridge.zulip_connections AS connection
@@ -301,12 +387,17 @@ class WorkspaceFileTransferWorker:
                   AND connection.external_account_uuid IS NOT NULL
                   AND connection.sync_enabled
                   AND (
+                      projection.delivery_priority > 0
+                      OR catalog.processing_status = 'reported'
+                  )
+                  AND (
                       projection.last_error IS DISTINCT FROM
                           'workspace_file_http_403'
                       OR catalog.processing_status = 'reported'
                   )
-                ORDER BY projection.delivery_priority, projection.available_at,
-                         projection.created_at, projection.uuid
+                ORDER BY projection.delivery_priority,
+                         file.source_created_at DESC, file.uuid DESC,
+                         projection.available_at, projection.uuid
                 LIMIT 1 FOR UPDATE OF projection SKIP LOCKED
             ), claimed AS (
                 UPDATE workspace_zulip_bridge.workspace_file_projections AS projection
@@ -317,6 +408,7 @@ class WorkspaceFileTransferWorker:
                 RETURNING projection.*
             )
             SELECT claimed.uuid AS projection_uuid, claimed.operation_uuid,
+                   claimed.delivery_priority,
                    file.uuid AS file_uuid, stream.uuid AS stream_uuid,
                    file.realm_uuid, connection.external_account_uuid,
                    stream.chat_key,
@@ -353,6 +445,7 @@ class WorkspaceFileTransferWorker:
             api_key=str(row["api_key"]),
             source_path=str(row["source_path"]),
             name=str(row["name"]),
+            delivery_priority=int(row["delivery_priority"]),
         )
 
     def _source_verify(self) -> bool | ssl.SSLContext:
@@ -363,10 +456,8 @@ class WorkspaceFileTransferWorker:
         context.load_verify_locations(cafile=ca_file)
         return context
 
-    def _source_client(self, job: _Job) -> httpx.AsyncClient:
+    def _source_client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
-            base_url=job.endpoint.rstrip("/"),
-            auth=httpx.BasicAuth(job.login, job.api_key),
             verify=self._source_verify(),
             follow_redirects=True,
             trust_env=False,
@@ -374,11 +465,17 @@ class WorkspaceFileTransferWorker:
             headers={"User-Agent": "workspace-zulip-bridge"},
         )
 
-    async def _probe_source(self, job: _Job) -> _Descriptor:
+    async def _stage_source(self, job: _Job) -> _StagedSource:
         digest = hashlib.sha256()
         size = 0
-        async with self._source_client(job) as client:
-            async with client.stream("GET", job.source_path) as response:
+        staged = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
+        client = self._persistent_source_client()
+        try:
+            async with client.stream(
+                "GET",
+                self._source_url(job),
+                auth=httpx.BasicAuth(job.login, job.api_key),
+            ) as response:
                 if response.is_error:
                     raise FileTransferError(
                         f"zulip_download_http_{response.status_code}",
@@ -391,7 +488,24 @@ class WorkspaceFileTransferWorker:
                     if size > MAX_FILE_BYTES:
                         raise FileTransferError("file_too_large", retryable=False)
                     digest.update(chunk)
-        return _Descriptor(size, content_type, digest.hexdigest())
+                    await asyncio.to_thread(staged.write, chunk)
+            await asyncio.to_thread(staged.seek, 0)
+            return _StagedSource(
+                _Descriptor(size, content_type, digest.hexdigest()),
+                staged,
+            )
+        except BaseException:
+            staged.close()
+            raise
+
+    @staticmethod
+    def _source_url(job: _Job) -> str:
+        return f"{job.endpoint.rstrip('/')}/{job.source_path.lstrip('/')}"
+
+    def _persistent_source_client(self) -> httpx.AsyncClient:
+        if self._source_http is None:
+            self._source_http = self._source_client()
+        return self._source_http
 
     @staticmethod
     def _content_type(response: httpx.Response, name: str) -> str:
@@ -418,10 +532,40 @@ class WorkspaceFileTransferWorker:
             follow_redirects=False,
             trust_env=False,
             timeout=httpx.Timeout(self._settings.workspace_request_timeout_seconds),
+            limits=httpx.Limits(
+                max_connections=_CONTROL_MAX_CONNECTIONS,
+                max_keepalive_connections=_CONTROL_MAX_CONNECTIONS,
+            ),
             headers={"Accept": "application/json"},
         )
 
-    async def _transfer(self, job: _Job, descriptor: _Descriptor) -> str:
+    def _persistent_control_client(self) -> httpx.AsyncClient:
+        if self._control_http is None:
+            self._control_http = self._control_client()
+        return self._control_http
+
+    def _persistent_upload_client(self) -> httpx.AsyncClient:
+        if self._upload_http is None:
+            self._upload_http = httpx.AsyncClient(
+                follow_redirects=False,
+                trust_env=False,
+                timeout=httpx.Timeout(
+                    max(300.0, self._settings.workspace_request_timeout_seconds)
+                ),
+            )
+        return self._upload_http
+
+    async def _close_clients(self) -> None:
+        clients = (self._source_http, self._control_http, self._upload_http)
+        self._source_http = None
+        self._control_http = None
+        self._upload_http = None
+        for client in clients:
+            if client is not None:
+                await client.aclose()
+
+    async def _transfer(self, job: _Job, staged: _StagedSource) -> str:
+        descriptor = staged.descriptor
         request = {
             "operation_uuid": str(job.operation_uuid),
             "external_account_uuid": str(job.external_account_uuid),
@@ -431,19 +575,21 @@ class WorkspaceFileTransferWorker:
             "content_type": descriptor.content_type,
             "sha256": descriptor.sha256,
         }
-        async with self._control_client() as control:
+        control = self._persistent_control_client()
+        async with self._control_semaphore:
             allocation_response = await control.put(
                 f"/v1/file-transfers/incoming/{job.projection_uuid}",
                 json=request,
             )
-            allocation = self._response(allocation_response)
-            if allocation.get("status") == "finalized":
-                return self._finalized_urn(allocation, descriptor)
-            upload = allocation.get("upload")
-            generation = allocation.get("allocation_generation")
-            if not isinstance(upload, dict) or not isinstance(generation, int):
-                raise FileTransferError("invalid_allocation_response")
-            await self._upload(job, descriptor, upload)
+        allocation = self._response(allocation_response)
+        if allocation.get("status") == "finalized":
+            return self._finalized_urn(allocation, descriptor)
+        upload = allocation.get("upload")
+        generation = allocation.get("allocation_generation")
+        if not isinstance(upload, dict) or not isinstance(generation, int):
+            raise FileTransferError("invalid_allocation_response")
+        await self._upload(staged, upload)
+        async with self._control_semaphore:
             finalize = await control.post(
                 f"/v1/file-transfers/incoming/{job.projection_uuid}/actions/finalize",
                 json={
@@ -454,7 +600,24 @@ class WorkspaceFileTransferWorker:
                     "sha256": descriptor.sha256,
                 },
             )
-            return self._finalized_urn(self._response(finalize), descriptor)
+        file_urn = self._finalized_urn(self._response(finalize), descriptor)
+        if job.delivery_priority == 0:
+            # A successful finalize response precedes the public Messenger
+            # read in a separate request.  Confirm the idempotent allocation
+            # from a fresh transaction before exposing a live message, so its
+            # native file cannot lose the race and return a transient 404.
+            async with self._control_semaphore:
+                committed = await control.put(
+                    f"/v1/file-transfers/incoming/{job.projection_uuid}",
+                    json=request,
+                )
+            confirmed_urn = self._finalized_urn(
+                self._response(committed),
+                descriptor,
+            )
+            if confirmed_urn != file_urn:
+                raise FileTransferError("workspace_file_urn_changed")
+        return file_urn
 
     @staticmethod
     def _response(response: httpx.Response) -> dict[str, Any]:
@@ -488,10 +651,10 @@ class WorkspaceFileTransferWorker:
 
     async def _upload(
         self,
-        job: _Job,
-        descriptor: _Descriptor,
+        staged: _StagedSource,
         upload: dict[str, Any],
     ) -> None:
+        descriptor = staged.descriptor
         url = upload.get("url")
         headers = upload.get("headers")
         if upload.get("method") != "PUT" or not isinstance(url, str):
@@ -508,36 +671,25 @@ class WorkspaceFileTransferWorker:
             raise FileTransferError("invalid_allocation_response")
         digest = hashlib.sha256()
         size = 0
-        async with self._source_client(job) as source:
-            async with source.stream("GET", job.source_path) as response:
-                if response.is_error:
-                    raise FileTransferError(
-                        f"zulip_download_http_{response.status_code}",
-                        retryable=response.status_code == 429
-                        or response.status_code >= 500,
-                    )
+        await asyncio.to_thread(staged.content.seek, 0)
 
-                async def chunks() -> AsyncIterator[bytes]:
-                    nonlocal size
-                    async for chunk in response.aiter_bytes():
-                        size += len(chunk)
-                        digest.update(chunk)
-                        yield chunk
+        async def chunks() -> AsyncIterator[bytes]:
+            nonlocal size
+            while chunk := await asyncio.to_thread(staged.content.read, 1024 * 1024):
+                size += len(chunk)
+                digest.update(chunk)
+                yield chunk
 
-                async with httpx.AsyncClient(
-                    follow_redirects=False,
-                    trust_env=False,
-                    timeout=httpx.Timeout(
-                        max(300.0, self._settings.workspace_request_timeout_seconds)
-                    ),
-                ) as uploader:
-                    result = await uploader.put(url, headers=headers, content=chunks())
-                if result.is_error:
-                    raise FileTransferError(
-                        f"object_upload_http_{result.status_code}",
-                        retryable=result.status_code == 429
-                        or result.status_code >= 500,
-                    )
+        result = await self._persistent_upload_client().put(
+            url,
+            headers=headers,
+            content=chunks(),
+        )
+        if result.is_error:
+            raise FileTransferError(
+                f"object_upload_http_{result.status_code}",
+                retryable=result.status_code == 429 or result.status_code >= 500,
+            )
         if size != descriptor.size_bytes or digest.hexdigest() != descriptor.sha256:
             raise FileTransferError("source_changed_during_upload")
 
@@ -589,6 +741,7 @@ class WorkspaceFileTransferWorker:
                 )
                 changed.append((UUID(str(row["uuid"])), projected, content_hash))
             if changed:
+                changed_message_uuids = [message_uuid for message_uuid, _, _ in changed]
                 await connection.executemany(
                     """
                     UPDATE workspace_zulip_bridge.zulip_messages
@@ -612,6 +765,20 @@ class WorkspaceFileTransferWorker:
                                   updated_at = clock_timestamp()
                     """,
                     [(job.realm_uuid, message_uuid) for message_uuid, _, _ in changed],
+                )
+                await connection.execute(
+                    """
+                    UPDATE workspace_zulip_bridge.sync_diffs
+                    SET available_at = clock_timestamp(),
+                        dependency_wait_count = 0, last_error = NULL,
+                        updated_at = clock_timestamp()
+                    WHERE entity_type = 'messages'
+                      AND entity_uuid = ANY($1::uuid[])
+                      AND direction = 'to_workspace'
+                      AND delivery_priority = 0
+                      AND processing_status IN ('pending', 'failed', 'blocked')
+                    """,
+                    changed_message_uuids,
                 )
             await connection.execute(
                 """
@@ -655,8 +822,8 @@ class WorkspaceFileTransferWorker:
             retryable,
         )
 
-    async def _complete_file_outbox(self, file_uuid: UUID | None = None) -> None:
-        await self._pool.execute(
+    async def _complete_file_outbox(self, file_uuid: UUID | None = None) -> int:
+        result = await self._pool.execute(
             """
             WITH candidates AS (
                 SELECT sequence
@@ -691,3 +858,4 @@ class WorkspaceFileTransferWorker:
             """,
             file_uuid,
         )
+        return int(result.rsplit(" ", 1)[-1])

@@ -4175,6 +4175,43 @@ async def _workspace_diff_dependencies_gate_children_and_batch_errors_isolate(
             """
             UPDATE workspace_zulip_bridge.sync_diffs
             SET processing_status = 'processing', claimed_at = $3,
+                attempt_count = 1, delivery_priority = 0,
+                dependency_wait_count = 16
+            WHERE provider_uuid = $1 AND entity_uuid = $2
+            """,
+            provider_uuid,
+            message_uuid,
+            claimed_at,
+        )
+        live_row = await pool.fetchrow(
+            """
+            SELECT * FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1 AND entity_type = 'messages'
+              AND entity_uuid = $2
+            """,
+            provider_uuid,
+            message_uuid,
+        )
+        assert live_row is not None
+        await worker._defer_for_dependencies([live_row])
+        live_deferred_state = await pool.fetchrow(
+            """
+            SELECT dependency_wait_count,
+                   EXTRACT(EPOCH FROM (available_at - updated_at)) AS retry_seconds
+            FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1 AND entity_type = 'messages'
+              AND entity_uuid = $2
+            """,
+            provider_uuid,
+            message_uuid,
+        )
+        assert live_deferred_state is not None
+        assert live_deferred_state["dependency_wait_count"] == 17
+        assert 4.5 <= float(live_deferred_state["retry_seconds"]) <= 5.5
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.sync_diffs
+            SET processing_status = 'processing', claimed_at = $3,
                 attempt_count = 1
             WHERE provider_uuid = $1 AND entity_uuid = $2
             """,
@@ -6656,7 +6693,7 @@ async def _workspace_diff_planner_schedules_unready_entity_graph(
                 late_message_uuid,
             )
 
-        assert await worker.plan() == 3
+        assert sum([await worker.plan() for _ in range(5)]) >= 1
         late_diff = await pool.fetchrow(
             """
             SELECT processing_status, source_hash
@@ -6735,6 +6772,8 @@ async def _workspace_diff_planner_schedules_unready_entity_graph(
             )
 
         assert await worker.plan() == 3
+        assert await worker.plan() == 1
+        assert await worker.plan() == 1
         delivered_types = await pool.fetch(
             """
             SELECT entity_type, count(*) AS count
@@ -6749,7 +6788,7 @@ async def _workspace_diff_planner_schedules_unready_entity_graph(
             [*backlog_message_uuids, flag_uuid, reaction_uuid],
         )
         assert [tuple(row.values()) for row in delivered_types] == [
-            ("message", 1),
+            ("message", 3),
             ("message_flag", 1),
             ("message_reaction", 1),
         ]
@@ -7449,11 +7488,20 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
             workspace_bridge_instance_uuid=bridge_uuid,
             workspace_control_state_dir=tmp_path / "control",
         )
-        worker = WorkspaceChatCatalogWorker(pool, settings)
-        transfer_worker = WorkspaceFileTransferWorker(pool, settings)
+        control_semaphore = asyncio.Semaphore(2)
+        worker = WorkspaceChatCatalogWorker(
+            pool,
+            settings,
+            control_semaphore=control_semaphore,
+        )
+        transfer_worker = WorkspaceFileTransferWorker(
+            pool,
+            settings,
+            control_semaphore=control_semaphore,
+        )
 
-        # A catalog is an authorization repair after Workspace rejects the
-        # exact file/chat pair, not a prerequisite for every native file.
+        # Historical files optimistically use an existing Workspace assignment,
+        # but live files publish their chat authorization before transfer.
         assert await worker._refresh_catalogs() == 0
         await pool.execute(
             """
@@ -7471,33 +7519,16 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
         await pool.execute(
             """
             INSERT INTO workspace_zulip_bridge.workspace_file_projections (
-                uuid, file_uuid, zulip_stream_uuid, operation_uuid
-            ) VALUES ($1, $2, $3, $1)
+                uuid, file_uuid, zulip_stream_uuid, operation_uuid,
+                delivery_priority
+            ) VALUES ($1, $2, $3, $1, 0)
             """,
             projection_uuid,
             file_uuid,
             stream_uuid,
         )
-        assert await worker._refresh_catalogs() == 0
-        file_job = await transfer_worker._claim_job()
-        assert file_job is not None
-        assert file_job.external_account_uuid == account_uuid
-        assert file_job.stream_uuid == stream_uuid
-        await transfer_worker._fail_job(
-            file_job,
-            "workspace_file_http_403",
-            retryable=True,
-        )
-        await pool.execute(
-            """
-            UPDATE workspace_zulip_bridge.workspace_file_projections
-            SET available_at = clock_timestamp()
-            WHERE uuid = $1
-            """,
-            projection_uuid,
-        )
-        assert await transfer_worker._claim_job() is None
         assert await worker._refresh_catalogs() == 1
+        assert await transfer_worker._claim_job() is None
         assert (
             await pool.fetchval(
                 """
@@ -7509,7 +7540,7 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
         )
         stored = await pool.fetchrow(
             """
-            SELECT catalog, report, processing_status
+            SELECT catalog, report, report_uuid, processing_status
             FROM workspace_zulip_bridge.workspace_chat_catalog_reports
             WHERE external_account_uuid = $1 AND zulip_stream_uuid = $2
             """,
@@ -7560,6 +7591,26 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
             account_uuid,
             stream_uuid,
         )
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports
+            SET available_at = clock_timestamp() - interval '1 hour'
+            WHERE external_account_uuid = $1 AND zulip_stream_uuid = $2
+            """,
+            other_account_uuid,
+            stream_uuid,
+        )
+        claimed_report = await worker._claim_report()
+        assert claimed_report is not None
+        assert claimed_report["report_uuid"] == stored["report_uuid"]
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports
+            SET processing_status = 'pending', claimed_at = NULL
+            WHERE report_uuid = $1
+            """,
+            stored["report_uuid"],
+        )
         assert await worker._retire_unneeded_reports() == 1
         assert (
             await pool.fetchval(
@@ -7593,6 +7644,15 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
         assert file_job is not None
         assert file_job.external_account_uuid == account_uuid
         assert file_job.stream_uuid == stream_uuid
+
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.workspace_file_projections
+            SET processing_status = 'blocked', claimed_at = NULL
+            WHERE uuid = $1
+            """,
+            projection_uuid,
+        )
 
         original_report = await pool.fetchval(
             """

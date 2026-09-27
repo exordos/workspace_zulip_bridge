@@ -115,6 +115,9 @@ class BridgeService:
                 stop_task,
             ]
             if self._settings.workspace_control_enabled:
+                file_control_semaphore = asyncio.Semaphore(
+                    self._settings.workspace_file_control_concurrency
+                )
                 control_worker = WorkspaceControlWorker(pool, self._settings)
                 supervised_tasks.append(
                     asyncio.create_task(
@@ -124,13 +127,22 @@ class BridgeService:
                 )
                 supervised_tasks.append(
                     asyncio.create_task(
-                        WorkspaceChatCatalogWorker(pool, self._settings).run(),
+                        WorkspaceChatCatalogWorker(
+                            pool,
+                            self._settings,
+                            control_semaphore=file_control_semaphore,
+                        ).run(),
                         name="workspace-chat-catalog",
                     )
                 )
                 supervised_tasks.extend(
                     asyncio.create_task(
-                        WorkspaceFileTransferWorker(pool, self._settings).run(),
+                        WorkspaceFileTransferWorker(
+                            pool,
+                            self._settings,
+                            coordinate=index == 0,
+                            control_semaphore=file_control_semaphore,
+                        ).run(),
                         name=f"workspace-file-transfer-{index}",
                     )
                     for index in range(self._settings.workspace_file_transfer_workers)
@@ -159,36 +171,22 @@ class BridgeService:
                         scope="unpartitioned",
                         tokens=tokens,
                     )
-                    workspace_diff_workers = [
-                        WorkspaceDiffWorker(
-                            pool,
-                            self._settings,
-                            plan_enabled=False,
-                            partition=partition,
-                            partition_count=partition_count,
-                            scope="partitioned",
-                            delivery_priority=1,
-                            entity_types=frozenset({"messages", "message_flags"}),
-                            tokens=tokens,
-                        )
-                        for partition, partition_count in content_worker_partitions
-                    ]
-                    workspace_unpartitioned_drainers = [
+                    # Historical delivery uses one homogeneous worker group.
+                    # Each pass selects one entity type globally, so workers can
+                    # parallelize that type without messages, flags, reactions,
+                    # and catalog rows all competing for the same database.
+                    workspace_background_drainers = [
                         WorkspaceDiffWorker(
                             pool,
                             self._settings,
                             plan_enabled=False,
                             partition=0,
-                            partition_count=content_partition_count,
-                            scope="unpartitioned",
+                            partition_count=1,
+                            scope="both",
                             delivery_priority=1,
                             tokens=tokens,
                         )
-                        for _ in range(
-                            self.unpartitioned_worker_count(
-                                self._settings.workspace_sync_workers
-                            )
-                        )
+                        for _ in range(self._settings.workspace_sync_workers)
                     ]
                     workspace_realtime_catalog_drainer = WorkspaceDiffWorker(
                         pool,
@@ -239,17 +237,6 @@ class BridgeService:
                         entity_types=frozenset({"message_reactions"}),
                         tokens=tokens,
                     )
-                    workspace_reaction_drainer = WorkspaceDiffWorker(
-                        pool,
-                        self._settings,
-                        plan_enabled=False,
-                        partition=0,
-                        partition_count=1,
-                        scope="partitioned",
-                        delivery_priority=1,
-                        entity_types=frozenset({"message_reactions"}),
-                        tokens=tokens,
-                    )
                     supervised_tasks.extend(
                         (
                             asyncio.create_task(
@@ -276,25 +263,12 @@ class BridgeService:
                             name="workspace-diff-planner",
                         )
                     )
-                    supervised_tasks.append(
-                        asyncio.create_task(
-                            workspace_reaction_drainer.run(),
-                            name="workspace-diff-reactions",
-                        )
-                    )
                     supervised_tasks.extend(
                         asyncio.create_task(
                             worker.run(),
-                            name=f"workspace-diff-worker-{index}",
+                            name=f"workspace-diff-background-{index}",
                         )
-                        for index, worker in enumerate(workspace_diff_workers)
-                    )
-                    supervised_tasks.extend(
-                        asyncio.create_task(
-                            worker.run(),
-                            name=f"workspace-diff-unpartitioned-{index}",
-                        )
-                        for index, worker in enumerate(workspace_unpartitioned_drainers)
+                        for index, worker in enumerate(workspace_background_drainers)
                     )
                     supervised_tasks.extend(
                         (

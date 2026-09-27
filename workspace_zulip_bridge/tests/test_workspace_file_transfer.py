@@ -1,6 +1,11 @@
 # Copyright 2026 Genesis Corporation
 # Licensed under the Apache License, Version 2.0 (the "License").
 
+import asyncio
+import hashlib
+import io
+from datetime import UTC
+from datetime import datetime
 from pathlib import Path
 from uuid import UUID
 
@@ -16,6 +21,81 @@ from workspace_zulip_bridge.workspace_file_transfer import workspace_file_name
 
 SOURCE_UUID = UUID("10000000-0000-0000-0000-000000000001")
 TARGET_UUID = UUID("20000000-0000-0000-0000-000000000002")
+
+
+class SeedPool:
+    def __init__(self, *, has_reserve: bool) -> None:
+        self.has_reserve = has_reserve
+        self.fetch_calls: list[tuple[str, tuple[object, ...]]] = []
+        self.fetchval_calls: list[tuple[str, tuple[object, ...]]] = []
+
+    async def fetch(self, query: str, *args: object) -> list[object]:
+        self.fetch_calls.append((query, args))
+        return []
+
+    async def fetchval(self, query: str, *args: object) -> bool:
+        self.fetchval_calls.append((query, args))
+        return self.has_reserve
+
+    async def execute(self, _query: str, *_args: object) -> str:
+        return "UPDATE 0"
+
+
+class FinalizeConnection:
+    def __init__(self) -> None:
+        self.executed: list[tuple[str, tuple[object, ...]]] = []
+
+    async def __aenter__(self) -> "FinalizeConnection":
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    def transaction(self) -> "FinalizeConnection":
+        return self
+
+    async def fetch(self, _query: str, *_args: object) -> list[dict[str, object]]:
+        return [
+            {
+                "uuid": SOURCE_UUID,
+                "workspace_content": (
+                    f"![native](urn:file:{SOURCE_UUID}?name=native.png)"
+                ),
+                "sender_user_uuid": TARGET_UUID,
+                "chat_key": "channel:42",
+                "topic_name": "general",
+                "created_at": datetime(2026, 9, 27, tzinfo=UTC),
+            }
+        ]
+
+    async def executemany(
+        self,
+        query: str,
+        args: list[object] | list[tuple[object, ...]],
+    ) -> None:
+        self.executed.append((query, (args,)))
+
+    async def execute(self, query: str, *args: object) -> str:
+        self.executed.append((query, args))
+        return "UPDATE 1"
+
+
+class FinalizePool:
+    def __init__(self) -> None:
+        self.connection = FinalizeConnection()
+
+    def acquire(self) -> FinalizeConnection:
+        return self.connection
+
+
+def _worker(pool: SeedPool) -> WorkspaceFileTransferWorker:
+    return WorkspaceFileTransferWorker(
+        pool,  # type: ignore[arg-type]
+        Settings(
+            database_dsn="postgresql:///unused",
+            workspace_control_url="https://control.example.invalid",
+        ),
+    )
 
 
 def test_external_chat_identity_stays_compatible_with_existing_catalogs() -> None:
@@ -56,6 +136,310 @@ def test_workspace_file_name_is_normalized_and_bounded() -> None:
     assert workspace_file_name("  a/b\\c\x00e\u0301.png  ") == "a_b_c_é.png"
     assert len(workspace_file_name("я" * 200).encode("utf-8")) <= 255
     assert workspace_file_name("\x00/\\") == "___"
+
+
+def test_file_backfill_skips_reseed_while_runnable_reserve_is_full() -> None:
+    pool = SeedPool(has_reserve=True)
+
+    assert asyncio.run(_worker(pool)._seed_projection_jobs()) == 0
+
+    assert len(pool.fetch_calls) == 1
+    assert "sync_diffs" in pool.fetch_calls[0][0]
+    assert len(pool.fetchval_calls) == 1
+    reserve_query, reserve_args = pool.fetchval_calls[0]
+    assert reserve_args == (1_000,)
+    assert "projection.available_at <= clock_timestamp()" in reserve_query
+    assert "connection.sync_enabled" in reserve_query
+
+
+def test_file_backfill_seeds_a_large_newest_first_candidate_page() -> None:
+    pool = SeedPool(has_reserve=False)
+
+    assert asyncio.run(_worker(pool)._seed_projection_jobs()) == 0
+
+    assert len(pool.fetch_calls) == 2
+    candidate_query, candidate_args = pool.fetch_calls[1]
+    assert candidate_args == (20_000,)
+    assert "WITH candidate_files AS MATERIALIZED" in candidate_query
+    assert "ORDER BY file.source_created_at DESC, file.uuid DESC" in candidate_query
+    assert "LIMIT $1" in candidate_query
+
+
+def test_staged_source_is_downloaded_once_and_reused_for_upload() -> None:
+    asyncio.run(_staged_source_is_downloaded_once_and_reused_for_upload())
+
+
+async def _staged_source_is_downloaded_once_and_reused_for_upload() -> None:
+    payload = b"native workspace file bytes"
+    source_calls = 0
+    uploaded: list[bytes] = []
+
+    async def source_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal source_calls
+        source_calls += 1
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "image/png"},
+            content=payload,
+            request=request,
+        )
+
+    async def upload_handler(request: httpx.Request) -> httpx.Response:
+        uploaded.append(await request.aread())
+        return httpx.Response(200, request=request)
+
+    worker = _worker(SeedPool(has_reserve=False))
+    worker._source_http = httpx.AsyncClient(
+        transport=httpx.MockTransport(source_handler)
+    )
+    worker._upload_http = httpx.AsyncClient(
+        transport=httpx.MockTransport(upload_handler)
+    )
+    job = workspace_file_transfer._Job(
+        projection_uuid=SOURCE_UUID,
+        operation_uuid=SOURCE_UUID,
+        file_uuid=SOURCE_UUID,
+        stream_uuid=TARGET_UUID,
+        realm_uuid=TARGET_UUID,
+        external_account_uuid=TARGET_UUID,
+        external_chat_uuid=TARGET_UUID,
+        endpoint="https://source.example.invalid",
+        login="test@example.invalid",
+        api_key="test-key",
+        source_path="user_uploads/native.png",
+        name="native.png",
+    )
+    staged = await worker._stage_source(job)
+    try:
+        assert staged.descriptor.size_bytes == len(payload)
+        assert staged.descriptor.sha256 == hashlib.sha256(payload).hexdigest()
+        await worker._upload(
+            staged,
+            {
+                "method": "PUT",
+                "url": "https://upload.example.invalid/native.png",
+                "headers": {
+                    "Content-Length": str(len(payload)),
+                    "Content-Type": "image/png",
+                },
+            },
+        )
+    finally:
+        staged.content.close()
+        await worker._close_clients()
+
+    assert source_calls == 1
+    assert uploaded == [payload]
+
+
+def test_finalized_live_file_wakes_its_waiting_message() -> None:
+    asyncio.run(_finalized_live_file_wakes_its_waiting_message())
+
+
+async def _finalized_live_file_wakes_its_waiting_message() -> None:
+    pool = FinalizePool()
+    worker = WorkspaceFileTransferWorker(
+        pool,  # type: ignore[arg-type]
+        Settings(
+            database_dsn="postgresql:///unused",
+            workspace_control_url="https://127.0.0.1",
+        ),
+    )
+    job = workspace_file_transfer._Job(
+        projection_uuid=SOURCE_UUID,
+        operation_uuid=SOURCE_UUID,
+        file_uuid=SOURCE_UUID,
+        stream_uuid=TARGET_UUID,
+        realm_uuid=TARGET_UUID,
+        external_account_uuid=TARGET_UUID,
+        external_chat_uuid=TARGET_UUID,
+        endpoint="https://127.0.0.1",
+        login="test@example.invalid",
+        api_key="test-key",
+        source_path="user_uploads/native.png",
+        name="native.png",
+    )
+    descriptor = workspace_file_transfer._Descriptor(
+        size_bytes=7,
+        content_type="image/png",
+        sha256=hashlib.sha256(b"content").hexdigest(),
+    )
+
+    await worker._finalize_job(job, descriptor, f"urn:image:{TARGET_UUID}")
+
+    wake_queries = [
+        (query, args)
+        for query, args in pool.connection.executed
+        if "UPDATE workspace_zulip_bridge.sync_diffs" in query
+    ]
+    assert len(wake_queries) == 1
+    assert wake_queries[0][1] == ([SOURCE_UUID],)
+    assert "dependency_wait_count = 0" in wake_queries[0][0]
+    assert "delivery_priority = 0" in wake_queries[0][0]
+
+
+def test_control_calls_share_one_gate_across_file_workers() -> None:
+    asyncio.run(_control_calls_share_one_gate_across_file_workers())
+
+
+async def _control_calls_share_one_gate_across_file_workers() -> None:
+    active = 0
+    maximum_active = 0
+
+    async def control_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal active, maximum_active
+        active += 1
+        maximum_active = max(maximum_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return httpx.Response(
+            200,
+            json={
+                "status": "finalized",
+                "file_urn": f"urn:file:{TARGET_UUID}",
+                "size_bytes": 0,
+                "content_type": "application/octet-stream",
+                "sha256": hashlib.sha256(b"").hexdigest(),
+            },
+            request=request,
+        )
+
+    control_semaphore = asyncio.Semaphore(2)
+    workers = [
+        WorkspaceFileTransferWorker(
+            object(),  # type: ignore[arg-type]
+            Settings(
+                database_dsn="postgresql:///unused",
+                workspace_control_url="https://control.example.invalid",
+            ),
+            control_semaphore=control_semaphore,
+        )
+        for _index in range(4)
+    ]
+    for worker in workers:
+        worker._control_http = httpx.AsyncClient(
+            base_url="https://control.example.invalid",
+            transport=httpx.MockTransport(control_handler),
+        )
+    job = workspace_file_transfer._Job(
+        projection_uuid=SOURCE_UUID,
+        operation_uuid=SOURCE_UUID,
+        file_uuid=SOURCE_UUID,
+        stream_uuid=TARGET_UUID,
+        realm_uuid=TARGET_UUID,
+        external_account_uuid=TARGET_UUID,
+        external_chat_uuid=TARGET_UUID,
+        endpoint="https://source.example.invalid",
+        login="test@example.invalid",
+        api_key="test-key",
+        source_path="user_uploads/native.png",
+        name="native.png",
+    )
+    descriptor = workspace_file_transfer._Descriptor(
+        size_bytes=0,
+        content_type="application/octet-stream",
+        sha256=hashlib.sha256(b"").hexdigest(),
+    )
+    try:
+        await asyncio.gather(
+            *(
+                worker._transfer(
+                    job,
+                    workspace_file_transfer._StagedSource(
+                        descriptor,
+                        io.BytesIO(),
+                    ),
+                )
+                for worker in workers
+            )
+        )
+    finally:
+        await asyncio.gather(*(worker._close_clients() for worker in workers))
+
+    assert maximum_active == 2
+
+
+def test_live_file_is_confirmed_after_finalize_before_message_release() -> None:
+    asyncio.run(_live_file_is_confirmed_after_finalize_before_message_release())
+
+
+async def _live_file_is_confirmed_after_finalize_before_message_release() -> None:
+    payload = b"live image"
+    descriptor = workspace_file_transfer._Descriptor(
+        size_bytes=len(payload),
+        content_type="image/png",
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    control_calls: list[str] = []
+
+    async def control_handler(request: httpx.Request) -> httpx.Response:
+        control_calls.append(f"{request.method} {request.url.path}")
+        response = {
+            "status": "finalized",
+            "file_urn": f"urn:image:{TARGET_UUID}",
+            "size_bytes": descriptor.size_bytes,
+            "content_type": descriptor.content_type,
+            "sha256": descriptor.sha256,
+        }
+        if len(control_calls) == 1:
+            response = {
+                "status": "allocated",
+                "allocation_generation": 1,
+                "upload": {
+                    "method": "PUT",
+                    "url": "https://upload.example.invalid/live.png",
+                    "headers": {
+                        "Content-Length": str(descriptor.size_bytes),
+                        "Content-Type": descriptor.content_type,
+                    },
+                },
+            }
+        return httpx.Response(200, json=response, request=request)
+
+    async def upload_handler(request: httpx.Request) -> httpx.Response:
+        assert await request.aread() == payload
+        return httpx.Response(200, request=request)
+
+    worker = _worker(SeedPool(has_reserve=False))
+    worker._control_http = httpx.AsyncClient(
+        base_url="https://control.example.invalid",
+        transport=httpx.MockTransport(control_handler),
+    )
+    worker._upload_http = httpx.AsyncClient(
+        transport=httpx.MockTransport(upload_handler),
+    )
+    job = workspace_file_transfer._Job(
+        projection_uuid=SOURCE_UUID,
+        operation_uuid=SOURCE_UUID,
+        file_uuid=SOURCE_UUID,
+        stream_uuid=TARGET_UUID,
+        realm_uuid=TARGET_UUID,
+        external_account_uuid=TARGET_UUID,
+        external_chat_uuid=TARGET_UUID,
+        endpoint="https://source.example.invalid",
+        login="test@example.invalid",
+        api_key="test-key",
+        source_path="user_uploads/live.png",
+        name="live.png",
+        delivery_priority=0,
+    )
+    try:
+        urn = await worker._transfer(
+            job,
+            workspace_file_transfer._StagedSource(
+                descriptor,
+                io.BytesIO(payload),
+            ),
+        )
+    finally:
+        await worker._close_clients()
+
+    assert urn == f"urn:image:{TARGET_UUID}"
+    assert control_calls == [
+        f"PUT /v1/file-transfers/incoming/{SOURCE_UUID}",
+        f"POST /v1/file-transfers/incoming/{SOURCE_UUID}/actions/finalize",
+        f"PUT /v1/file-transfers/incoming/{SOURCE_UUID}",
+    ]
 
 
 def test_control_client_loads_bridge_identity_into_tls_context(
@@ -106,6 +490,10 @@ def test_control_client_loads_bridge_identity_into_tls_context(
     assert captured["verify"] is context
     assert "cert" not in captured
     assert captured["headers"] == {"Accept": "application/json"}
+    limits = captured["limits"]
+    assert isinstance(limits, httpx.Limits)
+    assert limits.max_connections == 2
+    assert limits.max_keepalive_connections == 2
     assert context.loaded_chain == (
         str(state / "bridge.crt"),
         str(state / "bridge.key"),

@@ -385,6 +385,9 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_files (
 );
 CREATE INDEX IF NOT EXISTS zulip_files_message_ids_idx
     ON workspace_zulip_bridge.zulip_files USING gin (message_ids);
+CREATE INDEX IF NOT EXISTS zulip_files_newest_idx
+    ON workspace_zulip_bridge.zulip_files
+        (source_created_at DESC, uuid DESC);
 
 CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_message_files (
     message_uuid uuid NOT NULL
@@ -725,6 +728,18 @@ CREATE INDEX IF NOT EXISTS sync_diffs_live_delivery_pending_idx
          source_updated_at, entity_uuid)
     WHERE processing_status IN ('pending', 'failed')
       AND delivery_priority = 0;
+CREATE INDEX IF NOT EXISTS sync_diffs_backfill_delivery_pending_idx
+    ON workspace_zulip_bridge.sync_diffs
+        (provider_uuid,
+         (CASE entity_type
+            WHEN 'users' THEN 0 WHEN 'streams' THEN 1
+            WHEN 'stream_bindings' THEN 2 WHEN 'topics' THEN 3
+            WHEN 'topic_bindings' THEN 4 WHEN 'messages' THEN 5
+            WHEN 'message_flags' THEN 6 ELSE 7
+         END),
+         entity_type, source_updated_at DESC, entity_uuid DESC)
+    WHERE processing_status IN ('pending', 'failed')
+      AND delivery_priority = 1;
 CREATE INDEX IF NOT EXISTS sync_diffs_live_file_projection_idx
     ON workspace_zulip_bridge.sync_diffs (entity_uuid)
     WHERE entity_type = 'messages'

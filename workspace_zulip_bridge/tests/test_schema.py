@@ -77,6 +77,8 @@ def test_schema_normalizes_workspace_like_entities_and_personal_state() -> None:
     assert "zulip_files_message_ids_idx" in schema
     assert "workspace_file_projections_pending_idx" in schema
     assert "workspace_file_projections_pending_stream_idx" in schema
+    assert "zulip_files_newest_idx" in schema
+    assert "sync_diffs_backfill_delivery_pending_idx" in schema
     assert "workspace_chat_catalog_reports_pending_idx" in schema
     assert "zulip_message_flags_history_cleanup_idx" in schema
     assert "bytea" not in schema[
