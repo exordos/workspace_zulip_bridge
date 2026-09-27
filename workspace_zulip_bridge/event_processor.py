@@ -188,6 +188,17 @@ class ZulipEventProcessor:
         self._next_presence_expiry_at = 0.0
         self._cleanup_batch_size = settings.event_cleanup_batch_size
 
+    def _claim_scope_clause(self, alias: str) -> str:
+        if self._claim_scope == "all":
+            # Keep the window parameter typed for the compatibility-only
+            # unscoped processor without reintroducing a data-dependent OR.
+            return "$5::double precision > 0"
+        operator = ">=" if self._claim_scope == "realtime" else "<"
+        return (
+            f"{alias}.created_at {operator} "
+            "(statement_timestamp() - make_interval(secs => $5::double precision))"
+        )
+
     async def run(self) -> None:
         if self._claim_scope != "realtime":
             await self._maybe_requeue_expired_claims()
@@ -571,9 +582,11 @@ class ZulipEventProcessor:
     async def _claim_events(self) -> list[_ClaimedEvent]:
         if self._claim_scope == "all":
             await self._requeue_expired_claims()
+        head_scope = self._claim_scope_clause("event")
+        candidate_scope = self._claim_scope_clause("candidate")
         async with self._pool.acquire() as connection, connection.transaction():
             rows = await connection.fetch(
-                """
+                f"""
                 WITH claimable_queues AS MATERIALIZED (
                     SELECT queue.zulip_connection_uuid,
                            queue.queue_id,
@@ -593,27 +606,9 @@ class ZulipEventProcessor:
                               queue.zulip_connection_uuid
                           AND event.queue_id = queue.queue_id
                           AND event.processing_status = 'pending'
+                          AND ({head_scope})
                           AND (
-                              $5::text = 'all'
-                              OR (
-                                  $5::text = 'realtime'
-                                  AND event.created_at >= (
-                                      clock_timestamp() - make_interval(
-                                          secs => $6::double precision
-                                      )
-                                  )
-                              )
-                              OR (
-                                  $5::text = 'backlog'
-                                  AND event.created_at < (
-                                      clock_timestamp() - make_interval(
-                                          secs => $6::double precision
-                                      )
-                                  )
-                              )
-                          )
-                          AND (
-                              event.available_at <= clock_timestamp()
+                              event.available_at <= statement_timestamp()
                               OR NOT COALESCE(
                                   event.outcome_reason = ANY($2::text[]),
                                   false
@@ -629,32 +624,14 @@ class ZulipEventProcessor:
                               queue.zulip_connection_uuid
                           AND event.queue_id = queue.queue_id
                           AND event.processing_status = 'pending'
-                          AND event.available_at > clock_timestamp()
+                          AND event.available_at > statement_timestamp()
                           AND NOT COALESCE(
                               event.outcome_reason = ANY($2::text[]),
                               false
                           )
-                          AND (
-                              $5::text = 'all'
-                              OR (
-                                  $5::text = 'realtime'
-                                  AND event.created_at >= (
-                                      clock_timestamp() - make_interval(
-                                          secs => $6::double precision
-                                      )
-                                  )
-                              )
-                              OR (
-                                  $5::text = 'backlog'
-                                  AND event.created_at < (
-                                      clock_timestamp() - make_interval(
-                                          secs => $6::double precision
-                                      )
-                                  )
-                              )
-                          )
+                          AND ({head_scope})
                     ) AS blocker ON true
-                    WHERE head.available_at <= clock_timestamp()
+                    WHERE head.available_at <= statement_timestamp()
                       AND NOT EXISTS (
                           SELECT 1
                           FROM workspace_zulip_bridge.zulip_events AS inflight
@@ -666,7 +643,7 @@ class ZulipEventProcessor:
                     ORDER BY head.head_created_at,
                              queue.zulip_connection_uuid,
                              queue.queue_id
-                    LIMIT $7
+                    LIMIT $6
                     FOR UPDATE OF queue SKIP LOCKED
                 ), ranked_candidates AS MATERIALIZED (
                     SELECT event.uuid,
@@ -683,31 +660,13 @@ class ZulipEventProcessor:
                               queue.zulip_connection_uuid
                           AND candidate.queue_id = queue.queue_id
                           AND candidate.processing_status = 'pending'
-                          AND candidate.available_at <= clock_timestamp()
+                          AND candidate.available_at <= statement_timestamp()
                           AND (
                               queue.first_blocking_event_id IS NULL
                               OR candidate.event_id <
                                  queue.first_blocking_event_id
                           )
-                          AND (
-                              $5::text = 'all'
-                              OR (
-                                  $5::text = 'realtime'
-                                  AND candidate.created_at >= (
-                                      clock_timestamp() - make_interval(
-                                          secs => $6::double precision
-                                      )
-                                  )
-                              )
-                              OR (
-                                  $5::text = 'backlog'
-                                  AND candidate.created_at < (
-                                      clock_timestamp() - make_interval(
-                                          secs => $6::double precision
-                                      )
-                                  )
-                              )
-                          )
+                          AND ({candidate_scope})
                         ORDER BY candidate.event_id
                         LIMIT $3
                     ) AS event
@@ -797,7 +756,6 @@ class ZulipEventProcessor:
                 list(_DEPENDENCY_DEFERRAL_REASONS),
                 _EVENTS_PER_QUEUE_BATCH,
                 _DEPENDENCY_RETRY_SHARE_DIVISOR,
-                self._claim_scope,
                 self._settings.event_processor_realtime_window_seconds,
                 self._queue_batch_size,
             )

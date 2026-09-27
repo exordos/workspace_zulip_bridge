@@ -11,6 +11,31 @@ from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.event_processor import ZulipEventProcessor
 
 
+def test_claim_scope_uses_a_plan_specific_timestamp_predicate() -> None:
+    settings = Settings.from_env({})
+    processors = {
+        scope: ZulipEventProcessor(
+            cast(Any, object()),
+            cast(Any, object()),
+            settings,
+            claim_scope=scope,
+        )
+        for scope in ("all", "backlog", "realtime")
+    }
+
+    assert processors["all"]._claim_scope_clause("event") == (
+        "$5::double precision > 0"
+    )
+    assert processors["backlog"]._claim_scope_clause("event") == (
+        "event.created_at < "
+        "(statement_timestamp() - make_interval(secs => $5::double precision))"
+    )
+    assert processors["realtime"]._claim_scope_clause("event") == (
+        "event.created_at >= "
+        "(statement_timestamp() - make_interval(secs => $5::double precision))"
+    )
+
+
 def test_processing_timeout_keeps_processor_alive() -> None:
     async def run() -> None:
         processor = ZulipEventProcessor(
