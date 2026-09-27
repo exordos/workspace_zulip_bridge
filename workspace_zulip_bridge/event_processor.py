@@ -198,13 +198,26 @@ class ZulipEventProcessor:
                     recovered,
                 )
         while True:
-            deleted = 0
-            expired_presences = 0
-            if self._claim_scope != "realtime":
-                await self._maybe_requeue_expired_claims()
-                deleted = await self._maybe_cleanup_expired_events()
-                expired_presences = await self._maybe_expire_user_presences()
-            stats = await self.process_once()
+            try:
+                deleted = 0
+                expired_presences = 0
+                if self._claim_scope != "realtime":
+                    await self._maybe_requeue_expired_claims()
+                    deleted = await self._maybe_cleanup_expired_events()
+                    expired_presences = await self._maybe_expire_user_presences()
+                stats = await self.process_once()
+            except asyncio.CancelledError:
+                raise
+            except (TimeoutError, asyncpg.PostgresError) as error:
+                LOG.warning(
+                    "Zulip event processor pass failed scope=%s error=%s",
+                    self._claim_scope,
+                    type(error).__name__,
+                )
+                await asyncio.sleep(
+                    max(1.0, self._settings.event_processor_poll_seconds)
+                )
+                continue
             if stats.claimed:
                 LOG.info(
                     "Zulip event batch processed scope=%s claimed=%s applied=%s skipped=%s "

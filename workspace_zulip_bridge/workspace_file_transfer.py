@@ -105,7 +105,7 @@ class WorkspaceFileTransferWorker:
     async def run(self) -> None:
         while True:
             try:
-                changed = await self.process_once()
+                await self.process_once()
             except asyncio.CancelledError:
                 raise
             except (TimeoutError, asyncpg.PostgresError, httpx.HTTPError) as error:
@@ -113,10 +113,11 @@ class WorkspaceFileTransferWorker:
                     "Workspace file transfer pass failed error=%s",
                     type(error).__name__,
                 )
-                changed = 0
-            await asyncio.sleep(
-                0.0 if changed else self._settings.workspace_sync_poll_seconds
-            )
+            # A finalized transfer performs allocation and finalization against
+            # Workspace control state. Pace every pass, including successful
+            # backlog work, so small files cannot saturate the control service's
+            # database pool while realtime synchronization is active.
+            await asyncio.sleep(self._settings.workspace_control_poll_seconds)
 
     async def process_once(self) -> int:
         seeded = await self._seed_projection_jobs()
@@ -290,13 +291,23 @@ class WorkspaceFileTransferWorker:
                   ON stream.uuid = projection.zulip_stream_uuid
                 JOIN workspace_zulip_bridge.zulip_connections AS connection
                   ON connection.uuid = stream.source_connection_uuid
+                LEFT JOIN workspace_zulip_bridge.workspace_chat_catalog_reports
+                    AS catalog
+                  ON catalog.external_account_uuid =
+                     connection.external_account_uuid
+                 AND catalog.zulip_stream_uuid = stream.uuid
                 WHERE projection.processing_status IN ('pending', 'failed')
                   AND projection.available_at <= clock_timestamp()
                   AND connection.external_account_uuid IS NOT NULL
                   AND connection.sync_enabled
+                  AND (
+                      projection.last_error IS DISTINCT FROM
+                          'workspace_file_http_403'
+                      OR catalog.processing_status = 'reported'
+                  )
                 ORDER BY projection.delivery_priority, projection.available_at,
                          projection.created_at, projection.uuid
-                LIMIT 1 FOR UPDATE SKIP LOCKED
+                LIMIT 1 FOR UPDATE OF projection SKIP LOCKED
             ), claimed AS (
                 UPDATE workspace_zulip_bridge.workspace_file_projections AS projection
                 SET processing_status = 'processing',

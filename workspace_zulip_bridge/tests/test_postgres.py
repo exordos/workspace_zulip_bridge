@@ -40,6 +40,7 @@ from workspace_zulip_bridge.models import ZulipUserProfileStatus
 from workspace_zulip_bridge.models import ZulipUserTopic
 from workspace_zulip_bridge.monitor import collect_snapshot
 from workspace_zulip_bridge.stable_ids import stable_chat_uuid
+from workspace_zulip_bridge.stable_ids import stable_file_projection_uuid
 from workspace_zulip_bridge.stable_ids import stable_file_uuid
 from workspace_zulip_bridge.stable_ids import stable_message_flag_uuid
 from workspace_zulip_bridge.stable_ids import stable_message_uuid
@@ -54,6 +55,7 @@ from workspace_zulip_bridge.workspace_control import WorkspaceControlWorker
 from workspace_zulip_bridge.workspace_events import WorkspaceEvent
 from workspace_zulip_bridge.workspace_events import WorkspaceEventReceiver
 from workspace_zulip_bridge.workspace_events import WorkspaceEventStore
+from workspace_zulip_bridge.workspace_file_transfer import WorkspaceFileTransferWorker
 from workspace_zulip_bridge.workspace_sync import _SOURCE_TABLES
 from workspace_zulip_bridge.workspace_sync import ProviderApiError
 from workspace_zulip_bridge.workspace_sync import WorkspaceBootstrapper
@@ -7220,7 +7222,9 @@ async def _workspace_websocket_round_trip(dsn: str, tmp_path: Path) -> None:
 async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
     pool = await _pool(dsn)
     account_uuid = UUID("10000000-0000-4000-8000-0000000000c1")
+    other_account_uuid = UUID("10000000-0000-4000-8000-0000000000c6")
     owner_workspace_uuid = UUID("10000000-0000-4000-8000-0000000000c2")
+    member_workspace_uuid = UUID("10000000-0000-4000-8000-0000000000c7")
     project_uuid = UUID("10000000-0000-4000-8000-0000000000c3")
     provider_uuid = UUID("10000000-0000-4000-8000-0000000000c4")
     bridge_uuid = UUID("10000000-0000-4000-8000-0000000000c5")
@@ -7228,6 +7232,8 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
     owner_uuid = stable_user_uuid(ENDPOINT, 10)
     member_uuid = stable_user_uuid(ENDPOINT, 11)
     topic_uuid = stable_topic_uuid(stream_uuid, "deployments")
+    file_uuid = stable_file_uuid(ENDPOINT, "/user_uploads/native.png")
+    projection_uuid = stable_file_projection_uuid(file_uuid, stream_uuid)
     try:
         await pool.execute(
             """
@@ -7265,7 +7271,7 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
                     "member@example.test",
                     "Member",
                     400,
-                    None,
+                    member_workspace_uuid,
                 ),
             ],
         )
@@ -7280,6 +7286,19 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
             owner_uuid,
             account_uuid,
             owner_workspace_uuid,
+            stable_realm_uuid(ENDPOINT),
+        )
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.zulip_connections (
+                uuid, external_account_uuid, owner_workspace_user_uuid,
+                desired_generation, realm_uuid, zulip_user_uuid, login,
+                api_key, sync_enabled
+            ) VALUES ($1, $2, $3, 7, $4, $1, 'member@example.test', 'key', true)
+            """,
+            member_uuid,
+            other_account_uuid,
+            member_workspace_uuid,
             stable_realm_uuid(ENDPOINT),
         )
         await pool.execute(
@@ -7329,16 +7348,70 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
             stream_uuid,
             b"t" * 32,
         )
-        worker = WorkspaceChatCatalogWorker(
-            pool,
-            Settings(
-                database_dsn=dsn,
-                workspace_control_url="https://control.example.test",
-                workspace_bridge_instance_uuid=bridge_uuid,
-                workspace_control_state_dir=tmp_path / "control",
-            ),
+        settings = Settings(
+            database_dsn=dsn,
+            workspace_control_url="https://control.example.test",
+            workspace_bridge_instance_uuid=bridge_uuid,
+            workspace_control_state_dir=tmp_path / "control",
         )
+        worker = WorkspaceChatCatalogWorker(pool, settings)
+        transfer_worker = WorkspaceFileTransferWorker(pool, settings)
+
+        # A catalog is an authorization repair after Workspace rejects the
+        # exact file/chat pair, not a prerequisite for every native file.
+        assert await worker._refresh_catalogs() == 0
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.zulip_files (
+                uuid, realm_uuid, owner_user_uuid, zulip_attachment_id,
+                source_path, name, source_created_at, metadata_hash
+            ) VALUES ($1, $2, $3, 9001, '/user_uploads/native.png',
+                      'native.png', clock_timestamp(), $4)
+            """,
+            file_uuid,
+            stable_realm_uuid(ENDPOINT),
+            owner_uuid,
+            b"f" * 32,
+        )
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.workspace_file_projections (
+                uuid, file_uuid, zulip_stream_uuid, operation_uuid
+            ) VALUES ($1, $2, $3, $1)
+            """,
+            projection_uuid,
+            file_uuid,
+            stream_uuid,
+        )
+        assert await worker._refresh_catalogs() == 0
+        file_job = await transfer_worker._claim_job()
+        assert file_job is not None
+        assert file_job.external_account_uuid == account_uuid
+        assert file_job.stream_uuid == stream_uuid
+        await transfer_worker._fail_job(
+            file_job,
+            "workspace_file_http_403",
+            retryable=True,
+        )
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.workspace_file_projections
+            SET available_at = clock_timestamp()
+            WHERE uuid = $1
+            """,
+            projection_uuid,
+        )
+        assert await transfer_worker._claim_job() is None
         assert await worker._refresh_catalogs() == 1
+        assert (
+            await pool.fetchval(
+                """
+                SELECT count(*)
+                FROM workspace_zulip_bridge.workspace_chat_catalog_reports
+                """
+            )
+            == 1
+        )
         stored = await pool.fetchrow(
             """
             SELECT catalog, report, processing_status
@@ -7369,6 +7442,42 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
             "external_chat_catalog"
         )
         assert stored["processing_status"] == "pending"
+        assert await transfer_worker._claim_job() is None
+
+        # Simulate rows produced by the earlier all-members implementation.
+        # The worker must retire them instead of replaying a full account/chat
+        # cross product into Workspace.
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.workspace_chat_catalog_reports (
+                external_account_uuid, zulip_stream_uuid, resource_uuid,
+                observed_generation, catalog, catalog_hash, report_uuid,
+                report, source_updated_at
+            )
+            SELECT $1, zulip_stream_uuid, $2, observed_generation, catalog,
+                   catalog_hash, $3, report, source_updated_at
+            FROM workspace_zulip_bridge.workspace_chat_catalog_reports
+            WHERE external_account_uuid = $4 AND zulip_stream_uuid = $5
+            """,
+            other_account_uuid,
+            UUID("10000000-0000-4000-8000-0000000000c8"),
+            UUID("10000000-0000-4000-8000-0000000000c9"),
+            account_uuid,
+            stream_uuid,
+        )
+        assert await worker._retire_unneeded_reports() == 1
+        assert (
+            await pool.fetchval(
+                """
+                SELECT processing_status
+                FROM workspace_zulip_bridge.workspace_chat_catalog_reports
+                WHERE external_account_uuid = $1 AND zulip_stream_uuid = $2
+                """,
+                other_account_uuid,
+                stream_uuid,
+            )
+            == "blocked"
+        )
 
         worker._send_report = AsyncMock(return_value="applied")  # type: ignore[method-assign]
         assert await worker.process_once() == 1
@@ -7385,6 +7494,10 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
             )
             == "reported"
         )
+        file_job = await transfer_worker._claim_job()
+        assert file_job is not None
+        assert file_job.external_account_uuid == account_uuid
+        assert file_job.stream_uuid == stream_uuid
 
         original_report = await pool.fetchval(
             """
@@ -7403,7 +7516,7 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
             """,
             stream_uuid,
         )
-        assert await worker._refresh_catalogs() == 1
+        assert await worker._refresh_catalogs() == 0
         unchanged = await pool.fetchrow(
             """
             SELECT report, processing_status
@@ -7425,6 +7538,22 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
             stream_uuid,
             member_uuid,
         )
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.zulip_streams
+            SET chat_type = 'direct',
+                chat_parameters = '{"participant_user_ids":[10]}'::jsonb,
+                updated_at = clock_timestamp()
+            WHERE uuid = $1
+            """,
+            stream_uuid,
+        )
+        assert await worker._refresh_catalogs() == 0
+        await transfer_worker._fail_job(
+            file_job,
+            "workspace_file_http_403",
+            retryable=True,
+        )
         assert await worker._refresh_catalogs() == 1
         changed = await pool.fetchrow(
             """
@@ -7440,7 +7569,47 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
             item["provider_user_id"]
             for item in json.loads(changed["catalog"])["participants"]
         ] == ["10"]
+        assert json.loads(changed["catalog"])["source"]["chat_type"] == "channel"
+        assert json.loads(changed["catalog"])["topics"] == [
+            {
+                "provider_topic_id": "channel:42:default",
+                "name": "Zulip",
+                "is_default": True,
+            }
+        ]
         assert changed["processing_status"] == "pending"
+
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.workspace_file_projections
+            SET processing_status = 'blocked', claimed_at = NULL
+            WHERE uuid = $1
+            """,
+            projection_uuid,
+        )
+        assert await worker._retire_unneeded_reports() == 1
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.workspace_file_projections
+            SET processing_status = 'failed',
+                last_error = 'workspace_file_http_403'
+            WHERE uuid = $1
+            """,
+            projection_uuid,
+        )
+        assert await worker._refresh_catalogs() >= 1
+        assert (
+            await pool.fetchval(
+                """
+                SELECT processing_status
+                FROM workspace_zulip_bridge.workspace_chat_catalog_reports
+                WHERE external_account_uuid = $1 AND zulip_stream_uuid = $2
+                """,
+                account_uuid,
+                stream_uuid,
+            )
+            == "pending"
+        )
     finally:
         await pool.close()
 
@@ -9757,15 +9926,21 @@ async def _event_processor_dependency_deferrals_do_not_block_later_events(
                     "WZB_DATABASE_DSN": dsn,
                     "WZB_EVENT_PROCESSOR_BATCH_SIZE": "1",
                     "WZB_EVENT_PROCESSOR_MAX_ATTEMPTS": "2",
-                    "WZB_EVENT_PROCESSOR_RETRY_BASE_SECONDS": "0.05",
-                    "WZB_EVENT_PROCESSOR_RETRY_CAP_SECONDS": "0.05",
+                    "WZB_EVENT_PROCESSOR_RETRY_BASE_SECONDS": "60",
+                    "WZB_EVENT_PROCESSOR_RETRY_CAP_SECONDS": "60",
                 }
             ),
         )
         assert (await processor.process_once()).retried == 1
         second = await processor.process_once()
         assert (second.claimed, second.skipped) == (1, 1)
-        await asyncio.sleep(0.06)
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.zulip_events
+            SET available_at = clock_timestamp()
+            WHERE event_id = 1
+            """
+        )
         assert (await processor.process_once()).retried == 1
 
         rows = await pool.fetch(

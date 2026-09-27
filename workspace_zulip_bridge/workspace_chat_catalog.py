@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 import datetime
 import hashlib
 import json
@@ -92,7 +91,7 @@ class WorkspaceChatCatalogWorker:
     async def run(self) -> None:
         while True:
             try:
-                changed = await self.process_once()
+                await self.process_once()
             except asyncio.CancelledError:
                 raise
             except (TimeoutError, asyncpg.PostgresError, httpx.HTTPError) as error:
@@ -100,23 +99,23 @@ class WorkspaceChatCatalogWorker:
                     "Workspace chat catalog pass failed: error=%s",
                     type(error).__name__,
                 )
-                changed = 0
             except (CatalogReportError, ValueError) as error:
                 LOG.warning(
                     "Workspace chat catalog data is not ready: error=%s",
                     type(error).__name__,
                 )
-                changed = 0
-            await asyncio.sleep(
-                0.0 if changed else self._settings.workspace_control_poll_seconds
-            )
+            # Catalog application can materialize chat bindings and notification
+            # state in Workspace. Keep the producer deliberately paced even when
+            # more reports are ready so a large file backlog cannot overwhelm the
+            # control service's database pool.
+            await asyncio.sleep(self._settings.workspace_control_poll_seconds)
 
     async def process_once(self) -> int:
         refreshed = await self._refresh_catalogs()
-        await self._refresh_deletions()
+        retired = await self._retire_unneeded_reports()
         report = await self._claim_report()
         if report is None:
-            return refreshed
+            return refreshed + retired
         report_uuid = UUID(str(report["report_uuid"]))
         try:
             outcome = await self._send_report(_object(report["report"]))
@@ -136,9 +135,10 @@ class WorkspaceChatCatalogWorker:
             )
         else:
             await self._finish_report(report_uuid, outcome)
-        return refreshed + 1
+        return refreshed + retired + 1
 
     async def _refresh_catalogs(self) -> int:
+        changed = await self._reactivate_needed_reports()
         rows = await self._pool.fetch(
             """
             SELECT connection.external_account_uuid AS account_uuid,
@@ -174,10 +174,11 @@ class WorkspaceChatCatalogWorker:
               ON realm.uuid = connection.realm_uuid
             JOIN workspace_zulip_bridge.zulip_users AS owner
               ON owner.uuid = connection.zulip_user_uuid
+            JOIN workspace_zulip_bridge.zulip_streams AS stream
+              ON stream.source_connection_uuid = connection.uuid
             JOIN workspace_zulip_bridge.zulip_stream_bindings AS owner_binding
               ON owner_binding.zulip_user_uuid = owner.uuid
-            JOIN workspace_zulip_bridge.zulip_streams AS stream
-              ON stream.uuid = owner_binding.zulip_stream_uuid
+             AND owner_binding.zulip_stream_uuid = stream.uuid
             LEFT JOIN workspace_zulip_bridge.workspace_chat_catalog_reports
                 AS report
               ON report.external_account_uuid = connection.external_account_uuid
@@ -188,6 +189,16 @@ class WorkspaceChatCatalogWorker:
               AND connection.desired_generation IS NOT NULL
               AND realm.workspace_project_id IS NOT NULL
               AND NOT owner.disabled
+              AND EXISTS (
+                  SELECT 1
+                  FROM workspace_zulip_bridge.workspace_file_projections
+                      AS file_projection
+                  WHERE file_projection.zulip_stream_uuid = stream.uuid
+                    AND file_projection.processing_status IN (
+                        'pending', 'processing', 'failed'
+                    )
+                    AND file_projection.last_error = 'workspace_file_http_403'
+              )
               AND (
                   report.external_account_uuid IS NULL
                   OR report.observed_generation <> connection.desired_generation
@@ -209,20 +220,10 @@ class WorkspaceChatCatalogWorker:
                        ), '-infinity'::timestamptz)
                   )
               )
-            ORDER BY EXISTS (
-                         SELECT 1
-                         FROM workspace_zulip_bridge.workspace_file_projections
-                             AS file_projection
-                         WHERE file_projection.zulip_stream_uuid = stream.uuid
-                           AND file_projection.processing_status IN (
-                               'pending', 'failed'
-                           )
-                     ) DESC,
-                     connection.external_account_uuid, stream.uuid
+            ORDER BY connection.external_account_uuid, stream.uuid
             LIMIT 20
             """
         )
-        changed = 0
         for row in rows:
             source = _CatalogSource(
                 account_uuid=UUID(str(row["account_uuid"])),
@@ -250,11 +251,79 @@ class WorkspaceChatCatalogWorker:
                 )
         return changed
 
+    async def _reactivate_needed_reports(self) -> int:
+        result = await self._pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports AS report
+            SET processing_status = 'pending', attempt_count = 0,
+                available_at = clock_timestamp(), claimed_at = NULL,
+                last_error = NULL, updated_at = clock_timestamp()
+            WHERE report.processing_status = 'blocked'
+              AND report.last_error = 'catalog_not_required_for_file_transfer'
+              AND EXISTS (
+                  SELECT 1
+                  FROM workspace_zulip_bridge.workspace_file_projections
+                      AS file_projection
+                  JOIN workspace_zulip_bridge.zulip_streams AS stream
+                    ON stream.uuid = file_projection.zulip_stream_uuid
+                  JOIN workspace_zulip_bridge.zulip_connections AS connection
+                    ON connection.uuid = stream.source_connection_uuid
+                  WHERE file_projection.zulip_stream_uuid = report.zulip_stream_uuid
+                    AND connection.external_account_uuid =
+                        report.external_account_uuid
+                    AND file_projection.processing_status IN (
+                        'pending', 'processing', 'failed'
+                    )
+                    AND file_projection.last_error = 'workspace_file_http_403'
+              )
+            """
+        )
+        return int(result.rsplit(" ", 1)[-1])
+
+    async def _retire_unneeded_reports(self) -> int:
+        """Stop queued reports that cannot authorize an active file transfer."""
+
+        result = await self._pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports AS report
+            SET processing_status = 'blocked', claimed_at = NULL,
+                last_error = 'catalog_not_required_for_file_transfer',
+                updated_at = clock_timestamp()
+            WHERE report.processing_status IN ('pending', 'processing', 'failed')
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM workspace_zulip_bridge.workspace_file_projections
+                      AS file_projection
+                  JOIN workspace_zulip_bridge.zulip_streams AS stream
+                    ON stream.uuid = file_projection.zulip_stream_uuid
+                  JOIN workspace_zulip_bridge.zulip_connections AS connection
+                    ON connection.uuid = stream.source_connection_uuid
+                  WHERE file_projection.zulip_stream_uuid = report.zulip_stream_uuid
+                    AND connection.external_account_uuid =
+                        report.external_account_uuid
+                    AND file_projection.processing_status IN (
+                        'pending', 'processing', 'failed'
+                    )
+                    AND file_projection.last_error = 'workspace_file_http_403'
+              )
+            """
+        )
+        return int(result.rsplit(" ", 1)[-1])
+
     async def _build_catalog(self, source: _CatalogSource) -> dict[str, object]:
         participants = await self._participants(source)
+        # Workspace direct chats require two distinct identities, while Zulip
+        # also permits a user to send a private message to themselves. Model
+        # that provider-only shape as a one-member channel instead of creating
+        # a fake second identity or leaving its files permanently unauthorized.
+        catalog_chat_type = (
+            "channel"
+            if source.chat_type == "direct" and len(participants) == 1
+            else source.chat_type
+        )
         topics = await self._topics(source)
         capabilities = _COMMON_CAPABILITIES
-        if source.chat_type == "channel":
+        if catalog_chat_type == "channel":
             capabilities |= _CHANNEL_CAPABILITIES
         return {
             "operation": "upsert",
@@ -264,7 +333,7 @@ class WorkspaceChatCatalogWorker:
             "project_id": str(source.project_uuid),
             "source": {
                 "kind": "zulip",
-                "chat_type": source.chat_type,
+                "chat_type": catalog_chat_type,
                 "provider_chat_key": source.chat_key,
                 "provider_realm_uuid": str(source.realm_uuid),
                 "provider_owner_user_id": str(source.owner_zulip_user_id),
@@ -343,9 +412,7 @@ class WorkspaceChatCatalogWorker:
         if not any(participant["is_owner"] for participant in participants):
             raise CatalogReportError("catalog_owner_missing", retryable=False)
         minimum = 1
-        if source.chat_type == "direct":
-            minimum = 2
-        elif source.chat_type == "group_direct":
+        if source.chat_type == "group_direct":
             minimum = 3
         if len(participants) < minimum:
             raise CatalogReportError(
@@ -512,68 +579,6 @@ class WorkspaceChatCatalogWorker:
             source.source_updated_at,
         )
         return int(result.endswith(" 1"))
-
-    async def _refresh_deletions(self) -> int:
-        rows = await self._pool.fetch(
-            """
-            SELECT report.external_account_uuid, report.zulip_stream_uuid,
-                   report.resource_uuid, report.catalog,
-                   connection.desired_generation
-            FROM workspace_zulip_bridge.workspace_chat_catalog_reports AS report
-            JOIN workspace_zulip_bridge.zulip_connections AS connection
-              ON connection.external_account_uuid = report.external_account_uuid
-            WHERE connection.sync_enabled
-              AND connection.desired_generation IS NOT NULL
-              AND report.catalog->>'operation' = 'upsert'
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM workspace_zulip_bridge.zulip_stream_bindings AS binding
-                  WHERE binding.zulip_stream_uuid = report.zulip_stream_uuid
-                    AND binding.zulip_user_uuid = connection.zulip_user_uuid
-              )
-            ORDER BY report.external_account_uuid, report.zulip_stream_uuid
-            LIMIT 20
-            """
-        )
-        changed = 0
-        for row in rows:
-            catalog = copy.deepcopy(_object(row["catalog"]))
-            catalog["operation"] = "delete"
-            catalog_hash = _canonical_hash(catalog)
-            generation = int(row["desired_generation"])
-            resource_uuid = UUID(str(row["resource_uuid"]))
-            report_uuid = uuid5(
-                self._bridge_uuid,
-                f"catalog\0{resource_uuid}\0{generation}\0{catalog_hash.hex()}",
-            )
-            report = _report(
-                report_uuid,
-                resource_uuid,
-                generation,
-                _utc_now(),
-                catalog,
-            )
-            result = await self._pool.execute(
-                """
-                UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports
-                SET observed_generation = $3, catalog = $4::jsonb,
-                    catalog_hash = $5, report_uuid = $6, report = $7::jsonb,
-                    processing_status = 'pending', attempt_count = 0,
-                    available_at = clock_timestamp(), claimed_at = NULL,
-                    last_error = NULL, updated_at = clock_timestamp()
-                WHERE external_account_uuid = $1 AND zulip_stream_uuid = $2
-                  AND catalog->>'operation' = 'upsert'
-                """,
-                row["external_account_uuid"],
-                row["zulip_stream_uuid"],
-                generation,
-                json.dumps(catalog, ensure_ascii=False),
-                catalog_hash,
-                report_uuid,
-                json.dumps(report, ensure_ascii=False),
-            )
-            changed += int(result == "UPDATE 1")
-        return changed
 
     async def _claim_report(self) -> asyncpg.Record | None:
         return await self._pool.fetchrow(

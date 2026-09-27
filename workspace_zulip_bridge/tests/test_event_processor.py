@@ -4,9 +4,46 @@
 import asyncio
 from typing import Any
 from typing import cast
+from unittest.mock import AsyncMock
+from unittest.mock import patch
 
 from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.event_processor import ZulipEventProcessor
+
+
+def test_processing_timeout_keeps_processor_alive() -> None:
+    async def run() -> None:
+        processor = ZulipEventProcessor(
+            cast(Any, object()),
+            cast(Any, object()),
+            Settings.from_env({}),
+            claim_scope="realtime",
+        )
+        calls = 0
+
+        async def process_once() -> Any:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise TimeoutError
+            raise asyncio.CancelledError
+
+        processor.process_once = process_once  # type: ignore[method-assign]
+        with patch(
+            "workspace_zulip_bridge.event_processor.asyncio.sleep",
+            new_callable=AsyncMock,
+        ) as sleep:
+            try:
+                await processor.run()
+            except asyncio.CancelledError:
+                pass
+            else:
+                raise AssertionError("processor cancellation was swallowed")
+
+        assert calls == 2
+        sleep.assert_awaited_once_with(1.0)
+
+    asyncio.run(run())
 
 
 def test_cleanup_timeout_keeps_processor_alive_and_reduces_batch() -> None:
