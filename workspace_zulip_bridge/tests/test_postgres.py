@@ -2476,6 +2476,10 @@ def test_workspace_event_processor_prioritizes_live_messages() -> None:
     asyncio.run(_workspace_event_processor_prioritizes_live_messages(_dsn()))
 
 
+def test_workspace_event_processors_isolate_realtime_claims() -> None:
+    asyncio.run(_workspace_event_processors_isolate_realtime_claims(_dsn()))
+
+
 def test_workspace_event_processor_requeues_transient_failure() -> None:
     asyncio.run(_workspace_event_processor_requeues_transient_failure(_dsn()))
 
@@ -2715,6 +2719,69 @@ async def _workspace_event_processor_prioritizes_live_messages(dsn: str) -> None
             ("message_reaction", "skipped"),
             ("message", "skipped"),
         ]
+    finally:
+        await pool.close()
+
+
+async def _workspace_event_processors_isolate_realtime_claims(dsn: str) -> None:
+    pool = await _pool(dsn)
+    provider_uuid = UUID("10000000-0000-0000-0000-0000000000a1")
+    project_uuid = UUID("10000000-0000-0000-0000-0000000000a2")
+    try:
+        await pool.executemany(
+            """
+            INSERT INTO workspace_zulip_bridge.workspace_events (
+                uuid, provider_uuid, workspace_project_id, epoch_version,
+                object_type, action, entity_uuid, payload
+            ) VALUES ($1, $2, $3, $4, $5, 'updated', $6, '{}'::jsonb)
+            """,
+            [
+                (
+                    UUID("10000000-0000-0000-0000-0000000000a3"),
+                    provider_uuid,
+                    project_uuid,
+                    1,
+                    "topic",
+                    UUID("10000000-0000-0000-0000-0000000000a4"),
+                ),
+                (
+                    UUID("10000000-0000-0000-0000-0000000000a5"),
+                    provider_uuid,
+                    project_uuid,
+                    2,
+                    "message",
+                    UUID("10000000-0000-0000-0000-0000000000a6"),
+                ),
+            ],
+        )
+        settings = Settings(
+            database_dsn=dsn,
+            workspace_provider_uuid=provider_uuid,
+            workspace_project_id=project_uuid,
+        )
+        realtime = WorkspaceEventProcessor(pool, settings, scope="realtime")
+        background = WorkspaceEventProcessor(pool, settings, scope="background")
+        processed_types: list[str] = []
+
+        async def apply(row: asyncpg.Record) -> bool:
+            processed_types.append(str(row["object_type"]))
+            return False
+
+        realtime._apply = AsyncMock(side_effect=apply)
+        background._apply = AsyncMock(side_effect=apply)
+
+        assert await realtime.process_once() == 1
+        assert processed_types == ["message"]
+        assert (
+            await pool.fetchval(
+                "SELECT processing_status FROM workspace_zulip_bridge.workspace_events "
+                "WHERE provider_uuid = $1 AND object_type = 'topic'",
+                provider_uuid,
+            )
+            == "pending"
+        )
+        assert await background.process_once() == 1
+        assert processed_types == ["message", "topic"]
     finally:
         await pool.close()
 

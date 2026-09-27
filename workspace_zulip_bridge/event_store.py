@@ -54,7 +54,10 @@ from workspace_zulip_bridge.workspace_file_transfer import replace_source_file_u
 
 class EventStore:
     SCHEDULE_STREAM_BATCH_SIZE = 64
-    SCHEDULE_MESSAGE_BATCH_SIZE = 10_000
+    # A 10k adoption transaction exceeds the command timeout on multi-million
+    # message datasets and is then retried from zero forever.  Keep each pass
+    # small enough to commit progress while realtime workers stay responsive.
+    SCHEDULE_MESSAGE_BATCH_SIZE = 1_000
     QUEUE_GAP_SAFETY_SECONDS = 300.0
 
     def __init__(self, pool: asyncpg.Pool) -> None:

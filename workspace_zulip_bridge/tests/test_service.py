@@ -719,7 +719,9 @@ async def _run_workspace_receiver_test(
     assert "workspace-receiver-init" in calls
     assert "workspace-receiver-run" in calls
     assert "workspace-bootstrap-ensure" in calls
-    assert "workspace-event-processor-run" in calls
+    assert calls.count("workspace-event-processor-run") == 2
+    assert "workspace-event-processor-init-True-0/1-realtime-None-all" in calls
+    assert "workspace-event-processor-init-True-0/1-background-None-all" in calls
     assert calls.count("workspace-diff-worker-run") == 11
     assert "workspace-diff-worker-init-True-0/2-unpartitioned-None-all" in calls
     assert (

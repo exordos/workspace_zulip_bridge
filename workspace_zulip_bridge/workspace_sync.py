@@ -834,16 +834,51 @@ class WorkspaceBootstrapper:
 
 
 class WorkspaceEventProcessor:
-    def __init__(self, pool: asyncpg.Pool, settings: Settings) -> None:
+    REALTIME_OBJECT_TYPES = ("message", "message_flag", "message_reaction")
+    REALTIME_BATCH_SIZE = 16
+
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        settings: Settings,
+        *,
+        scope: Literal["all", "realtime", "background"] = "all",
+    ) -> None:
         assert settings.workspace_provider_uuid is not None
+        if scope not in {"all", "realtime", "background"}:
+            raise ValueError("invalid Workspace event processor scope")
         self._pool = pool
         self._settings = settings
         self._provider_uuid = settings.workspace_provider_uuid
+        self._scope = scope
         self._next_cleanup_at = 0.0
+
+    @property
+    def _object_type_filter(self) -> str:
+        scope = getattr(self, "_scope", "all")
+        values = ", ".join(f"'{value}'" for value in self.REALTIME_OBJECT_TYPES)
+        if scope == "realtime":
+            return f"object_type IN ({values})"
+        if scope == "background":
+            return f"object_type NOT IN ({values})"
+        return "TRUE"
+
+    @property
+    def _claim_batch_size(self) -> int:
+        if getattr(self, "_scope", "all") == "realtime":
+            return min(
+                self._settings.workspace_event_batch_size,
+                self.REALTIME_BATCH_SIZE,
+            )
+        return self._settings.workspace_event_batch_size
 
     async def run(self) -> None:
         while True:
-            deleted = await self._maybe_cleanup_expired_events()
+            deleted = (
+                0
+                if getattr(self, "_scope", "all") == "realtime"
+                else await self._maybe_cleanup_expired_events()
+            )
             changed = await self.process_once()
             if not changed and deleted != self._settings.event_cleanup_batch_size:
                 await asyncio.sleep(self._settings.workspace_sync_poll_seconds)
@@ -902,13 +937,14 @@ class WorkspaceEventProcessor:
     async def process_once(self) -> int:
         async with self._pool.acquire() as connection, connection.transaction():
             await connection.execute(
-                """
+                f"""
                 UPDATE workspace_zulip_bridge.workspace_events
                 SET processing_status = 'pending', claimed_at = NULL,
                     available_at = clock_timestamp(), processed_at = NULL,
                     last_error = 'claim_expired'
                 WHERE provider_uuid = $1
                   AND processing_status = 'processing'
+                  AND {self._object_type_filter}
                   AND claimed_at < (
                       clock_timestamp()
                       - make_interval(secs => $2::double precision)
@@ -918,12 +954,13 @@ class WorkspaceEventProcessor:
                 self._settings.event_processor_claim_timeout_seconds,
             )
             rows = await connection.fetch(
-                """
+                f"""
                 WITH claim AS (
                     SELECT sequence
                     FROM workspace_zulip_bridge.workspace_events
                     WHERE provider_uuid = $1 AND processing_status = 'pending'
                       AND available_at <= clock_timestamp()
+                      AND {self._object_type_filter}
                     ORDER BY CASE object_type
                         WHEN 'message' THEN 0
                         WHEN 'message_flag' THEN 1
@@ -946,7 +983,7 @@ class WorkspaceEventProcessor:
                 RETURNING event.*
                 """,
                 self._provider_uuid,
-                self._settings.workspace_event_batch_size,
+                self._claim_batch_size,
             )
         if not rows:
             return 0

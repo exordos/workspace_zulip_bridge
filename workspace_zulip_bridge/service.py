@@ -144,8 +144,11 @@ class BridgeService:
                 bootstrapper = WorkspaceBootstrapper(pool, self._settings, tokens)
                 if await self._ensure_bootstrap(bootstrapper, stop):
                     receiver = WorkspaceEventReceiver(pool, self._settings, tokens)
-                    workspace_event_processor = WorkspaceEventProcessor(
-                        pool, self._settings
+                    workspace_realtime_event_processor = WorkspaceEventProcessor(
+                        pool, self._settings, scope="realtime"
+                    )
+                    workspace_background_event_processor = WorkspaceEventProcessor(
+                        pool, self._settings, scope="background"
                     )
                     workspace_diff_planner = WorkspaceDiffWorker(
                         pool,
@@ -258,8 +261,12 @@ class BridgeService:
                                 name="workspace-event-receiver",
                             ),
                             asyncio.create_task(
-                                workspace_event_processor.run(),
-                                name="workspace-event-processor",
+                                workspace_realtime_event_processor.run(),
+                                name="workspace-event-processor-realtime",
+                            ),
+                            asyncio.create_task(
+                                workspace_background_event_processor.run(),
+                                name="workspace-event-processor-background",
                             ),
                         )
                     )
