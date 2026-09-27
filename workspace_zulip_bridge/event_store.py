@@ -739,6 +739,91 @@ class EventStore:
                      AND connection.sync_enabled
                      AND connection.catalog_completed_at IS NOT NULL
                     ORDER BY stream.uuid, zulip_user.role,
+                             zulip_user.uuid, connection.uuid
+                ), candidates AS MATERIALIZED (
+                    SELECT stream.uuid, winners.connection_uuid,
+                           winners.color
+                    FROM workspace_zulip_bridge.zulip_streams AS stream
+                    JOIN winners ON winners.stream_uuid = stream.uuid
+                    WHERE stream.source_connection_uuid IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM workspace_zulip_bridge.zulip_messages AS message
+                          WHERE message.zulip_stream_uuid = stream.uuid
+                      )
+                    ORDER BY stream.updated_at DESC, stream.uuid
+                    FOR UPDATE OF stream SKIP LOCKED
+                    LIMIT $1
+                ), updated AS (
+                    UPDATE workspace_zulip_bridge.zulip_streams AS stream
+                    SET source_connection_uuid = candidates.connection_uuid,
+                        color = candidates.color,
+                        history_loaded_at = NULL,
+                        updated_at = clock_timestamp()
+                    FROM candidates
+                    WHERE stream.uuid = candidates.uuid
+                    RETURNING stream.uuid
+                ), touched_bindings AS (
+                    UPDATE workspace_zulip_bridge.zulip_stream_bindings AS binding
+                    SET updated_at = clock_timestamp()
+                    FROM updated
+                    WHERE binding.zulip_stream_uuid = updated.uuid
+                    RETURNING 1
+                ), touched_topics AS (
+                    UPDATE workspace_zulip_bridge.zulip_topics AS topic
+                    SET updated_at = clock_timestamp()
+                    FROM updated
+                    WHERE topic.zulip_stream_uuid = updated.uuid
+                    RETURNING 1
+                ), touched_topic_bindings AS (
+                    UPDATE workspace_zulip_bridge.zulip_topic_bindings AS binding
+                    SET updated_at = clock_timestamp()
+                    FROM updated
+                    WHERE binding.zulip_stream_uuid = updated.uuid
+                    RETURNING 1
+                )
+                SELECT (SELECT count(*) FROM updated) AS assigned_count,
+                       0::bigint AS adopted_count,
+                       0::bigint AS messages_deleted
+                """,
+                self.SCHEDULE_STREAM_BATCH_SIZE,
+            )
+            if assigned is not None and not assigned["assigned_count"]:
+                assigned = await connection.fetchrow(
+                    """
+                WITH ready_realms AS MATERIALIZED (
+                    SELECT connection.realm_uuid
+                    FROM workspace_zulip_bridge.zulip_connections AS connection
+                    JOIN workspace_zulip_bridge.zulip_users AS zulip_user
+                      ON zulip_user.uuid = connection.zulip_user_uuid
+                    WHERE connection.sync_enabled AND NOT zulip_user.disabled
+                      AND NOT zulip_user.is_bot
+                      AND connection.catalog_completed_at IS NOT NULL
+                    GROUP BY connection.realm_uuid
+                ), winners AS MATERIALIZED (
+                    SELECT DISTINCT ON (stream.uuid)
+                           stream.uuid AS stream_uuid,
+                           connection.uuid AS connection_uuid,
+                           CASE
+                               WHEN binding.membership_parameters ->> 'color'
+                                    ~ '^#[0-9A-Fa-f]{6}$'
+                               THEN ('x' || substr(
+                                   binding.membership_parameters ->> 'color', 2
+                               ))::bit(24)::int
+                               ELSE NULL
+                           END AS color
+                    FROM workspace_zulip_bridge.zulip_streams AS stream
+                    JOIN ready_realms ON ready_realms.realm_uuid = stream.realm_uuid
+                    JOIN workspace_zulip_bridge.zulip_stream_bindings AS binding
+                      ON binding.zulip_stream_uuid = stream.uuid
+                    JOIN workspace_zulip_bridge.zulip_users AS zulip_user
+                      ON zulip_user.uuid = binding.zulip_user_uuid
+                     AND NOT zulip_user.disabled AND NOT zulip_user.is_bot
+                    JOIN workspace_zulip_bridge.zulip_connections AS connection
+                      ON connection.zulip_user_uuid = zulip_user.uuid
+                     AND connection.sync_enabled
+                     AND connection.catalog_completed_at IS NOT NULL
+                    ORDER BY stream.uuid, zulip_user.role,
                              zulip_user.uuid,
                              connection.uuid
                 ), changed AS MATERIALIZED (
@@ -828,9 +913,9 @@ class EventStore:
                        (SELECT count(*) FROM adopted) AS adopted_count,
                        0::bigint AS messages_deleted
                 """,
-                self.SCHEDULE_STREAM_BATCH_SIZE,
-                self.SCHEDULE_MESSAGE_BATCH_SIZE,
-            )
+                    self.SCHEDULE_STREAM_BATCH_SIZE,
+                    self.SCHEDULE_MESSAGE_BATCH_SIZE,
+                )
             await connection.execute(
                 """
                 UPDATE workspace_zulip_bridge.zulip_connections AS connection

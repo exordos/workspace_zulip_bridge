@@ -8103,6 +8103,10 @@ def test_scheduler_reassigns_large_histories_in_bounded_batches() -> None:
     asyncio.run(_scheduler_batched_reassignment_round_trip(_dsn()))
 
 
+def test_scheduler_prioritizes_new_empty_chats_during_reassignment() -> None:
+    asyncio.run(_scheduler_prioritizes_new_empty_chat(_dsn()))
+
+
 def test_scheduler_uses_completed_catalogs_while_another_account_is_filling() -> None:
     asyncio.run(_scheduler_incomplete_catalog_round_trip(_dsn()))
 
@@ -8350,6 +8354,80 @@ async def _scheduler_batched_reassignment_round_trip(dsn: str) -> None:
                 member_uuid,
             )
             == 2
+        )
+    finally:
+        await pool.close()
+
+
+async def _scheduler_prioritizes_new_empty_chat(dsn: str) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        store.SCHEDULE_STREAM_BATCH_SIZE = 1
+        async with pool.acquire() as connection:
+            owner_uuid = await _insert_user(
+                connection, 10, 100, queue_id="queue-owner", status="filling"
+            )
+            member_uuid = await _insert_user(
+                connection, 20, 400, queue_id="queue-member", status="filling"
+            )
+        assert (
+            await store.store_chat_catalog(
+                owner_uuid, "queue-owner", _catalog(10, [(7, "Existing")], {})
+            )
+        ).activated
+        assert (
+            await store.store_chat_catalog(
+                member_uuid, "queue-member", _catalog(20, [(7, "Existing")], {})
+            )
+        ).activated
+        assert (await store.reconcile_chat_schedules()).assigned == 1
+
+        existing_stream_uuid = stable_chat_uuid(ENDPOINT, "channel:7")
+        new_stream_uuid = stable_chat_uuid(ENDPOINT, "channel:8")
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.zulip_messages (
+                uuid, realm_uuid, source_connection_uuid, zulip_stream_uuid,
+                sender_user_uuid, zulip_message_id, content, content_hash,
+                message_hash, created_at, source_updated_at
+            ) VALUES ($1, $2, $3, $4, $3, 1, 'history', $5, $5,
+                      clock_timestamp(), clock_timestamp())
+            """,
+            stable_message_uuid(ENDPOINT, 1),
+            stable_realm_uuid(ENDPOINT),
+            owner_uuid,
+            existing_stream_uuid,
+            b"m" * 32,
+        )
+        await pool.execute(
+            "UPDATE workspace_zulip_bridge.zulip_users "
+            "SET disabled = true WHERE uuid = $1",
+            owner_uuid,
+        )
+        assert (
+            await store.store_chat_catalog(
+                member_uuid,
+                "queue-member",
+                _catalog(20, [(7, "Existing"), (8, "New")], {}),
+            )
+        ).activated
+
+        reconciled = await store.reconcile_chat_schedules()
+
+        assert (reconciled.invalidated, reconciled.assigned) == (1, 1)
+        assert await pool.fetchval(
+            "SELECT source_connection_uuid IS NULL "
+            "FROM workspace_zulip_bridge.zulip_streams WHERE uuid = $1",
+            existing_stream_uuid,
+        )
+        assert (
+            await pool.fetchval(
+                "SELECT source_connection_uuid "
+                "FROM workspace_zulip_bridge.zulip_streams WHERE uuid = $1",
+                new_stream_uuid,
+            )
+            == member_uuid
         )
     finally:
         await pool.close()
