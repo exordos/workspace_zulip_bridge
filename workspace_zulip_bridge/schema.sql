@@ -284,6 +284,9 @@ CREATE INDEX IF NOT EXISTS zulip_messages_updated_at_brin
 CREATE INDEX IF NOT EXISTS zulip_messages_sync_plan_idx
     ON workspace_zulip_bridge.zulip_messages
         (realm_uuid, source_updated_at, uuid);
+CREATE INDEX IF NOT EXISTS zulip_messages_projection_upgrade_idx
+    ON workspace_zulip_bridge.zulip_messages (uuid)
+    WHERE converter_version < 1 OR workspace_content IS NULL;
 CREATE INDEX IF NOT EXISTS zulip_messages_missing_topic_idx
     ON workspace_zulip_bridge.zulip_messages
         (realm_uuid, zulip_stream_uuid, uuid)

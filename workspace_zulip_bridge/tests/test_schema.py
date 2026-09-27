@@ -100,6 +100,7 @@ def test_schema_normalizes_workspace_like_entities_and_personal_state() -> None:
     assert "sync_repair_cursors_due_idx" in schema
     assert "partition_key uuid" in schema
     assert "zulip_messages_sync_plan_idx" in schema
+    assert "zulip_messages_projection_upgrade_idx" in schema
     assert "zulip_message_flags_sync_plan_idx" in schema
     assert "zulip_message_reactions_sync_plan_idx" in schema
     assert "sync_diffs_content_partition_0_pending_idx" in schema
