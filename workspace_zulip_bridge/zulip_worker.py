@@ -1148,20 +1148,6 @@ class ZulipThreadSupervisor:
         return True
 
     async def reconcile(self) -> None:
-        if await self._store.chat_schedule_reconciliation_requested():
-            await asyncio.to_thread(self._catalog_write_gate.acquire)
-            try:
-                schedule = await self._store.reconcile_chat_schedules()
-            finally:
-                self._catalog_write_gate.release()
-            if schedule.invalidated or schedule.assigned or schedule.messages_deleted:
-                LOG.info(
-                    "Zulip chat schedules reconciled invalidated=%s assigned=%s "
-                    "messages_deleted=%s",
-                    schedule.invalidated,
-                    schedule.assigned,
-                    schedule.messages_deleted,
-                )
         users = {user.uuid: user for user in await self._store.list_users()}
         stale_ids = [
             user_uuid
@@ -1183,6 +1169,25 @@ class ZulipThreadSupervisor:
             worker.start()
             self._workers[user_uuid] = (self._signature(user), worker)
             LOG.info("Zulip worker started user_uuid=%s", user_uuid)
+
+        # Realtime workers must recover independently of catalog maintenance.
+        # A large chat schedule reconciliation can time out while adopting
+        # historical messages; running it before worker ownership used to leave
+        # every dead long-poll thread offline until that maintenance completed.
+        if await self._store.chat_schedule_reconciliation_requested():
+            await asyncio.to_thread(self._catalog_write_gate.acquire)
+            try:
+                schedule = await self._store.reconcile_chat_schedules()
+            finally:
+                self._catalog_write_gate.release()
+            if schedule.invalidated or schedule.assigned or schedule.messages_deleted:
+                LOG.info(
+                    "Zulip chat schedules reconciled invalidated=%s assigned=%s "
+                    "messages_deleted=%s",
+                    schedule.invalidated,
+                    schedule.assigned,
+                    schedule.messages_deleted,
+                )
 
     async def _stop_workers(self, workers: list[Worker]) -> None:
         if not workers:

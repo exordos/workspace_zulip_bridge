@@ -1115,7 +1115,8 @@ async def _schedule_reconciliation_deadlock_test() -> None:
 
     assert not await supervisor._reconcile_once()
     assert store.schedule_reconciliations == 1
-    assert not workers
+    assert len(workers) == 2
+    assert all(worker.alive for worker in workers)
 
     assert await supervisor._reconcile_once()
     assert store.schedule_reconciliations == 2
@@ -1129,6 +1130,7 @@ def test_schedule_reconciliation_timeout_does_not_stop_supervisor() -> None:
 
 async def _schedule_reconciliation_timeout_test() -> None:
     store = ScheduleTrackingStore()
+    workers: list[FakeWorker] = []
 
     async def timeout_once() -> ChatScheduleReconcile:
         store.schedule_reconciliations += 1
@@ -1139,11 +1141,15 @@ async def _schedule_reconciliation_timeout_test() -> None:
         store,  # type: ignore[arg-type]
         asyncio.get_running_loop(),
         Settings(database_dsn="postgresql:///test"),
-        worker_factory=lambda user, gate: FakeWorker(user),  # type: ignore[arg-type]
+        worker_factory=lambda user, gate: (
+            workers.append(FakeWorker(user)) or workers[-1]
+        ),
     )
 
     assert not await supervisor._reconcile_once()
     assert store.schedule_reconciliations == 1
+    assert len(workers) == 2
+    assert all(worker.alive for worker in workers)
 
 
 def test_supervisor_owns_exactly_one_thread_per_user() -> None:
