@@ -136,6 +136,7 @@ def test_schema_contains_event_retention_and_workspace_outbox_state() -> None:
     assert "recovery_required boolean NOT NULL DEFAULT false" in schema
     assert "maintenance_migrations" in schema
     assert "sync_diffs_live_delivery_pending_idx" in schema
+    assert "sync_diffs_live_file_projection_idx" in schema
     assert "sync_diffs_pending_idx" not in schema
 
 

@@ -693,6 +693,12 @@ CREATE INDEX IF NOT EXISTS sync_diffs_live_delivery_pending_idx
          source_updated_at, entity_uuid)
     WHERE processing_status IN ('pending', 'failed')
       AND delivery_priority = 0;
+CREATE INDEX IF NOT EXISTS sync_diffs_live_file_projection_idx
+    ON workspace_zulip_bridge.sync_diffs (entity_uuid)
+    WHERE entity_type = 'messages'
+      AND delivery_priority = 0
+      AND direction = 'to_workspace'
+      AND processing_status IN ('pending', 'processing', 'failed', 'blocked');
 CREATE INDEX IF NOT EXISTS sync_diffs_processing_idx
     ON workspace_zulip_bridge.sync_diffs (claimed_at, entity_uuid)
     WHERE processing_status = 'processing';
