@@ -1774,7 +1774,8 @@ class WorkspaceDiffWorker:
                     message.zulip_stream_uuid
                   AND (target.data ->> 'topic_uuid')::uuid = message.topic_uuid
                   AND target.data -> 'payload' = jsonb_build_object(
-                    'kind', 'markdown', 'content', message.content
+                    'kind', 'markdown', 'content',
+                    COALESCE(message.workspace_content, message.content)
                   )
                   AND (target.data ->> 'created_at')::timestamptz =
                     message.created_at
@@ -1822,7 +1823,8 @@ class WorkspaceDiffWorker:
                     message.zulip_stream_uuid
                   AND (target.data ->> 'topic_uuid')::uuid = message.topic_uuid
                   AND target.data -> 'payload' = jsonb_build_object(
-                    'kind', 'markdown', 'content', message.content
+                    'kind', 'markdown', 'content',
+                    COALESCE(message.workspace_content, message.content)
                   )
                   AND (target.data ->> 'created_at')::timestamptz =
                     message.created_at
@@ -5232,7 +5234,8 @@ _ENTITY_QUERIES = {
                 sender.workspace_user_uuid, message.sender_user_uuid
             ),
             'payload', jsonb_build_object(
-                'kind', 'markdown', 'content', message.content
+                'kind', 'markdown', 'content',
+                COALESCE(message.workspace_content, message.content)
             ),
             'created_at', message.created_at
         ) AS data

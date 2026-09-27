@@ -802,6 +802,7 @@ class ZulipEventThread(threading.Thread):
                             user_uuids=self._user_uuids,
                             stream_ids_by_name=self._stream_ids_by_name,
                             allowed_chat_keys={scheduled_chat.chat_key},
+                            endpoint=self.user.endpoint,
                         )
                         page_write = self._submit(
                             history.store_page(built_page.messages)

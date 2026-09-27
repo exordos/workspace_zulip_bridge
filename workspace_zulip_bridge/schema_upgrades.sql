@@ -157,6 +157,13 @@ BEGIN
     IF to_regclass('workspace_zulip_bridge.zulip_messages') IS NOT NULL THEN
         ALTER TABLE workspace_zulip_bridge.zulip_messages
             ADD COLUMN IF NOT EXISTS source_updated_at timestamptz;
+        -- Existing rows are re-projected in bounded bridge-owned batches.  Do
+        -- not rewrite the whole message table while the schema lock is held.
+        ALTER TABLE workspace_zulip_bridge.zulip_messages
+            ADD COLUMN IF NOT EXISTS workspace_content text;
+        ALTER TABLE workspace_zulip_bridge.zulip_messages
+            ADD COLUMN IF NOT EXISTS converter_version integer
+            NOT NULL DEFAULT 0;
         UPDATE workspace_zulip_bridge.zulip_messages
         SET source_updated_at = created_at
         WHERE source_updated_at IS NULL;

@@ -14,6 +14,10 @@ import asyncpg
 from asyncpg.pool import PoolConnectionProxy
 
 from workspace_zulip_bridge.chat_catalog import ChatCatalogBuilder
+from workspace_zulip_bridge.message_conversion import CONVERTER_VERSION
+from workspace_zulip_bridge.message_conversion import ZulipToWorkspaceContext
+from workspace_zulip_bridge.message_conversion import zulip_to_workspace
+from workspace_zulip_bridge.message_history import message_content_hash
 from workspace_zulip_bridge.message_history import message_flags_hash
 from workspace_zulip_bridge.models import NOTIFICATION_SETTINGS_GENERATION
 from workspace_zulip_bridge.models import ChatCatalogWrite
@@ -54,6 +58,170 @@ class EventStore:
 
     def __init__(self, pool: asyncpg.Pool) -> None:
         self._pool = pool
+        self._projection_cursor: UUID | None = None
+        self._projection_complete = False
+
+    async def reproject_message_batch(self, limit: int = 1000) -> int:
+        """Upgrade stored message projections without a table-wide rewrite."""
+
+        if self._projection_complete:
+            return 0
+        async with self._pool.acquire() as connection, connection.transaction():
+            rows = await connection.fetch(
+                """
+                SELECT message.uuid, message.realm_uuid,
+                       message.zulip_message_id, message.sender_user_uuid,
+                       message.content, message.content_hash,
+                       extract(epoch FROM message.created_at)::bigint AS sent_at,
+                       stream.chat_key, topic.name AS topic_name,
+                       realm.identity_key AS endpoint,
+                       owner.zulip_user_id AS own_user_id
+                FROM workspace_zulip_bridge.zulip_messages AS message
+                JOIN workspace_zulip_bridge.zulip_streams AS stream
+                  ON stream.uuid = message.zulip_stream_uuid
+                JOIN workspace_zulip_bridge.zulip_realms AS realm
+                  ON realm.uuid = message.realm_uuid
+                LEFT JOIN workspace_zulip_bridge.zulip_topics AS topic
+                  ON topic.uuid = message.topic_uuid
+                JOIN workspace_zulip_bridge.zulip_connections AS connection
+                  ON connection.uuid = COALESCE(
+                      message.source_connection_uuid,
+                      stream.source_connection_uuid
+                  )
+                JOIN workspace_zulip_bridge.zulip_users AS owner
+                  ON owner.uuid = connection.zulip_user_uuid
+                WHERE (
+                    message.converter_version < $1
+                    OR message.workspace_content IS NULL
+                )
+                  AND ($2::uuid IS NULL OR message.uuid > $2)
+                ORDER BY message.uuid
+                LIMIT $3
+                FOR UPDATE OF message SKIP LOCKED
+                """,
+                CONVERTER_VERSION,
+                self._projection_cursor,
+                limit,
+            )
+            if not rows:
+                self._projection_complete = True
+                return 0
+
+            realm_uuids = list({row["realm_uuid"] for row in rows})
+            user_rows = await connection.fetch(
+                """
+                SELECT realm_uuid, zulip_user_id, uuid
+                FROM workspace_zulip_bridge.zulip_users
+                WHERE realm_uuid = ANY($1::uuid[])
+                """,
+                realm_uuids,
+            )
+            stream_rows = await connection.fetch(
+                """
+                SELECT realm_uuid, name,
+                       substring(chat_key FROM '^channel:([0-9]+)$')::bigint
+                           AS zulip_stream_id
+                FROM workspace_zulip_bridge.zulip_streams
+                WHERE realm_uuid = ANY($1::uuid[])
+                  AND chat_key ~ '^channel:[0-9]+$'
+                """,
+                realm_uuids,
+            )
+            user_uuids: dict[UUID, dict[int, UUID]] = {}
+            for user in user_rows:
+                user_uuids.setdefault(user["realm_uuid"], {})[user["zulip_user_id"]] = (
+                    user["uuid"]
+                )
+            stream_ids: dict[UUID, dict[str, int]] = {}
+            for stream in stream_rows:
+                stream_ids.setdefault(stream["realm_uuid"], {})[stream["name"]] = (
+                    stream["zulip_stream_id"]
+                )
+            message_contents: dict[UUID, dict[int, str]] = {}
+            for row in rows:
+                message_contents.setdefault(row["realm_uuid"], {})[
+                    row["zulip_message_id"]
+                ] = row["content"]
+
+            records: list[tuple[UUID, str, bytes, bool]] = []
+            for row in rows:
+                workspace_content = zulip_to_workspace(
+                    row["content"],
+                    context=ZulipToWorkspaceContext(
+                        endpoint=row["endpoint"],
+                        own_user_id=row["own_user_id"],
+                        user_uuids=user_uuids.get(row["realm_uuid"], {}),
+                        stream_ids_by_name=stream_ids.get(row["realm_uuid"], {}),
+                        message_contents=message_contents.get(row["realm_uuid"], {}),
+                    ),
+                ).content
+                content_hash = message_content_hash(
+                    sender_user_uuid=row["sender_user_uuid"],
+                    chat_key=row["chat_key"],
+                    topic_name=row["topic_name"],
+                    content=workspace_content,
+                    sent_at=row["sent_at"],
+                )
+                records.append(
+                    (
+                        row["uuid"],
+                        workspace_content,
+                        content_hash,
+                        bytes(row["content_hash"]) != content_hash,
+                    )
+                )
+
+            await connection.execute(
+                """
+                CREATE TEMP TABLE IF NOT EXISTS wzb_message_projection (
+                    uuid uuid PRIMARY KEY,
+                    workspace_content text NOT NULL,
+                    content_hash bytea NOT NULL,
+                    projection_changed boolean NOT NULL
+                ) ON COMMIT DELETE ROWS;
+                TRUNCATE wzb_message_projection;
+                """
+            )
+            await connection.copy_records_to_table(
+                "wzb_message_projection",
+                records=records,
+                columns=(
+                    "uuid",
+                    "workspace_content",
+                    "content_hash",
+                    "projection_changed",
+                ),
+            )
+            await connection.execute(
+                """
+                WITH updated AS MATERIALIZED (
+                    UPDATE workspace_zulip_bridge.zulip_messages AS message
+                    SET workspace_content = projection.workspace_content,
+                        content_hash = projection.content_hash,
+                        converter_version = $1,
+                        updated_at = clock_timestamp()
+                    FROM wzb_message_projection AS projection
+                    WHERE message.uuid = projection.uuid
+                      AND (
+                          message.converter_version < $1
+                          OR message.workspace_content IS NULL
+                      )
+                    RETURNING message.uuid, message.realm_uuid,
+                              projection.projection_changed
+                )
+                INSERT INTO workspace_zulip_bridge.workspace_outbox
+                    (realm_uuid, entity_type, action, entity_uuid)
+                SELECT realm_uuid, 'message', 'upsert', uuid
+                FROM updated
+                WHERE projection_changed
+                ON CONFLICT (realm_uuid, entity_type, entity_uuid)
+                    WHERE delivery_status = 'pending'
+                DO UPDATE SET action = 'upsert', updated_at = clock_timestamp()
+                """,
+                CONVERTER_VERSION,
+            )
+        self._projection_cursor = rows[-1]["uuid"]
+        return len(rows)
 
     async def list_users(self) -> list[ZulipUser]:
         async with self._pool.acquire() as connection:
@@ -1887,6 +2055,8 @@ class HistorySession:
                 stream_uuid uuid NOT NULL, topic_uuid uuid, topic_name text,
                 topic_hash bytea,
                 sender_user_uuid uuid NOT NULL, content text NOT NULL,
+                workspace_content text NOT NULL,
+                converter_version integer NOT NULL,
                 reactions jsonb NOT NULL, reaction_users jsonb NOT NULL,
                 content_hash bytea NOT NULL, message_hash bytea NOT NULL,
                 flag_uuid uuid NOT NULL, write_flags boolean NOT NULL,
@@ -1970,6 +2140,8 @@ class HistorySession:
                     hashlib.sha256(topic_name.encode("utf-8")).digest(),
                     message.sender_user_uuid,
                     message.content,
+                    message.workspace_content or message.content,
+                    CONVERTER_VERSION,
                     message.reactions_json,
                     message.reaction_users_json,
                     message.content_hash,
@@ -2040,6 +2212,8 @@ class HistorySession:
                     "topic_hash",
                     "sender_user_uuid",
                     "content",
+                    "workspace_content",
+                    "converter_version",
                     "reactions",
                     "reaction_users",
                     "content_hash",
@@ -2197,7 +2371,16 @@ class HistorySession:
             """
             WITH resolved AS MATERIALIZED (
                 SELECT page.*,
-                       stream.source_connection_uuid = $1 AS write_common
+                       stream.source_connection_uuid = $1 AS write_common,
+                       existing.uuid IS NULL
+                       OR existing.content_hash IS DISTINCT FROM page.content_hash
+                       OR existing.zulip_stream_uuid IS DISTINCT FROM page.stream_uuid
+                       OR existing.topic_uuid IS DISTINCT FROM page.topic_uuid
+                       OR existing.sender_user_uuid
+                          IS DISTINCT FROM page.sender_user_uuid
+                       OR existing.created_at
+                          IS DISTINCT FROM to_timestamp(page.sent_at)
+                           AS projection_changed
                 FROM wzb_message_page AS page
                 JOIN workspace_zulip_bridge.zulip_streams AS stream
                   ON stream.uuid = page.stream_uuid
@@ -2219,10 +2402,12 @@ class HistorySession:
                 INSERT INTO workspace_zulip_bridge.zulip_messages
                     (uuid, realm_uuid, source_connection_uuid, zulip_stream_uuid,
                      topic_uuid, sender_user_uuid, zulip_message_id, content,
+                     workspace_content, converter_version,
                      reactions, reaction_users, content_hash, message_hash, created_at,
                      source_updated_at)
                 SELECT uuid, $2, $1, stream_uuid, topic_uuid, sender_user_uuid,
-                       zulip_message_id, content, reactions, reaction_users,
+                       zulip_message_id, content, workspace_content,
+                       converter_version, reactions, reaction_users,
                        content_hash, message_hash, to_timestamp(sent_at),
                        to_timestamp(source_updated_at)
                 FROM resolved
@@ -2232,7 +2417,10 @@ class HistorySession:
                     zulip_stream_uuid = EXCLUDED.zulip_stream_uuid,
                     topic_uuid = EXCLUDED.topic_uuid,
                     sender_user_uuid = EXCLUDED.sender_user_uuid,
-                    content = EXCLUDED.content, reactions = EXCLUDED.reactions,
+                    content = EXCLUDED.content,
+                    workspace_content = EXCLUDED.workspace_content,
+                    converter_version = EXCLUDED.converter_version,
+                    reactions = EXCLUDED.reactions,
                     reaction_users = EXCLUDED.reaction_users,
                     content_hash = EXCLUDED.content_hash,
                     message_hash = EXCLUDED.message_hash,
@@ -2250,6 +2438,9 @@ class HistorySession:
                     ),
                     updated_at = clock_timestamp()
                 WHERE zulip_messages.message_hash IS DISTINCT FROM EXCLUDED.message_hash
+                   OR zulip_messages.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+                   OR zulip_messages.converter_version
+                      IS DISTINCT FROM EXCLUDED.converter_version
                 RETURNING uuid, zulip_message_id
             ), flags AS (
                 INSERT INTO workspace_zulip_bridge.zulip_message_flags
@@ -2365,7 +2556,10 @@ class HistorySession:
             ), outbox AS (
                 INSERT INTO workspace_zulip_bridge.workspace_outbox
                     (realm_uuid, entity_type, action, entity_uuid)
-                SELECT $2, 'message', 'upsert', uuid FROM changed
+                SELECT $2, 'message', 'upsert', changed.uuid
+                FROM changed
+                JOIN resolved ON resolved.uuid = changed.uuid
+                WHERE resolved.projection_changed
                 UNION ALL
                 SELECT $2, 'message_flag', 'upsert', uuid FROM flags
                 UNION ALL

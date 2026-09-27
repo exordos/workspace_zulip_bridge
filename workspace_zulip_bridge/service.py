@@ -77,6 +77,10 @@ class BridgeService:
                 self._probe_loop(pool),
                 name="database-probe",
             )
+            projection_task = asyncio.create_task(
+                self._message_projection_loop(store),
+                name="message-projection",
+            )
             supervisor_task = asyncio.create_task(
                 supervisor.run(),
                 name="zulip-thread-supervisor",
@@ -95,6 +99,7 @@ class BridgeService:
             stop_task = asyncio.create_task(stop.wait(), name="stop-signal")
             supervised_tasks = [
                 probe_task,
+                projection_task,
                 supervisor_task,
                 backlog_event_processor_task,
                 *realtime_event_processor_tasks,
@@ -346,6 +351,23 @@ class BridgeService:
         while True:
             await asyncio.sleep(self._settings.db_probe_seconds)
             await probe_database(pool)
+
+    async def _message_projection_loop(self, store: EventStore) -> None:
+        await asyncio.sleep(1.0)
+        while True:
+            try:
+                changed = await store.reproject_message_batch()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.exception("Stored message projection upgrade failed; retrying")
+                await asyncio.sleep(5.0)
+                continue
+            if changed:
+                LOG.info("Stored message projections upgraded count=%s", changed)
+                await asyncio.sleep(0)
+                continue
+            await asyncio.sleep(1.0)
 
     async def _bootstrap_loop(self, bootstrapper: _Bootstrapper) -> None:
         attempt = 0

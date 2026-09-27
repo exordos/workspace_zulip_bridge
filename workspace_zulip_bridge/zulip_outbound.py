@@ -16,6 +16,14 @@ import asyncpg
 import httpx
 
 from workspace_zulip_bridge.config import Settings
+from workspace_zulip_bridge.message_conversion import CONVERTER_VERSION
+from workspace_zulip_bridge.message_conversion import WorkspaceMessageReference
+from workspace_zulip_bridge.message_conversion import WorkspaceStreamReference
+from workspace_zulip_bridge.message_conversion import WorkspaceTopicReference
+from workspace_zulip_bridge.message_conversion import WorkspaceToZulipContext
+from workspace_zulip_bridge.message_conversion import WorkspaceUserReference
+from workspace_zulip_bridge.message_conversion import workspace_reference_uuids
+from workspace_zulip_bridge.message_conversion import workspace_to_zulip
 from workspace_zulip_bridge.message_history import message_content_hash
 from workspace_zulip_bridge.message_history import message_flags_hash
 from workspace_zulip_bridge.message_history import message_state_hash
@@ -647,11 +655,12 @@ class ZulipOutboundWriter:
             or target_payload.get("kind") != "markdown"
         ):
             raise ZulipOutboundError("only markdown messages can be sent to Zulip")
-        content = (
-            str(target_payload.get("content", ""))
-            if target_payload != source_payload
-            else None
-        )
+        content = None
+        if target_payload != source_payload:
+            content = await self._workspace_message_content(
+                str(target_payload.get("content", "")),
+                actor,
+            )
         topic = None
         if target.get("topic_uuid") != source.get("topic_uuid"):
             topic_data = await self._target_or_source_topic(
@@ -684,7 +693,8 @@ class ZulipOutboundWriter:
             raise ZulipOutboundError(
                 "Zulip event queue is unavailable for message send"
             )
-        content = str(payload.get("content", ""))
+        workspace_content = str(payload.get("content", ""))
+        content = await self._workspace_message_content(workspace_content, actor)
         message_link = await self._pool.fetchrow(
             """
             INSERT INTO workspace_zulip_bridge.zulip_entity_links (
@@ -775,7 +785,7 @@ class ZulipOutboundWriter:
             sender_user_uuid=actor.user_uuid,
             chat_key=str(stream["chat_key"]),
             topic_name=str(topic["name"]),
-            content=content,
+            content=workspace_content,
             sent_at=sent_at,
         )
         state_hash = message_state_hash(
@@ -818,11 +828,12 @@ class ZulipOutboundWriter:
                         INSERT INTO workspace_zulip_bridge.zulip_messages (
                             uuid, realm_uuid, source_connection_uuid,
                             zulip_stream_uuid, topic_uuid, sender_user_uuid,
-                            zulip_message_id, content, reactions, reaction_users,
+                            zulip_message_id, content, workspace_content,
+                            converter_version, reactions, reaction_users,
                             content_hash, message_hash, created_at, source_updated_at
                         ) VALUES (
-                            $1, $2, $3, $4, $5, $6, $7, $8,
-                            '[]'::jsonb, '{}'::jsonb, $9, $10, $11, $12
+                            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                            '[]'::jsonb, '{}'::jsonb, $11, $12, $13, $14
                         ) ON CONFLICT (uuid) DO UPDATE SET
                             source_connection_uuid = EXCLUDED.source_connection_uuid,
                             zulip_stream_uuid = EXCLUDED.zulip_stream_uuid,
@@ -830,6 +841,8 @@ class ZulipOutboundWriter:
                             sender_user_uuid = EXCLUDED.sender_user_uuid,
                             zulip_message_id = EXCLUDED.zulip_message_id,
                             content = EXCLUDED.content,
+                            workspace_content = EXCLUDED.workspace_content,
+                            converter_version = EXCLUDED.converter_version,
                             reactions = EXCLUDED.reactions,
                             reaction_users = EXCLUDED.reaction_users,
                             content_hash = EXCLUDED.content_hash,
@@ -846,6 +859,8 @@ class ZulipOutboundWriter:
                         actor.user_uuid,
                         message_id,
                         content,
+                        workspace_content,
+                        CONVERTER_VERSION,
                         content_hash,
                         state_hash,
                         created_at,
@@ -1190,11 +1205,153 @@ class ZulipOutboundWriter:
         return await self._pool.fetchrow(
             """
             SELECT uuid, zulip_message_id, zulip_stream_uuid AS stream_uuid,
-                   sender_user_uuid
+                   sender_user_uuid, content,
+                   COALESCE(workspace_content, content) AS workspace_content
             FROM workspace_zulip_bridge.zulip_messages WHERE uuid = $1
             """,
             message_uuid,
         )
+
+    async def _workspace_message_content(
+        self,
+        content: str,
+        actor: _Actor,
+    ) -> str:
+        endpoint = getattr(actor, "endpoint", None)
+        if endpoint is None:
+            endpoint = await self._pool.fetchval(
+                """
+                SELECT identity_key
+                FROM workspace_zulip_bridge.zulip_realms
+                WHERE uuid = $1
+                """,
+                actor.realm_uuid,
+            )
+        if not isinstance(endpoint, str):
+            raise ZulipOutboundError("Zulip realm identity is unavailable")
+        references = workspace_reference_uuids(content)
+        user_uuids = set(references.get("user", ()))
+        message_uuids = set(references.get("message", ())) | set(
+            references.get("quote", ())
+        )
+        topic_uuids = set(references.get("topic", ()))
+        stream_uuids = set(references.get("stream", ()))
+
+        users: dict[UUID, WorkspaceUserReference] = {}
+        if user_uuids:
+            rows = await self._pool.fetch(
+                """
+                SELECT uuid, zulip_user_id, full_name
+                FROM workspace_zulip_bridge.zulip_users
+                WHERE realm_uuid = $1 AND uuid = ANY($2::uuid[])
+                """,
+                actor.realm_uuid,
+                list(user_uuids),
+            )
+            users = {
+                row["uuid"]: WorkspaceUserReference(
+                    zulip_user_id=row["zulip_user_id"],
+                    full_name=row["full_name"],
+                )
+                for row in rows
+            }
+
+        topics: dict[UUID, WorkspaceTopicReference] = {}
+        if topic_uuids:
+            rows = await self._pool.fetch(
+                """
+                SELECT topic.uuid, topic.zulip_stream_uuid, topic.name
+                FROM workspace_zulip_bridge.zulip_topics AS topic
+                JOIN workspace_zulip_bridge.zulip_streams AS stream
+                  ON stream.uuid = topic.zulip_stream_uuid
+                WHERE stream.realm_uuid = $1 AND topic.uuid = ANY($2::uuid[])
+                """,
+                actor.realm_uuid,
+                list(topic_uuids),
+            )
+            topics = {
+                row["uuid"]: WorkspaceTopicReference(
+                    stream_uuid=row["zulip_stream_uuid"],
+                    name=row["name"],
+                )
+                for row in rows
+            }
+            stream_uuids.update(topic.stream_uuid for topic in topics.values())
+
+        messages: dict[UUID, WorkspaceMessageReference] = {}
+        if message_uuids:
+            rows = await self._pool.fetch(
+                """
+                SELECT message.uuid, message.zulip_message_id,
+                       sender.full_name AS sender_name, message.content,
+                       message.zulip_stream_uuid, topic.name AS topic_name
+                FROM workspace_zulip_bridge.zulip_messages AS message
+                JOIN workspace_zulip_bridge.zulip_users AS sender
+                  ON sender.uuid = message.sender_user_uuid
+                LEFT JOIN workspace_zulip_bridge.zulip_topics AS topic
+                  ON topic.uuid = message.topic_uuid
+                WHERE message.realm_uuid = $1
+                  AND message.uuid = ANY($2::uuid[])
+                """,
+                actor.realm_uuid,
+                list(message_uuids),
+            )
+            messages = {
+                row["uuid"]: WorkspaceMessageReference(
+                    zulip_message_id=row["zulip_message_id"],
+                    sender_name=row["sender_name"],
+                    content=row["content"],
+                    stream_uuid=row["zulip_stream_uuid"],
+                    topic_name=row["topic_name"],
+                )
+                for row in rows
+            }
+            stream_uuids.update(message.stream_uuid for message in messages.values())
+
+        streams: dict[UUID, WorkspaceStreamReference] = {}
+        if stream_uuids:
+            rows = await self._pool.fetch(
+                """
+                SELECT uuid, chat_key, name
+                FROM workspace_zulip_bridge.zulip_streams
+                WHERE realm_uuid = $1 AND uuid = ANY($2::uuid[])
+                """,
+                actor.realm_uuid,
+                list(stream_uuids),
+            )
+            streams = {
+                row["uuid"]: WorkspaceStreamReference(
+                    chat_key=row["chat_key"],
+                    name=row["name"],
+                )
+                for row in rows
+            }
+
+        files: dict[UUID, str] = {}
+        file_uuids = set(references.get("file", ()))
+        if file_uuids:
+            rows = await self._pool.fetch(
+                """
+                SELECT uuid, source_path
+                FROM workspace_zulip_bridge.zulip_files
+                WHERE realm_uuid = $1 AND uuid = ANY($2::uuid[])
+                """,
+                actor.realm_uuid,
+                list(file_uuids),
+            )
+            files = {row["uuid"]: row["source_path"] for row in rows}
+
+        return workspace_to_zulip(
+            content,
+            context=WorkspaceToZulipContext(
+                endpoint=endpoint,
+                users=users,
+                streams=streams,
+                topics=topics,
+                messages=messages,
+                files=files,
+            ),
+        ).content
 
     async def _stream(self, stream_uuid: UUID) -> asyncpg.Record | None:
         return await self._pool.fetchrow(

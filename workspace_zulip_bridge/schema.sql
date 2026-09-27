@@ -234,6 +234,9 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_messages (
         REFERENCES workspace_zulip_bridge.zulip_users (uuid),
     zulip_message_id bigint NOT NULL,
     content text NOT NULL,
+    workspace_content text,
+    converter_version integer NOT NULL DEFAULT 0
+        CHECK (converter_version >= 0),
     reactions jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(reactions) = 'array'),
     reaction_users jsonb NOT NULL DEFAULT '{}'::jsonb
         CHECK (jsonb_typeof(reaction_users) = 'object'),

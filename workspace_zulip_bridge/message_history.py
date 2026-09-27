@@ -11,6 +11,8 @@ from urllib.parse import unquote
 from urllib.parse import urlsplit
 from uuid import UUID
 
+from workspace_zulip_bridge.message_conversion import ZulipToWorkspaceContext
+from workspace_zulip_bridge.message_conversion import zulip_to_workspace
 from workspace_zulip_bridge.models import MessagePageBuild
 from workspace_zulip_bridge.models import ZulipFileMetadata
 from workspace_zulip_bridge.models import ZulipMessage
@@ -119,7 +121,14 @@ def build_message_page(
     user_uuids: Mapping[int, UUID],
     stream_ids_by_name: Mapping[str, int],
     allowed_chat_keys: set[str],
+    endpoint: str | None = None,
 ) -> MessagePageBuild:
+    message_contents = {
+        int(candidate["id"]): str(candidate["content"])
+        for candidate in raw_messages
+        if isinstance(candidate.get("id"), int)
+        and isinstance(candidate.get("content"), str)
+    }
     messages: list[ZulipMessage] = []
     skipped_messages = 0
     skipped_reactions = 0
@@ -131,6 +140,8 @@ def build_message_page(
             user_uuids=user_uuids,
             stream_ids_by_name=stream_ids_by_name,
             allowed_chat_keys=allowed_chat_keys,
+            endpoint=endpoint,
+            message_contents=message_contents,
         )
         if parsed is None:
             skipped_messages += 1
@@ -154,6 +165,8 @@ def _parse_message(
     user_uuids: Mapping[int, UUID],
     stream_ids_by_name: Mapping[str, int],
     allowed_chat_keys: set[str],
+    endpoint: str | None,
+    message_contents: Mapping[int, str],
 ) -> tuple[ZulipMessage, int, set[str]] | None:
     message_id = raw_message.get("id")
     sender_user_id = raw_message.get("sender_id")
@@ -280,11 +293,23 @@ def _parse_message(
         value = raw_message.get(field)
         if isinstance(value, int):
             modification_times.append(value)
+    workspace_content = content
+    if endpoint is not None:
+        workspace_content = zulip_to_workspace(
+            content,
+            context=ZulipToWorkspaceContext(
+                endpoint=endpoint,
+                own_user_id=own_user_id,
+                user_uuids=user_uuids,
+                stream_ids_by_name=stream_ids_by_name,
+                message_contents=message_contents,
+            ),
+        ).content
     content_hash = message_content_hash(
         sender_user_uuid=sender_user_uuid,
         chat_key=chat_key,
         topic_name=topic_name,
-        content=content,
+        content=workspace_content,
         sent_at=sent_at,
     )
     message_hash = message_state_hash(
@@ -318,6 +343,7 @@ def _parse_message(
             files=files,
             sent_at=sent_at,
             source_updated_at=max(modification_times),
+            workspace_content=workspace_content,
         ),
         skipped_reactions,
         unknown_flags,

@@ -28,6 +28,7 @@ from workspace_zulip_bridge.database import prepare_database
 from workspace_zulip_bridge.event_processor import ZulipEventProcessor
 from workspace_zulip_bridge.event_processor import _user_status_change
 from workspace_zulip_bridge.event_store import EventStore
+from workspace_zulip_bridge.message_conversion import CONVERTER_VERSION
 from workspace_zulip_bridge.message_history import message_flags_hash
 from workspace_zulip_bridge.models import UserDirectoryWrite
 from workspace_zulip_bridge.models import ZulipAttachment
@@ -2711,6 +2712,107 @@ async def _workspace_event_processor_prioritizes_live_messages(dsn: str) -> None
 
 def test_live_zulip_message_bypasses_backfill_diff_queue() -> None:
     asyncio.run(_live_zulip_message_bypasses_backfill_diff_queue(_dsn()))
+
+
+def test_stored_messages_are_reprojected_in_bounded_batches() -> None:
+    asyncio.run(_stored_messages_are_reprojected_in_bounded_batches(_dsn()))
+
+
+async def _stored_messages_are_reprojected_in_bounded_batches(dsn: str) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            owner_uuid = await _insert_user(
+                connection,
+                10,
+                100,
+                queue_id="queue-owner",
+                status="filling",
+            )
+        assert (
+            await store.store_chat_catalog(
+                owner_uuid,
+                "queue-owner",
+                _catalog(10, [(7, "Shared")], {"channel:7": 1}),
+            )
+        ).activated
+        assert (await store.reconcile_chat_schedules()).assigned == 1
+        message = ZulipMessage(
+            message_id=9010,
+            chat_key="channel:7",
+            topic_name="Projection",
+            sender_user_uuid=owner_uuid,
+            content="hello @**User 10|10**",
+            is_read=True,
+            is_starred=False,
+            is_collapsed=False,
+            is_mentioned=False,
+            is_stream_wildcard_mentioned=False,
+            is_topic_wildcard_mentioned=False,
+            has_alert_word=False,
+            is_historical=False,
+            reactions_json="[]",
+            message_hash=b"r" * 32,
+            content_hash=b"s" * 32,
+            sent_at=1_800_000_010,
+        )
+        message_uuid = await _load_one_chat(
+            store,
+            pool,
+            owner_uuid,
+            "queue-owner",
+            message,
+        )
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.zulip_messages
+            SET workspace_content = NULL, converter_version = 0,
+                content_hash = $2
+            WHERE uuid = $1
+            """,
+            message_uuid,
+            b"s" * 32,
+        )
+        await pool.execute(
+            """
+            DELETE FROM workspace_zulip_bridge.workspace_outbox
+            WHERE entity_type = 'message' AND entity_uuid = $1
+            """,
+            message_uuid,
+        )
+
+        projector = EventStore(pool)
+        assert await projector.reproject_message_batch(limit=1) == 1
+        row = await pool.fetchrow(
+            """
+            SELECT content, workspace_content, converter_version
+            FROM workspace_zulip_bridge.zulip_messages
+            WHERE uuid = $1
+            """,
+            message_uuid,
+        )
+        assert row is not None
+        assert row["content"] == "hello @**User 10|10**"
+        assert row["workspace_content"] == (
+            f"hello [User 10](urn:user:{stable_user_uuid(ENDPOINT, 10)})"
+        )
+        assert row["converter_version"] == CONVERTER_VERSION
+        assert (
+            await pool.fetchval(
+                """
+            SELECT count(*)
+            FROM workspace_zulip_bridge.workspace_outbox
+            WHERE entity_type = 'message' AND entity_uuid = $1
+              AND delivery_status = 'pending'
+            """,
+                message_uuid,
+            )
+            == 1
+        )
+        assert await projector.reproject_message_batch(limit=1) == 0
+    finally:
+        await pool.close()
 
 
 async def _live_zulip_message_bypasses_backfill_diff_queue(dsn: str) -> None:

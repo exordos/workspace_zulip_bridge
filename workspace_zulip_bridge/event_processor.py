@@ -17,6 +17,8 @@ import asyncpg
 
 from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.event_store import EventStore
+from workspace_zulip_bridge.message_conversion import ZulipToWorkspaceContext
+from workspace_zulip_bridge.message_conversion import zulip_to_workspace
 from workspace_zulip_bridge.message_history import build_message_page
 from workspace_zulip_bridge.message_history import extract_file_metadata
 from workspace_zulip_bridge.message_history import message_content_hash
@@ -131,6 +133,7 @@ class _MessageSnapshot:
     topic_name: str | None
     sender_user_uuid: UUID
     content: str
+    workspace_content: str
     is_read: bool
     is_starred: bool
     is_collapsed: bool
@@ -1363,6 +1366,7 @@ class ZulipEventProcessor:
                 return _Outcome(item.event.uuid, "retry", "local_message_link_retry")
         message_payload, write_flags = _normalize_live_message(raw_message)
         user_uuids = await self._load_user_uuids(item.event.endpoint)
+        stream_ids_by_name = await self._load_stream_ids_by_name(item.event.endpoint)
         sender_id = raw_message.get("sender_id")
         if isinstance(sender_id, int) and sender_id not in user_uuids:
             await self._store.request_catalog_refresh(
@@ -1374,8 +1378,9 @@ class ZulipEventProcessor:
             [message_payload],
             own_user_id=item.event.own_user_id,
             user_uuids=user_uuids,
-            stream_ids_by_name={},
+            stream_ids_by_name=stream_ids_by_name,
             allowed_chat_keys={item.chat_key} if item.chat_key is not None else set(),
+            endpoint=item.event.endpoint,
         )
         if not built.messages:
             return _Outcome(item.event.uuid, "skipped", "message_filtered")
@@ -1411,6 +1416,7 @@ class ZulipEventProcessor:
                 for item in items
             ]
         user_uuids = await self._load_user_uuids(first.event.endpoint)
+        stream_ids_by_name = await self._load_stream_ids_by_name(first.event.endpoint)
         messages: list[ZulipMessage] = []
         outcomes: list[_Outcome] = []
         for item_index, item in enumerate(items):
@@ -1478,8 +1484,9 @@ class ZulipEventProcessor:
                 [message_payload],
                 own_user_id=first.event.own_user_id,
                 user_uuids=user_uuids,
-                stream_ids_by_name={},
+                stream_ids_by_name=stream_ids_by_name,
                 allowed_chat_keys={item.chat_key},
+                endpoint=item.event.endpoint,
             )
             if not built.messages:
                 outcomes.append(
@@ -1702,6 +1709,14 @@ class ZulipEventProcessor:
             item.event.endpoint,
             item.message_ids,
         )
+        if item.event.own_user_id is None:
+            return _Outcome(item.event.uuid, "failed", "invalid_message_event")
+        projection_context = ZulipToWorkspaceContext(
+            endpoint=item.event.endpoint,
+            own_user_id=item.event.own_user_id,
+            user_uuids=await self._load_user_uuids(item.event.endpoint),
+            stream_ids_by_name=await self._load_stream_ids_by_name(item.event.endpoint),
+        )
         messages: list[ZulipMessage] = []
         for snapshot in snapshots:
             changes: dict[str, object] = {}
@@ -1721,7 +1736,19 @@ class ZulipEventProcessor:
                 content = payload.get("content")
                 if isinstance(content, str):
                     changes["content"] = content
-            messages.append(_snapshot_message(snapshot, **changes))
+            workspace_content = snapshot.workspace_content
+            if "content" in changes:
+                workspace_content = zulip_to_workspace(
+                    str(changes["content"]),
+                    context=projection_context,
+                ).content
+            messages.append(
+                _snapshot_message(
+                    snapshot,
+                    workspace_content=workspace_content,
+                    **changes,
+                )
+            )
         return await self._store_messages(item, messages, "message_update")
 
     async def _apply_delete(self, item: _RoutedEvent) -> _Outcome:
@@ -1978,6 +2005,23 @@ class ZulipEventProcessor:
             )
         return {row["zulip_user_id"]: row["uuid"] for row in rows}
 
+    async def _load_stream_ids_by_name(self, endpoint: str) -> dict[str, int]:
+        async with self._pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT stream.name,
+                       substring(stream.chat_key FROM '^channel:([0-9]+)$')::bigint
+                           AS zulip_stream_id
+                FROM workspace_zulip_bridge.zulip_streams AS stream
+                JOIN workspace_zulip_bridge.zulip_realms AS realm
+                  ON realm.uuid = stream.realm_uuid
+                WHERE realm.identity_key = $1
+                  AND stream.chat_key ~ '^channel:[0-9]+$'
+                """,
+                endpoint,
+            )
+        return {row["name"]: row["zulip_stream_id"] for row in rows}
+
     async def _load_message_snapshots(
         self,
         endpoint: str,
@@ -1993,6 +2037,8 @@ class ZulipEventProcessor:
                        topic.name AS topic_name,
                        message.sender_user_uuid,
                        message.content,
+                       COALESCE(message.workspace_content, message.content)
+                           AS workspace_content,
                        message.reactions::text AS reactions_json,
                        extract(epoch FROM message.created_at)::bigint AS sent_at,
                        extract(epoch FROM message.source_updated_at)::bigint
@@ -2025,6 +2071,7 @@ class ZulipEventProcessor:
                     topic_name=row["topic_name"],
                     sender_user_uuid=row["sender_user_uuid"],
                     content=row["content"],
+                    workspace_content=row["workspace_content"],
                     is_read=False,
                     is_starred=False,
                     is_collapsed=False,
@@ -2417,9 +2464,14 @@ def _event_chat_key(
 
 def _snapshot_message(
     snapshot: _MessageSnapshot,
+    *,
+    workspace_content: str | None = None,
     **changes: Any,
 ) -> ZulipMessage:
     updated = replace(snapshot, **changes)
+    projected_content = (
+        updated.workspace_content if workspace_content is None else workspace_content
+    )
     reactions = [dict(reaction) for reaction in updated.reactions]
     reaction_users: dict[str, list[str]] = {}
     for reaction in reactions:
@@ -2430,7 +2482,7 @@ def _snapshot_message(
         sender_user_uuid=updated.sender_user_uuid,
         chat_key=updated.chat_key,
         topic_name=updated.topic_name,
-        content=updated.content,
+        content=projected_content,
         sent_at=updated.sent_at,
     )
     message_hash = message_state_hash(
@@ -2473,6 +2525,7 @@ def _snapshot_message(
         write_flags=False,
         sent_at=updated.sent_at,
         source_updated_at=updated.source_updated_at,
+        workspace_content=projected_content,
     )
 
 
