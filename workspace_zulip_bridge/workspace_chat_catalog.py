@@ -148,9 +148,120 @@ class WorkspaceChatCatalogWorker:
 
     async def _refresh_catalogs(self) -> int:
         changed = await self._reactivate_needed_reports()
+        # Newly discovered and reassigned chats must not wait for the complete
+        # historical catalog comparison. Select that small realtime lane first,
+        # then calculate the more expensive aggregate timestamp only for the
+        # selected chats. The historical comparison below remains the fallback
+        # once this lane is empty.
         rows = await self._pool.fetch(
             """
-            SELECT connection.external_account_uuid AS account_uuid,
+            WITH candidates AS MATERIALIZED (
+                SELECT connection.external_account_uuid AS account_uuid,
+                       stream.uuid AS stream_uuid,
+                       connection.desired_generation,
+                       connection.owner_workspace_user_uuid,
+                       realm.workspace_project_id AS project_uuid,
+                       realm.uuid AS realm_uuid,
+                       owner.uuid AS owner_zulip_user_uuid,
+                       owner.zulip_user_id AS owner_zulip_user_id,
+                       stream.chat_type, stream.chat_key,
+                       stream.name AS display_name, stream.description,
+                       stream.chat_parameters,
+                       stream.updated_at AS stream_updated_at,
+                       owner_binding.updated_at AS owner_binding_updated_at,
+                       owner.updated_at AS owner_updated_at
+                FROM workspace_zulip_bridge.zulip_connections AS connection
+                JOIN workspace_zulip_bridge.zulip_realms AS realm
+                  ON realm.uuid = connection.realm_uuid
+                JOIN workspace_zulip_bridge.zulip_users AS owner
+                  ON owner.uuid = connection.zulip_user_uuid
+                JOIN workspace_zulip_bridge.zulip_streams AS stream
+                  ON stream.source_connection_uuid = connection.uuid
+                JOIN workspace_zulip_bridge.zulip_stream_bindings AS owner_binding
+                  ON owner_binding.zulip_user_uuid = owner.uuid
+                 AND owner_binding.zulip_stream_uuid = stream.uuid
+                LEFT JOIN workspace_zulip_bridge.workspace_chat_catalog_reports
+                    AS report
+                  ON report.external_account_uuid =
+                         connection.external_account_uuid
+                 AND report.zulip_stream_uuid = stream.uuid
+                WHERE connection.sync_enabled
+                  AND connection.external_account_uuid IS NOT NULL
+                  AND connection.owner_workspace_user_uuid IS NOT NULL
+                  AND connection.desired_generation IS NOT NULL
+                  AND realm.workspace_project_id IS NOT NULL
+                  AND NOT owner.disabled
+                  AND (
+                      report.external_account_uuid IS NULL
+                      OR report.observed_generation <>
+                         connection.desired_generation
+                  )
+                ORDER BY (report.external_account_uuid IS NULL) DESC,
+                         stream.updated_at DESC,
+                         connection.external_account_uuid, stream.uuid
+                LIMIT 20
+            )
+            SELECT candidate.account_uuid, candidate.stream_uuid,
+                   candidate.desired_generation,
+                   candidate.owner_workspace_user_uuid,
+                   candidate.project_uuid, candidate.realm_uuid,
+                   candidate.owner_zulip_user_uuid,
+                   candidate.owner_zulip_user_id,
+                   candidate.chat_type, candidate.chat_key,
+                   candidate.display_name, candidate.description,
+                   candidate.chat_parameters,
+                   EXISTS (
+                       SELECT 1
+                       FROM workspace_zulip_bridge.workspace_file_projections
+                           AS live_projection
+                       WHERE live_projection.zulip_stream_uuid =
+                                 candidate.stream_uuid
+                         AND live_projection.delivery_priority = 0
+                         AND live_projection.processing_status IN (
+                             'pending', 'processing', 'failed'
+                         )
+                   ) AS has_live_file_work,
+                   (
+                       SELECT max(live_file.source_created_at)
+                       FROM workspace_zulip_bridge.workspace_file_projections
+                           AS live_projection
+                       JOIN workspace_zulip_bridge.zulip_files AS live_file
+                         ON live_file.uuid = live_projection.file_uuid
+                       WHERE live_projection.zulip_stream_uuid =
+                                 candidate.stream_uuid
+                         AND live_projection.delivery_priority = 0
+                         AND live_projection.processing_status IN (
+                             'pending', 'processing', 'failed'
+                         )
+                   ) AS newest_live_file_at,
+                   GREATEST(
+                       candidate.stream_updated_at,
+                       candidate.owner_binding_updated_at,
+                       candidate.owner_updated_at,
+                       COALESCE((
+                           SELECT max(topic.updated_at)
+                           FROM workspace_zulip_bridge.zulip_topics AS topic
+                           WHERE topic.zulip_stream_uuid = candidate.stream_uuid
+                       ), '-infinity'::timestamptz),
+                       COALESCE((
+                           SELECT max(GREATEST(binding.updated_at, member.updated_at))
+                           FROM workspace_zulip_bridge.zulip_stream_bindings
+                               AS binding
+                           JOIN workspace_zulip_bridge.zulip_users AS member
+                             ON member.uuid = binding.zulip_user_uuid
+                           WHERE binding.zulip_stream_uuid =
+                                 candidate.stream_uuid
+                       ), '-infinity'::timestamptz)
+                   ) AS source_updated_at
+            FROM candidates AS candidate
+            ORDER BY candidate.stream_updated_at DESC,
+                     candidate.account_uuid, candidate.stream_uuid
+            """
+        )
+        if not rows:
+            rows = await self._pool.fetch(
+                """
+                SELECT connection.external_account_uuid AS account_uuid,
                    stream.uuid AS stream_uuid,
                    connection.desired_generation,
                    connection.owner_workspace_user_uuid,
@@ -245,9 +356,9 @@ class WorkspaceChatCatalogWorker:
                      has_live_file_work DESC,
                      newest_live_file_at DESC NULLS LAST,
                      connection.external_account_uuid, stream.uuid
-            LIMIT 20
-            """
-        )
+                LIMIT 20
+                """
+            )
         for row in rows:
             source = _CatalogSource(
                 account_uuid=UUID(str(row["account_uuid"])),
