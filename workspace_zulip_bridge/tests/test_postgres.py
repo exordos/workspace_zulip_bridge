@@ -2811,6 +2811,38 @@ async def _stored_messages_are_reprojected_in_bounded_batches(dsn: str) -> None:
             == 1
         )
         assert await projector.reproject_message_batch(limit=1) == 0
+
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.zulip_messages
+            SET content = 'plain text', workspace_content = NULL,
+                converter_version = 0, content_hash = $2
+            WHERE uuid = $1
+            """,
+            message_uuid,
+            b"z" * 32,
+        )
+        await pool.execute(
+            """
+            DELETE FROM workspace_zulip_bridge.workspace_outbox
+            WHERE entity_type = 'message' AND entity_uuid = $1
+            """,
+            message_uuid,
+        )
+        plain_projector = EventStore(pool)
+        assert await plain_projector.reproject_message_batch(limit=1) == 1
+        assert (
+            await pool.fetchval(
+                """
+            SELECT count(*)
+            FROM workspace_zulip_bridge.workspace_outbox
+            WHERE entity_type = 'message' AND entity_uuid = $1
+              AND delivery_status = 'pending'
+            """,
+                message_uuid,
+            )
+            == 0
+        )
     finally:
         await pool.close()
 

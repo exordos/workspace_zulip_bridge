@@ -71,7 +71,7 @@ class EventStore:
                 """
                 SELECT message.uuid, message.realm_uuid,
                        message.zulip_message_id, message.sender_user_uuid,
-                       message.content, message.content_hash,
+                       message.content, message.workspace_content,
                        extract(epoch FROM message.created_at)::bigint AS sent_at,
                        stream.chat_key, topic.name AS topic_name,
                        realm.identity_key AS endpoint,
@@ -167,7 +167,12 @@ class EventStore:
                         row["uuid"],
                         workspace_content,
                         content_hash,
-                        bytes(row["content_hash"]) != content_hash,
+                        workspace_content
+                        != (
+                            row["workspace_content"]
+                            if row["workspace_content"] is not None
+                            else row["content"]
+                        ),
                     )
                 )
 
