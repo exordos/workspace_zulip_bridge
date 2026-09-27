@@ -6858,6 +6858,15 @@ async def _workspace_diff_worker_round_trip(dsn: str, tmp_path: Path) -> None:
                 native_stream_uuid,
                 b"n" * 32,
             )
+            await pool.execute(
+                """
+                UPDATE workspace_zulip_bridge.workspace_mirror_state
+                SET reconciliation_version = 0
+                WHERE provider_uuid = $1
+                """,
+                provider_uuid,
+            )
+            worker._unmapped_cleanup_done = False
             assert await worker.plan() == 0
             assert (
                 await pool.fetchval(

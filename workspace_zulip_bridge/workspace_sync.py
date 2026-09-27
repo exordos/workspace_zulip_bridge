@@ -58,6 +58,7 @@ WORKSPACE_EVENT_PRIORITY = {
     "topic": 7,
 }
 RECONCILIATION_VERSION = 19
+UNMAPPED_SCOPE_RECONCILIATION_VERSION = 1
 
 
 class ProviderApiError(RuntimeError):
@@ -1464,14 +1465,15 @@ class WorkspaceDiffWorker:
             state.get("initial_sync_completed_at") is not None
             and state.get("target_scan_generation", generation) != generation
         )
+        current_reconciliation_version = int(state.get("reconciliation_version", 0))
+        total = await self._plan_source_outbox(realm_uuid, generation)
         if (
             state.get("initial_sync_completed_at") is not None
+            and current_reconciliation_version < UNMAPPED_SCOPE_RECONCILIATION_VERSION
             and not self._unmapped_cleanup_done
         ):
             await self._skip_unmapped_target_diffs(realm_uuid, generation)
             self._unmapped_cleanup_done = True
-        total = await self._plan_source_outbox(realm_uuid, generation)
-        current_reconciliation_version = int(state.get("reconciliation_version", 0))
         if not self._topic_bindings_repair_done:
             self._topic_bindings_repair_done = await self._ensure_topic_bindings(
                 realm_uuid
