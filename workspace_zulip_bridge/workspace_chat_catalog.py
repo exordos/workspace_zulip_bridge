@@ -241,9 +241,9 @@ class WorkspaceChatCatalogWorker:
                        ), '-infinity'::timestamptz)
                   )
               )
-            ORDER BY has_live_file_work DESC,
+            ORDER BY source_updated_at DESC,
+                     has_live_file_work DESC,
                      newest_live_file_at DESC NULLS LAST,
-                     source_updated_at DESC,
                      connection.external_account_uuid, stream.uuid
             LIMIT 20
             """
@@ -641,8 +641,13 @@ class WorkspaceChatCatalogWorker:
                  AND file_work.zulip_stream_uuid = report.zulip_stream_uuid
                 WHERE report.processing_status IN ('pending', 'failed')
                   AND report.available_at <= clock_timestamp()
-                ORDER BY coalesce(file_work.delivery_priority, 1),
+                ORDER BY (
+                             report.source_updated_at >= clock_timestamp()
+                             - make_interval(secs => $1::double precision)
+                         ) DESC,
+                         coalesce(file_work.delivery_priority, 1),
                          file_work.newest_file_at DESC NULLS LAST,
+                         report.source_updated_at DESC,
                          report.available_at, report.updated_at,
                          report.external_account_uuid, report.zulip_stream_uuid
                 LIMIT 1 FOR UPDATE SKIP LOCKED
@@ -655,7 +660,8 @@ class WorkspaceChatCatalogWorker:
             WHERE report.external_account_uuid = candidate.external_account_uuid
               AND report.zulip_stream_uuid = candidate.zulip_stream_uuid
             RETURNING report.report_uuid, report.report
-            """
+            """,
+            self._settings.event_processor_realtime_window_seconds,
         )
 
     def _client(self) -> httpx.AsyncClient:
