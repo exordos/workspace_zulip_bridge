@@ -392,13 +392,15 @@ class WorkspaceFileTransferWorker:
         for path in (ca, certificate, key):
             if not path.is_file():
                 raise FileTransferError("bridge_identity_not_ready")
+        context = ssl.create_default_context(cafile=str(ca))
+        context.load_cert_chain(str(certificate), str(key))
         return httpx.AsyncClient(
             base_url=self._control_url,
-            verify=str(ca),
-            cert=(str(certificate), str(key)),
+            verify=context,
             follow_redirects=False,
             trust_env=False,
             timeout=httpx.Timeout(self._settings.workspace_request_timeout_seconds),
+            headers={"Accept": "application/json"},
         )
 
     async def _transfer(self, job: _Job, descriptor: _Descriptor) -> str:
