@@ -18,6 +18,11 @@ _BRIDGE_NAMESPACE = uuid5(
 # ownership of catalog reporting and native file transfer.
 _EXTERNAL_CHAT_NAMESPACE = UUID("9a1d0e75-50a5-413c-b3e8-d070232ef57f")
 
+# Workspace derives native Messenger entities from an external chat catalog
+# with this public, stable namespace.  The bridge must use the same identities
+# when it sends messages into a chat that was materialized by the catalog path.
+_WORKSPACE_PROJECTION_NAMESPACE = UUID("71bdfd0a-35b6-54ac-83d1-54869e3c7e67")
+
 
 def canonical_endpoint(endpoint: str) -> str:
     parsed = urlsplit(endpoint.strip())
@@ -96,6 +101,27 @@ def stable_external_chat_uuid(account_uuid: UUID, chat_key: str) -> UUID:
     return uuid5(
         _EXTERNAL_CHAT_NAMESPACE,
         f"zulip:{account_uuid}:external_chat:{chat_key}",
+    )
+
+
+def stable_external_chat_stream_uuid(external_chat_uuid: UUID) -> UUID:
+    """Return the Workspace stream projected from an external chat catalog."""
+
+    return uuid5(
+        _WORKSPACE_PROJECTION_NAMESPACE,
+        f"{external_chat_uuid}:stream:canonical",
+    )
+
+
+def stable_external_chat_topic_uuid(
+    external_chat_uuid: UUID,
+    provider_topic_id: str,
+) -> UUID:
+    """Return one Workspace topic projected from an external chat catalog."""
+
+    return uuid5(
+        _WORKSPACE_PROJECTION_NAMESPACE,
+        f"{external_chat_uuid}:topic:{provider_topic_id}",
     )
 
 

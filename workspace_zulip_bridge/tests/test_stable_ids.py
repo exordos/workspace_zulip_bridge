@@ -1,12 +1,15 @@
 # Copyright 2026 Genesis Corporation
 # Licensed under the Apache License, Version 2.0 (the "License").
 
+from uuid import UUID
 from uuid import uuid4
 
 import pytest
 
 from workspace_zulip_bridge.stable_ids import canonical_endpoint
 from workspace_zulip_bridge.stable_ids import stable_chat_uuid
+from workspace_zulip_bridge.stable_ids import stable_external_chat_stream_uuid
+from workspace_zulip_bridge.stable_ids import stable_external_chat_topic_uuid
 from workspace_zulip_bridge.stable_ids import stable_file_projection_uuid
 from workspace_zulip_bridge.stable_ids import stable_file_uuid
 from workspace_zulip_bridge.stable_ids import stable_message_flag_uuid
@@ -80,6 +83,18 @@ def test_relationship_and_file_ids_are_stable() -> None:
     assert stable_file_projection_uuid(
         source_file_uuid, stream_uuid
     ) != stable_file_projection_uuid(source_file_uuid, uuid4())
+
+
+def test_external_chat_projection_ids_match_workspace_contract() -> None:
+    external_chat_uuid = UUID("351dfd85-c909-5c6b-911f-4950ecca2fc6")
+
+    assert stable_external_chat_stream_uuid(external_chat_uuid) == UUID(
+        "8f01887c-3da0-5a95-a412-b7ce740c7ede"
+    )
+    assert stable_external_chat_topic_uuid(
+        external_chat_uuid,
+        "745:test",
+    ) == UUID("a12782b7-bb96-5c72-ba8c-bf7720bcbbe7")
 
 
 @pytest.mark.parametrize(

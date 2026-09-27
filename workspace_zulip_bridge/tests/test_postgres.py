@@ -40,6 +40,9 @@ from workspace_zulip_bridge.models import ZulipUserProfileStatus
 from workspace_zulip_bridge.models import ZulipUserTopic
 from workspace_zulip_bridge.monitor import collect_snapshot
 from workspace_zulip_bridge.stable_ids import stable_chat_uuid
+from workspace_zulip_bridge.stable_ids import stable_external_chat_stream_uuid
+from workspace_zulip_bridge.stable_ids import stable_external_chat_topic_uuid
+from workspace_zulip_bridge.stable_ids import stable_external_chat_uuid
 from workspace_zulip_bridge.stable_ids import stable_file_projection_uuid
 from workspace_zulip_bridge.stable_ids import stable_file_uuid
 from workspace_zulip_bridge.stable_ids import stable_message_flag_uuid
@@ -2790,6 +2793,17 @@ def test_live_zulip_message_bypasses_backfill_diff_queue() -> None:
     asyncio.run(_live_zulip_message_bypasses_backfill_diff_queue(_dsn()))
 
 
+def test_catalog_projected_live_message_uses_workspace_parent_ids(
+    tmp_path: Path,
+) -> None:
+    asyncio.run(
+        _catalog_projected_live_message_uses_workspace_parent_ids(
+            _dsn(),
+            tmp_path,
+        )
+    )
+
+
 def test_stored_messages_are_reprojected_in_bounded_batches() -> None:
     asyncio.run(_stored_messages_are_reprojected_in_bounded_batches(_dsn()))
 
@@ -3163,6 +3177,213 @@ async def _live_zulip_message_bypasses_backfill_diff_queue(dsn: str) -> None:
             "source_hash": None,
             "target_hash": b"w" * 32,
         }
+    finally:
+        await pool.close()
+
+
+async def _catalog_projected_live_message_uses_workspace_parent_ids(
+    dsn: str,
+    tmp_path: Path,
+) -> None:
+    pool = await _pool(dsn)
+    provider_uuid = UUID("10000000-0000-0000-0000-0000000000d1")
+    project_uuid = UUID("10000000-0000-0000-0000-0000000000d2")
+    generation = UUID("10000000-0000-0000-0000-0000000000d3")
+    account_uuid = UUID("10000000-0000-0000-0000-0000000000d4")
+    workspace_user_uuid = UUID("10000000-0000-0000-0000-0000000000d5")
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            owner_uuid = await _insert_user(
+                connection,
+                10,
+                100,
+                queue_id="queue-catalog-projection",
+                status="filling",
+            )
+        catalog = _catalog(10, [(7, "Projected")], {"channel:7": 1})
+        assert (
+            await store.store_chat_catalog(
+                owner_uuid,
+                "queue-catalog-projection",
+                catalog,
+            )
+        ).activated
+        assert (await store.reconcile_chat_schedules()).assigned == 1
+        realm_uuid = stable_realm_uuid(ENDPOINT)
+        stream_uuid = stable_chat_uuid(ENDPOINT, "channel:7")
+        topic_uuid = stable_topic_uuid(stream_uuid, "Live")
+        external_chat_uuid = stable_external_chat_uuid(account_uuid, "channel:7")
+        projected_stream_uuid = stable_external_chat_stream_uuid(external_chat_uuid)
+        projected_topic_uuid = stable_external_chat_topic_uuid(
+            external_chat_uuid,
+            "7:Live",
+        )
+        async with pool.acquire() as connection:
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_realms
+                SET workspace_project_id = $2, workspace_provider_uuid = $3
+                WHERE uuid = $1
+                """,
+                realm_uuid,
+                project_uuid,
+                provider_uuid,
+            )
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_connections
+                SET external_account_uuid = $2,
+                    owner_workspace_user_uuid = $3,
+                    desired_generation = 1
+                WHERE uuid = $1
+                """,
+                owner_uuid,
+                account_uuid,
+                workspace_user_uuid,
+            )
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_users
+                SET workspace_user_uuid = $2
+                WHERE uuid = $1
+                """,
+                owner_uuid,
+                workspace_user_uuid,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_topics (
+                    uuid, zulip_stream_uuid, name, content_hash
+                ) VALUES ($1, $2, 'Live', $3)
+                """,
+                topic_uuid,
+                stream_uuid,
+                b"t" * 32,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.workspace_mirror_state (
+                    provider_uuid, workspace_project_id, active_generation,
+                    bootstrap_status
+                ) VALUES ($1, $2, $3, 'ready')
+                """,
+                provider_uuid,
+                project_uuid,
+                generation,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.workspace_users (
+                    provider_uuid, snapshot_generation, uuid,
+                    workspace_project_id, content_hash, source_updated_at, data
+                ) VALUES ($1, $2, $3, $4, $5, clock_timestamp(), '{}'::jsonb)
+                """,
+                provider_uuid,
+                generation,
+                workspace_user_uuid,
+                project_uuid,
+                b"u" * 32,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.workspace_chat_catalog_reports (
+                    external_account_uuid, zulip_stream_uuid, resource_uuid,
+                    observed_generation, catalog, catalog_hash, report_uuid,
+                    report, processing_status, reported_at, source_updated_at
+                ) VALUES (
+                    $1, $2, $3, 1, $6::jsonb, $4, $5, '{}'::jsonb,
+                    'reported', clock_timestamp(), clock_timestamp()
+                )
+                """,
+                account_uuid,
+                stream_uuid,
+                external_chat_uuid,
+                b"c" * 32,
+                UUID("10000000-0000-0000-0000-0000000000d6"),
+                json.dumps(
+                    {
+                        "topics": [
+                            {
+                                "provider_topic_id": "7:Live",
+                                "name": "Live",
+                                "is_default": False,
+                            }
+                        ]
+                    }
+                ),
+            )
+
+        message = ZulipMessage(
+            message_id=9101,
+            chat_key="channel:7",
+            topic_name="Live",
+            sender_user_uuid=owner_uuid,
+            content="live projected",
+            is_read=True,
+            is_starred=False,
+            is_collapsed=False,
+            is_mentioned=False,
+            is_stream_wildcard_mentioned=False,
+            is_topic_wildcard_mentioned=False,
+            has_alert_word=False,
+            is_historical=False,
+            reactions_json="[]",
+            message_hash=b"m" * 32,
+            content_hash=b"c" * 32,
+            sent_at=1_800_000_100,
+        )
+        result = await store.apply_live_messages(
+            owner_uuid,
+            "queue-catalog-projection",
+            (),
+            (message,),
+            (),
+        )
+        assert result.messages_changed == 1
+        message_uuid = stable_message_uuid(ENDPOINT, 9101)
+        diff = await pool.fetchrow(
+            """
+            SELECT * FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1 AND entity_type = 'messages'
+              AND entity_uuid = $2
+            """,
+            provider_uuid,
+            message_uuid,
+        )
+        assert diff is not None
+        assert diff["delivery_priority"] == 0
+
+        token_file = tmp_path / "workspace-catalog-projection.token"
+        token_file.write_text("integration-token")
+        settings = Settings.from_env(
+            {
+                "WZB_DATABASE_DSN": dsn,
+                "WZB_DB_POOL_MIN_SIZE": "1",
+                "WZB_DB_POOL_MAX_SIZE": "4",
+                "WZB_ZULIP_HISTORY_CONCURRENCY": "2",
+                "WZB_WORKSPACE_WEBSOCKET_URL": (
+                    "ws://workspace.test/api/workspace/v1/events/ws"
+                ),
+                "WZB_WORKSPACE_PROJECT_ID": str(project_uuid),
+                "WZB_WORKSPACE_PROVIDER_UUID": str(provider_uuid),
+                "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+            }
+        )
+        worker = WorkspaceDiffWorker(pool, settings)
+        loaded = await worker._load_zulip_entities("messages", [message_uuid])
+        data = loaded[("messages", message_uuid)]
+        assert data["stream_uuid"] == str(projected_stream_uuid)
+        assert data["topic_uuid"] == str(projected_topic_uuid)
+        operation = {
+            "action": "upsert",
+            "type": "messages",
+            "uuid": str(message_uuid),
+        }
+        candidate = (diff, data, b"p" * 32, operation)
+        ready, deferred = await worker._partition_dependency_ready([candidate])
+        assert ready == [candidate]
+        assert deferred == []
     finally:
         await pool.close()
 

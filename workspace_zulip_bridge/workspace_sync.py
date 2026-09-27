@@ -24,6 +24,8 @@ import httpx
 from asyncpg.pool import PoolConnectionProxy
 
 from workspace_zulip_bridge.config import Settings
+from workspace_zulip_bridge.stable_ids import stable_external_chat_stream_uuid
+from workspace_zulip_bridge.stable_ids import stable_external_chat_topic_uuid
 from workspace_zulip_bridge.stable_ids import stable_topic_binding_uuid
 from workspace_zulip_bridge.stable_ids import stable_topic_uuid
 from workspace_zulip_bridge.workspace_auth import WorkspaceTokenManager
@@ -171,6 +173,18 @@ def _provider_api_error(response: httpx.Response) -> ProviderApiError:
         ):
             item_index = candidate_index
     return ProviderApiError(response.status_code, error_code, item_index)
+
+
+def _catalog_topic_provider_id(
+    chat_type: str,
+    chat_key: str,
+    topic_name: str | None,
+) -> str:
+    if chat_type == "channel":
+        if topic_name is None:
+            raise ValueError("channel message must have a catalog topic")
+        return f"{chat_key.removeprefix('channel:')}:{topic_name}"
+    return f"{chat_key}:default"
 
 
 def _bootstrap_error(error: BaseException) -> RuntimeError:
@@ -3898,6 +3912,11 @@ class WorkspaceDiffWorker:
                 if binding_uuid is not None:
                     dependencies["stream_bindings"].add(binding_uuid)
         ready_ids = await self._load_ready_dependency_ids(dependencies)
+        catalog_dependencies = await self._load_catalog_message_dependency_ids(
+            candidates
+        )
+        ready_ids.setdefault("streams", set()).update(catalog_dependencies["streams"])
+        ready_ids.setdefault("topics", set()).update(catalog_dependencies["topics"])
         ready = []
         deferred = []
         for candidate in sorted(
@@ -3939,6 +3958,76 @@ class WorkspaceDiffWorker:
             else:
                 deferred.append(row)
         return ready, deferred
+
+    async def _load_catalog_message_dependency_ids(
+        self,
+        candidates: list[tuple[asyncpg.Record, dict[str, Any], bytes, dict[str, Any]]],
+    ) -> dict[str, set[UUID]]:
+        ready: dict[str, set[UUID]] = defaultdict(set)
+        message_uuids = [
+            UUID(str(row["entity_uuid"]))
+            for row, _, _, operation in candidates
+            if row["entity_type"] == "messages" and operation.get("action") != "delete"
+        ]
+        if not message_uuids:
+            return ready
+        rows = await self._pool.fetch(
+            """
+            SELECT report.resource_uuid, stream.chat_type, stream.chat_key,
+                   topic.name AS topic_name
+            FROM workspace_zulip_bridge.zulip_messages AS message
+            JOIN workspace_zulip_bridge.zulip_streams AS stream
+              ON stream.uuid = message.zulip_stream_uuid
+            JOIN workspace_zulip_bridge.zulip_connections AS connection
+              ON connection.uuid = stream.source_connection_uuid
+            JOIN workspace_zulip_bridge.zulip_realms AS realm
+              ON realm.uuid = message.realm_uuid
+            JOIN workspace_zulip_bridge.workspace_mirror_state AS mirror
+              ON mirror.provider_uuid = realm.workspace_provider_uuid
+             AND mirror.bootstrap_status = 'ready'
+             AND mirror.active_generation IS NOT NULL
+            JOIN workspace_zulip_bridge.workspace_chat_catalog_reports AS report
+              ON report.external_account_uuid = connection.external_account_uuid
+             AND report.zulip_stream_uuid = stream.uuid
+             AND report.processing_status = 'reported'
+            LEFT JOIN workspace_zulip_bridge.zulip_topics AS topic
+              ON topic.uuid = message.topic_uuid
+            LEFT JOIN workspace_zulip_bridge.workspace_streams AS legacy_stream
+              ON legacy_stream.provider_uuid = realm.workspace_provider_uuid
+             AND legacy_stream.snapshot_generation = mirror.active_generation
+             AND legacy_stream.uuid = stream.uuid
+            WHERE message.uuid = ANY($1::uuid[])
+              AND legacy_stream.uuid IS NULL
+              AND EXISTS (
+                  SELECT 1
+                  FROM jsonb_array_elements(report.catalog -> 'topics')
+                      AS catalog_topic
+                  WHERE catalog_topic ->> 'provider_topic_id' = CASE
+                      WHEN stream.chat_type = 'channel'
+                      THEN regexp_replace(stream.chat_key, '^channel:', '')
+                           || ':' || topic.name
+                      ELSE stream.chat_key || ':default'
+                  END
+              )
+            """,
+            message_uuids,
+        )
+        for row in rows:
+            external_chat_uuid = UUID(str(row["resource_uuid"]))
+            ready["streams"].add(stable_external_chat_stream_uuid(external_chat_uuid))
+            ready["topics"].add(
+                stable_external_chat_topic_uuid(
+                    external_chat_uuid,
+                    _catalog_topic_provider_id(
+                        str(row["chat_type"]),
+                        str(row["chat_key"]),
+                        str(row["topic_name"])
+                        if row["topic_name"] is not None
+                        else None,
+                    ),
+                )
+            )
+        return ready
 
     async def _load_file_ready_message_ids(
         self,
@@ -4962,13 +5051,31 @@ class WorkspaceDiffWorker:
         self, entity_type: str, entity_uuids: list[UUID]
     ) -> dict[tuple[str, UUID], dict[str, Any]]:
         rows = await self._pool.fetch(_ENTITY_QUERIES[entity_type], entity_uuids)
-        return {
-            (entity_type, UUID(str(row["entity_uuid"]))): project_entity(
+        result: dict[tuple[str, UUID], dict[str, Any]] = {}
+        for row in rows:
+            data = _json_object(row["data"])
+            if entity_type == "messages" and row["catalog_resource_uuid"] is not None:
+                external_chat_uuid = UUID(str(row["catalog_resource_uuid"]))
+                data["stream_uuid"] = str(
+                    stable_external_chat_stream_uuid(external_chat_uuid)
+                )
+                data["topic_uuid"] = str(
+                    stable_external_chat_topic_uuid(
+                        external_chat_uuid,
+                        _catalog_topic_provider_id(
+                            str(row["chat_type"]),
+                            str(row["chat_key"]),
+                            str(row["topic_name"])
+                            if row["topic_name"] is not None
+                            else None,
+                        ),
+                    )
+                )
+            result[(entity_type, UUID(str(row["entity_uuid"])))] = project_entity(
                 entity_type,
-                _json_object(row["data"]),
+                data,
             )
-            for row in rows
-        }
+        return result
 
     async def _load_workspace_entities(
         self, entity_type: str, entity_uuids: list[UUID]
@@ -5399,10 +5506,33 @@ _ENTITY_QUERIES = {
                 COALESCE(message.workspace_content, message.content)
             ),
             'created_at', message.created_at
-        ) AS data
+        ) AS data,
+        CASE WHEN legacy_stream.uuid IS NULL
+                  AND report.processing_status = 'reported'
+             THEN report.resource_uuid END AS catalog_resource_uuid,
+        stream.chat_type, stream.chat_key, topic.name AS topic_name
         FROM workspace_zulip_bridge.zulip_messages AS message
         JOIN workspace_zulip_bridge.zulip_users AS sender
           ON sender.uuid = message.sender_user_uuid
+        JOIN workspace_zulip_bridge.zulip_streams AS stream
+          ON stream.uuid = message.zulip_stream_uuid
+        JOIN workspace_zulip_bridge.zulip_connections AS connection
+          ON connection.uuid = stream.source_connection_uuid
+        JOIN workspace_zulip_bridge.zulip_realms AS realm
+          ON realm.uuid = message.realm_uuid
+        JOIN workspace_zulip_bridge.workspace_mirror_state AS mirror
+          ON mirror.provider_uuid = realm.workspace_provider_uuid
+         AND mirror.bootstrap_status = 'ready'
+         AND mirror.active_generation IS NOT NULL
+        LEFT JOIN workspace_zulip_bridge.zulip_topics AS topic
+          ON topic.uuid = message.topic_uuid
+        LEFT JOIN workspace_zulip_bridge.workspace_chat_catalog_reports AS report
+          ON report.external_account_uuid = connection.external_account_uuid
+         AND report.zulip_stream_uuid = stream.uuid
+        LEFT JOIN workspace_zulip_bridge.workspace_streams AS legacy_stream
+          ON legacy_stream.provider_uuid = realm.workspace_provider_uuid
+         AND legacy_stream.snapshot_generation = mirror.active_generation
+         AND legacy_stream.uuid = stream.uuid
         WHERE message.uuid = ANY($1::uuid[])
     """,
     "message_flags": """

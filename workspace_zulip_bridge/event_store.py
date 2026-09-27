@@ -1639,6 +1639,17 @@ class EventStore:
                   WHERE parent.provider_uuid = realm.workspace_provider_uuid
                     AND parent.snapshot_generation = mirror.active_generation
                     AND parent.uuid = source.zulip_stream_uuid
+                  UNION ALL
+                  SELECT 1
+                  FROM workspace_zulip_bridge.zulip_streams AS stream
+                  JOIN workspace_zulip_bridge.zulip_connections AS supplier
+                    ON supplier.uuid = stream.source_connection_uuid
+                  JOIN workspace_zulip_bridge.workspace_chat_catalog_reports AS report
+                    ON report.external_account_uuid =
+                           supplier.external_account_uuid
+                   AND report.zulip_stream_uuid = stream.uuid
+                   AND report.processing_status = 'reported'
+                  WHERE stream.uuid = source.zulip_stream_uuid
               )
               AND EXISTS (
                   SELECT 1
@@ -1646,6 +1657,17 @@ class EventStore:
                   WHERE parent.provider_uuid = realm.workspace_provider_uuid
                     AND parent.snapshot_generation = mirror.active_generation
                     AND parent.uuid = source.topic_uuid
+                  UNION ALL
+                  SELECT 1
+                  FROM workspace_zulip_bridge.zulip_streams AS stream
+                  JOIN workspace_zulip_bridge.zulip_connections AS supplier
+                    ON supplier.uuid = stream.source_connection_uuid
+                  JOIN workspace_zulip_bridge.workspace_chat_catalog_reports AS report
+                    ON report.external_account_uuid =
+                           supplier.external_account_uuid
+                   AND report.zulip_stream_uuid = stream.uuid
+                   AND report.processing_status = 'reported'
+                  WHERE stream.uuid = source.zulip_stream_uuid
               )
               AND EXISTS (
                   SELECT 1
