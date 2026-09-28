@@ -48,3 +48,31 @@ async def _catalog_report_waits_for_shared_control_capacity(tmp_path: Path) -> N
 
     assert await task == "applied"
     client.post.assert_awaited_once()
+
+
+def test_non_coordinator_only_delivers_catalog_reports(tmp_path: Path) -> None:
+    asyncio.run(_non_coordinator_only_delivers_catalog_reports(tmp_path))
+
+
+async def _non_coordinator_only_delivers_catalog_reports(tmp_path: Path) -> None:
+    settings = Settings(
+        database_dsn="postgresql:///unused",
+        workspace_control_url="https://127.0.0.1",
+        workspace_bridge_instance_uuid=UUID("10000000-0000-4000-8000-000000000001"),
+        workspace_control_state_dir=tmp_path,
+    )
+    worker = WorkspaceChatCatalogWorker(
+        object(),  # type: ignore[arg-type]
+        settings,
+        coordinate=False,
+    )
+    worker._refresh_catalogs = AsyncMock(  # type: ignore[method-assign]
+        side_effect=AssertionError("non-coordinator refreshed catalogs")
+    )
+    worker._retire_unneeded_reports = AsyncMock(  # type: ignore[method-assign]
+        side_effect=AssertionError("non-coordinator retired reports")
+    )
+    worker._claim_report = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+    assert await worker.process_once() == 0
+    worker._claim_report.assert_awaited_once()

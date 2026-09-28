@@ -85,6 +85,7 @@ class WorkspaceChatCatalogWorker:
         pool: asyncpg.Pool,
         settings: Settings,
         *,
+        coordinate: bool = True,
         control_semaphore: asyncio.Semaphore | None = None,
     ) -> None:
         if settings.workspace_control_url is None:
@@ -96,6 +97,7 @@ class WorkspaceChatCatalogWorker:
         self._control_url = settings.workspace_control_url.rstrip("/")
         self._bridge_uuid = settings.workspace_bridge_instance_uuid
         self._state = settings.workspace_control_state_dir
+        self._coordinate = coordinate
         self._control_semaphore = control_semaphore or asyncio.Semaphore(
             settings.workspace_file_control_concurrency
         )
@@ -123,8 +125,8 @@ class WorkspaceChatCatalogWorker:
             await asyncio.sleep(self._settings.workspace_control_poll_seconds)
 
     async def process_once(self) -> int:
-        refreshed = await self._refresh_catalogs()
-        retired = await self._retire_unneeded_reports()
+        refreshed = await self._refresh_catalogs() if self._coordinate else 0
+        retired = await self._retire_unneeded_reports() if self._coordinate else 0
         report = await self._claim_report()
         if report is None:
             return refreshed + retired

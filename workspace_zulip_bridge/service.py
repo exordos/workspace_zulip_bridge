@@ -130,6 +130,7 @@ class BridgeService:
                         WorkspaceChatCatalogWorker(
                             pool,
                             self._settings,
+                            coordinate=index == 0,
                             control_semaphore=file_control_semaphore,
                         ).run(),
                         name=f"workspace-chat-catalog-{index}",
