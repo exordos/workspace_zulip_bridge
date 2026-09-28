@@ -653,12 +653,38 @@ class WorkspaceControlWorker:
                 raise ValueError("external chat topic identity is invalid")
         result = await self._pool.execute(
             """
+            WITH changed_assignment AS MATERIALIZED (
+                SELECT report.zulip_stream_uuid,
+                       assignment IS DISTINCT FROM $2::jsonb AS assignment_changed
+                FROM workspace_zulip_bridge.workspace_chat_catalog_reports AS report
+                WHERE resource_uuid = $3 AND external_account_uuid = $4
+                  AND (assignment_generation IS NULL OR assignment_generation <= $1)
+                FOR UPDATE
+            ), invalidate_completion AS (
+                UPDATE workspace_zulip_bridge.workspace_mirror_state AS mirror
+                SET initial_sync_completed_at = NULL, updated_at = clock_timestamp()
+                FROM changed_assignment AS changed
+                JOIN workspace_zulip_bridge.zulip_streams AS stream
+                  ON stream.uuid = changed.zulip_stream_uuid
+                JOIN workspace_zulip_bridge.zulip_realms AS realm
+                  ON realm.uuid = stream.realm_uuid
+                WHERE mirror.provider_uuid = realm.workspace_provider_uuid
+                  AND changed.assignment_changed
+            )
             UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports
             SET assignment_generation = $1, assignment = $2::jsonb,
                 assignment_reconciled = CASE
                     WHEN assignment IS DISTINCT FROM $2::jsonb THEN false
                     ELSE assignment_reconciled
                 END,
+                assignment_repair_available_at = clock_timestamp(),
+                assignment_repair_last_error = NULL,
+                assignment_repair_stage = CASE
+                    WHEN assignment IS DISTINCT FROM $2::jsonb THEN 0
+                    ELSE assignment_repair_stage END,
+                assignment_repair_entity_uuid = CASE
+                    WHEN assignment IS DISTINCT FROM $2::jsonb THEN NULL
+                    ELSE assignment_repair_entity_uuid END,
                 assignment_repair_created_at = CASE
                     WHEN assignment IS DISTINCT FROM $2::jsonb THEN NULL
                     ELSE assignment_repair_created_at
@@ -668,6 +694,7 @@ class WorkspaceControlWorker:
                     ELSE assignment_repair_uuid
                 END,
                 updated_at = clock_timestamp()
+            FROM changed_assignment AS selected
             WHERE resource_uuid = $3
               AND external_account_uuid = $4
               AND (
@@ -689,6 +716,8 @@ class WorkspaceControlWorker:
             UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports
             SET assignment_generation = NULL, assignment = NULL,
                 assignment_reconciled = false,
+                assignment_repair_stage = 0,
+                assignment_repair_entity_uuid = NULL,
                 assignment_repair_created_at = NULL,
                 assignment_repair_uuid = NULL,
                 updated_at = clock_timestamp()
@@ -706,6 +735,8 @@ class WorkspaceControlWorker:
             UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports
             SET assignment_generation = NULL, assignment = NULL,
                 assignment_reconciled = false,
+                assignment_repair_stage = 0,
+                assignment_repair_entity_uuid = NULL,
                 assignment_repair_created_at = NULL,
                 assignment_repair_uuid = NULL,
                 updated_at = clock_timestamp()

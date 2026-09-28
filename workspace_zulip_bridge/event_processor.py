@@ -9,6 +9,8 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import replace
+from datetime import UTC
+from datetime import datetime
 from typing import Any
 from typing import Literal
 from uuid import UUID
@@ -80,6 +82,28 @@ def _normalize_live_message(
     return {**raw_message, "flags": []}, False
 
 
+_NOTIFICATION_SUBSCRIPTION_PROPERTIES = frozenset(
+    {
+        "desktop_notifications",
+        "audible_notifications",
+        "push_notifications",
+        "email_notifications",
+        "wildcard_mentions_notify",
+        "is_muted",
+        "in_home_view",
+    }
+)
+
+
+def _notification_subscription(payload: Mapping[str, Any]) -> bool:
+    property_name = payload.get("property")
+    return (
+        payload.get("op") == "update"
+        and isinstance(property_name, str)
+        and property_name in _NOTIFICATION_SUBSCRIPTION_PROPERTIES
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class EventBatchStats:
     claimed: int = 0
@@ -132,6 +156,7 @@ class _RoutedEvent:
 class _MessageSnapshot:
     message_id: int
     chat_key: str
+    topic_uuid: UUID | None
     topic_name: str | None
     sender_user_uuid: UUID
     content: str
@@ -191,6 +216,7 @@ class ZulipEventProcessor:
         self._next_cleanup_at = 0.0
         self._next_redundant_update_skip_at = 0.0
         self._next_presence_expiry_at = 0.0
+        self._topic_normalization_done = False
         self._cleanup_batch_size = settings.event_cleanup_batch_size
         self._redundant_update_batch_size = min(
             self.MAX_REDUNDANT_UPDATE_BATCH_SIZE,
@@ -222,8 +248,11 @@ class ZulipEventProcessor:
                 deleted = 0
                 redundant_updates_skipped = 0
                 expired_presences = 0
+                normalized_topics = 0
                 if self._claim_scope != "realtime" and self._run_maintenance:
                     await self._maybe_requeue_expired_claims()
+                    if not self._topic_normalization_done:
+                        normalized_topics = await self._normalize_prefixed_topics_once()
                     redundant_updates_skipped = (
                         await self._maybe_skip_redundant_update_events()
                     )
@@ -266,7 +295,24 @@ class ZulipEventProcessor:
                 continue
             if expired_presences == self._settings.event_cleanup_batch_size:
                 continue
+            if normalized_topics == self._cleanup_batch_size:
+                continue
             await asyncio.sleep(self._settings.event_processor_poll_seconds)
+
+    async def _normalize_prefixed_topics_once(self) -> int:
+        normalized = await self._store.normalize_prefixed_topics(
+            self._cleanup_batch_size
+        )
+        if normalized == self._cleanup_batch_size:
+            return normalized
+        pending, blocked = await self._store.prefixed_topic_normalization_status()
+        self._topic_normalization_done = pending == 0
+        if self._topic_normalization_done and blocked:
+            LOG.warning(
+                "Legacy prefixed topics require manual conflict resolution count=%s",
+                blocked,
+            )
+        return normalized
 
     async def _maybe_skip_redundant_update_events(self) -> int:
         if time.monotonic() < self._next_redundant_update_skip_at:
@@ -417,7 +463,7 @@ class ZulipEventProcessor:
                 WITH expired AS MATERIALIZED (
                     SELECT event.uuid
                     FROM workspace_zulip_bridge.zulip_events AS event
-                    WHERE event.processing_status IN ('applied', 'skipped', 'failed')
+                    WHERE event.processing_status IN ('applied', 'skipped')
                       AND event.created_at < (
                           clock_timestamp()
                           - make_interval(secs => $1::double precision)
@@ -872,9 +918,20 @@ class ZulipEventProcessor:
             if event.active_queue
             and event.event_type == "subscription"
             and event.payload.get("op") in {"add", "remove", "update"}
+            and not _notification_subscription(event.payload)
         }
         for connection_uuid, queue_id in refreshes:
             await self._store.request_catalog_refresh(connection_uuid, queue_id)
+
+        notification_refreshes = {
+            (event.user_uuid, event.queue_id)
+            for event in events
+            if event.active_queue
+            and event.event_type == "subscription"
+            and _notification_subscription(event.payload)
+        }
+        for connection_uuid, queue_id in notification_refreshes:
+            await self._store.request_notification_snapshot(connection_uuid, queue_id)
 
         direct_messages: dict[
             tuple[UUID, str, str], tuple[_ClaimedEvent, Mapping[str, Any]]
@@ -1291,7 +1348,12 @@ class ZulipEventProcessor:
         if event_type == "attachment":
             return await self._apply_attachment(item)
         if event_type == "subscription":
-            return _Outcome(item.event.uuid, "applied", "catalog_refresh_requested")
+            reason = (
+                "notification_refresh_requested"
+                if _notification_subscription(item.event.payload)
+                else "catalog_refresh_requested"
+            )
+            return _Outcome(item.event.uuid, "applied", reason)
         if event_type in {"realm_user", "realm_bot"}:
             return await self._apply_directory_event(item)
         if event_type == "user_topic":
@@ -1312,17 +1374,12 @@ class ZulipEventProcessor:
         value = item.event.payload.get("value")
         if not isinstance(value, bool):
             return _Outcome(item.event.uuid, "failed", "invalid_user_setting_event")
-        changed = await self._store.store_user_notification_setting(
+        await self._store.store_user_notification_setting(
             item.event.user_uuid,
             item.event.queue_id,
             enable_stream_desktop_notifications=value,
         )
-        if changed:
-            await self._store.request_catalog_refresh(
-                item.event.user_uuid,
-                item.event.queue_id,
-            )
-        return _Outcome(item.event.uuid, "applied", "user_notification_setting")
+        return _Outcome(item.event.uuid, "applied", "notification_refresh_requested")
 
     async def _apply_user_topic(self, item: _RoutedEvent) -> _Outcome:
         change = _user_topic_change(item.event.payload)
@@ -1806,20 +1863,65 @@ class ZulipEventProcessor:
             stream_ids_by_name=await self._load_stream_ids_by_name(item.event.endpoint),
         )
         messages: list[ZulipMessage] = []
+        subject = payload.get("subject")
+        effective_topic_display_name = subject if isinstance(subject, str) else None
+        original_subject = payload.get("orig_subject")
+        edit_timestamp = payload.get("edit_timestamp")
+        raw_message_ids = payload.get("message_ids")
+        source_stream_id = payload.get("stream_id")
+        new_stream_id = payload.get("new_stream_id")
+        topic_uuids = {snapshot.topic_uuid for snapshot in snapshots}
+        snapshot_message_ids = tuple(snapshot.message_id for snapshot in snapshots)
+        whole_topic_change = (
+            isinstance(subject, str)
+            and isinstance(original_subject, str)
+            and type(edit_timestamp) is int
+            and payload.get("propagate_mode") == "change_all"
+            and isinstance(raw_message_ids, list)
+            and tuple(
+                sorted(value for value in raw_message_ids if isinstance(value, int))
+            )
+            == item.message_ids
+            and snapshot_message_ids == item.message_ids
+            and (
+                not isinstance(new_stream_id, int)
+                or (
+                    isinstance(source_stream_id, int)
+                    and new_stream_id == source_stream_id
+                )
+            )
+            and len(topic_uuids) == 1
+        )
+        if whole_topic_change:
+            assert isinstance(subject, str)
+            assert isinstance(original_subject, str)
+            assert type(edit_timestamp) is int
+            topic_uuid = next(iter(topic_uuids))
+            if topic_uuid is not None:
+                effective_topic_display_name = (
+                    await self._store.apply_topic_display_change(
+                        item.event.user_uuid,
+                        item.event.queue_id,
+                        topic_uuid,
+                        original_subject,
+                        subject,
+                        datetime.fromtimestamp(edit_timestamp, UTC),
+                    )
+                )
         for snapshot in snapshots:
             changes: dict[str, object] = {}
-            edit_timestamp = payload.get("edit_timestamp")
             if type(edit_timestamp) is int:
                 changes["source_updated_at"] = max(
                     snapshot.source_updated_at,
                     edit_timestamp,
                 )
-            new_stream_id = payload.get("new_stream_id")
             if isinstance(new_stream_id, int):
                 changes["chat_key"] = f"channel:{new_stream_id}"
-            subject = payload.get("subject")
-            if isinstance(subject, str) and snapshot.topic_name is not None:
-                changes["topic_name"] = subject
+            if (
+                effective_topic_display_name is not None
+                and snapshot.topic_name is not None
+            ):
+                changes["topic_name"] = effective_topic_display_name
             if snapshot.message_id == primary_id:
                 content = payload.get("content")
                 if isinstance(content, str):
@@ -2128,7 +2230,7 @@ class ZulipEventProcessor:
                 """
                 SELECT message.zulip_message_id,
                        chat.chat_key,
-                       topic.name AS topic_name,
+                       message.topic_uuid, topic.name AS topic_name,
                        message.sender_user_uuid,
                        message.content,
                        COALESCE(message.workspace_content, message.content)
@@ -2162,6 +2264,7 @@ class ZulipEventProcessor:
                 _MessageSnapshot(
                     message_id=row["zulip_message_id"],
                     chat_key=row["chat_key"],
+                    topic_uuid=row["topic_uuid"],
                     topic_name=row["topic_name"],
                     sender_user_uuid=row["sender_user_uuid"],
                     content=row["content"],

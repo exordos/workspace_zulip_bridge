@@ -18,9 +18,11 @@ from uuid import uuid5
 
 import asyncpg
 import httpx
+from asyncpg.pool import PoolConnectionProxy
 
 from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.stable_ids import stable_external_chat_uuid
+from workspace_zulip_bridge.topic_state import topic_display_name
 from workspace_zulip_bridge.workspace_file_transfer import CATALOG_PROJECTION_REVISION
 from workspace_zulip_bridge.workspace_file_transfer import MAX_FILE_BYTES
 
@@ -46,6 +48,16 @@ _COMMON_CAPABILITIES = frozenset(
         "messenger.reaction.write",
     }
 )
+
+
+def _legacy_catalog_topic_provider_id(chat_key: str, display_name: str) -> str:
+    if not chat_key.startswith("channel:"):
+        raise ValueError("catalog topic identities only apply to channels")
+    return f"{chat_key.removeprefix('channel:')}:{display_name}"
+
+
+def _opaque_catalog_topic_provider_id(topic_uuid: UUID) -> str:
+    return f"topic-uuid:{topic_uuid}"
 
 
 class CatalogReportError(RuntimeError):
@@ -97,6 +109,7 @@ class WorkspaceChatCatalogWorker:
         self._bridge_uuid = settings.workspace_bridge_instance_uuid
         self._state = settings.workspace_control_state_dir
         self._coordinate = coordinate
+        self._assignment_repair_key: tuple[UUID, str] | None = None
         self._control_semaphore = control_semaphore or asyncio.Semaphore(
             settings.workspace_file_control_concurrency
         )
@@ -128,9 +141,7 @@ class WorkspaceChatCatalogWorker:
     async def process_once(self) -> int:
         refreshed = 0
         retired = 0
-        requeued = 0
         if self._coordinate:
-            requeued = await self._requeue_assignment_messages()
             # Do not let an old report backlog hide newly discovered chats or
             # a projection-format upgrade.  Only the coordinator performs this
             # bounded, newest-first refresh; the remaining workers keep
@@ -142,7 +153,7 @@ class WorkspaceChatCatalogWorker:
             retired = await self._retire_unneeded_reports()
             reports = await self._claim_reports()
         if not reports:
-            return refreshed + retired + requeued
+            return refreshed + retired
         try:
             outcomes = await self._send_reports(
                 [_object(report["report"]) for report in reports]
@@ -167,198 +178,213 @@ class WorkspaceChatCatalogWorker:
             for report in reports:
                 report_uuid = UUID(str(report["report_uuid"]))
                 await self._finish_report(report_uuid, outcomes[report_uuid])
-        return refreshed + retired + requeued + len(reports)
+        return refreshed + retired + len(reports)
+
+    async def run_assignment_repairs(self) -> None:
+        """Repair persisted assignments independently of catalog publication."""
+        while True:
+            changed = 0
+            try:
+                changed = await self._requeue_assignment_messages()
+            except (TimeoutError, asyncpg.PostgresError, ValueError):
+                LOG.warning("Workspace assignment repair deferred")
+            await asyncio.sleep(
+                0 if changed else self._settings.workspace_control_poll_seconds
+            )
 
     async def _requeue_assignment_messages(self) -> int:
-        """Reproject one assigned chat newest-first without a global rescan."""
+        self._assignment_repair_key = None
+        try:
+            return await self._repair_assignment_page()
+        except (TimeoutError, asyncpg.PostgresError, ValueError) as error:
+            if self._assignment_repair_key is not None:
+                report_uuid, assignment = self._assignment_repair_key
+                await self._pool.execute(
+                    """
+                    UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports
+                    SET assignment_repair_available_at = clock_timestamp() + interval '1 minute',
+                        assignment_repair_last_error = $3, updated_at = clock_timestamp()
+                    WHERE report_uuid = $1 AND assignment = $2::jsonb
+                    """,
+                    report_uuid,
+                    assignment,
+                    type(error).__name__,
+                )
+            raise
 
-        row = await self._pool.fetchrow(
-            """
-            WITH candidate_report AS MATERIALIZED (
-                SELECT report.external_account_uuid,
-                       report.zulip_stream_uuid,
-                       stream.realm_uuid,
+    async def _repair_assignment_page(self) -> int:
+        """Scan one index-supported page, advancing past already-correct rows."""
+        from workspace_zulip_bridge.workspace_sync import _catalog_projection_topic_uuid
+        from workspace_zulip_bridge.workspace_sync import _catalog_topic_provider_id
+
+        stages = (
+            ("stream", "zulip_streams", "uuid"),
+            ("stream_binding", "zulip_stream_bindings", "zulip_stream_uuid"),
+            ("topic", "zulip_topics", "zulip_stream_uuid"),
+            ("topic_binding", "zulip_topic_bindings", "zulip_stream_uuid"),
+            ("message", "zulip_messages", "zulip_stream_uuid"),
+            ("message_flag", "zulip_message_flags", "zulip_stream_uuid"),
+        )
+        async with self._pool.acquire() as connection, connection.transaction():
+            report = await connection.fetchrow(
+                """
+                SELECT report.external_account_uuid, report.zulip_stream_uuid,
+                       report.report_uuid, report.assignment::text, report.catalog,
+                       report.resource_uuid, stream.chat_type, stream.chat_key,
+                       report.assignment_repair_stage,
+                       report.assignment_repair_entity_uuid,
                        report.assignment_repair_created_at,
                        report.assignment_repair_uuid,
+                       realm.uuid AS realm_uuid, realm.workspace_provider_uuid,
+                       mirror.active_generation,
                        (report.assignment #>>
-                           '{workspace_projection,stream,uuid}')::uuid
+                           '{workspace_projection,stream,uuid}')
                            AS projection_stream_uuid
-                FROM workspace_zulip_bridge.workspace_chat_catalog_reports
-                    AS report
+                FROM workspace_zulip_bridge.workspace_chat_catalog_reports AS report
                 JOIN workspace_zulip_bridge.zulip_streams AS stream
                   ON stream.uuid = report.zulip_stream_uuid
-                WHERE report.processing_status = 'reported'
-                  AND report.assignment IS NOT NULL
-                  AND NOT report.assignment_reconciled
-                ORDER BY report.source_activity_at DESC,
-                         report.external_account_uuid,
-                         report.zulip_stream_uuid
-                LIMIT 1
-                FOR UPDATE SKIP LOCKED
-            ), queued_stream AS (
-                INSERT INTO workspace_zulip_bridge.workspace_outbox (
-                    realm_uuid, entity_type, action, entity_uuid
-                )
-                SELECT realm_uuid, 'stream', 'upsert', zulip_stream_uuid
-                FROM candidate_report
-                WHERE assignment_repair_created_at IS NULL
-                  AND assignment_repair_uuid IS NULL
-                ON CONFLICT (realm_uuid, entity_type, entity_uuid)
-                    WHERE delivery_status = 'pending'
-                DO UPDATE SET action = 'upsert', entity_hash = NULL,
-                              available_at = clock_timestamp(),
-                              updated_at = clock_timestamp()
-                RETURNING 1
-            ), queued_stream_bindings AS (
-                INSERT INTO workspace_zulip_bridge.workspace_outbox (
-                    realm_uuid, entity_type, action, entity_uuid
-                )
-                SELECT report.realm_uuid, 'stream_binding', 'upsert', binding.uuid
-                FROM candidate_report AS report
-                JOIN workspace_zulip_bridge.zulip_stream_bindings AS binding
-                  ON binding.zulip_stream_uuid = report.zulip_stream_uuid
-                WHERE report.assignment_repair_created_at IS NULL
-                  AND report.assignment_repair_uuid IS NULL
-                ON CONFLICT (realm_uuid, entity_type, entity_uuid)
-                    WHERE delivery_status = 'pending'
-                DO UPDATE SET action = 'upsert', entity_hash = NULL,
-                              available_at = clock_timestamp(),
-                              updated_at = clock_timestamp()
-                RETURNING 1
-            ), queued_topics AS (
-                INSERT INTO workspace_zulip_bridge.workspace_outbox (
-                    realm_uuid, entity_type, action, entity_uuid
-                )
-                SELECT report.realm_uuid, 'topic', 'upsert', topic.uuid
-                FROM candidate_report AS report
-                JOIN workspace_zulip_bridge.zulip_topics AS topic
-                  ON topic.zulip_stream_uuid = report.zulip_stream_uuid
-                WHERE report.assignment_repair_created_at IS NULL
-                  AND report.assignment_repair_uuid IS NULL
-                ON CONFLICT (realm_uuid, entity_type, entity_uuid)
-                    WHERE delivery_status = 'pending'
-                DO UPDATE SET action = 'upsert', entity_hash = NULL,
-                              available_at = clock_timestamp(),
-                              updated_at = clock_timestamp()
-                RETURNING 1
-            ), queued_topic_bindings AS (
-                INSERT INTO workspace_zulip_bridge.workspace_outbox (
-                    realm_uuid, entity_type, action, entity_uuid
-                )
-                SELECT report.realm_uuid, 'topic_binding', 'upsert', binding.uuid
-                FROM candidate_report AS report
-                JOIN workspace_zulip_bridge.zulip_topic_bindings AS binding
-                  ON binding.zulip_stream_uuid = report.zulip_stream_uuid
-                WHERE report.assignment_repair_created_at IS NULL
-                  AND report.assignment_repair_uuid IS NULL
-                ON CONFLICT (realm_uuid, entity_type, entity_uuid)
-                    WHERE delivery_status = 'pending'
-                DO UPDATE SET action = 'upsert', entity_hash = NULL,
-                              available_at = clock_timestamp(),
-                              updated_at = clock_timestamp()
-                RETURNING 1
-            ), batch AS MATERIALIZED (
-                SELECT message.uuid, message.realm_uuid, message.created_at
-                FROM candidate_report AS report
-                JOIN workspace_zulip_bridge.zulip_messages AS message
-                  ON message.zulip_stream_uuid = report.zulip_stream_uuid
+                JOIN workspace_zulip_bridge.zulip_connections AS supplier
+                  ON supplier.uuid = stream.source_connection_uuid
+                 AND supplier.external_account_uuid = report.external_account_uuid
+                 AND supplier.sync_enabled
                 JOIN workspace_zulip_bridge.zulip_realms AS realm
-                  ON realm.uuid = message.realm_uuid
+                  ON realm.uuid = stream.realm_uuid
                 JOIN workspace_zulip_bridge.workspace_mirror_state AS mirror
                   ON mirror.provider_uuid = realm.workspace_provider_uuid
                  AND mirror.active_generation IS NOT NULL
-                LEFT JOIN workspace_zulip_bridge.workspace_messages AS target
-                  ON target.provider_uuid = mirror.provider_uuid
-                 AND target.snapshot_generation = mirror.active_generation
-                 AND target.uuid = message.uuid
-                WHERE (
-                    report.assignment_repair_created_at IS NULL
-                    OR (message.created_at, message.uuid) < (
-                        report.assignment_repair_created_at,
-                        report.assignment_repair_uuid
-                    )
-                )
-                  AND (
-                    target.uuid IS NULL
-                    OR (target.data ->> 'stream_uuid')::uuid IS DISTINCT FROM
-                       report.projection_stream_uuid
-                  )
-                ORDER BY message.created_at DESC, message.uuid DESC
-                LIMIT 1000
-            ), queued_messages AS (
-                INSERT INTO workspace_zulip_bridge.workspace_outbox (
-                    realm_uuid, entity_type, action, entity_uuid
-                )
-                SELECT realm_uuid, 'message', 'upsert', uuid FROM batch
-                ON CONFLICT (realm_uuid, entity_type, entity_uuid)
-                    WHERE delivery_status = 'pending'
-                DO UPDATE SET action = 'upsert', entity_hash = NULL,
-                              available_at = clock_timestamp(),
-                              updated_at = clock_timestamp()
-                RETURNING 1
-            ), queued_flags AS (
-                INSERT INTO workspace_zulip_bridge.workspace_outbox (
-                    realm_uuid, entity_type, action, entity_uuid
-                )
-                SELECT flag.realm_uuid, 'message_flag', 'upsert', flag.uuid
-                FROM workspace_zulip_bridge.zulip_message_flags AS flag
-                JOIN batch ON batch.uuid = flag.message_uuid
-                ON CONFLICT (realm_uuid, entity_type, entity_uuid)
-                    WHERE delivery_status = 'pending'
-                DO UPDATE SET action = 'upsert', entity_hash = NULL,
-                              available_at = clock_timestamp(),
-                              updated_at = clock_timestamp()
-                RETURNING 1
-            ), progress AS (
-                UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports
-                    AS report
-                SET assignment_reconciled = (SELECT count(*) < 1000 FROM batch),
-                    assignment_repair_created_at = COALESCE(
-                        (
-                            SELECT created_at FROM batch
-                            ORDER BY created_at, uuid LIMIT 1
-                        ),
-                        report.assignment_repair_created_at
-                    ),
-                    assignment_repair_uuid = COALESCE(
-                        (
-                            SELECT uuid FROM batch
-                            ORDER BY created_at, uuid LIMIT 1
-                        ),
-                        report.assignment_repair_uuid
-                    ),
-                    updated_at = clock_timestamp()
-                FROM candidate_report AS candidate
-                WHERE report.external_account_uuid =
-                          candidate.external_account_uuid
-                  AND report.zulip_stream_uuid = candidate.zulip_stream_uuid
-                RETURNING report.assignment_reconciled
+                WHERE report.processing_status = 'reported'
+                  AND report.projection_revision >= $1
+                  AND report.assignment IS NOT NULL
+                  AND report.assignment #>> '{workspace_projection,stream,uuid}' IS NOT NULL
+                  AND NOT report.assignment_reconciled
+                  AND report.assignment_repair_available_at <= clock_timestamp()
+                ORDER BY report.updated_at, report.external_account_uuid,
+                         report.zulip_stream_uuid
+                LIMIT 1 FOR UPDATE OF report SKIP LOCKED
+                """,
+                CATALOG_PROJECTION_REVISION,
             )
-            SELECT (SELECT count(*) FROM queued_stream) AS streams,
-                   (SELECT count(*) FROM queued_stream_bindings)
-                       AS stream_bindings,
-                   (SELECT count(*) FROM queued_topics) AS topics,
-                   (SELECT count(*) FROM queued_topic_bindings)
-                       AS topic_bindings,
-                   (SELECT count(*) FROM queued_messages) AS messages,
-                   (SELECT count(*) FROM queued_flags) AS flags,
-                   COALESCE(
-                       (SELECT assignment_reconciled FROM progress),
-                       true
-                   ) AS reconciled
-            """
-        )
-        if row is None:
-            return 0
-        return (
-            int(row["streams"])
-            + int(row["stream_bindings"])
-            + int(row["topics"])
-            + int(row["topic_bindings"])
-            + int(row["messages"])
-            + int(row["flags"])
-            + int(not row["reconciled"])
-        )
+            if report is None:
+                return 0
+            self._assignment_repair_key = (report["report_uuid"], report["assignment"])
+            projection_stream_uuid = UUID(report["projection_stream_uuid"])
+            assignment = _object(report["assignment"])
+            stage = int(report["assignment_repair_stage"])
+            entity_type, table, stream_column = stages[stage]
+            # SQL identifiers below come exclusively from the fixed stage list.
+            # Scan before testing target state; otherwise a matching prefix can
+            # force an unbounded read or continually hide later mismatches.
+            if entity_type == "message":
+                rows = await connection.fetch(
+                    """
+                    WITH page AS MATERIALIZED (
+                        SELECT uuid, created_at, topic_uuid
+                        FROM workspace_zulip_bridge.zulip_messages
+                        WHERE zulip_stream_uuid = $1
+                          AND ($2::timestamptz IS NULL OR (created_at, uuid) < ($2, $3::uuid))
+                        ORDER BY created_at DESC, uuid DESC LIMIT 1000
+                    )
+                    SELECT page.uuid, page.created_at, identity.provider_topic_id,
+                           target.data ->> 'topic_uuid' AS target_topic_uuid,
+                           (target.uuid IS NULL OR
+                            (target.data ->> 'stream_uuid')::uuid IS DISTINCT FROM $6::uuid)
+                               AS needs_repair
+                    FROM page
+                    LEFT JOIN workspace_zulip_bridge.zulip_topic_catalog_identities AS identity
+                      ON identity.topic_uuid = page.topic_uuid
+                     AND identity.zulip_stream_uuid = $1
+                    LEFT JOIN workspace_zulip_bridge.workspace_messages AS target
+                      ON target.provider_uuid = $4 AND target.snapshot_generation = $5
+                     AND target.uuid = page.uuid
+                    ORDER BY page.created_at DESC, page.uuid DESC
+                    """,
+                    report["zulip_stream_uuid"],
+                    report["assignment_repair_created_at"],
+                    report["assignment_repair_uuid"],
+                    report["workspace_provider_uuid"],
+                    report["active_generation"],
+                    projection_stream_uuid,
+                )
+            else:
+                rows = await connection.fetch(
+                    f"""
+                    SELECT uuid, true AS needs_repair
+                    FROM workspace_zulip_bridge.{table}
+                    WHERE {stream_column} = $1
+                      AND ($2::uuid IS NULL OR uuid > $2)
+                    ORDER BY uuid LIMIT 1000
+                    """,
+                    report["zulip_stream_uuid"],
+                    report["assignment_repair_entity_uuid"],
+                )
+            entity_uuids = []
+            topic_projection_uuids: dict[str, UUID] = {}
+            for row in rows:
+                needs_repair = row["needs_repair"]
+                if entity_type == "message":
+                    provider_topic_id = _catalog_topic_provider_id(
+                        report["chat_type"],
+                        report["chat_key"],
+                        row["provider_topic_id"],
+                    )
+                    if provider_topic_id not in topic_projection_uuids:
+                        topic_projection_uuids[provider_topic_id] = (
+                            _catalog_projection_topic_uuid(
+                                _object(report["catalog"]),
+                                report["resource_uuid"],
+                                provider_topic_id,
+                                assignment,
+                            )
+                        )
+                    topic_uuid = topic_projection_uuids[provider_topic_id]
+                    needs_repair = needs_repair or row["target_topic_uuid"] != str(
+                        topic_uuid
+                    )
+                if needs_repair:
+                    entity_uuids.append(row["uuid"])
+            if entity_uuids:
+                await connection.execute(
+                    """
+                    INSERT INTO workspace_zulip_bridge.workspace_outbox (
+                        realm_uuid, entity_type, action, entity_uuid, import_required
+                    )
+                    SELECT $1, $2, 'upsert', uuid, true FROM unnest($3::uuid[]) AS uuid
+                    ON CONFLICT (realm_uuid, entity_type, entity_uuid)
+                        WHERE delivery_status = 'pending'
+                    DO UPDATE SET action = 'upsert', entity_hash = NULL,
+                        import_required = true, available_at = clock_timestamp(), updated_at = clock_timestamp()
+                    """,
+                    report["realm_uuid"],
+                    entity_type,
+                    entity_uuids,
+                )
+            finished_stage = len(rows) < 1000
+            next_stage = min(stage + int(finished_stage), len(stages) - 1)
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports
+                SET assignment_repair_stage = $3,
+                    assignment_repair_entity_uuid = $4,
+                    assignment_repair_created_at = $5,
+                    assignment_repair_uuid = $6,
+                    assignment_reconciled = $7,
+                    assignment_repair_last_error = NULL,
+                    updated_at = clock_timestamp()
+                WHERE external_account_uuid = $1 AND zulip_stream_uuid = $2
+                """,
+                report["external_account_uuid"],
+                report["zulip_stream_uuid"],
+                next_stage,
+                rows[-1]["uuid"] if rows and not finished_stage else None,
+                rows[-1]["created_at"]
+                if rows and entity_type == "message"
+                else report["assignment_repair_created_at"],
+                rows[-1]["uuid"]
+                if rows and entity_type == "message"
+                else report["assignment_repair_uuid"],
+                finished_stage and stage == len(stages) - 1,
+            )
+            return max(1, len(rows))
 
     async def _refresh_catalogs(self, *, priority_only: bool = False) -> int:
         changed = await self._reactivate_needed_reports()
@@ -818,39 +844,214 @@ class WorkspaceChatCatalogWorker:
                     "is_default": True,
                 }
             ]
-        rows = await self._pool.fetch(
-            """
-            SELECT uuid, name
-            FROM workspace_zulip_bridge.zulip_topics
-            WHERE zulip_stream_uuid = $1
-            ORDER BY name, uuid
-            """,
-            source.stream_uuid,
-        )
-        provider_stream_id = source.chat_key.removeprefix("channel:")
+        async with self._pool.acquire() as connection, connection.transaction():
+            await connection.fetchrow(
+                """
+                SELECT uuid
+                FROM workspace_zulip_bridge.zulip_streams
+                WHERE uuid = $1
+                FOR UPDATE
+                """,
+                source.stream_uuid,
+            )
+            await self._ensure_topic_catalog_identities(connection, source)
+            rows = await connection.fetch(
+                """
+                SELECT topic.uuid, topic.name, identity.provider_topic_id
+                FROM workspace_zulip_bridge.zulip_topics AS topic
+                LEFT JOIN
+                    workspace_zulip_bridge.zulip_topic_catalog_identities
+                    AS identity
+                  ON identity.topic_uuid = topic.uuid
+                WHERE topic.zulip_stream_uuid = $1
+                ORDER BY topic.name, topic.uuid
+                """,
+                source.stream_uuid,
+            )
+        if any(row["provider_topic_id"] is None for row in rows):
+            raise CatalogReportError(
+                "catalog_topic_identity_ambiguous",
+                retryable=False,
+            )
         return [
             {
-                "provider_topic_id": f"{provider_stream_id}:{row['name']}",
+                "provider_topic_id": str(row["provider_topic_id"]),
                 "name": str(row["name"]),
                 "is_default": False,
             }
             for row in rows
         ]
 
+    async def _ensure_topic_catalog_identities(
+        self,
+        connection: asyncpg.Connection | PoolConnectionProxy,
+        source: _CatalogSource,
+    ) -> None:
+        missing = await connection.fetch(
+            """
+            SELECT topic.uuid, topic.name, topic.is_done, topic.created_at,
+                   COALESCE(
+                       array_remove(
+                           array_agg(alias.alias ORDER BY alias.created_at), NULL
+                       ),
+                       '{}'::text[]
+                   ) AS aliases,
+                   COALESCE(
+                       array_remove(array_agg(
+                           alias.alias ORDER BY alias.created_at
+                       ) FILTER (WHERE alias.active), NULL),
+                       '{}'::text[]
+                   ) AS active_aliases
+            FROM workspace_zulip_bridge.zulip_topics AS topic
+            LEFT JOIN workspace_zulip_bridge.zulip_topic_aliases AS alias
+              ON alias.topic_uuid = topic.uuid
+             AND alias.zulip_stream_uuid = topic.zulip_stream_uuid
+            LEFT JOIN workspace_zulip_bridge.zulip_topic_catalog_identities
+                AS identity
+              ON identity.topic_uuid = topic.uuid
+            WHERE topic.zulip_stream_uuid = $1 AND identity.uuid IS NULL
+            GROUP BY topic.uuid
+            ORDER BY topic.created_at, topic.uuid
+            """,
+            source.stream_uuid,
+        )
+        if not missing:
+            return
+        report = await connection.fetchrow(
+            """
+            SELECT catalog, assignment, reported_at
+            FROM workspace_zulip_bridge.workspace_chat_catalog_reports
+            WHERE external_account_uuid = $2
+              AND zulip_stream_uuid = $1 AND assignment IS NOT NULL
+            ORDER BY reported_at DESC NULLS LAST, external_account_uuid
+            LIMIT 1
+            """,
+            source.stream_uuid,
+            source.account_uuid,
+        )
+        assigned_ids: set[str] = set()
+        reported_at: datetime.datetime | None = None
+        if report is not None:
+            raw_assignment = report["assignment"]
+            assignment = (
+                json.loads(raw_assignment)
+                if isinstance(raw_assignment, str)
+                else raw_assignment
+            )
+            if isinstance(assignment, Mapping):
+                projection = assignment.get("workspace_projection")
+                topics = (
+                    projection.get("topics")
+                    if isinstance(projection, Mapping)
+                    else None
+                )
+                if isinstance(topics, list):
+                    assigned_ids = {
+                        str(item["provider_topic_id"])
+                        for item in topics
+                        if isinstance(item, Mapping)
+                        and item.get("provider_topic_id") is not None
+                    }
+            reported_at = report["reported_at"]
+        reserved_ids = {
+            str(value)
+            for value in await connection.fetch(
+                """
+                SELECT provider_topic_id
+                FROM workspace_zulip_bridge.zulip_topic_catalog_identities
+                WHERE zulip_stream_uuid = $1
+                """,
+                source.stream_uuid,
+            )
+            for value in (value["provider_topic_id"],)
+        }
+        for row in missing:
+            topic_uuid = UUID(str(row["uuid"]))
+            aliases = [str(alias) for alias in row["aliases"]]
+            active_aliases = [str(alias) for alias in row["active_aliases"]]
+            current_display_name = topic_display_name(
+                str(row["name"]),
+                bool(row["is_done"]),
+            )
+            source_names = set(aliases)
+            source_names.add(str(row["name"]))
+            source_names.add(current_display_name)
+            matching_ids = assigned_ids.intersection(
+                _legacy_catalog_topic_provider_id(source.chat_key, name)
+                for name in source_names
+            )
+            if len(matching_ids) > 1:
+                raise CatalogReportError(
+                    "catalog_topic_identity_ambiguous",
+                    retryable=False,
+                )
+            if matching_ids:
+                provider_topic_id = matching_ids.pop()
+                catalog_topic_key = provider_topic_id.removeprefix(
+                    f"{source.chat_key.removeprefix('channel:')}:"
+                )
+                linked = await connection.fetchval(
+                    """
+                    UPDATE workspace_zulip_bridge.zulip_topic_catalog_identities
+                    SET topic_uuid = $3
+                    WHERE zulip_stream_uuid = $1 AND provider_topic_id = $2
+                      AND topic_uuid IS NULL
+                    RETURNING topic_uuid
+                    """,
+                    source.stream_uuid,
+                    provider_topic_id,
+                    topic_uuid,
+                )
+                if linked is None and provider_topic_id in reserved_ids:
+                    raise CatalogReportError(
+                        "catalog_topic_identity_ambiguous",
+                        retryable=False,
+                    )
+            else:
+                if (
+                    assigned_ids
+                    and isinstance(reported_at, datetime.datetime)
+                    and row["created_at"] <= reported_at
+                ):
+                    raise CatalogReportError(
+                        "catalog_topic_identity_ambiguous",
+                        retryable=False,
+                    )
+                raw_display_name = (
+                    active_aliases[0]
+                    if len(active_aliases) == 1
+                    else current_display_name
+                )
+                catalog_topic_key = raw_display_name
+                legacy_id = _legacy_catalog_topic_provider_id(
+                    source.chat_key,
+                    raw_display_name,
+                )
+                provider_topic_id = (
+                    _opaque_catalog_topic_provider_id(topic_uuid)
+                    if legacy_id in reserved_ids
+                    else legacy_id
+                )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_topic_catalog_identities (
+                    topic_uuid, zulip_stream_uuid, catalog_topic_key,
+                    provider_topic_id
+                ) VALUES ($1, $2, $3, $4)
+                ON CONFLICT DO NOTHING
+                """,
+                topic_uuid,
+                source.stream_uuid,
+                catalog_topic_key,
+                provider_topic_id,
+            )
+            reserved_ids.add(provider_topic_id)
+
     async def _queue_catalog(
         self,
         source: _CatalogSource,
         catalog: dict[str, object],
     ) -> int:
-        previous_projection_revision = await self._pool.fetchval(
-            """
-            SELECT projection_revision
-            FROM workspace_zulip_bridge.workspace_chat_catalog_reports
-            WHERE external_account_uuid = $1 AND zulip_stream_uuid = $2
-            """,
-            source.account_uuid,
-            source.stream_uuid,
-        )
         catalog_hash = _canonical_hash(
             {
                 "projection_revision": CATALOG_PROJECTION_REVISION,
@@ -935,6 +1136,16 @@ class WorkspaceChatCatalogWorker:
                     THEN false
                     ELSE workspace_chat_catalog_reports.assignment_reconciled
                 END,
+                assignment_repair_available_at = clock_timestamp(),
+                assignment_repair_last_error = NULL,
+                assignment_repair_stage = CASE
+                    WHEN workspace_chat_catalog_reports.catalog_hash IS DISTINCT FROM EXCLUDED.catalog_hash
+                      OR workspace_chat_catalog_reports.observed_generation IS DISTINCT FROM EXCLUDED.observed_generation
+                    THEN 0 ELSE workspace_chat_catalog_reports.assignment_repair_stage END,
+                assignment_repair_entity_uuid = CASE
+                    WHEN workspace_chat_catalog_reports.catalog_hash IS DISTINCT FROM EXCLUDED.catalog_hash
+                      OR workspace_chat_catalog_reports.observed_generation IS DISTINCT FROM EXCLUDED.observed_generation
+                    THEN NULL ELSE workspace_chat_catalog_reports.assignment_repair_entity_uuid END,
                 assignment_repair_created_at = CASE
                     WHEN workspace_chat_catalog_reports.catalog_hash
                          IS DISTINCT FROM EXCLUDED.catalog_hash
@@ -1029,71 +1240,7 @@ class WorkspaceChatCatalogWorker:
             source.source_activity_at,
             source.source_updated_at,
         )
-        if (
-            previous_projection_revision is not None
-            and previous_projection_revision < CATALOG_PROJECTION_REVISION
-        ):
-            await self._requeue_moved_projection_messages(source)
         return int(result.endswith(" 1"))
-
-    async def _requeue_moved_projection_messages(
-        self,
-        source: _CatalogSource,
-    ) -> int:
-        """Reproject only rows that landed in the superseded chat projection."""
-        result = await self._pool.fetchrow(
-            """
-            WITH moved_messages AS MATERIALIZED (
-                SELECT message.uuid
-                FROM workspace_zulip_bridge.zulip_realms AS realm
-                JOIN workspace_zulip_bridge.workspace_mirror_state AS state
-                  ON state.provider_uuid = realm.workspace_provider_uuid
-                 AND state.active_generation IS NOT NULL
-                JOIN workspace_zulip_bridge.zulip_messages AS message
-                  ON message.realm_uuid = realm.uuid
-                 AND message.zulip_stream_uuid = $1
-                JOIN workspace_zulip_bridge.workspace_messages AS target
-                  ON target.provider_uuid = realm.workspace_provider_uuid
-                 AND target.snapshot_generation = state.active_generation
-                 AND target.uuid = message.uuid
-                WHERE realm.uuid = $2
-                  AND target.data->>'stream_uuid' IS DISTINCT FROM $1::text
-            ), queued_messages AS (
-                INSERT INTO workspace_zulip_bridge.workspace_outbox (
-                    realm_uuid, entity_type, action, entity_uuid
-                )
-                SELECT $2, 'message', 'upsert', uuid
-                FROM moved_messages
-                ON CONFLICT (realm_uuid, entity_type, entity_uuid)
-                    WHERE delivery_status = 'pending'
-                DO UPDATE SET action = 'upsert', entity_hash = NULL,
-                              available_at = clock_timestamp(),
-                              attempt_count = 0, last_error = NULL,
-                              updated_at = clock_timestamp()
-                RETURNING 1
-            ), queued_flags AS (
-                INSERT INTO workspace_zulip_bridge.workspace_outbox (
-                    realm_uuid, entity_type, action, entity_uuid
-                )
-                SELECT $2, 'message_flag', 'upsert', flag.uuid
-                FROM workspace_zulip_bridge.zulip_message_flags AS flag
-                JOIN moved_messages ON moved_messages.uuid = flag.message_uuid
-                ON CONFLICT (realm_uuid, entity_type, entity_uuid)
-                    WHERE delivery_status = 'pending'
-                DO UPDATE SET action = 'upsert', entity_hash = NULL,
-                              available_at = clock_timestamp(),
-                              attempt_count = 0, last_error = NULL,
-                              updated_at = clock_timestamp()
-                RETURNING 1
-            )
-            SELECT (SELECT count(*) FROM queued_messages) AS messages,
-                   (SELECT count(*) FROM queued_flags) AS flags
-            """,
-            source.stream_uuid,
-            source.realm_uuid,
-        )
-        assert result is not None
-        return int(result["messages"]) + int(result["flags"])
 
     async def _claim_reports(self, limit: int = 20) -> list[asyncpg.Record]:
         return await self._pool.fetch(

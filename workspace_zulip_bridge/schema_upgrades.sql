@@ -28,6 +28,41 @@ BEGIN
             ADD COLUMN IF NOT EXISTS workspace_user_uuid uuid;
     END IF;
 
+    IF to_regclass('workspace_zulip_bridge.zulip_topics') IS NOT NULL THEN
+        ALTER TABLE workspace_zulip_bridge.zulip_topics
+            DROP CONSTRAINT IF EXISTS
+                zulip_topics_zulip_stream_uuid_name_key;
+        IF NOT EXISTS (
+            SELECT 1
+            FROM pg_constraint
+            WHERE conrelid =
+                    'workspace_zulip_bridge.zulip_topics'::regclass
+              AND conname = 'zulip_topics_stream_name_state_key'
+        ) THEN
+            ALTER TABLE workspace_zulip_bridge.zulip_topics
+                ADD CONSTRAINT zulip_topics_stream_name_state_key
+                UNIQUE (zulip_stream_uuid, name, is_done);
+        END IF;
+
+        CREATE TABLE IF NOT EXISTS
+            workspace_zulip_bridge.zulip_topic_catalog_identities (
+                uuid uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                topic_uuid uuid UNIQUE,
+                zulip_stream_uuid uuid NOT NULL
+                    REFERENCES workspace_zulip_bridge.zulip_streams (uuid)
+                    ON DELETE CASCADE,
+                catalog_topic_key text NOT NULL,
+                provider_topic_id text NOT NULL,
+                created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+                UNIQUE (zulip_stream_uuid, provider_topic_id)
+            );
+        CREATE INDEX IF NOT EXISTS
+            zulip_topic_catalog_identities_stream_topic_idx
+            ON workspace_zulip_bridge.zulip_topic_catalog_identities (
+                zulip_stream_uuid, topic_uuid
+            );
+    END IF;
+
     IF to_regclass('workspace_zulip_bridge.zulip_connections') IS NOT NULL THEN
         ALTER TABLE workspace_zulip_bridge.zulip_connections
             ADD COLUMN IF NOT EXISTS external_account_uuid uuid;
@@ -47,6 +82,12 @@ BEGIN
             NOT NULL DEFAULT true;
         ALTER TABLE workspace_zulip_bridge.zulip_connections
             ADD COLUMN IF NOT EXISTS notification_settings_updated_at timestamptz
+            NOT NULL DEFAULT 'epoch';
+        ALTER TABLE workspace_zulip_bridge.zulip_connections
+            ADD COLUMN IF NOT EXISTS notification_snapshot_at timestamptz
+            NOT NULL DEFAULT 'epoch';
+        ALTER TABLE workspace_zulip_bridge.zulip_connections
+            ADD COLUMN IF NOT EXISTS notification_refresh_requested_at timestamptz
             NOT NULL DEFAULT 'epoch';
         UPDATE workspace_zulip_bridge.zulip_connections
         SET last_event_cursor_at = updated_at
@@ -101,6 +142,9 @@ BEGIN
     END IF;
 
     IF to_regclass('workspace_zulip_bridge.zulip_topics') IS NOT NULL THEN
+        ALTER TABLE workspace_zulip_bridge.zulip_topics
+            ADD COLUMN IF NOT EXISTS source_updated_at timestamptz
+            NOT NULL DEFAULT 'epoch';
         CREATE INDEX IF NOT EXISTS zulip_topics_casefold_name_idx
             ON workspace_zulip_bridge.zulip_topics (
                 zulip_stream_uuid, lower(name)
@@ -317,6 +361,168 @@ BEGIN
 END;
 $upgrade$;
 
+-- Catalog topic identities are immutable and outlive the source topic row.
+-- Seed reservations from the last acknowledged assignment before any runtime
+-- normalization can change a prefixed source title.
+DO $topic_catalog_upgrade$
+BEGIN
+    IF to_regclass(
+        'workspace_zulip_bridge.zulip_topic_catalog_identities'
+    ) IS NULL THEN
+        RETURN;
+    END IF;
+
+    IF to_regclass(
+        'workspace_zulip_bridge.workspace_chat_catalog_reports'
+    ) IS NOT NULL THEN
+        INSERT INTO workspace_zulip_bridge.zulip_topic_catalog_identities (
+            zulip_stream_uuid, catalog_topic_key, provider_topic_id
+        )
+        SELECT DISTINCT report.zulip_stream_uuid,
+               CASE
+                   WHEN left(assigned.provider_topic_id, length(prefix.value)) =
+                        prefix.value
+                   THEN substr(
+                       assigned.provider_topic_id,
+                       length(prefix.value) + 1
+                   )
+                   ELSE assigned.provider_topic_id
+               END,
+               assigned.provider_topic_id
+        FROM workspace_zulip_bridge.workspace_chat_catalog_reports AS report
+        JOIN workspace_zulip_bridge.zulip_streams AS stream
+          ON stream.uuid = report.zulip_stream_uuid
+         AND stream.chat_type = 'channel'
+        CROSS JOIN LATERAL (
+            SELECT regexp_replace(stream.chat_key, '^channel:', '') || ':'
+                AS value
+        ) AS prefix
+        CROSS JOIN LATERAL (
+            SELECT item ->> 'provider_topic_id' AS provider_topic_id
+            FROM jsonb_array_elements(
+                COALESCE(
+                    report.assignment #> '{workspace_projection,topics}',
+                    '[]'::jsonb
+                )
+            ) AS item
+            WHERE item ->> 'provider_topic_id' IS NOT NULL
+        ) AS assigned
+        ON CONFLICT (zulip_stream_uuid, provider_topic_id) DO NOTHING;
+
+        IF to_regclass(
+            'workspace_zulip_bridge.zulip_topic_aliases'
+        ) IS NOT NULL THEN
+            WITH candidate_pairs AS (
+                SELECT DISTINCT identity.uuid AS identity_uuid,
+                       topic.uuid AS topic_uuid
+                FROM workspace_zulip_bridge.zulip_topic_catalog_identities
+                    AS identity
+                JOIN workspace_zulip_bridge.zulip_streams AS stream
+                  ON stream.uuid = identity.zulip_stream_uuid
+                JOIN workspace_zulip_bridge.zulip_topics AS topic
+                  ON topic.zulip_stream_uuid = identity.zulip_stream_uuid
+                LEFT JOIN workspace_zulip_bridge.zulip_topic_aliases AS alias
+                  ON alias.zulip_stream_uuid = topic.zulip_stream_uuid
+                 AND alias.topic_uuid = topic.uuid
+                WHERE identity.topic_uuid IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM workspace_zulip_bridge.zulip_topic_catalog_identities
+                          AS bound_identity
+                      WHERE bound_identity.topic_uuid = topic.uuid
+                  )
+                  AND identity.provider_topic_id =
+                      regexp_replace(stream.chat_key, '^channel:', '') || ':' ||
+                      COALESCE(alias.alias, topic.name)
+            ), counted AS (
+                SELECT identity_uuid, topic_uuid,
+                       count(*) OVER (PARTITION BY identity_uuid)
+                           AS topics_per_identity,
+                       count(*) OVER (PARTITION BY topic_uuid)
+                           AS identities_per_topic
+                FROM candidate_pairs
+            ), unambiguous AS (
+                SELECT identity_uuid, topic_uuid
+                FROM counted
+                WHERE topics_per_identity = 1 AND identities_per_topic = 1
+            )
+            UPDATE workspace_zulip_bridge.zulip_topic_catalog_identities
+                AS identity
+            SET topic_uuid = unambiguous.topic_uuid
+            FROM unambiguous
+            WHERE identity.uuid = unambiguous.identity_uuid;
+        ELSE
+            WITH candidate_pairs AS (
+                SELECT identity.uuid AS identity_uuid, topic.uuid AS topic_uuid
+                FROM workspace_zulip_bridge.zulip_topic_catalog_identities
+                    AS identity
+                JOIN workspace_zulip_bridge.zulip_streams AS stream
+                  ON stream.uuid = identity.zulip_stream_uuid
+                JOIN workspace_zulip_bridge.zulip_topics AS topic
+                  ON topic.zulip_stream_uuid = identity.zulip_stream_uuid
+                WHERE identity.topic_uuid IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM workspace_zulip_bridge.zulip_topic_catalog_identities
+                          AS bound_identity
+                      WHERE bound_identity.topic_uuid = topic.uuid
+                  )
+                  AND identity.provider_topic_id =
+                      regexp_replace(stream.chat_key, '^channel:', '') || ':' ||
+                      topic.name
+            ), counted AS (
+                SELECT identity_uuid, topic_uuid,
+                       count(*) OVER (PARTITION BY identity_uuid)
+                           AS topics_per_identity,
+                       count(*) OVER (PARTITION BY topic_uuid)
+                           AS identities_per_topic
+                FROM candidate_pairs
+            ), unambiguous AS (
+                SELECT identity_uuid, topic_uuid
+                FROM counted
+                WHERE topics_per_identity = 1 AND identities_per_topic = 1
+            )
+            UPDATE workspace_zulip_bridge.zulip_topic_catalog_identities
+                AS identity
+            SET topic_uuid = unambiguous.topic_uuid
+            FROM unambiguous
+            WHERE identity.uuid = unambiguous.identity_uuid;
+        END IF;
+    END IF;
+
+    INSERT INTO workspace_zulip_bridge.zulip_topic_catalog_identities (
+        topic_uuid, zulip_stream_uuid, catalog_topic_key, provider_topic_id
+    )
+    SELECT topic.uuid, topic.zulip_stream_uuid, topic.name,
+           regexp_replace(stream.chat_key, '^channel:', '') || ':' || topic.name
+    FROM workspace_zulip_bridge.zulip_topics AS topic
+    JOIN workspace_zulip_bridge.zulip_streams AS stream
+      ON stream.uuid = topic.zulip_stream_uuid
+     AND stream.chat_type = 'channel'
+    WHERE NOT EXISTS (
+              SELECT 1
+              FROM workspace_zulip_bridge.zulip_topic_catalog_identities
+                  AS identity
+              WHERE identity.topic_uuid = topic.uuid
+          )
+      AND (
+          to_regclass(
+              'workspace_zulip_bridge.workspace_chat_catalog_reports'
+          ) IS NULL
+          OR NOT EXISTS (
+              SELECT 1
+              FROM workspace_zulip_bridge.workspace_chat_catalog_reports AS report
+              WHERE report.zulip_stream_uuid = topic.zulip_stream_uuid
+                AND report.assignment IS NOT NULL
+                AND topic.created_at <= COALESCE(
+                    report.reported_at, 'infinity'::timestamptz
+                )
+          )
+      )
+    ON CONFLICT DO NOTHING;
+END;
+$topic_catalog_upgrade$;
+
 DO $upgrade$
 BEGIN
     IF to_regclass(
@@ -390,3 +596,64 @@ BEGIN
     END IF;
 END;
 $upgrade$;
+
+DO $$
+BEGIN
+    IF to_regclass('workspace_zulip_bridge.workspace_file_projections') IS NOT NULL THEN
+        ALTER TABLE workspace_zulip_bridge.workspace_file_projections
+            ADD COLUMN IF NOT EXISTS heartbeat_at timestamptz;
+    END IF;
+END;
+$$;
+
+DO $$
+BEGIN
+    IF to_regclass('workspace_zulip_bridge.workspace_chat_catalog_reports') IS NOT NULL THEN
+        -- The old cursor skipped stream-matching rows before LIMIT and never
+        -- checked the parent topic. Reset it once when installing this scanner.
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'workspace_zulip_bridge'
+              AND table_name = 'workspace_chat_catalog_reports'
+              AND column_name = 'assignment_repair_stage'
+        ) THEN
+            UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports
+            SET assignment_reconciled = false, assignment_repair_created_at = NULL,
+                assignment_repair_uuid = NULL
+            WHERE assignment IS NOT NULL;
+            UPDATE workspace_zulip_bridge.workspace_mirror_state
+            SET initial_sync_completed_at = NULL
+            WHERE EXISTS (
+                SELECT 1 FROM workspace_zulip_bridge.zulip_realms AS realm
+                WHERE realm.workspace_provider_uuid = workspace_mirror_state.provider_uuid
+            );
+        END IF;
+        ALTER TABLE workspace_zulip_bridge.workspace_chat_catalog_reports
+            ADD COLUMN IF NOT EXISTS assignment_repair_stage smallint NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS assignment_repair_entity_uuid uuid;
+    END IF;
+END;
+$$;
+
+DO $$
+BEGIN
+    IF to_regclass('workspace_zulip_bridge.workspace_chat_catalog_reports') IS NOT NULL THEN
+        ALTER TABLE workspace_zulip_bridge.workspace_chat_catalog_reports
+            ADD COLUMN IF NOT EXISTS assignment_repair_available_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+            ADD COLUMN IF NOT EXISTS assignment_repair_last_error text;
+    END IF;
+    IF to_regclass('workspace_zulip_bridge.workspace_mirror_state') IS NOT NULL THEN
+        ALTER TABLE workspace_zulip_bridge.workspace_mirror_state
+            ADD COLUMN IF NOT EXISTS initial_sync_watermark_at timestamptz;
+    END IF;
+END;
+$$;
+
+DO $$
+BEGIN
+    IF to_regclass('workspace_zulip_bridge.workspace_outbox') IS NOT NULL THEN
+        ALTER TABLE workspace_zulip_bridge.workspace_outbox
+            ADD COLUMN IF NOT EXISTS import_required boolean NOT NULL DEFAULT false;
+    END IF;
+END;
+$$;

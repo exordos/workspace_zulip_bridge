@@ -137,6 +137,16 @@ class BridgeService:
                     )
                     for index in range(self._settings.workspace_chat_catalog_workers)
                 )
+                supervised_tasks.append(
+                    asyncio.create_task(
+                        WorkspaceChatCatalogWorker(
+                            pool,
+                            self._settings,
+                            control_semaphore=file_control_semaphore,
+                        ).run_assignment_repairs(),
+                        name="workspace-assignment-repair",
+                    )
+                )
                 supervised_tasks.extend(
                     asyncio.create_task(
                         WorkspaceFileTransferWorker(

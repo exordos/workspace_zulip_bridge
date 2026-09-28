@@ -322,6 +322,14 @@ class ZulipApiClient:
             enable_stream_desktop_notifications,
         )
 
+    def delete_queue(self, queue_id: str) -> None:
+        """Dispose a temporary registration queue; repeated cleanup is harmless."""
+        try:
+            self._request("DELETE", "/api/v1/events", data={"queue_id": queue_id})
+        except ZulipApiError as exc:
+            if exc.code != "BAD_EVENT_QUEUE_ID":
+                raise
+
     def get_events(
         self,
         queue_id: str,

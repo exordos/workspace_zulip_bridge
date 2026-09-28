@@ -184,6 +184,7 @@ class ZulipEventThread(threading.Thread):
         self._bootstrap_user_statuses: tuple[ZulipUserProfileStatus, ...] = ()
         self._bootstrap_state_pending = False
         self._bootstrap_notification_snapshot_at: datetime | None = None
+        self._temporary_notification_queues: set[str] = set()
         self._stream_desktop_notifications_default = (
             user.enable_stream_desktop_notifications
         )
@@ -477,6 +478,15 @@ class ZulipEventThread(threading.Thread):
                     return
                 self._catalog_filled = True
                 continue
+            snapshot_required = self._submit(
+                self._store.notification_snapshot_required(self.user.uuid, queue_id)
+            )
+            if snapshot_required is None:
+                return
+            if snapshot_required:
+                if not self._refresh_notification_snapshot(client, queue_id):
+                    return
+                continue
             if user_status == "scheduling":
                 self._stop_requested.wait(self._settings.user_refresh_seconds)
                 continue
@@ -552,6 +562,7 @@ class ZulipEventThread(threading.Thread):
                 replace_all=True,
             )
         )
+        catalog_observed_at = datetime.now(UTC)
         subscriptions = client.get_subscriptions()
         if not self._bootstrap_state_pending:
             notification_default = self._submit(
@@ -620,6 +631,7 @@ class ZulipEventThread(threading.Thread):
                     self.user.uuid,
                     queue_id,
                     catalog,
+                    catalog_observed_at=catalog_observed_at,
                     bootstrap_user_topics=(
                         self._bootstrap_user_topics
                         if self._bootstrap_state_pending
@@ -900,6 +912,59 @@ class ZulipEventThread(threading.Thread):
         )
         return True
 
+    def _register_notification_snapshot(
+        self, client: ZulipApiClient, retained_queue_id: str
+    ) -> RegisteredQueue:
+        # Retry a failed cleanup before allocating another queue. Only snapshot
+        # queues enter this set; the retained realtime queue never does.
+        for pending in tuple(self._temporary_notification_queues):
+            client.delete_queue(pending)
+            self._temporary_notification_queues.discard(pending)
+        registered = client.register()
+        if registered.queue_id in {retained_queue_id, self._queue_id}:
+            raise RuntimeError(
+                "notification snapshot did not allocate a separate queue"
+            )
+        self._temporary_notification_queues.add(registered.queue_id)
+        # The returned registration response already contains the snapshot; its
+        # queue is not consumed and is disposable before subsequent reads/writes.
+        client.delete_queue(registered.queue_id)
+        self._temporary_notification_queues.discard(registered.queue_id)
+        return registered
+
+    def _refresh_notification_snapshot(
+        self, client: ZulipApiClient, queue_id: str
+    ) -> bool:
+        if self._identity is None:
+            return False
+        with self._registration_gate:
+            if self._stop_requested.is_set() or self._queue_id != queue_id:
+                return False
+            observed_at = datetime.now(UTC)
+            registered = self._register_notification_snapshot(client, queue_id)
+        subscriptions = client.get_subscriptions()
+        builder = ChatCatalogBuilder(
+            self._identity.user_id, self._identity.full_name, self._identity.role
+        )
+        channels = builder.add_subscriptions(
+            subscriptions,
+            desktop_notifications_default=registered.enable_stream_desktop_notifications,
+        )
+        changed = self._submit(
+            self._store.store_notification_snapshot(
+                self.user.uuid,
+                queue_id,
+                channels,
+                registered.user_topics,
+                enable_stream_desktop_notifications=registered.enable_stream_desktop_notifications,
+                observed_at=observed_at,
+            )
+        )
+        if changed is None:
+            return False
+        self._notification_snapshot_needed = False
+        return True
+
     def _restore_runtime_state(self, client: ZulipApiClient) -> bool:
         identity = client.get_own_user()
         directory, _ = self._load_directory(client)
@@ -925,7 +990,9 @@ class ZulipEventThread(threading.Thread):
         snapshot_at: datetime | None = None
         if self._notification_snapshot_needed:
             snapshot_at = datetime.now(UTC)
-            registered = client.register()
+            registered = self._register_notification_snapshot(
+                client, self.user.queue_id
+            )
             self._stream_desktop_notifications_default = (
                 registered.enable_stream_desktop_notifications
             )

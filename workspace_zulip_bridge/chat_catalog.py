@@ -4,6 +4,7 @@
 import hashlib
 import json
 from collections.abc import Mapping
+from collections.abc import Sequence
 from dataclasses import dataclass
 from dataclasses import replace
 from typing import Any
@@ -198,13 +199,7 @@ class ChatCatalogBuilder:
             replace(chat, available_message_count=counts.get(chat.chat_key, 0))
             for chat in chats
         ]
-        chats.sort(key=lambda chat: chat.chat_key)
-        digest = hashlib.sha256()
-        for chat in chats:
-            digest.update(chat.content_hash)
-            digest.update(chat.membership_hash)
-            digest.update(chat.available_message_count.to_bytes(8, "big"))
-        return ZulipChatCatalog(tuple(chats), digest.digest())
+        return build_chat_catalog(chats)
 
     def _make_direct_chat(
         self,
@@ -231,6 +226,51 @@ class ChatCatalogBuilder:
             chat_parameters=parameters,
             membership_parameters={},
         )
+
+
+def build_chat_catalog(chats: Sequence[ZulipChat]) -> ZulipChatCatalog:
+    ordered = tuple(sorted(chats, key=lambda chat: chat.chat_key))
+    digest = hashlib.sha256()
+    for chat in ordered:
+        digest.update(chat.content_hash)
+        digest.update(chat.membership_hash)
+        digest.update(chat.available_message_count.to_bytes(8, "big"))
+    return ZulipChatCatalog(ordered, digest.digest())
+
+
+def with_stream_notification_default(
+    chats: Sequence[ZulipChat], enabled: bool
+) -> tuple[ZulipChat, ...]:
+    """Rebase inherited modes when a newer global setting races a catalog read."""
+    result = []
+    for chat in chats:
+        parameters = json.loads(chat.membership_parameters_json)
+        if (
+            chat.chat_type != "channel"
+            or parameters.get("is_muted")
+            or parameters.get("desktop_notifications") is not None
+        ):
+            result.append(chat)
+            continue
+        mode = "all_messages" if enabled else "mentions_only"
+        if chat.notification_mode == mode:
+            result.append(chat)
+            continue
+        refreshed = _make_chat(
+            chat_type=chat.chat_type,
+            chat_key=chat.chat_key,
+            name=chat.name,
+            role=chat.role,
+            membership_kind=chat.membership_kind,
+            notification_mode=mode,
+            chat_parameters=json.loads(chat.chat_parameters_json),
+            membership_parameters=parameters,
+            first_visible_message_id=chat.first_visible_message_id,
+        )
+        result.append(
+            replace(refreshed, available_message_count=chat.available_message_count)
+        )
+    return tuple(result)
 
 
 def _make_chat(

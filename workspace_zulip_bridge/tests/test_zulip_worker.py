@@ -10,8 +10,10 @@ from datetime import datetime
 from uuid import UUID
 
 import asyncpg
+import pytest
 
 from workspace_zulip_bridge.config import Settings
+from workspace_zulip_bridge.models import NOTIFICATION_SETTINGS_GENERATION
 from workspace_zulip_bridge.models import ChatCatalogWrite
 from workspace_zulip_bridge.models import ChatScheduleReconcile
 from workspace_zulip_bridge.models import HistoryWrite
@@ -171,6 +173,7 @@ class FakeStore:
         self.presence_thresholds: list[tuple[str, int]] = []
         self.schedule_reconciliation_requested = False
         self.notification_snapshots: list[tuple[UUID, str, bool]] = []
+        self.notification_snapshot_pending = False
         self.file_transfer_active = False
 
     async def file_transfer_stage_active(self) -> bool:
@@ -186,6 +189,11 @@ class FakeStore:
     ) -> bool | None:
         return True
 
+    async def notification_snapshot_required(
+        self, user_uuid: UUID, queue_id: str
+    ) -> bool | None:
+        return self.notification_snapshot_pending
+
     async def store_notification_snapshot(
         self,
         user_uuid: UUID,
@@ -199,6 +207,7 @@ class FakeStore:
         self.notification_snapshots.append(
             (user_uuid, queue_id, enable_stream_desktop_notifications)
         )
+        self.notification_snapshot_pending = False
         return 0
 
     async def set_user_identity(
@@ -297,6 +306,7 @@ class FakeStore:
         *,
         bootstrap_user_topics: object = None,
         notification_snapshot_at: object = None,
+        catalog_observed_at: object = None,
         enable_stream_desktop_notifications: bool = True,
     ) -> ChatCatalogWrite:
         self.catalogs.append((user_uuid, queue_id, catalog))
@@ -331,6 +341,10 @@ class FakeApi:
         self.closed = threading.Event()
         self.polls = 0
         self.registrations = 0
+        self.deleted_queues: list[str] = []
+
+    def delete_queue(self, queue_id: str) -> None:
+        self.deleted_queues.append(queue_id)
 
     def register(self) -> RegisteredQueue:
         self.registrations += 1
@@ -465,11 +479,12 @@ def test_private_conversation_discovery_pages_through_complete_history() -> None
     asyncio.run(_private_conversation_discovery_pages_through_complete_history())
 
 
-def test_existing_queue_loads_one_time_notification_snapshot() -> None:
-    asyncio.run(_existing_queue_loads_one_time_notification_snapshot())
+@pytest.mark.parametrize("generation", [0, 1, NOTIFICATION_SETTINGS_GENERATION])
+def test_existing_queue_loads_one_time_notification_snapshot(generation: int) -> None:
+    asyncio.run(_existing_queue_loads_one_time_notification_snapshot(generation))
 
 
-async def _existing_queue_loads_one_time_notification_snapshot() -> None:
+async def _existing_queue_loads_one_time_notification_snapshot(generation: int) -> None:
     user = ZulipUser(
         USER_ONE.uuid,
         USER_ONE.endpoint,
@@ -477,6 +492,7 @@ async def _existing_queue_loads_one_time_notification_snapshot() -> None:
         "not-a-real-api-key",
         queue_id="existing-queue",
         last_event_id=17,
+        notification_settings_generation=generation,
     )
     store = FakeStore()
     api = FakeApi()
@@ -490,8 +506,20 @@ async def _existing_queue_loads_one_time_notification_snapshot() -> None:
     )
 
     assert await asyncio.to_thread(worker._restore_runtime_state, api)
-    assert api.registrations == 1
-    assert store.notification_snapshots == [(user.uuid, "existing-queue", False)]
+    expected = int(generation < NOTIFICATION_SETTINGS_GENERATION)
+    assert api.registrations == expected
+    assert api.deleted_queues == ["queue-1"] * expected
+    assert (
+        store.notification_snapshots
+        == [(user.uuid, "existing-queue", False)] * expected
+    )
+    assert await asyncio.to_thread(worker._restore_runtime_state, api)
+    assert api.registrations == expected
+    assert api.deleted_queues == ["queue-1"] * expected
+    assert (
+        store.notification_snapshots
+        == [(user.uuid, "existing-queue", False)] * expected
+    )
 
 
 async def _private_conversation_discovery_pages_through_complete_history() -> None:
@@ -1272,3 +1300,134 @@ async def _supervisor_test() -> None:
 
     assert workers[0].stopped
     assert workers[1].alive
+
+
+def test_active_worker_repairs_ambiguous_notification_without_history_reload() -> None:
+    asyncio.run(_active_worker_repairs_ambiguous_notification_without_history_reload())
+
+
+async def _active_worker_repairs_ambiguous_notification_without_history_reload() -> (
+    None
+):
+    from dataclasses import replace
+
+    user = replace(
+        USER_ONE,
+        queue_id="existing-queue",
+        last_event_id=17,
+        notification_settings_generation=NOTIFICATION_SETTINGS_GENERATION,
+    )
+    store = FakeStore()
+    api = FakeApi()
+    worker = ZulipEventThread(
+        user,
+        store,
+        asyncio.get_running_loop(),  # type: ignore[arg-type]
+        Settings(database_dsn="postgresql:///test"),
+        threading.BoundedSemaphore(1),
+        api_factory=lambda current_user: api,  # type: ignore[arg-type]
+    )
+    assert await asyncio.to_thread(worker._restore_runtime_state, api)
+    assert api.registrations == 0
+    worker._catalog_filled = True
+    worker._resume_existing_queue = False
+    store.notification_snapshot_pending = True
+
+    async def stop_after_repair(*_args: object) -> list[object]:
+        worker._stop_requested.set()
+        return []
+
+    store.list_pending_history_chats = stop_after_repair  # type: ignore[method-assign]
+    await asyncio.wait_for(
+        asyncio.to_thread(worker._maintain_queue_session, api, "existing-queue"),
+        timeout=3,
+    )
+    assert api.registrations == 1
+    assert store.notification_snapshots == [(user.uuid, "existing-queue", False)]
+    assert api.deleted_queues == ["queue-1"]
+    assert store.catalogs == []
+    assert store.history_begins == 0
+    assert store.queues == []
+
+
+def test_snapshot_cleanup_failure_is_retried_before_allocating_another_queue() -> None:
+    asyncio.run(_snapshot_cleanup_failure_is_retried_before_allocating_another_queue())
+
+
+async def _snapshot_cleanup_failure_is_retried_before_allocating_another_queue() -> (
+    None
+):
+    from dataclasses import replace
+
+    class CleanupFailureApi(FakeApi):
+        failures = 2
+
+        def delete_queue(self, queue_id: str) -> None:
+            assert queue_id != "existing-queue"
+            if self.failures:
+                self.failures -= 1
+                raise ZulipApiError("http_503_zulip_error", retryable=True)
+            super().delete_queue(queue_id)
+
+    user = replace(USER_ONE, queue_id="existing-queue", last_event_id=17)
+    api = CleanupFailureApi()
+    worker = ZulipEventThread(
+        user,
+        FakeStore(),
+        asyncio.get_running_loop(),
+        Settings.from_env({}),
+        threading.BoundedSemaphore(1),
+    )  # type: ignore[arg-type]
+    for _ in range(2):
+        with pytest.raises(ZulipApiError):
+            worker._register_notification_snapshot(api, "existing-queue")  # type: ignore[arg-type]
+        assert api.registrations == 1
+        assert worker._temporary_notification_queues == {"queue-1"}
+    worker._register_notification_snapshot(api, "existing-queue")  # type: ignore[arg-type]
+    assert api.registrations == 2
+    assert api.deleted_queues == ["queue-1", "queue-1"]
+    assert not worker._temporary_notification_queues
+
+
+def test_snapshot_queue_is_cleaned_before_following_reads_can_fail() -> None:
+    asyncio.run(_snapshot_queue_is_cleaned_before_following_reads_can_fail())
+
+
+async def _snapshot_queue_is_cleaned_before_following_reads_can_fail() -> None:
+    from dataclasses import replace
+
+    class ReadFailureApi(FakeApi):
+        def get_attachments(self):
+            raise ZulipApiError("http_503_zulip_error", retryable=True)
+
+    user = replace(USER_ONE, queue_id="existing-queue", last_event_id=17)
+    api = ReadFailureApi()
+    worker = ZulipEventThread(
+        user,
+        FakeStore(),
+        asyncio.get_running_loop(),
+        Settings.from_env({}),
+        threading.BoundedSemaphore(1),
+    )  # type: ignore[arg-type]
+    with pytest.raises(ZulipApiError):
+        await asyncio.to_thread(worker._restore_runtime_state, api)  # type: ignore[arg-type]
+    assert api.deleted_queues == ["queue-1"]
+    assert not worker._temporary_notification_queues
+
+
+def test_snapshot_cleanup_refuses_the_retained_queue() -> None:
+    async def run():
+        api = FakeApi()
+        worker = ZulipEventThread(
+            USER_ONE,
+            FakeStore(),
+            asyncio.get_running_loop(),
+            Settings.from_env({}),
+            threading.BoundedSemaphore(1),
+        )  # type: ignore[arg-type]
+        with pytest.raises(RuntimeError, match="separate queue"):
+            worker._register_notification_snapshot(api, "queue-1")  # type: ignore[arg-type]
+        assert api.deleted_queues == []
+        assert not worker._temporary_notification_queues
+
+    asyncio.run(run())

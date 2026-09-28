@@ -24,6 +24,8 @@ import httpx
 from asyncpg.pool import PoolConnectionProxy
 
 from workspace_zulip_bridge.config import Settings
+from workspace_zulip_bridge.import_pipeline import historical_files_runnable
+from workspace_zulip_bridge.import_pipeline import lock_historical_stage
 from workspace_zulip_bridge.stable_ids import stable_external_chat_stream_uuid
 from workspace_zulip_bridge.stable_ids import stable_external_chat_topic_uuid
 from workspace_zulip_bridge.stable_ids import stable_message_flag_uuid
@@ -189,12 +191,12 @@ def _provider_api_error(response: httpx.Response) -> ProviderApiError:
 def _catalog_topic_provider_id(
     chat_type: str,
     chat_key: str,
-    topic_name: str | None,
+    stored_provider_topic_id: str | None,
 ) -> str:
     if chat_type == "channel":
-        if topic_name is None:
-            raise ValueError("channel message must have a catalog topic")
-        return f"{chat_key.removeprefix('channel:')}:{topic_name}"
+        if stored_provider_topic_id is None:
+            raise ValueError("channel topic has no catalog identity")
+        return stored_provider_topic_id
     return f"{chat_key}:default"
 
 
@@ -618,7 +620,7 @@ class WorkspaceBootstrapper:
                     snapshot_epoch_version = $5, bootstrap_status = 'ready',
                     entity_counts = $6::jsonb, snapshot_hash = $7,
                     last_error = NULL, bootstrapped_at = clock_timestamp(),
-                    initial_sync_completed_at = NULL,
+                    initial_sync_completed_at = NULL, initial_sync_watermark_at = NULL,
                     updated_at = clock_timestamp()
                 WHERE provider_uuid = $1 AND workspace_project_id = $2
                 """,
@@ -970,7 +972,7 @@ class WorkspaceEventProcessor:
                     FROM workspace_zulip_bridge.workspace_events AS event
                     WHERE event.provider_uuid = $1
                       AND event.processing_status IN (
-                          'applied', 'skipped', 'failed'
+                          'applied', 'skipped'
                       )
                       AND event.received_at < (
                           clock_timestamp()
@@ -1333,7 +1335,8 @@ class WorkspaceEventProcessor:
             SELECT report.resource_uuid, report.catalog, report.assignment,
                    stream.uuid AS stream_uuid,
                    stream.chat_type, stream.chat_key,
-                   topic.uuid AS topic_uuid, topic.name AS topic_name
+                   topic.uuid AS topic_uuid,
+                   identity.provider_topic_id AS topic_provider_id
             FROM workspace_zulip_bridge.workspace_chat_catalog_reports AS report
             JOIN workspace_zulip_bridge.zulip_streams AS stream
               ON stream.uuid = report.zulip_stream_uuid
@@ -1341,6 +1344,9 @@ class WorkspaceEventProcessor:
               ON realm.uuid = stream.realm_uuid
             LEFT JOIN workspace_zulip_bridge.zulip_topics AS topic
               ON topic.zulip_stream_uuid = stream.uuid
+            LEFT JOIN workspace_zulip_bridge.zulip_topic_catalog_identities
+                AS identity
+              ON identity.topic_uuid = topic.uuid
             WHERE realm.workspace_provider_uuid = $1
               AND realm.workspace_project_id = $2
               AND report.processing_status = 'reported'
@@ -1365,10 +1371,16 @@ class WorkspaceEventProcessor:
             ] = source_stream_uuid
             if row["topic_uuid"] is None:
                 continue
+            if row["chat_type"] == "channel" and row["topic_provider_id"] is None:
+                continue
             provider_topic_id = _catalog_topic_provider_id(
                 str(row["chat_type"]),
                 str(row["chat_key"]),
-                str(row["topic_name"]),
+                (
+                    str(row["topic_provider_id"])
+                    if row["topic_provider_id"] is not None
+                    else None
+                ),
             )
             projection = assignment.get("workspace_projection")
             assigned_topics = (
@@ -1759,17 +1771,6 @@ class WorkspaceDiffWorker:
         # planner must never wait for a slow Provider API batch: doing so stalls
         # every source cursor and turns a handful of rejected legacy entities
         # into a global synchronization pause.
-        if await self._historical_file_work_pending():
-            # Direct chats still need their synthetic topic while the
-            # historical file stage is active: catalog publication and
-            # realtime delivery both depend on it, and the repair is bounded.
-            if not self._direct_topics_repair_done:
-                realm_uuid = await self._link_realm()
-                if realm_uuid is not None:
-                    self._direct_topics_repair_done = await self._ensure_direct_topics(
-                        realm_uuid
-                    )
-            return 0
         planned = await self.plan()
         if planned is None:
             return 0
@@ -1789,41 +1790,9 @@ class WorkspaceDiffWorker:
         return processed
 
     async def _historical_file_work_pending(self) -> bool:
-        """Keep historical delivery on the file stage until it is drained."""
+        """Only runnable/in-flight files own the heavy stage, not dependencies."""
 
-        return bool(
-            await self._pool.fetchval(
-                """
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM workspace_zulip_bridge.workspace_file_projections
-                    WHERE delivery_priority = 1
-                      AND processing_status IN (
-                          'pending', 'processing', 'failed'
-                      )
-                    LIMIT 1
-                ) OR EXISTS (
-                    SELECT 1
-                    FROM workspace_zulip_bridge.workspace_outbox AS outbox
-                    JOIN workspace_zulip_bridge.zulip_message_files AS link
-                      ON link.file_uuid = outbox.entity_uuid
-                    JOIN workspace_zulip_bridge.zulip_messages AS message
-                      ON message.uuid = link.message_uuid
-                     AND message.workspace_content IS NOT NULL
-                    LEFT JOIN workspace_zulip_bridge.workspace_file_projections
-                        AS projection
-                      ON projection.file_uuid = link.file_uuid
-                     AND projection.zulip_stream_uuid =
-                            message.zulip_stream_uuid
-                    WHERE outbox.entity_type = 'file'
-                      AND outbox.action = 'upsert'
-                      AND outbox.delivery_status IN ('pending', 'failed')
-                      AND projection.uuid IS NULL
-                    LIMIT 1
-                )
-                """
-            )
-        )
+        return await historical_files_runnable(self._pool)
 
     async def plan(self) -> int | None:
         realm_uuid = await self._link_realm()
@@ -2585,7 +2554,7 @@ class WorkspaceDiffWorker:
             await self._pool.execute(
                 """
                 UPDATE workspace_zulip_bridge.workspace_mirror_state
-                SET initial_sync_completed_at = NULL,
+                SET initial_sync_completed_at = NULL, initial_sync_watermark_at = NULL,
                     updated_at = clock_timestamp()
                 WHERE provider_uuid = $1
                   AND initial_sync_completed_at IS NOT NULL
@@ -2617,7 +2586,7 @@ class WorkspaceDiffWorker:
             await self._pool.execute(
                 """
                 UPDATE workspace_zulip_bridge.workspace_mirror_state
-                SET initial_sync_completed_at = NULL,
+                SET initial_sync_completed_at = NULL, initial_sync_watermark_at = NULL,
                     updated_at = clock_timestamp()
                 WHERE provider_uuid = $1
                   AND initial_sync_completed_at IS NOT NULL
@@ -2649,7 +2618,7 @@ class WorkspaceDiffWorker:
             await self._pool.execute(
                 """
                 UPDATE workspace_zulip_bridge.workspace_mirror_state
-                SET initial_sync_completed_at = NULL,
+                SET initial_sync_completed_at = NULL, initial_sync_watermark_at = NULL,
                     updated_at = clock_timestamp()
                 WHERE provider_uuid = $1
                   AND initial_sync_completed_at IS NOT NULL
@@ -3750,6 +3719,19 @@ class WorkspaceDiffWorker:
 
     async def process_once(self, client: httpx.AsyncClient) -> int:
         async with self._pool.acquire() as connection, connection.transaction():
+            if getattr(self, "_delivery_priority", None) == 1:
+                await lock_historical_stage(connection)
+                # Recheck inside every claim transaction: a retry can become
+                # ready while a previous delivery batch is on the network.
+                # An active entity batch owns the stage until it finishes.
+                entity_stage_active = await connection.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM workspace_zulip_bridge.sync_diffs "
+                    "WHERE delivery_priority = 1 AND processing_status = 'processing')"
+                )
+                if not entity_stage_active and await historical_files_runnable(
+                    connection
+                ):
+                    return 0
             await connection.execute(
                 f"""
                 UPDATE workspace_zulip_bridge.sync_diffs
@@ -3791,23 +3773,33 @@ class WorkspaceDiffWorker:
             source_order = (
                 "DESC" if getattr(self, "_delivery_priority", None) == 1 else "ASC"
             )
+            stage_scope = (
+                "TRUE"
+                if delivery_priority == 1
+                else f"({self._entity_type_filter}) AND ({self._partition_filter})"
+            )
+            stage_provider = "TRUE" if delivery_priority == 1 else "provider_uuid = $1"
             rows = await connection.fetch(
                 f"""
                 WITH selected_type AS MATERIALIZED (
-                    SELECT entity_type
-                    FROM workspace_zulip_bridge.sync_diffs
-                    WHERE provider_uuid = $1
-                      AND processing_status IN ('pending', 'failed')
-                      AND available_at <= clock_timestamp()
-                      AND delivery_priority = $3
-                      AND {self._entity_type_filter}
-                      AND {self._partition_filter}
-                    ORDER BY CASE entity_type
-                        WHEN 'users' THEN 0 WHEN 'streams' THEN 1
-                        WHEN 'stream_bindings' THEN 2 WHEN 'topics' THEN 3
-                        WHEN 'topic_bindings' THEN 4 WHEN 'messages' THEN 5
-                        WHEN 'message_flags' THEN 6 ELSE 7 END
-                    LIMIT 1
+                    SELECT COALESCE(
+                        (SELECT entity_type
+                         FROM workspace_zulip_bridge.sync_diffs
+                         WHERE {stage_provider} AND delivery_priority = $3
+                           AND processing_status = 'processing' AND {stage_scope}
+                         ORDER BY entity_type LIMIT 1),
+                        (SELECT entity_type
+                         FROM workspace_zulip_bridge.sync_diffs
+                         WHERE {stage_provider} AND delivery_priority = $3
+                           AND processing_status IN ('pending', 'failed')
+                           AND available_at <= clock_timestamp() AND {stage_scope}
+                         ORDER BY CASE entity_type
+                             WHEN 'users' THEN 0 WHEN 'streams' THEN 1
+                             WHEN 'stream_bindings' THEN 2 WHEN 'topics' THEN 3
+                             WHEN 'topic_bindings' THEN 4 WHEN 'messages' THEN 5
+                             WHEN 'message_flags' THEN 6 ELSE 7 END
+                         LIMIT 1)
+                    ) AS entity_type
                 ), claim AS (
                     SELECT provider_uuid, entity_type, entity_uuid
                     FROM workspace_zulip_bridge.sync_diffs
@@ -4284,7 +4276,7 @@ class WorkspaceDiffWorker:
             SELECT report.resource_uuid, report.catalog, report.assignment,
                    stream.uuid AS stream_uuid, stream.chat_type, stream.chat_key,
                    topic.uuid AS topic_uuid,
-                   topic.name AS topic_name
+                   identity.provider_topic_id AS topic_provider_id
             FROM workspace_zulip_bridge.zulip_messages AS message
             JOIN workspace_zulip_bridge.zulip_streams AS stream
               ON stream.uuid = message.zulip_stream_uuid
@@ -4303,6 +4295,9 @@ class WorkspaceDiffWorker:
              AND report.assignment IS NOT NULL
             LEFT JOIN workspace_zulip_bridge.zulip_topics AS topic
               ON topic.uuid = message.topic_uuid
+            LEFT JOIN workspace_zulip_bridge.zulip_topic_catalog_identities
+                AS identity
+              ON identity.topic_uuid = topic.uuid
             WHERE message.uuid = ANY($1::uuid[])
               AND EXISTS (
                   SELECT 1
@@ -4310,8 +4305,7 @@ class WorkspaceDiffWorker:
                       AS catalog_topic
                   WHERE catalog_topic ->> 'provider_topic_id' = CASE
                       WHEN stream.chat_type = 'channel'
-                      THEN regexp_replace(stream.chat_key, '^channel:', '')
-                           || ':' || topic.name
+                      THEN identity.provider_topic_id
                       ELSE stream.chat_key || ':default'
                   END
               )
@@ -4332,7 +4326,11 @@ class WorkspaceDiffWorker:
             provider_topic_id = _catalog_topic_provider_id(
                 str(row["chat_type"]),
                 str(row["chat_key"]),
-                str(row["topic_name"]) if row["topic_name"] is not None else None,
+                (
+                    str(row["topic_provider_id"])
+                    if row["topic_provider_id"] is not None
+                    else None
+                ),
             )
             ready["topics"].add(
                 _catalog_projection_topic_uuid(
@@ -4600,7 +4598,11 @@ class WorkspaceDiffWorker:
             grouped[row["entity_type"]].append(row["entity_uuid"])
         for entity_type, entity_uuids in grouped.items():
             source_entities.update(
-                await self._load_zulip_entities(entity_type, entity_uuids)
+                await self._load_zulip_entities(
+                    entity_type,
+                    entity_uuids,
+                    canonical_source=True,
+                )
             )
             target_entities.update(
                 await self._load_workspace_entities(entity_type, entity_uuids)
@@ -4847,6 +4849,22 @@ class WorkspaceDiffWorker:
         return await client.put(url, json=json)
 
     async def _complete_initial_sync(self) -> bool:
+        # Freeze the initial-import boundary once. New realtime events are a
+        # separate health signal and cannot keep a converged historical import
+        # perpetually incomplete. Historical work remains mandatory at any age.
+        await self._pool.execute(
+            "UPDATE workspace_zulip_bridge.workspace_mirror_state "
+            "SET initial_sync_watermark_at = clock_timestamp() "
+            "WHERE provider_uuid = $1 AND initial_sync_watermark_at IS NULL "
+            "AND initial_sync_completed_at IS NULL "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM workspace_zulip_bridge.zulip_connections AS source "
+            "JOIN workspace_zulip_bridge.zulip_users AS actor ON actor.uuid = source.zulip_user_uuid "
+            "JOIN workspace_zulip_bridge.zulip_realms AS realm ON realm.uuid = source.realm_uuid "
+            "WHERE realm.workspace_provider_uuid = $1 AND source.sync_enabled "
+            "AND NOT actor.disabled AND NOT actor.is_bot AND source.lifecycle_status <> 'active')",
+            self._provider_uuid,
+        )
         result = await self._pool.execute(
             """
             UPDATE workspace_zulip_bridge.workspace_mirror_state AS mirror
@@ -4881,12 +4899,62 @@ class WorkspaceDiffWorker:
                   SELECT 1 FROM workspace_zulip_bridge.sync_diffs AS diff
                   WHERE diff.provider_uuid = mirror.provider_uuid
                     AND diff.direction = 'to_workspace'
+                    AND (diff.delivery_priority = 1 OR diff.created_at <= mirror.initial_sync_watermark_at)
                     AND diff.processing_status IN (
-                        'pending', 'processing', 'failed'
+                        'pending', 'processing', 'failed', 'blocked'
                     )
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM workspace_zulip_bridge.workspace_outbox AS outbox
+                  JOIN workspace_zulip_bridge.zulip_realms AS realm
+                    ON realm.uuid = outbox.realm_uuid
+                  WHERE realm.workspace_provider_uuid = mirror.provider_uuid
+                    AND outbox.delivery_status <> 'delivered'
+                    AND (outbox.import_required OR outbox.created_at <= mirror.initial_sync_watermark_at)
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM workspace_zulip_bridge.workspace_file_projections AS file
+                  JOIN workspace_zulip_bridge.zulip_streams AS stream
+                    ON stream.uuid = file.zulip_stream_uuid
+                  JOIN workspace_zulip_bridge.zulip_realms AS realm
+                    ON realm.uuid = stream.realm_uuid
+                  WHERE realm.workspace_provider_uuid = mirror.provider_uuid
+                    AND file.processing_status <> 'finalized'
+                    AND (file.delivery_priority = 1 OR file.created_at <= mirror.initial_sync_watermark_at)
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM workspace_zulip_bridge.zulip_streams AS stream
+                  JOIN workspace_zulip_bridge.zulip_connections AS supplier
+                    ON supplier.uuid = stream.source_connection_uuid AND supplier.sync_enabled
+                  JOIN workspace_zulip_bridge.zulip_realms AS realm
+                    ON realm.uuid = stream.realm_uuid
+                  LEFT JOIN workspace_zulip_bridge.workspace_chat_catalog_reports AS catalog
+                    ON catalog.zulip_stream_uuid = stream.uuid
+                   AND catalog.external_account_uuid = supplier.external_account_uuid
+                  WHERE realm.workspace_provider_uuid = mirror.provider_uuid
+                    AND (catalog.processing_status IS DISTINCT FROM 'reported'
+                         OR NOT catalog.assignment_reconciled
+                         OR catalog.projection_revision < $2)
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM workspace_zulip_bridge.workspace_events AS event
+                  WHERE event.provider_uuid = mirror.provider_uuid
+                    AND event.processing_status IN ('pending', 'processing', 'failed')
+                    AND event.received_at <= mirror.initial_sync_watermark_at
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM workspace_zulip_bridge.zulip_events AS event
+                  JOIN workspace_zulip_bridge.zulip_connections AS connection
+                    ON connection.uuid = event.zulip_connection_uuid
+                  JOIN workspace_zulip_bridge.zulip_realms AS realm
+                    ON realm.uuid = connection.realm_uuid
+                  WHERE realm.workspace_provider_uuid = mirror.provider_uuid
+                    AND event.processing_status IN ('pending', 'processing', 'failed')
+                    AND event.created_at <= mirror.initial_sync_watermark_at
               )
             """,
             self._provider_uuid,
+            CATALOG_PROJECTION_REVISION,
         )
         return result == "UPDATE 1"
 
@@ -5378,12 +5446,50 @@ class WorkspaceDiffWorker:
         return len(rows) < self.TOPIC_BINDING_REPAIR_BATCH_SIZE
 
     async def _load_zulip_entities(
-        self, entity_type: str, entity_uuids: list[UUID]
+        self,
+        entity_type: str,
+        entity_uuids: list[UUID],
+        *,
+        canonical_source: bool = False,
     ) -> dict[tuple[str, UUID], dict[str, Any]]:
         rows = await self._pool.fetch(_ENTITY_QUERIES[entity_type], entity_uuids)
+        source_user_fields = {
+            "streams": ("owner_uuid", "direct_user_uuid"),
+            "stream_bindings": ("user_uuid", "who_uuid"),
+            "topic_bindings": ("user_uuid",),
+            "messages": ("author_uuid",),
+            "message_flags": ("user_uuid",),
+            "message_reactions": ("user_uuid",),
+        }.get(entity_type, ())
+        source_users: dict[tuple[UUID, UUID], UUID] = {}
+        if canonical_source and source_user_fields:
+            projected_user_uuids = {
+                UUID(str(data[field]))
+                for row in rows
+                for data in (_json_object(row["data"]),)
+                for field in source_user_fields
+                if data.get(field) is not None
+            }
+            if projected_user_uuids:
+                user_rows = await self._pool.fetch(
+                    """
+                    SELECT uuid, realm_uuid, workspace_user_uuid
+                    FROM workspace_zulip_bridge.zulip_users
+                    WHERE workspace_user_uuid = ANY($1::uuid[])
+                    """,
+                    list(projected_user_uuids),
+                )
+                source_users = {
+                    (
+                        UUID(str(row["realm_uuid"])),
+                        UUID(str(row["workspace_user_uuid"])),
+                    ): UUID(str(row["uuid"]))
+                    for row in user_rows
+                }
         result: dict[tuple[str, UUID], dict[str, Any]] = {}
         for row in rows:
             data = _json_object(row["data"])
+            projected_data = dict(data)
             source_entity_uuid = UUID(str(row["entity_uuid"]))
             workspace_entity_uuid = source_entity_uuid
             catalog_resource_uuid = row.get("catalog_resource_uuid")
@@ -5402,17 +5508,25 @@ class WorkspaceDiffWorker:
                     external_chat_uuid,
                     assignment,
                 )
-                if "stream_uuid" in data:
-                    data["stream_uuid"] = str(workspace_stream_uuid)
+                if "stream_uuid" in projected_data:
+                    projected_data["stream_uuid"] = str(workspace_stream_uuid)
                 if entity_type == "streams":
                     workspace_entity_uuid = workspace_stream_uuid
                 if entity_type in {"topics", "topic_bindings", "messages"}:
+                    if (
+                        row["chat_type"] == "channel"
+                        and row["topic_provider_id"] is None
+                    ):
+                        self._assignment_blocked_entities.add(
+                            (entity_type, source_entity_uuid)
+                        )
+                        continue
                     provider_topic_id = _catalog_topic_provider_id(
                         str(row["chat_type"]),
                         str(row["chat_key"]),
                         (
-                            str(row["topic_name"])
-                            if row["topic_name"] is not None
+                            str(row["topic_provider_id"])
+                            if row["topic_provider_id"] is not None
                             else None
                         ),
                     )
@@ -5422,38 +5536,49 @@ class WorkspaceDiffWorker:
                         provider_topic_id,
                         assignment,
                     )
-                    if "topic_uuid" in data:
-                        data["topic_uuid"] = str(workspace_topic_uuid)
+                    if "topic_uuid" in projected_data:
+                        projected_data["topic_uuid"] = str(workspace_topic_uuid)
                     if entity_type == "topics":
                         workspace_entity_uuid = workspace_topic_uuid
                 if entity_type == "stream_bindings":
                     workspace_entity_uuid = stable_stream_binding_uuid(
                         workspace_stream_uuid,
-                        UUID(str(data["user_uuid"])),
+                        UUID(str(projected_data["user_uuid"])),
                     )
                 elif entity_type == "topic_bindings":
                     workspace_entity_uuid = stable_topic_binding_uuid(
-                        UUID(str(data["topic_uuid"])),
-                        UUID(str(data["user_uuid"])),
+                        UUID(str(projected_data["topic_uuid"])),
+                        UUID(str(projected_data["user_uuid"])),
                     )
                 elif entity_type == "message_flags":
                     workspace_entity_uuid = stable_message_flag_uuid(
-                        UUID(str(data["message_uuid"])),
-                        UUID(str(data["user_uuid"])),
+                        UUID(str(projected_data["message_uuid"])),
+                        UUID(str(projected_data["user_uuid"])),
                     )
             if entity_type == "message_reactions":
                 workspace_entity_uuid = stable_reaction_uuid(
-                    UUID(str(data["message_uuid"])),
-                    UUID(str(data["user_uuid"])),
+                    UUID(str(projected_data["message_uuid"])),
+                    UUID(str(projected_data["user_uuid"])),
                     str(row["reaction_type"]),
                     str(row["emoji_code"]),
                 )
             self._workspace_entity_ids[(entity_type, source_entity_uuid)] = (
                 workspace_entity_uuid
             )
+            if canonical_source:
+                source_realm_uuid = UUID(str(row["source_realm_uuid"]))
+                for field in source_user_fields:
+                    value = data.get(field)
+                    if value is not None:
+                        data[field] = str(
+                            source_users.get(
+                                (source_realm_uuid, UUID(str(value))),
+                                UUID(str(value)),
+                            )
+                        )
             result[(entity_type, source_entity_uuid)] = project_entity(
                 entity_type,
-                data,
+                data if canonical_source else projected_data,
             )
         return result
 
@@ -5780,7 +5905,8 @@ _OUTBOX_SOURCE_VERSIONS = {
 
 _ENTITY_QUERIES = {
     "users": """
-        SELECT zulip_user.uuid AS entity_uuid, jsonb_build_object(
+        SELECT zulip_user.uuid AS entity_uuid, zulip_user.realm_uuid AS source_realm_uuid,
+               jsonb_build_object(
             'username', zulip_user.login,
             'display_name', zulip_user.full_name,
             'email', zulip_user.login,
@@ -5812,7 +5938,8 @@ _ENTITY_QUERIES = {
           AND zulip_user.workspace_user_uuid IS NULL
     """,
     "streams": """
-        SELECT stream.uuid AS entity_uuid, jsonb_build_object(
+        SELECT stream.uuid AS entity_uuid, stream.realm_uuid AS source_realm_uuid,
+               jsonb_build_object(
             'name', stream.name, 'description', COALESCE(stream.description, ''),
             'owner_uuid', COALESCE(
                 owner_user.workspace_user_uuid, stream.owner_user_uuid,
@@ -5836,7 +5963,7 @@ _ENTITY_QUERIES = {
         CASE WHEN report.processing_status = 'reported'
                    AND report.assignment IS NOT NULL
              THEN report.assignment END AS assignment,
-        stream.chat_type, stream.chat_key, NULL::text AS topic_name
+        stream.chat_type, stream.chat_key, NULL::text AS topic_provider_id
         FROM workspace_zulip_bridge.zulip_streams AS stream
         LEFT JOIN workspace_zulip_bridge.zulip_connections AS connection
           ON connection.uuid = stream.source_connection_uuid
@@ -5852,7 +5979,8 @@ _ENTITY_QUERIES = {
         WHERE stream.uuid = ANY($1::uuid[])
     """,
     "stream_bindings": """
-        SELECT binding.uuid AS entity_uuid, jsonb_build_object(
+        SELECT binding.uuid AS entity_uuid, stream.realm_uuid AS source_realm_uuid,
+               jsonb_build_object(
             'stream_uuid', binding.zulip_stream_uuid,
             'user_uuid', COALESCE(
                 bound_user.workspace_user_uuid, binding.zulip_user_uuid
@@ -5873,7 +6001,7 @@ _ENTITY_QUERIES = {
         CASE WHEN report.processing_status = 'reported'
                    AND report.assignment IS NOT NULL
              THEN report.assignment END AS assignment,
-        stream.chat_type, stream.chat_key, NULL::text AS topic_name
+        stream.chat_type, stream.chat_key, NULL::text AS topic_provider_id
         FROM workspace_zulip_bridge.zulip_stream_bindings AS binding
         JOIN workspace_zulip_bridge.zulip_streams AS stream
           ON stream.uuid = binding.zulip_stream_uuid
@@ -5891,7 +6019,8 @@ _ENTITY_QUERIES = {
         WHERE binding.uuid = ANY($1::uuid[])
     """,
     "topics": """
-        SELECT topic.uuid AS entity_uuid, jsonb_build_object(
+        SELECT topic.uuid AS entity_uuid, stream.realm_uuid AS source_realm_uuid,
+               jsonb_build_object(
             'stream_uuid', topic.zulip_stream_uuid, 'name', topic.name,
             'is_done', topic.is_done, 'version', topic.version,
             'created_at', topic.created_at
@@ -5904,10 +6033,14 @@ _ENTITY_QUERIES = {
         CASE WHEN report.processing_status = 'reported'
                    AND report.assignment IS NOT NULL
              THEN report.assignment END AS assignment,
-        stream.chat_type, stream.chat_key, topic.name AS topic_name
+        stream.chat_type, stream.chat_key,
+        identity.provider_topic_id AS topic_provider_id
         FROM workspace_zulip_bridge.zulip_topics AS topic
         JOIN workspace_zulip_bridge.zulip_streams AS stream
           ON stream.uuid = topic.zulip_stream_uuid
+        LEFT JOIN workspace_zulip_bridge.zulip_topic_catalog_identities
+            AS identity
+          ON identity.topic_uuid = topic.uuid
         LEFT JOIN workspace_zulip_bridge.zulip_connections AS connection
           ON connection.uuid = stream.source_connection_uuid
         LEFT JOIN workspace_zulip_bridge.workspace_chat_catalog_reports AS report
@@ -5916,7 +6049,8 @@ _ENTITY_QUERIES = {
         WHERE topic.uuid = ANY($1::uuid[])
     """,
     "topic_bindings": """
-        SELECT binding.uuid AS entity_uuid, jsonb_build_object(
+        SELECT binding.uuid AS entity_uuid, stream.realm_uuid AS source_realm_uuid,
+               jsonb_build_object(
             'stream_uuid', binding.zulip_stream_uuid,
             'topic_uuid', binding.topic_uuid,
             'user_uuid', COALESCE(
@@ -5932,12 +6066,16 @@ _ENTITY_QUERIES = {
         CASE WHEN report.processing_status = 'reported'
                    AND report.assignment IS NOT NULL
              THEN report.assignment END AS assignment,
-        stream.chat_type, stream.chat_key, topic.name AS topic_name
+        stream.chat_type, stream.chat_key,
+        identity.provider_topic_id AS topic_provider_id
         FROM workspace_zulip_bridge.zulip_topic_bindings AS binding
         JOIN workspace_zulip_bridge.zulip_users AS zulip_user
           ON zulip_user.uuid = binding.zulip_user_uuid
         JOIN workspace_zulip_bridge.zulip_topics AS topic
           ON topic.uuid = binding.topic_uuid
+        LEFT JOIN workspace_zulip_bridge.zulip_topic_catalog_identities
+            AS identity
+          ON identity.topic_uuid = topic.uuid
         JOIN workspace_zulip_bridge.zulip_streams AS stream
           ON stream.uuid = binding.zulip_stream_uuid
         LEFT JOIN workspace_zulip_bridge.zulip_connections AS connection
@@ -5948,7 +6086,8 @@ _ENTITY_QUERIES = {
         WHERE binding.uuid = ANY($1::uuid[])
     """,
     "messages": """
-        SELECT message.uuid AS entity_uuid, jsonb_build_object(
+        SELECT message.uuid AS entity_uuid, message.realm_uuid AS source_realm_uuid,
+               jsonb_build_object(
             'stream_uuid', message.zulip_stream_uuid,
             'topic_uuid', message.topic_uuid,
             'author_uuid', COALESCE(
@@ -5968,7 +6107,8 @@ _ENTITY_QUERIES = {
         CASE WHEN report.processing_status = 'reported'
                    AND report.assignment IS NOT NULL
              THEN report.assignment END AS assignment,
-        stream.chat_type, stream.chat_key, topic.name AS topic_name
+        stream.chat_type, stream.chat_key,
+        identity.provider_topic_id AS topic_provider_id
         FROM workspace_zulip_bridge.zulip_messages AS message
         JOIN workspace_zulip_bridge.zulip_users AS sender
           ON sender.uuid = message.sender_user_uuid
@@ -5984,13 +6124,17 @@ _ENTITY_QUERIES = {
          AND mirror.active_generation IS NOT NULL
         LEFT JOIN workspace_zulip_bridge.zulip_topics AS topic
           ON topic.uuid = message.topic_uuid
+        LEFT JOIN workspace_zulip_bridge.zulip_topic_catalog_identities
+            AS identity
+          ON identity.topic_uuid = topic.uuid
         LEFT JOIN workspace_zulip_bridge.workspace_chat_catalog_reports AS report
           ON report.external_account_uuid = connection.external_account_uuid
          AND report.zulip_stream_uuid = stream.uuid
         WHERE message.uuid = ANY($1::uuid[])
     """,
     "message_flags": """
-        SELECT flag.uuid AS entity_uuid, jsonb_build_object(
+        SELECT flag.uuid AS entity_uuid, stream.realm_uuid AS source_realm_uuid,
+               jsonb_build_object(
             'stream_uuid', flag.zulip_stream_uuid,
             'message_uuid', flag.message_uuid,
             'user_uuid', COALESCE(
@@ -6007,7 +6151,7 @@ _ENTITY_QUERIES = {
         CASE WHEN report.processing_status = 'reported'
                    AND report.assignment IS NOT NULL
              THEN report.assignment END AS assignment,
-        stream.chat_type, stream.chat_key, NULL::text AS topic_name
+        stream.chat_type, stream.chat_key, NULL::text AS topic_provider_id
         FROM workspace_zulip_bridge.zulip_message_flags AS flag
         JOIN workspace_zulip_bridge.zulip_users AS flag_user
           ON flag_user.uuid = flag.zulip_user_uuid
@@ -6021,7 +6165,8 @@ _ENTITY_QUERIES = {
         WHERE flag.uuid = ANY($1::uuid[])
     """,
     "message_reactions": """
-        SELECT reaction.uuid AS entity_uuid, jsonb_build_object(
+        SELECT reaction.uuid AS entity_uuid, message.realm_uuid AS source_realm_uuid,
+               jsonb_build_object(
             'message_uuid', reaction.message_uuid,
             'user_uuid', COALESCE(
                 reaction_user.workspace_user_uuid, reaction.zulip_user_uuid
@@ -6031,6 +6176,8 @@ _ENTITY_QUERIES = {
         ) AS data,
         reaction.reaction_type, reaction.emoji_code
         FROM workspace_zulip_bridge.zulip_message_reactions AS reaction
+        JOIN workspace_zulip_bridge.zulip_messages AS message
+          ON message.uuid = reaction.message_uuid
         JOIN workspace_zulip_bridge.zulip_users AS reaction_user
           ON reaction_user.uuid = reaction.zulip_user_uuid
         WHERE reaction.uuid = ANY($1::uuid[])
