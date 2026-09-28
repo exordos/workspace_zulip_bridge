@@ -7,6 +7,9 @@ import logging
 import random
 import ssl
 import threading
+from collections.abc import Awaitable
+from collections.abc import Callable
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl
@@ -22,11 +25,15 @@ from websockets.typing import Subprotocol
 from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.database import open_pool
 from workspace_zulip_bridge.models import WorkspaceEventCursor
+from workspace_zulip_bridge.realtime import WorkspaceRealtimeForwarder
+from workspace_zulip_bridge.realtime import ZulipQueueUnavailableError
 from workspace_zulip_bridge.v4_store import V4Store
 from workspace_zulip_bridge.workspace_auth import WorkspaceTokenManager
+from workspace_zulip_bridge.zulip_api import ZulipApiError
 
 LOG = logging.getLogger(__name__)
 WORKSPACE_EVENTS_PROTOCOL = "workspace.events.v1"
+EventHandler = Callable[[Mapping[str, Any]], Awaitable[None]]
 
 
 class WorkspaceCursorGapError(RuntimeError):
@@ -36,12 +43,13 @@ class WorkspaceCursorGapError(RuntimeError):
 
 
 class WorkspaceEventReceiver:
-    """Maintain the Workspace socket and discard frames after cursoring them."""
+    """Apply live Workspace message events before advancing their cursor."""
 
     def __init__(
         self,
         store: V4Store,
         settings: Settings,
+        event_handler: EventHandler,
         tokens: WorkspaceTokenManager | None = None,
     ) -> None:
         if not settings.workspace_events_enabled:
@@ -54,6 +62,7 @@ class WorkspaceEventReceiver:
         self._url = settings.workspace_websocket_url
         self._project_uuid = settings.workspace_project_id
         self._provider_uuid = settings.workspace_provider_uuid
+        self._event_handler = event_handler
         self._tokens = tokens or WorkspaceTokenManager(settings)
 
     async def run(self) -> None:
@@ -69,10 +78,15 @@ class WorkspaceEventReceiver:
             except asyncio.CancelledError:
                 raise
             except WorkspaceCursorGapError as exc:
+                LOG.warning(
+                    "Workspace realtime cursor expired; resuming at the live edge: "
+                    "minimum_epoch_version=%d",
+                    exc.minimum_epoch_version,
+                )
                 await self._store.reset_workspace_cursor(
                     self._provider_uuid,
                     self._project_uuid,
-                    max(0, exc.minimum_epoch_version - 1),
+                    0,
                 )
             except Exception as exc:
                 LOG.warning(
@@ -128,83 +142,66 @@ class WorkspaceEventReceiver:
 
     async def _consume(self, websocket: Any, cursor: WorkspaceEventCursor) -> None:
         generation = cursor.epoch_generation
-        pending_version = cursor.last_epoch_version
-        pending_count = 0
-        try:
-            while True:
-                timeout = (
-                    self._settings.workspace_event_flush_seconds
-                    if pending_count
-                    else None
+        while True:
+            frame = _decode_frame(await websocket.recv())
+            if frame.get("error") == "epoch_pruned" or frame.get("code") == 410:
+                minimum = _nonnegative_int(
+                    frame.get("minimum_epoch_version", 0),
+                    "minimum_epoch_version",
                 )
-                try:
-                    raw = await asyncio.wait_for(websocket.recv(), timeout=timeout)
-                except TimeoutError:
-                    if generation is not None:
-                        await self._store.advance_workspace_cursor(
-                            self._provider_uuid,
-                            self._project_uuid,
-                            generation,
-                            pending_version,
-                        )
-                    pending_count = 0
-                    continue
-                frame = _decode_frame(raw)
-                if frame.get("error") == "epoch_pruned" or frame.get("code") == 410:
-                    minimum = _nonnegative_int(
-                        frame.get("minimum_epoch_version", 0),
-                        "minimum_epoch_version",
-                    )
-                    raise WorkspaceCursorGapError(minimum)
-                if frame.get("type") == "ready":
-                    generation = UUID(str(frame["epoch_generation"]))
-                    pending_version = _nonnegative_int(
-                        frame["epoch_version"],
-                        "epoch_version",
-                    )
-                    await self._store.advance_workspace_cursor(
-                        self._provider_uuid,
-                        self._project_uuid,
-                        generation,
-                        pending_version,
-                    )
-                    pending_count = 0
-                    continue
-                _validate_event_route(frame, self._project_uuid, self._provider_uuid)
-                pending_version = max(
-                    pending_version,
-                    _nonnegative_int(frame["epoch_version"], "epoch_version"),
-                )
-                pending_count += 1
-                if pending_count < self._settings.workspace_event_batch_size:
-                    continue
-                if generation is None:
-                    raise ValueError("Workspace event arrived before ready frame")
+                raise WorkspaceCursorGapError(minimum)
+            if frame.get("type") == "ready":
+                generation = UUID(str(frame["epoch_generation"]))
+                version = _nonnegative_int(frame["epoch_version"], "epoch_version")
                 await self._store.advance_workspace_cursor(
                     self._provider_uuid,
                     self._project_uuid,
                     generation,
-                    pending_version,
+                    version,
                 )
-                pending_count = 0
-        finally:
-            if pending_count:
-                if generation is None:
-                    raise ValueError("Workspace event arrived before ready frame")
-                await self._store.advance_workspace_cursor(
-                    self._provider_uuid,
-                    self._project_uuid,
-                    generation,
-                    pending_version,
+                continue
+            if generation is None:
+                raise ValueError("Workspace event arrived before ready frame")
+            _validate_event_route(frame, self._project_uuid, self._provider_uuid)
+            try:
+                await self._event_handler(frame)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if not _permanent_delivery_error(exc):
+                    raise
+                error = (
+                    exc.code if isinstance(exc, ZulipApiError) else type(exc).__name__
                 )
+                LOG.warning(
+                    "Skipping permanent Workspace realtime event "
+                    "epoch_version=%s error=%s",
+                    frame.get("epoch_version"),
+                    error,
+                )
+            await self._store.advance_workspace_cursor(
+                self._provider_uuid,
+                self._project_uuid,
+                generation,
+                _nonnegative_int(frame["epoch_version"], "epoch_version"),
+            )
+
+
+def _permanent_delivery_error(error: Exception) -> bool:
+    if isinstance(error, ZulipQueueUnavailableError):
+        return False
+    if isinstance(error, ZulipApiError):
+        return not error.retryable
+    return isinstance(error, (ValueError, RuntimeError))
 
 
 class WorkspaceEventThread(threading.Thread):
     """Run the Workspace WebSocket on an event loop isolated in one OS thread."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, tokens: WorkspaceTokenManager) -> None:
         super().__init__(name="workspace-events", daemon=True)
         self._settings = settings
+        self._tokens = tokens
         self._state_lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._task: asyncio.Task[None] | None = None
@@ -245,10 +242,12 @@ class WorkspaceEventThread(threading.Thread):
     async def _run(self) -> None:
         pool = await open_pool(self._settings)
         try:
+            store = V4Store(pool)
             receiver = WorkspaceEventReceiver(
-                V4Store(pool),
+                store,
                 self._settings,
-                WorkspaceTokenManager(self._settings),
+                WorkspaceRealtimeForwarder(store, self._settings).apply,
+                self._tokens,
             )
             await receiver.run()
         finally:

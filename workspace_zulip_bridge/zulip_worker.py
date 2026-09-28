@@ -8,6 +8,7 @@ import random
 import threading
 from collections.abc import Callable
 from collections.abc import Coroutine
+from collections.abc import Mapping
 from typing import Any
 from typing import Protocol
 from uuid import UUID
@@ -16,6 +17,7 @@ import httpx
 
 from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.models import ExternalAccount
+from workspace_zulip_bridge.models import ZulipIdentity
 from workspace_zulip_bridge.v4_store import V4Store
 from workspace_zulip_bridge.zulip_api import ZulipApiClient
 from workspace_zulip_bridge.zulip_api import ZulipApiError
@@ -35,10 +37,14 @@ class Worker(Protocol):
 
 ApiFactory = Callable[[ExternalAccount], ZulipApiClient]
 WorkerFactory = Callable[[ExternalAccount, threading.Semaphore], Worker]
+EventHandler = Callable[
+    [ExternalAccount, ZulipIdentity, Mapping[str, Any]],
+    Coroutine[Any, Any, None],
+]
 
 
 class ZulipEventThread(threading.Thread):
-    """Own one Zulip queue and discard every received event after cursoring it."""
+    """Apply live Zulip message events before advancing their queue cursor."""
 
     def __init__(
         self,
@@ -47,6 +53,7 @@ class ZulipEventThread(threading.Thread):
         loop: asyncio.AbstractEventLoop,
         settings: Settings,
         registration_gate: threading.Semaphore,
+        event_handler: EventHandler,
         api_factory: ApiFactory | None = None,
     ) -> None:
         super().__init__(name=f"zulip-account-{account.uuid}", daemon=True)
@@ -55,6 +62,7 @@ class ZulipEventThread(threading.Thread):
         self._loop = loop
         self._settings = settings
         self._registration_gate = registration_gate
+        self._event_handler = event_handler
         self._api_factory = api_factory or self._default_api_factory
         self._stop_requested = threading.Event()
         self._client_lock = threading.Lock()
@@ -125,6 +133,7 @@ class ZulipEventThread(threading.Thread):
             attempt += 1
 
     def _poll(self, client: ZulipApiClient) -> None:
+        identity = client.own_user()
         while not self._stop_requested.is_set():
             if self._queue_id is None or self._last_event_id is None:
                 with self._registration_gate:
@@ -146,7 +155,7 @@ class ZulipEventThread(threading.Thread):
             queue_id = self._queue_id
             last_event_id = self._last_event_id
             try:
-                next_event_id = client.poll(
+                events = client.poll(
                     queue_id,
                     last_event_id,
                     self._longpoll_timeout_seconds,
@@ -165,17 +174,40 @@ class ZulipEventThread(threading.Thread):
                     self._settings.zulip_default_longpoll_timeout_seconds
                 )
                 continue
-            if next_event_id == last_event_id:
-                continue
-            if not self._submit(
-                self._store.advance_zulip_cursor(
-                    self.account.uuid,
-                    queue_id,
-                    next_event_id,
-                )
-            ):
-                return
-            self._last_event_id = next_event_id
+            for event in events:
+                event_id = int(event["id"])
+                if event_id <= last_event_id:
+                    continue
+                apply_event = True
+                if event.get("type") == "update_message":
+                    message_id = event.get("message_id")
+                    if not isinstance(message_id, int):
+                        raise ZulipApiError("invalid_event", retryable=True)
+                    event = dict(event)
+                    try:
+                        event["message"] = client.get_message(message_id)
+                    except ZulipApiError as exc:
+                        if exc.status_code not in {400, 404}:
+                            raise
+                        LOG.info(
+                            "Skipping vanished Zulip update account_uuid=%s "
+                            "message_id=%d",
+                            self.account.uuid,
+                            message_id,
+                        )
+                        apply_event = False
+                if apply_event:
+                    self._submit(self._event_handler(self.account, identity, event))
+                if not self._submit(
+                    self._store.advance_zulip_cursor(
+                        self.account.uuid,
+                        queue_id,
+                        event_id,
+                    )
+                ):
+                    return
+                last_event_id = event_id
+                self._last_event_id = event_id
 
     def _mark_disconnected(self, error: str) -> None:
         LOG.warning(
@@ -232,11 +264,13 @@ class ZulipThreadSupervisor:
         store: V4Store,
         loop: asyncio.AbstractEventLoop,
         settings: Settings,
+        event_handler: EventHandler,
         worker_factory: WorkerFactory | None = None,
     ) -> None:
         self._store = store
         self._loop = loop
         self._settings = settings
+        self._event_handler = event_handler
         self._registration_gate = threading.BoundedSemaphore(
             settings.zulip_registration_concurrency
         )
@@ -302,4 +336,5 @@ class ZulipThreadSupervisor:
             self._loop,
             self._settings,
             registration_gate,
+            self._event_handler,
         )

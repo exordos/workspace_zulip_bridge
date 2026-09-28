@@ -10,7 +10,10 @@ from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.database import open_pool
 from workspace_zulip_bridge.database import prepare_database
 from workspace_zulip_bridge.database import probe_database
+from workspace_zulip_bridge.realtime import WorkspaceRealtimeClient
+from workspace_zulip_bridge.realtime import ZulipRealtimeProcessor
 from workspace_zulip_bridge.v4_store import V4Store
+from workspace_zulip_bridge.workspace_auth import WorkspaceTokenManager
 from workspace_zulip_bridge.workspace_control import WorkspaceControlWorker
 from workspace_zulip_bridge.workspace_events import WorkspaceEventThread
 from workspace_zulip_bridge.zulip_worker import ZulipThreadSupervisor
@@ -30,10 +33,16 @@ class BridgeService:
             await prepare_database(pool)
             await probe_database(pool)
             store = V4Store(pool)
+            workspace_tokens = WorkspaceTokenManager(self._settings)
+            workspace = WorkspaceRealtimeClient(
+                self._settings,
+                workspace_tokens,
+            )
             supervisor = ZulipThreadSupervisor(
                 store,
                 asyncio.get_running_loop(),
                 self._settings,
+                ZulipRealtimeProcessor(store, workspace).apply,
             )
             tasks.extend(
                 (
@@ -53,7 +62,10 @@ class BridgeService:
                     )
                 )
             if self._settings.workspace_events_enabled:
-                workspace_thread = WorkspaceEventThread(self._settings)
+                workspace_thread = WorkspaceEventThread(
+                    self._settings,
+                    workspace_tokens,
+                )
                 workspace_thread.start()
                 tasks.append(
                     asyncio.create_task(
@@ -61,7 +73,7 @@ class BridgeService:
                         name="workspace-thread-watch",
                     )
                 )
-            LOG.info("v4 connection daemon is ready")
+            LOG.info("v4 realtime bridge is ready")
             completed, _ = await asyncio.wait(
                 tasks,
                 return_when=asyncio.FIRST_COMPLETED,
@@ -82,7 +94,7 @@ class BridgeService:
                 if workspace_thread.is_alive():
                     LOG.warning("Workspace event thread did not stop")
             await pool.close()
-            LOG.info("v4 connection daemon stopped")
+            LOG.info("v4 realtime bridge stopped")
 
     async def _probe_loop(self, pool: asyncpg.Pool) -> None:
         while True:

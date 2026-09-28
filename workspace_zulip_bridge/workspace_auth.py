@@ -8,6 +8,7 @@ import base64
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -38,12 +39,19 @@ class WorkspaceTokenManager:
         )
         self._timeout = settings.workspace_request_timeout_seconds
         self._transport = transport
-        self._lock = asyncio.Lock()
+        self._lock = threading.Lock()
         self._access_token: str | None = None
         self._refresh_token: str | None = None
 
     async def access_token(self, *, force_refresh: bool = False) -> str:
-        async with self._lock:
+        lock_waiter = asyncio.create_task(asyncio.to_thread(self._lock.acquire))
+        try:
+            await asyncio.shield(lock_waiter)
+        except asyncio.CancelledError:
+            if await lock_waiter:
+                self._lock.release()
+            raise
+        try:
             if self._access_token is None:
                 if self._access_path.is_file():
                     self._access_token = await asyncio.to_thread(
@@ -91,6 +99,8 @@ class WorkspaceTokenManager:
                     next_refresh_token,
                 )
             return access_token
+        finally:
+            self._lock.release()
 
     async def _password_login(self) -> str:
         if (

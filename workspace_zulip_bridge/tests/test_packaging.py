@@ -113,21 +113,18 @@ def test_exordos_manifest_renders_without_implicit_values() -> None:
         "workspace_zulip_bridge_config"
     ]["body"]["content"]
     assert "WZB_WORKSPACE_CONTROL_URL=" in config
-    assert "WZB_EVENT_PROCESSOR_BATCH_SIZE=128" in config
-    assert "WZB_EVENT_PROCESSOR_REALTIME_BATCH_SIZE=16" in config
-    assert "WZB_EVENT_PROCESSOR_REALTIME_WORKERS=4" in config
-    assert "WZB_EVENT_PROCESSOR_REALTIME_WINDOW_SECONDS=300" in config
-    assert "WZB_ZULIP_HISTORY_CONCURRENCY=4" in config
-    assert "WZB_ZULIP_MESSAGE_PAGE_SIZE=2000" in config
-    assert "WZB_WORKSPACE_SYNC_WORKERS=2" in config
-    assert "WZB_EVENT_PROCESSOR_BACKLOG_RETRY_CAP_SECONDS=300" in config
+    assert "WZB_WORKSPACE_API_URL=" in config
+    assert "WZB_EVENT_PROCESSOR_" not in config
+    assert "WZB_ZULIP_HISTORY_" not in config
+    assert "WZB_ZULIP_MESSAGE_PAGE_SIZE" not in config
+    assert "WZB_WORKSPACE_SYNC_WORKERS" not in config
     assert f"WZB_WORKSPACE_PROJECT_ID={{{workspace_project_id}}}" in config
     assert "WZB_WORKSPACE_USERNAME=" in config
     assert "WZB_WORKSPACE_PASSWORD_FILE=" in config
     on_change = manifest["resources"]["$core.config.configs"][
         "workspace_zulip_bridge_config"
     ]["on_change"]["command"]
-    assert "rm -f /var/lib/workspace_zulip_bridge/workspace.token" in on_change
-    assert "workspace.refresh-token" in on_change
+    assert "workspace.token" not in on_change
+    assert "workspace.refresh-token" not in on_change
     assert "control/desired-state-v4-cursor" in on_change
     assert "control/desired-state-cursor" not in on_change

@@ -66,7 +66,6 @@ class Settings:
     workspace_token_url: str | None = None
     workspace_ca_file: Path | None = None
     workspace_event_batch_size: int = 500
-    workspace_event_flush_seconds: float = 0.1
     workspace_retry_base_seconds: float = 1.0
     workspace_retry_cap_seconds: float = 60.0
     workspace_request_timeout_seconds: float = 60.0
@@ -176,9 +175,6 @@ class Settings:
             workspace_event_batch_size=_read_int(
                 source, "WZB_WORKSPACE_EVENT_BATCH_SIZE", 500
             ),
-            workspace_event_flush_seconds=_read_float(
-                source, "WZB_WORKSPACE_EVENT_FLUSH_SECONDS", 0.1
-            ),
             workspace_retry_base_seconds=_read_float(
                 source, "WZB_WORKSPACE_RETRY_BASE_SECONDS", 1.0
             ),
@@ -240,7 +236,6 @@ class Settings:
             ),
             "WZB_ZULIP_REGISTRATION_CONCURRENCY": (self.zulip_registration_concurrency),
             "WZB_WORKSPACE_EVENT_BATCH_SIZE": self.workspace_event_batch_size,
-            "WZB_WORKSPACE_EVENT_FLUSH_SECONDS": self.workspace_event_flush_seconds,
             "WZB_WORKSPACE_RETRY_BASE_SECONDS": self.workspace_retry_base_seconds,
             "WZB_WORKSPACE_RETRY_CAP_SECONDS": self.workspace_retry_cap_seconds,
             "WZB_WORKSPACE_REQUEST_TIMEOUT_SECONDS": (

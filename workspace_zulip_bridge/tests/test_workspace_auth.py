@@ -2,6 +2,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License").
 
 import asyncio
+import threading
 from pathlib import Path
 
 import httpx
@@ -9,6 +10,61 @@ import pytest
 
 from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.workspace_auth import WorkspaceTokenManager
+
+
+def test_token_manager_coordinates_refresh_across_native_threads(
+    tmp_path: Path,
+) -> None:
+    access_file = tmp_path / "workspace.token"
+    refresh_file = tmp_path / "workspace.refresh-token"
+    access_file.write_text("header.eyJleHAiOjB9.signature")
+    refresh_file.write_text("old-refresh")
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        await asyncio.sleep(0.05)
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "fresh-access",
+                "refresh_token": "fresh-refresh",
+            },
+        )
+
+    settings = Settings.from_env(
+        {
+            "WZB_WORKSPACE_WEBSOCKET_URL": (
+                "wss://workspace.example/api/workspace/v1/events/ws"
+            ),
+            "WZB_WORKSPACE_PROJECT_ID": "10000000-0000-0000-0000-000000000001",
+            "WZB_WORKSPACE_PROVIDER_UUID": "10000000-0000-0000-0000-000000000002",
+            "WZB_WORKSPACE_TOKEN_FILE": str(access_file),
+            "WZB_WORKSPACE_REFRESH_TOKEN_FILE": str(refresh_file),
+        }
+    )
+    manager = WorkspaceTokenManager(
+        settings,
+        transport=httpx.MockTransport(handler),
+    )
+    barrier = threading.Barrier(2)
+    results: list[str] = []
+
+    def access_token() -> None:
+        barrier.wait()
+        results.append(asyncio.run(manager.access_token()))
+
+    threads = [threading.Thread(target=access_token) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert results == ["fresh-access", "fresh-access"]
+    assert len(requests) == 1
+    assert access_file.read_text() == "fresh-access\n"
+    assert refresh_file.read_text() == "fresh-refresh\n"
 
 
 def test_expired_access_token_is_refreshed_and_rotation_is_persisted(

@@ -7,6 +7,8 @@ from uuid import UUID
 import asyncpg
 
 from workspace_zulip_bridge.models import ExternalAccount
+from workspace_zulip_bridge.models import MessageLink
+from workspace_zulip_bridge.models import StreamLink
 from workspace_zulip_bridge.models import WorkspaceEventCursor
 
 
@@ -19,6 +21,20 @@ class V4Store:
 
     def __init__(self, pool: asyncpg.Pool) -> None:
         self._pool = pool
+
+    @staticmethod
+    def _account(row: asyncpg.Record) -> ExternalAccount:
+        return ExternalAccount(
+            uuid=row["uuid"],
+            owner_workspace_user_uuid=row["owner_workspace_user_uuid"],
+            desired_generation=row["desired_generation"],
+            workspace_project_id=row["workspace_project_id"],
+            endpoint=row["endpoint"],
+            login=row["login"],
+            api_key=row["api_key"],
+            queue_id=row["queue_id"],
+            last_event_id=row["last_event_id"],
+        )
 
     async def list_external_accounts(self) -> list[ExternalAccount]:
         rows = await self._pool.fetch(
@@ -34,20 +50,165 @@ class V4Store:
             ORDER BY account.uuid
             """
         )
-        return [
-            ExternalAccount(
-                uuid=row["uuid"],
-                owner_workspace_user_uuid=row["owner_workspace_user_uuid"],
-                desired_generation=row["desired_generation"],
-                workspace_project_id=row["workspace_project_id"],
-                endpoint=row["endpoint"],
-                login=row["login"],
-                api_key=row["api_key"],
-                queue_id=row["queue_id"],
-                last_event_id=row["last_event_id"],
+        return [self._account(row) for row in rows]
+
+    async def external_account(self, account_uuid: UUID) -> ExternalAccount | None:
+        row = await self._pool.fetchrow(
+            """
+            SELECT account.uuid, account.owner_workspace_user_uuid,
+                   account.desired_generation, account.workspace_project_id,
+                   account.endpoint, account.login, account.api_key,
+                   queue.queue_id, queue.last_event_id
+            FROM workspace_zulip_bridge.v4_external_accounts AS account
+            LEFT JOIN workspace_zulip_bridge.v4_zulip_queues AS queue
+              ON queue.external_account_uuid = account.uuid
+            WHERE account.uuid = $1 AND account.enabled
+            """,
+            account_uuid,
+        )
+        return None if row is None else self._account(row)
+
+    async def upsert_realtime_links(
+        self,
+        account_uuid: UUID,
+        stream_uuid: UUID,
+        chat_key: str,
+        topic_uuid: UUID,
+        topic_name: str,
+        message_uuid: UUID,
+        zulip_message_id: int | None,
+    ) -> None:
+        async with self._pool.acquire() as connection, connection.transaction():
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.v4_stream_links (
+                    workspace_stream_uuid, external_account_uuid, chat_key
+                ) VALUES ($1, $2, $3)
+                ON CONFLICT (workspace_stream_uuid) DO UPDATE SET
+                    external_account_uuid = EXCLUDED.external_account_uuid,
+                    chat_key = EXCLUDED.chat_key,
+                    updated_at = clock_timestamp()
+                """,
+                stream_uuid,
+                account_uuid,
+                chat_key,
             )
-            for row in rows
-        ]
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.v4_topic_links (
+                    workspace_topic_uuid, workspace_stream_uuid, topic_name
+                ) VALUES ($1, $2, $3)
+                ON CONFLICT (workspace_topic_uuid) DO UPDATE SET
+                    workspace_stream_uuid = EXCLUDED.workspace_stream_uuid,
+                    topic_name = EXCLUDED.topic_name,
+                    updated_at = clock_timestamp()
+                """,
+                topic_uuid,
+                stream_uuid,
+                topic_name,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.v4_message_links (
+                    workspace_message_uuid, external_account_uuid,
+                    zulip_message_id, workspace_stream_uuid,
+                    workspace_topic_uuid
+                ) VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (workspace_message_uuid) DO UPDATE SET
+                    external_account_uuid = EXCLUDED.external_account_uuid,
+                    zulip_message_id = EXCLUDED.zulip_message_id,
+                    workspace_stream_uuid = EXCLUDED.workspace_stream_uuid,
+                    workspace_topic_uuid = EXCLUDED.workspace_topic_uuid,
+                    updated_at = clock_timestamp()
+                """,
+                message_uuid,
+                account_uuid,
+                zulip_message_id,
+                stream_uuid,
+                topic_uuid,
+            )
+
+    async def workspace_message_uuid(
+        self,
+        account_uuid: UUID,
+        zulip_message_id: int,
+    ) -> UUID | None:
+        value = await self._pool.fetchval(
+            """
+            SELECT workspace_message_uuid
+            FROM workspace_zulip_bridge.v4_message_links
+            WHERE external_account_uuid = $1 AND zulip_message_id = $2
+            """,
+            account_uuid,
+            zulip_message_id,
+        )
+        return None if value is None else UUID(str(value))
+
+    async def stream_link(self, stream_uuid: UUID) -> StreamLink | None:
+        row = await self._pool.fetchrow(
+            """
+            SELECT account.uuid, account.owner_workspace_user_uuid,
+                   account.desired_generation, account.workspace_project_id,
+                   account.endpoint, account.login, account.api_key,
+                   queue.queue_id, queue.last_event_id, link.chat_key
+            FROM workspace_zulip_bridge.v4_stream_links AS link
+            JOIN workspace_zulip_bridge.v4_external_accounts AS account
+              ON account.uuid = link.external_account_uuid AND account.enabled
+            LEFT JOIN workspace_zulip_bridge.v4_zulip_queues AS queue
+              ON queue.external_account_uuid = account.uuid
+            WHERE link.workspace_stream_uuid = $1
+            """,
+            stream_uuid,
+        )
+        if row is None:
+            return None
+        return StreamLink(account=self._account(row), chat_key=row["chat_key"])
+
+    async def topic_name(self, topic_uuid: UUID) -> str | None:
+        value = await self._pool.fetchval(
+            """
+            SELECT topic_name FROM workspace_zulip_bridge.v4_topic_links
+            WHERE workspace_topic_uuid = $1
+            """,
+            topic_uuid,
+        )
+        return None if value is None else str(value)
+
+    async def message_link(self, message_uuid: UUID) -> MessageLink | None:
+        row = await self._pool.fetchrow(
+            """
+            SELECT account.uuid, account.owner_workspace_user_uuid,
+                   account.desired_generation, account.workspace_project_id,
+                   account.endpoint, account.login, account.api_key,
+                   queue.queue_id, queue.last_event_id,
+                   link.zulip_message_id, link.workspace_stream_uuid,
+                   link.workspace_topic_uuid
+            FROM workspace_zulip_bridge.v4_message_links AS link
+            JOIN workspace_zulip_bridge.v4_external_accounts AS account
+              ON account.uuid = link.external_account_uuid AND account.enabled
+            LEFT JOIN workspace_zulip_bridge.v4_zulip_queues AS queue
+              ON queue.external_account_uuid = account.uuid
+            WHERE link.workspace_message_uuid = $1
+            """,
+            message_uuid,
+        )
+        if row is None:
+            return None
+        return MessageLink(
+            account=self._account(row),
+            zulip_message_id=row["zulip_message_id"],
+            workspace_stream_uuid=row["workspace_stream_uuid"],
+            workspace_topic_uuid=row["workspace_topic_uuid"],
+        )
+
+    async def delete_message_link(self, message_uuid: UUID) -> None:
+        await self._pool.execute(
+            """
+            DELETE FROM workspace_zulip_bridge.v4_message_links
+            WHERE workspace_message_uuid = $1
+            """,
+            message_uuid,
+        )
 
     async def upsert_external_account(
         self,

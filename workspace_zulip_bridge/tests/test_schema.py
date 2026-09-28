@@ -16,6 +16,11 @@ def test_v4_schema_only_creates_prefixed_tables() -> None:
     assert "v4_external_accounts" in schema
     assert "v4_zulip_queues" in schema
     assert "v4_workspace_event_cursors" in schema
+    assert "v4_stream_links" in schema
+    assert "v4_topic_links" in schema
+    assert "v4_message_links" in schema
+    assert "history" not in schema.lower()
+    assert "backfill" not in schema.lower()
     assert "DROP TABLE" not in schema
     assert "ALTER TABLE" not in schema
     for line in schema.splitlines():

@@ -10,8 +10,10 @@ import pytest
 
 from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.models import WorkspaceEventCursor
+from workspace_zulip_bridge.realtime import ZulipQueueUnavailableError
 from workspace_zulip_bridge.workspace_events import WorkspaceEventReceiver
 from workspace_zulip_bridge.workspace_events import _cursor_url
+from workspace_zulip_bridge.zulip_api import ZulipApiError
 
 PROJECT_UUID = UUID("10000000-0000-0000-0000-000000000001")
 PROVIDER_UUID = UUID("10000000-0000-0000-0000-000000000002")
@@ -31,6 +33,10 @@ class FakeWebsocket:
 class FakeStore:
     def __init__(self) -> None:
         self.cursors: list[tuple[UUID, int]] = []
+        self.events: list[dict[str, object]] = []
+
+    async def apply(self, frame: dict[str, object]) -> None:
+        self.events.append(frame)
 
     async def advance_workspace_cursor(
         self,
@@ -50,6 +56,7 @@ def _receiver(tmp_path: Path) -> tuple[WorkspaceEventReceiver, FakeStore]:
     settings = Settings.from_env(
         {
             "WZB_WORKSPACE_WEBSOCKET_URL": "wss://workspace.example/events/ws",
+            "WZB_WORKSPACE_API_URL": "https://workspace.example/api",
             "WZB_WORKSPACE_PROJECT_ID": str(PROJECT_UUID),
             "WZB_WORKSPACE_PROVIDER_UUID": str(PROVIDER_UUID),
             "WZB_WORKSPACE_TOKEN_FILE": str(token),
@@ -57,7 +64,14 @@ def _receiver(tmp_path: Path) -> tuple[WorkspaceEventReceiver, FakeStore]:
         }
     )
     store = FakeStore()
-    return WorkspaceEventReceiver(store, settings), store  # type: ignore[arg-type]
+    return (
+        WorkspaceEventReceiver(  # type: ignore[arg-type]
+            store,
+            settings,
+            store.apply,  # type: ignore[arg-type]
+        ),
+        store,
+    )
 
 
 def _receiver_with_batch_size(
@@ -69,6 +83,7 @@ def _receiver_with_batch_size(
     settings = Settings.from_env(
         {
             "WZB_WORKSPACE_WEBSOCKET_URL": "wss://workspace.example/events/ws",
+            "WZB_WORKSPACE_API_URL": "https://workspace.example/api",
             "WZB_WORKSPACE_PROJECT_ID": str(PROJECT_UUID),
             "WZB_WORKSPACE_PROVIDER_UUID": str(PROVIDER_UUID),
             "WZB_WORKSPACE_TOKEN_FILE": str(token),
@@ -76,7 +91,14 @@ def _receiver_with_batch_size(
         }
     )
     store = FakeStore()
-    return WorkspaceEventReceiver(store, settings), store  # type: ignore[arg-type]
+    return (
+        WorkspaceEventReceiver(  # type: ignore[arg-type]
+            store,
+            settings,
+            store.apply,  # type: ignore[arg-type]
+        ),
+        store,
+    )
 
 
 def test_cursor_url_contains_only_resume_state() -> None:
@@ -90,7 +112,7 @@ def test_cursor_url_contains_only_resume_state() -> None:
     assert f"epoch_generation={GENERATION}" in result
 
 
-def test_receiver_discards_event_payload_and_advances_only_cursor(
+def test_receiver_applies_event_before_advancing_cursor(
     tmp_path: Path,
 ) -> None:
     receiver, store = _receiver(tmp_path)
@@ -117,9 +139,10 @@ def test_receiver_discards_event_payload_and_advances_only_cursor(
         )
 
     assert store.cursors == [(GENERATION, 3), (GENERATION, 4)]
+    assert store.events == [frames[1]]
 
 
-def test_receiver_flushes_cursor_when_socket_closes_between_batches(
+def test_receiver_advances_each_realtime_event_without_batching(
     tmp_path: Path,
 ) -> None:
     receiver, store = _receiver_with_batch_size(tmp_path, 100)
@@ -146,3 +169,91 @@ def test_receiver_flushes_cursor_when_socket_closes_between_batches(
         )
 
     assert store.cursors == [(GENERATION, 3), (GENERATION, 4)]
+    assert store.events == [frames[1]]
+
+
+def test_receiver_skips_a_permanent_failure_without_blocking_later_events(
+    tmp_path: Path,
+) -> None:
+    receiver, store = _receiver(tmp_path)
+    frames = [
+        {
+            "type": "ready",
+            "epoch_generation": str(GENERATION),
+            "epoch_version": 3,
+        },
+        {
+            "epoch_version": 4,
+            "project_id": str(PROJECT_UUID),
+            "user_uuid": str(PROVIDER_UUID),
+            "payload": {"content": "invalid"},
+        },
+        {
+            "epoch_version": 5,
+            "project_id": str(PROJECT_UUID),
+            "user_uuid": str(PROVIDER_UUID),
+            "payload": {"content": "valid"},
+        },
+    ]
+    handled: list[int] = []
+
+    async def handle(frame: dict[str, object]) -> None:
+        version = int(frame["epoch_version"])
+        handled.append(version)
+        if version == 4:
+            raise ValueError("permanent event failure")
+
+    receiver._event_handler = handle  # type: ignore[assignment]
+
+    with pytest.raises(StopAsyncIteration):
+        asyncio.run(
+            receiver._consume(
+                FakeWebsocket(frames),
+                WorkspaceEventCursor(None, 0),
+            )
+        )
+
+    assert handled == [4, 5]
+    assert store.cursors == [(GENERATION, 3), (GENERATION, 4), (GENERATION, 5)]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ZulipApiError("RATE_LIMIT_HIT", retryable=True, status_code=429),
+        ZulipQueueUnavailableError("queue unavailable"),
+    ],
+)
+def test_receiver_replays_a_retryable_forwarder_failure(
+    tmp_path: Path,
+    error: Exception,
+) -> None:
+    receiver, store = _receiver(tmp_path)
+    frames = [
+        {
+            "type": "ready",
+            "epoch_generation": str(GENERATION),
+            "epoch_version": 3,
+        },
+        {
+            "epoch_version": 4,
+            "project_id": str(PROJECT_UUID),
+            "user_uuid": str(PROVIDER_UUID),
+            "payload": {"content": "retry"},
+        },
+    ]
+
+    async def handle(_frame: dict[str, object]) -> None:
+        raise error
+
+    receiver._event_handler = handle  # type: ignore[assignment]
+
+    with pytest.raises(type(error), match=str(error)):
+        asyncio.run(
+            receiver._consume(
+                FakeWebsocket(frames),
+                WorkspaceEventCursor(None, 0),
+            )
+        )
+
+    assert store.cursors == [(GENERATION, 3)]

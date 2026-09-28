@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 
 from workspace_zulip_bridge.models import RegisteredQueue
+from workspace_zulip_bridge.models import ZulipIdentity
 
 _SAFE_REMOTE_ERROR_CODES = frozenset(
     {
@@ -78,17 +79,39 @@ class ZulipApiClient:
     def check_auth(self) -> None:
         self._request("GET", "/api/v1/users/me")
 
+    def own_user_id(self) -> int:
+        return self.own_user().user_id
+
+    def own_user(self) -> ZulipIdentity:
+        payload = self._request("GET", "/api/v1/users/me")
+        user_id = payload.get("user_id")
+        email = payload.get("email")
+        full_name = payload.get("full_name")
+        if (
+            not isinstance(user_id, int)
+            or not isinstance(email, str)
+            or not email
+            or not isinstance(full_name, str)
+            or not full_name
+        ):
+            raise ZulipApiError("invalid_own_user_response", retryable=True)
+        return ZulipIdentity(user_id, email, full_name)
+
     def register(self) -> RegisteredQueue:
         payload = self._request(
             "POST",
             "/api/v1/register",
             data={
-                # Initial state is intentionally empty. Omitting event_types keeps
-                # the queue subscribed to all live event types.
+                "event_types": json.dumps(
+                    ["message", "update_message", "delete_message"],
+                    separators=(",", ":"),
+                ),
                 "fetch_event_types": "[]",
+                "apply_markdown": "false",
                 "slim_presence": "true",
                 "client_capabilities": json.dumps(
                     {
+                        "bulk_message_deletion": True,
                         "notification_settings_null": False,
                         "simplified_presence_events": True,
                     },
@@ -114,7 +137,7 @@ class ZulipApiClient:
         queue_id: str,
         last_event_id: int,
         longpoll_timeout_seconds: float,
-    ) -> int:
+    ) -> list[Mapping[str, Any]]:
         payload = self._request(
             "GET",
             "/api/v1/events",
@@ -131,12 +154,88 @@ class ZulipApiClient:
         events = payload.get("events")
         if not isinstance(events, list):
             raise ZulipApiError("invalid_events_response", retryable=True)
-        next_event_id = last_event_id
         for event in events:
-            if not isinstance(event, Mapping) or not isinstance(event.get("id"), int):
+            if (
+                not isinstance(event, Mapping)
+                or not isinstance(event.get("id"), int)
+                or not isinstance(event.get("type"), str)
+            ):
                 raise ZulipApiError("invalid_event", retryable=True)
-            next_event_id = max(next_event_id, event["id"])
-        return next_event_id
+        return events
+
+    def get_message(self, message_id: int) -> Mapping[str, Any]:
+        payload = self._request(
+            "GET",
+            f"/api/v1/messages/{message_id}",
+            params={
+                "apply_markdown": "false",
+                "allow_empty_topic_name": "true",
+            },
+        )
+        message = payload.get("message")
+        if not isinstance(message, Mapping):
+            raise ZulipApiError("invalid_message_response", retryable=True)
+        return message
+
+    def send_message(
+        self,
+        chat_key: str,
+        own_user_id: int,
+        content: str,
+        *,
+        topic: str | None,
+        queue_id: str,
+        local_id: str,
+    ) -> int:
+        if chat_key.startswith("channel:"):
+            try:
+                recipient = str(int(chat_key.removeprefix("channel:")))
+            except ValueError as exc:
+                raise ValueError("invalid channel chat key") from exc
+            data = {
+                "type": "stream",
+                "to": recipient,
+                "topic": topic or "General",
+                "content": content,
+            }
+        elif chat_key.startswith("direct:"):
+            try:
+                participant_ids = {
+                    int(value) for value in chat_key.removeprefix("direct:").split(",")
+                }
+            except ValueError as exc:
+                raise ValueError("invalid direct chat key") from exc
+            if own_user_id not in participant_ids:
+                raise ValueError("direct chat key does not include current user")
+            recipients = sorted(participant_ids - {own_user_id}) or [own_user_id]
+            data = {
+                "type": "private",
+                "to": json.dumps(recipients, separators=(",", ":")),
+                "content": content,
+            }
+        else:
+            raise ValueError("unsupported chat key")
+        data.update({"queue_id": queue_id, "local_id": local_id})
+        payload = self._request("POST", "/api/v1/messages", data=data)
+        message_id = payload.get("id")
+        if not isinstance(message_id, int):
+            raise ZulipApiError("invalid_send_message_response", retryable=True)
+        return message_id
+
+    def update_message(
+        self,
+        message_id: int,
+        *,
+        content: str,
+        topic: str | None,
+    ) -> None:
+        data = {"content": content}
+        if topic is not None:
+            data.update({"topic": topic, "propagate_mode": "change_one"})
+        self._request("PATCH", f"/api/v1/messages/{message_id}", data=data)
+
+    def delete_message(self, message_id: int) -> None:
+        self._request("DELETE", f"/api/v1/messages/{message_id}")
 
     def _request(
         self,

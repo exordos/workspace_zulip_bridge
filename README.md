@@ -1,7 +1,8 @@
 # Workspace Zulip Bridge v4
 
-Protocol v4 is currently a connection-only foundation. It deliberately does
-not synchronize Workspace and Zulip entities yet.
+Protocol v4 is a deliberately small realtime message bridge. It inherits the
+v3 enrollment and external-account control protocol, but it has no history,
+bootstrap, snapshot, catalog, projection, or backfill path.
 
 ## Runtime
 
@@ -14,13 +15,19 @@ not synchronize Workspace and Zulip entities yet.
 - Desired-state `external_account` resources are decrypted and written only to
   `v4_external_accounts`.
 - One native thread per enabled external account authenticates to Zulip,
-  registers an event queue, keeps it alive with long polling, and advances only
-  the queue cursor. Event payloads are discarded.
+  registers an event queue with an empty initial-state request, and receives
+  only message create, edit, and delete events through long polling.
 - One separate native thread owns the Workspace `workspace.events.v1`
-  WebSocket. It validates event routing and advances only the epoch cursor.
-  Event payloads are discarded.
-- No stream, topic, user, message, file, flag, reaction, history, projection,
-  diff, outbox, or task processing exists in this stage.
+  WebSocket and forwards only native Workspace message events into already
+  known external Zulip routes.
+- The bridge applies a received Zulip message and its current user/stream/topic
+  context atomically through `POST /v1/provider/v4/realtime`. Workspace remains
+  authoritative and stores only normal entities with Zulip source markers.
+- The bridge stores no message body or event payload. It retains only cursors
+  and the minimum route/identifier links needed for edits, deletes, and echo
+  suppression.
+- Files, flags, reactions, history, projections, diffs, outboxes, and generic
+  task processing are intentionally outside v4.
 
 ## Storage isolation
 
@@ -29,6 +36,9 @@ The v4 runtime creates and accesses exactly these tables:
 - `workspace_zulip_bridge.v4_external_accounts`
 - `workspace_zulip_bridge.v4_zulip_queues`
 - `workspace_zulip_bridge.v4_workspace_event_cursors`
+- `workspace_zulip_bridge.v4_stream_links`
+- `workspace_zulip_bridge.v4_topic_links`
+- `workspace_zulip_bridge.v4_message_links`
 
 Legacy tables are intentionally left in the database. The v4 schema contains
 no `ALTER TABLE` or `DROP TABLE`, and runtime code never reads or updates those

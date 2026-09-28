@@ -35,6 +35,27 @@ class RegisteredQueue:
 
 
 @dataclass(frozen=True, slots=True)
+class ZulipIdentity:
+    user_id: int
+    email: str
+    full_name: str
+
+
+@dataclass(frozen=True, slots=True)
 class WorkspaceEventCursor:
     epoch_generation: UUID | None
     last_epoch_version: int
+
+
+@dataclass(frozen=True, slots=True)
+class StreamLink:
+    account: ExternalAccount
+    chat_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class MessageLink:
+    account: ExternalAccount
+    zulip_message_id: int | None
+    workspace_stream_uuid: UUID
+    workspace_topic_uuid: UUID

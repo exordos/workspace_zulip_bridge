@@ -48,3 +48,41 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.v4_workspace_event_cursors (
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
+
+CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.v4_stream_links (
+    workspace_stream_uuid uuid PRIMARY KEY,
+    external_account_uuid uuid NOT NULL
+        REFERENCES workspace_zulip_bridge.v4_external_accounts (uuid)
+        ON DELETE CASCADE,
+    chat_key text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    UNIQUE (external_account_uuid, chat_key)
+);
+
+CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.v4_topic_links (
+    workspace_topic_uuid uuid PRIMARY KEY,
+    workspace_stream_uuid uuid NOT NULL
+        REFERENCES workspace_zulip_bridge.v4_stream_links (workspace_stream_uuid)
+        ON DELETE CASCADE,
+    topic_name text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.v4_message_links (
+    workspace_message_uuid uuid PRIMARY KEY,
+    external_account_uuid uuid NOT NULL
+        REFERENCES workspace_zulip_bridge.v4_external_accounts (uuid)
+        ON DELETE CASCADE,
+    zulip_message_id bigint,
+    workspace_stream_uuid uuid NOT NULL
+        REFERENCES workspace_zulip_bridge.v4_stream_links (workspace_stream_uuid)
+        ON DELETE CASCADE,
+    workspace_topic_uuid uuid NOT NULL
+        REFERENCES workspace_zulip_bridge.v4_topic_links (workspace_topic_uuid)
+        ON DELETE CASCADE,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    UNIQUE (external_account_uuid, zulip_message_id)
+);

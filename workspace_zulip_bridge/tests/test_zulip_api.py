@@ -24,9 +24,7 @@ def _client(handler: object) -> ZulipApiClient:
     )
 
 
-def test_registers_all_live_events_without_initial_state_and_discards_payloads() -> (
-    None
-):
+def test_registers_only_live_message_events_without_initial_state() -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -34,7 +32,12 @@ def test_registers_all_live_events_without_initial_state_and_discards_payloads()
         if request.url.path.endswith("/register"):
             form = parse_qs(request.content.decode())
             assert json.loads(form["fetch_event_types"][0]) == []
-            assert "event_types" not in form
+            assert json.loads(form["event_types"][0]) == [
+                "message",
+                "update_message",
+                "delete_message",
+            ]
+            assert form["apply_markdown"] == ["false"]
             return httpx.Response(
                 200,
                 json={
@@ -59,7 +62,10 @@ def test_registers_all_live_events_without_initial_state_and_discards_payloads()
     try:
         queue = client.register()
         assert queue.queue_id == "queue-1"
-        assert client.poll(queue.queue_id, queue.last_event_id, 90) == 5
+        assert client.poll(queue.queue_id, queue.last_event_id, 90) == [
+            {"id": 4, "type": "message", "sensitive": "discarded"},
+            {"id": 5, "type": "heartbeat"},
+        ]
     finally:
         client.close()
     assert len(requests) == 2
@@ -103,3 +109,50 @@ def test_auth_check_discards_profile_payload() -> None:
         client.close()
 
     assert [request.url.path for request in requests] == ["/api/v1/users/me"]
+
+
+def test_realtime_message_methods_use_only_point_operations() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "result": "success",
+                    "message": {"id": 71, "content": "edited"},
+                },
+            )
+        if request.method == "POST":
+            return httpx.Response(200, json={"result": "success", "id": 71})
+        return httpx.Response(200, json={"result": "success"})
+
+    client = _client(handler)
+    try:
+        assert client.get_message(71)["content"] == "edited"
+        assert (
+            client.send_message(
+                "channel:9",
+                42,
+                "hello",
+                topic="Realtime",
+                queue_id="queue-1",
+                local_id="local-1",
+            )
+            == 71
+        )
+        client.update_message(71, content="edited", topic="Realtime")
+        client.delete_message(71)
+    finally:
+        client.close()
+
+    assert [(request.method, request.url.path) for request in requests] == [
+        ("GET", "/api/v1/messages/71"),
+        ("POST", "/api/v1/messages"),
+        ("PATCH", "/api/v1/messages/71"),
+        ("DELETE", "/api/v1/messages/71"),
+    ]
+    send_form = parse_qs(requests[1].content.decode())
+    assert send_form["queue_id"] == ["queue-1"]
+    assert send_form["local_id"] == ["local-1"]

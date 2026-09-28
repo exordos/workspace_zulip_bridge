@@ -10,6 +10,7 @@ import pytest
 from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.models import ExternalAccount
 from workspace_zulip_bridge.models import RegisteredQueue
+from workspace_zulip_bridge.models import ZulipIdentity
 from workspace_zulip_bridge.zulip_api import ZulipApiError
 from workspace_zulip_bridge.zulip_worker import ZulipEventThread
 from workspace_zulip_bridge.zulip_worker import ZulipThreadSupervisor
@@ -52,14 +53,19 @@ class FakeClient:
     def register(self) -> RegisteredQueue:
         return RegisteredQueue("queue-1", 0, 90)
 
-    def poll(self, queue_id: str, event_id: int, timeout: float) -> int:
+    def own_user(self) -> ZulipIdentity:
+        return ZulipIdentity(42, "owner@example.test", "Owner")
+
+    def poll(
+        self, queue_id: str, event_id: int, timeout: float
+    ) -> list[dict[str, object]]:
         assert (queue_id, event_id, timeout) == ("queue-1", 0, 90)
         assert self.worker is not None
         self.worker._stop_requested.set()
-        return 7
+        return [{"id": 7, "type": "message"}]
 
 
-def test_worker_registers_queue_and_only_advances_cursor() -> None:
+def test_worker_applies_event_before_advancing_cursor() -> None:
     asyncio.run(_run_worker_test())
 
 
@@ -75,26 +81,43 @@ async def _run_worker_test() -> None:
     )
     store = FakeStore()
     client = FakeClient()
+    applied: list[tuple[int, int]] = []
+
+    async def handle(
+        event_account: ExternalAccount,
+        identity: ZulipIdentity,
+        event: dict[str, object],
+    ) -> None:
+        assert event_account == account
+        applied.append((identity.user_id, int(event["id"])))
+
     worker = ZulipEventThread(
         account,
         store,  # type: ignore[arg-type]
         asyncio.get_running_loop(),
         Settings(),
         threading.BoundedSemaphore(1),
+        handle,  # type: ignore[arg-type]
     )
     client.worker = worker
 
     await asyncio.to_thread(worker._poll, client)  # type: ignore[arg-type]
 
     assert store.queues == [("queue-1", 0)]
+    assert applied == [(42, 7)]
     assert store.cursors == [("queue-1", 7)]
 
 
 class ExpiringClient:
+    def own_user(self) -> ZulipIdentity:
+        return ZulipIdentity(42, "owner@example.test", "Owner")
+
     def register(self) -> RegisteredQueue:
         return RegisteredQueue("queue-b", 20, 90)
 
-    def poll(self, queue_id: str, event_id: int, timeout: float) -> int:
+    def poll(
+        self, queue_id: str, event_id: int, timeout: float
+    ) -> list[dict[str, object]]:
         if queue_id == "queue-a":
             assert (event_id, timeout) == (10, 180)
             raise ZulipApiError("BAD_EVENT_QUEUE_ID", retryable=True)
@@ -109,10 +132,15 @@ class ResumingClient:
     def register(self) -> RegisteredQueue:
         raise AssertionError("the replacement queue must be resumed")
 
-    def poll(self, queue_id: str, event_id: int, timeout: float) -> int:
+    def own_user(self) -> ZulipIdentity:
+        return ZulipIdentity(42, "owner@example.test", "Owner")
+
+    def poll(
+        self, queue_id: str, event_id: int, timeout: float
+    ) -> list[dict[str, object]]:
         assert (queue_id, event_id, timeout) == ("queue-b", 20, 90)
         self._worker._stop_requested.set()
-        return 21
+        return [{"id": 21, "type": "heartbeat"}]
 
 
 def test_worker_resumes_replacement_queue_after_retryable_failure() -> None:
@@ -132,12 +160,21 @@ async def _run_reconnect_test() -> None:
         last_event_id=10,
     )
     store = FakeStore()
+
+    async def handle(
+        _account: ExternalAccount,
+        _identity: ZulipIdentity,
+        _event: dict[str, object],
+    ) -> None:
+        return None
+
     worker = ZulipEventThread(
         account,
         store,  # type: ignore[arg-type]
         asyncio.get_running_loop(),
         Settings(),
         threading.BoundedSemaphore(1),
+        handle,  # type: ignore[arg-type]
     )
 
     with pytest.raises(ZulipApiError, match="RATE_LIMIT_HIT"):
@@ -150,6 +187,66 @@ async def _run_reconnect_test() -> None:
     assert store.cleared == ["queue-a"]
     assert store.queues == [("queue-b", 20)]
     assert store.cursors == [("queue-b", 21)]
+
+
+class VanishedUpdateClient:
+    def __init__(self, worker: ZulipEventThread) -> None:
+        self._worker = worker
+
+    def own_user(self) -> ZulipIdentity:
+        return ZulipIdentity(42, "owner@example.test", "Owner")
+
+    def poll(
+        self, queue_id: str, event_id: int, timeout: float
+    ) -> list[dict[str, object]]:
+        assert (queue_id, event_id, timeout) == ("queue-1", 4, 180)
+        self._worker._stop_requested.set()
+        return [{"id": 5, "type": "update_message", "message_id": 71}]
+
+    def get_message(self, message_id: int) -> dict[str, object]:
+        assert message_id == 71
+        raise ZulipApiError("BAD_REQUEST", retryable=False, status_code=400)
+
+
+def test_worker_advances_past_an_update_for_a_vanished_message() -> None:
+    asyncio.run(_run_vanished_update_test())
+
+
+async def _run_vanished_update_test() -> None:
+    account = ExternalAccount(
+        ACCOUNT_UUID,
+        OWNER_UUID,
+        1,
+        PROJECT_UUID,
+        "https://zulip.example.test",
+        "user@example.test",
+        "private-key",
+        queue_id="queue-1",
+        last_event_id=4,
+    )
+    store = FakeStore()
+    applied: list[int] = []
+
+    async def handle(
+        _account: ExternalAccount,
+        _identity: ZulipIdentity,
+        event: dict[str, object],
+    ) -> None:
+        applied.append(int(event["id"]))
+
+    worker = ZulipEventThread(
+        account,
+        store,  # type: ignore[arg-type]
+        asyncio.get_running_loop(),
+        Settings(),
+        threading.BoundedSemaphore(1),
+        handle,  # type: ignore[arg-type]
+    )
+
+    await asyncio.to_thread(worker._poll, VanishedUpdateClient(worker))  # type: ignore[arg-type]
+
+    assert applied == []
+    assert store.cursors == [("queue-1", 5)]
 
 
 class SupervisorStore:
@@ -193,6 +290,13 @@ async def _run_stuck_worker_test() -> None:
     store = SupervisorStore(account)
     workers: list[SupervisorWorker] = []
 
+    async def handle(
+        _account: ExternalAccount,
+        _identity: ZulipIdentity,
+        _event: dict[str, object],
+    ) -> None:
+        return None
+
     def worker_factory(
         worker_account: ExternalAccount,
         registration_gate: threading.Semaphore,
@@ -206,6 +310,7 @@ async def _run_stuck_worker_test() -> None:
         store,  # type: ignore[arg-type]
         asyncio.get_running_loop(),
         Settings(thread_stop_timeout_seconds=0),
+        handle,  # type: ignore[arg-type]
         worker_factory,
     )
     await supervisor.reconcile()

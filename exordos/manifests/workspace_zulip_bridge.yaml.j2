@@ -1,5 +1,5 @@
 name: "workspace_zulip_bridge"
-description: "Workspace and Zulip connection foundation for protocol v4"
+description: "Workspace and Zulip realtime message bridge for protocol v4"
 schema_version: 1
 version: "{{ version }}"
 api_version: "v1"
@@ -86,9 +86,7 @@ resources:
       on_change:
         kind: shell
         command: >-
-          rm -f /var/lib/workspace_zulip_bridge/workspace.token
-          /var/lib/workspace_zulip_bridge/workspace.refresh-token
-          /var/lib/workspace_zulip_bridge/control/desired-state-v4-cursor &&
+          rm -f /var/lib/workspace_zulip_bridge/control/desired-state-v4-cursor &&
           systemctl restart workspace-zulip-bridge
       body:
         kind: text
@@ -97,14 +95,6 @@ resources:
           WZB_DATABASE_DSN=postgresql:///workspace_zulip_bridge?host=/var/run/postgresql
           WZB_DB_POOL_MIN_SIZE=2
           WZB_DB_POOL_MAX_SIZE=16
-          WZB_EVENT_PROCESSOR_BATCH_SIZE=128
-          WZB_EVENT_PROCESSOR_REALTIME_BATCH_SIZE=16
-          WZB_EVENT_PROCESSOR_REALTIME_WORKERS=4
-          WZB_EVENT_PROCESSOR_REALTIME_WINDOW_SECONDS=300
-          WZB_EVENT_PROCESSOR_BACKLOG_RETRY_CAP_SECONDS=300
-          WZB_ZULIP_HISTORY_CONCURRENCY=4
-          WZB_ZULIP_MESSAGE_PAGE_SIZE=2000
-          WZB_WORKSPACE_SYNC_WORKERS=2
           WZB_ZULIP_CA_FILE=/var/lib/workspace_zulip_bridge/control/zulip-ca.pem
           WZB_WORKSPACE_WEBSOCKET_URL=ws://workspace-backend.{$workspace_zulip_bridge.imports.$core_local_domain:name}/api/workspace/v1/events/ws
           WZB_WORKSPACE_API_URL=http://workspace-backend.{$workspace_zulip_bridge.imports.$core_local_domain:name}/api/workspace/v1/messenger
