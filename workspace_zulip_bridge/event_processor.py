@@ -897,18 +897,12 @@ class ZulipEventProcessor:
                 (event, raw_message),
             )
 
-        direct_changed = False
         for event, raw_message in direct_messages.values():
-            direct_changed = (
-                await self._store.store_direct_message_chat(
-                    event.user_uuid,
-                    event.queue_id,
-                    raw_message,
-                )
-                or direct_changed
+            await self._store.store_direct_message_chat(
+                event.user_uuid,
+                event.queue_id,
+                raw_message,
             )
-        if direct_changed:
-            await self._store.reconcile_chat_schedules()
 
     async def _resolve_local_message_links(
         self,
@@ -1382,19 +1376,14 @@ class ZulipEventProcessor:
                 "applied" if refreshed else "retry",
                 "directory_refresh_requested",
             )
-        result = await self._store.store_user_directory(
+        await self._store.store_user_directory(
             item.event.endpoint,
             (directory_user,),
-        )
-        schedule = (
-            await self._store.reconcile_chat_schedules() if result.changed else None
         )
         return _Outcome(
             item.event.uuid,
             "applied",
             "directory_user",
-            messages_deleted=schedule.messages_deleted if schedule else 0,
-            chats_changed=(schedule.invalidated + schedule.assigned if schedule else 0),
         )
 
     async def _apply_attachment(self, item: _RoutedEvent) -> _Outcome:

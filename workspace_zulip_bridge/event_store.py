@@ -869,51 +869,54 @@ class EventStore:
                        )
                     ORDER BY stream.uuid
                     FOR UPDATE OF stream SKIP LOCKED
-                    LIMIT $1
-                ), message_counts AS MATERIALIZED (
-                    SELECT changed.uuid AS stream_uuid,
-                           count(message.uuid) AS mismatch_count
-                    FROM changed
-                    LEFT JOIN workspace_zulip_bridge.zulip_messages AS message
-                      ON message.zulip_stream_uuid = changed.uuid
-                     AND message.source_connection_uuid IS DISTINCT FROM
-                         changed.new_connection_uuid
-                    GROUP BY changed.uuid
+                    LIMIT 1
                 ), candidates AS MATERIALIZED (
-                    SELECT message.uuid, changed.uuid AS stream_uuid,
+                    SELECT candidate.uuid, changed.uuid AS stream_uuid,
                            changed.new_connection_uuid
                     FROM changed
-                    JOIN workspace_zulip_bridge.zulip_messages AS message
-                      ON message.zulip_stream_uuid = changed.uuid
-                     AND message.source_connection_uuid IS DISTINCT FROM
-                         changed.new_connection_uuid
-                    ORDER BY changed.uuid, message.uuid
-                    FOR UPDATE OF message SKIP LOCKED
-                    LIMIT $2
+                    CROSS JOIN LATERAL (
+                        SELECT message.uuid
+                        FROM workspace_zulip_bridge.zulip_messages AS message
+                        WHERE message.zulip_stream_uuid = changed.uuid
+                          AND message.source_connection_uuid IS DISTINCT FROM
+                              changed.new_connection_uuid
+                        ORDER BY message.uuid
+                        FOR UPDATE OF message SKIP LOCKED
+                        LIMIT $1
+                    ) AS candidate
                 ), adopted AS (
                     UPDATE workspace_zulip_bridge.zulip_messages AS message
                     SET source_connection_uuid = candidates.new_connection_uuid
                     FROM candidates
                     WHERE message.uuid = candidates.uuid
-                    RETURNING candidates.stream_uuid
-                ), adopted_counts AS MATERIALIZED (
-                    SELECT stream_uuid, count(*) AS adopted_count
-                    FROM adopted
-                    GROUP BY stream_uuid
+                    RETURNING candidates.uuid AS message_uuid,
+                              candidates.stream_uuid
+                ), completed AS MATERIALIZED (
+                    SELECT changed.uuid, changed.new_connection_uuid,
+                           changed.new_color
+                    FROM changed
+                    LEFT JOIN LATERAL (
+                        SELECT message.uuid
+                        FROM workspace_zulip_bridge.zulip_messages AS message
+                        WHERE message.zulip_stream_uuid = changed.uuid
+                          AND message.source_connection_uuid IS DISTINCT FROM
+                              changed.new_connection_uuid
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM adopted
+                              WHERE adopted.message_uuid = message.uuid
+                          )
+                        LIMIT 1
+                    ) AS remaining ON true
+                    WHERE remaining.uuid IS NULL
                 ), updated AS (
                     UPDATE workspace_zulip_bridge.zulip_streams AS stream
-                    SET source_connection_uuid = changed.new_connection_uuid,
-                        color = changed.new_color,
+                    SET source_connection_uuid = completed.new_connection_uuid,
+                        color = completed.new_color,
                         history_loaded_at = NULL,
                         updated_at = clock_timestamp()
-                    FROM changed
-                    JOIN message_counts
-                      ON message_counts.stream_uuid = changed.uuid
-                    LEFT JOIN adopted_counts
-                      ON adopted_counts.stream_uuid = changed.uuid
-                    WHERE stream.uuid = changed.uuid
-                      AND message_counts.mismatch_count =
-                          COALESCE(adopted_counts.adopted_count, 0)
+                    FROM completed
+                    WHERE stream.uuid = completed.uuid
                     RETURNING stream.uuid
                 ), touched_bindings AS (
                     UPDATE workspace_zulip_bridge.zulip_stream_bindings AS binding
@@ -938,7 +941,6 @@ class EventStore:
                        (SELECT count(*) FROM adopted) AS adopted_count,
                        0::bigint AS messages_deleted
                 """,
-                    self.SCHEDULE_STREAM_BATCH_SIZE,
                     self.SCHEDULE_MESSAGE_BATCH_SIZE,
                 )
             await connection.execute(
