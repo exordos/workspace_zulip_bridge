@@ -29,6 +29,9 @@ from workspace_zulip_bridge.stable_ids import stable_file_projection_uuid
 
 LOG = logging.getLogger(__name__)
 MAX_FILE_BYTES = 50 * 1024 * 1024
+# Increment when a catalog replay is required before files may be projected.
+# The catalog and file workers share this readiness contract.
+CATALOG_PROJECTION_REVISION = 3
 _CONTENT_TYPE = re.compile(r"^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$")
 _WORKSPACE_URN = re.compile(r"^urn:(?:file|image|video):[0-9a-f-]{36}$")
 _BACKFILL_CANDIDATE_BATCH_SIZE = 20_000
@@ -346,15 +349,13 @@ class WorkspaceFileTransferWorker:
                       AND projection.available_at <= clock_timestamp()
                       AND connection.external_account_uuid IS NOT NULL
                       AND connection.sync_enabled
-                      AND (
-                          projection.last_error IS DISTINCT FROM
-                              'workspace_file_http_403'
-                          OR catalog.processing_status = 'reported'
-                      )
+                      AND catalog.processing_status = 'reported'
+                      AND catalog.projection_revision >= $2
                     LIMIT $1
                 ) AS ready
                 """,
                 _BACKFILL_LOW_WATERMARK,
+                CATALOG_PROJECTION_REVISION,
             )
         )
 
@@ -386,15 +387,8 @@ class WorkspaceFileTransferWorker:
                   AND projection.available_at <= clock_timestamp()
                   AND connection.external_account_uuid IS NOT NULL
                   AND connection.sync_enabled
-                  AND (
-                      projection.delivery_priority > 0
-                      OR catalog.processing_status = 'reported'
-                  )
-                  AND (
-                      projection.last_error IS DISTINCT FROM
-                          'workspace_file_http_403'
-                      OR catalog.processing_status = 'reported'
-                  )
+                  AND catalog.processing_status = 'reported'
+                  AND catalog.projection_revision >= $1
                 ORDER BY projection.delivery_priority,
                          file.source_created_at DESC, file.uuid DESC,
                          projection.available_at, projection.uuid
@@ -425,7 +419,8 @@ class WorkspaceFileTransferWorker:
               ON realm.uuid = file.realm_uuid
             WHERE connection.external_account_uuid IS NOT NULL
               AND connection.sync_enabled
-            """
+            """,
+            CATALOG_PROJECTION_REVISION,
         )
         if row is None:
             return None

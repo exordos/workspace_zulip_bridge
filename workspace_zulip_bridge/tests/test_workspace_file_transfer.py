@@ -41,6 +41,16 @@ class SeedPool:
         return "UPDATE 0"
 
 
+class ClaimPool(SeedPool):
+    def __init__(self) -> None:
+        super().__init__(has_reserve=False)
+        self.fetchrow_calls: list[tuple[str, tuple[object, ...]]] = []
+
+    async def fetchrow(self, query: str, *args: object) -> None:
+        self.fetchrow_calls.append((query, args))
+        return None
+
+
 class FinalizeConnection:
     def __init__(self) -> None:
         self.executed: list[tuple[str, tuple[object, ...]]] = []
@@ -147,9 +157,14 @@ def test_file_backfill_skips_reseed_while_runnable_reserve_is_full() -> None:
     assert "sync_diffs" in pool.fetch_calls[0][0]
     assert len(pool.fetchval_calls) == 1
     reserve_query, reserve_args = pool.fetchval_calls[0]
-    assert reserve_args == (1_000,)
+    assert reserve_args == (
+        1_000,
+        workspace_file_transfer.CATALOG_PROJECTION_REVISION,
+    )
     assert "projection.available_at <= clock_timestamp()" in reserve_query
     assert "connection.sync_enabled" in reserve_query
+    assert "catalog.processing_status = 'reported'" in reserve_query
+    assert "catalog.projection_revision >= $2" in reserve_query
 
 
 def test_file_backfill_seeds_a_large_newest_first_candidate_page() -> None:
@@ -163,6 +178,18 @@ def test_file_backfill_seeds_a_large_newest_first_candidate_page() -> None:
     assert "WITH candidate_files AS MATERIALIZED" in candidate_query
     assert "ORDER BY file.source_created_at DESC, file.uuid DESC" in candidate_query
     assert "LIMIT $1" in candidate_query
+
+
+def test_file_claim_waits_for_current_catalog_and_prefers_newest() -> None:
+    pool = ClaimPool()
+
+    assert asyncio.run(_worker(pool)._claim_job()) is None
+
+    query, args = pool.fetchrow_calls[0]
+    assert args == (workspace_file_transfer.CATALOG_PROJECTION_REVISION,)
+    assert "catalog.processing_status = 'reported'" in query
+    assert "catalog.projection_revision >= $1" in query
+    assert "file.source_created_at DESC, file.uuid DESC" in query
 
 
 def test_staged_source_is_downloaded_once_and_reused_for_upload() -> None:

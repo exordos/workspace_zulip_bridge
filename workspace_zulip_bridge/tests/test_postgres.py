@@ -58,6 +58,7 @@ from workspace_zulip_bridge.workspace_control import WorkspaceControlWorker
 from workspace_zulip_bridge.workspace_events import WorkspaceEvent
 from workspace_zulip_bridge.workspace_events import WorkspaceEventReceiver
 from workspace_zulip_bridge.workspace_events import WorkspaceEventStore
+from workspace_zulip_bridge.workspace_file_transfer import CATALOG_PROJECTION_REVISION
 from workspace_zulip_bridge.workspace_file_transfer import WorkspaceFileTransferWorker
 from workspace_zulip_bridge.workspace_sync import _SOURCE_TABLES
 from workspace_zulip_bridge.workspace_sync import ProviderApiError
@@ -7880,7 +7881,7 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
             "external_chat_catalog"
         )
         assert stored["processing_status"] == "pending"
-        assert stored["projection_revision"] == 2
+        assert stored["projection_revision"] == CATALOG_PROJECTION_REVISION
         assert stored["source_activity_at"] is not None
         assert await transfer_worker._claim_job() is None
 
@@ -8100,7 +8101,7 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
             stream_uuid,
         )
         assert upgraded is not None
-        assert upgraded["projection_revision"] == 2
+        assert upgraded["projection_revision"] == CATALOG_PROJECTION_REVISION
         assert upgraded["processing_status"] == "pending"
         assert upgraded["report_uuid"] != previous_report_uuid
         assert upgraded["reported_at"] is None

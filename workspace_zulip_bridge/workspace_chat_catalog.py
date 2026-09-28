@@ -21,11 +21,10 @@ import httpx
 
 from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.stable_ids import stable_external_chat_uuid
+from workspace_zulip_bridge.workspace_file_transfer import CATALOG_PROJECTION_REVISION
 from workspace_zulip_bridge.workspace_file_transfer import MAX_FILE_BYTES
 
 LOG = logging.getLogger(__name__)
-
-_CATALOG_PROJECTION_REVISION = 2
 
 _CHANNEL_CAPABILITIES = frozenset(
     {
@@ -202,8 +201,12 @@ class WorkspaceChatCatalogWorker:
                       OR report.observed_generation <>
                          connection.desired_generation
                       OR report.projection_revision <> $1
-                  )
+                )
                 ORDER BY (report.external_account_uuid IS NULL) DESC,
+                         COALESCE(
+                             report.source_activity_at,
+                             stream.created_at
+                         ) DESC,
                          stream.updated_at DESC,
                          connection.external_account_uuid, stream.uuid
                 LIMIT 20
@@ -274,7 +277,7 @@ class WorkspaceChatCatalogWorker:
             ORDER BY candidate.stream_updated_at DESC,
                      candidate.account_uuid, candidate.stream_uuid
             """,
-            _CATALOG_PROJECTION_REVISION,
+            CATALOG_PROJECTION_REVISION,
         )
         if not rows:
             rows = await self._pool.fetch(
@@ -387,7 +390,7 @@ class WorkspaceChatCatalogWorker:
                      connection.external_account_uuid, stream.uuid
                 LIMIT 20
                 """,
-                _CATALOG_PROJECTION_REVISION,
+                CATALOG_PROJECTION_REVISION,
             )
         for row in rows:
             source = _CatalogSource(
@@ -619,7 +622,7 @@ class WorkspaceChatCatalogWorker:
     ) -> int:
         catalog_hash = _canonical_hash(
             {
-                "projection_revision": _CATALOG_PROJECTION_REVISION,
+                "projection_revision": CATALOG_PROJECTION_REVISION,
                 "catalog": catalog,
             }
         )
@@ -749,7 +752,7 @@ class WorkspaceChatCatalogWorker:
             source.desired_generation,
             json.dumps(catalog, ensure_ascii=False),
             catalog_hash,
-            _CATALOG_PROJECTION_REVISION,
+            CATALOG_PROJECTION_REVISION,
             report_uuid,
             json.dumps(report, ensure_ascii=False),
             source.source_activity_at,
