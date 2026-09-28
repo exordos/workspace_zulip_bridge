@@ -27,6 +27,8 @@ from workspace_zulip_bridge.message_conversion import workspace_to_zulip
 from workspace_zulip_bridge.message_history import message_content_hash
 from workspace_zulip_bridge.message_history import message_flags_hash
 from workspace_zulip_bridge.message_history import message_state_hash
+from workspace_zulip_bridge.stable_ids import stable_external_chat_uuid
+from workspace_zulip_bridge.workspace_file_transfer import WorkspaceOutgoingFileReader
 from workspace_zulip_bridge.zulip_api import ZulipApiClient
 from workspace_zulip_bridge.zulip_api import ZulipApiError
 
@@ -71,6 +73,7 @@ def _binding_role(role: int) -> str:
 @dataclass(frozen=True, slots=True)
 class _Actor:
     connection_uuid: UUID
+    external_account_uuid: UUID | None
     realm_uuid: UUID
     user_uuid: UUID
     zulip_user_id: int
@@ -82,9 +85,24 @@ class _Actor:
 
 
 class ZulipOutboundWriter:
-    def __init__(self, pool: asyncpg.Pool, settings: Settings) -> None:
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        settings: Settings,
+        *,
+        outgoing_files: WorkspaceOutgoingFileReader | None = None,
+    ) -> None:
         self._pool = pool
         self._settings = settings
+        self._outgoing_files = (
+            outgoing_files
+            if outgoing_files is not None
+            else (
+                WorkspaceOutgoingFileReader(settings)
+                if settings.workspace_control_url is not None
+                else None
+            )
+        )
         self._clients: dict[
             UUID, tuple[tuple[str, str, str, str | None], ZulipApiClient]
         ] = {}
@@ -97,6 +115,8 @@ class ZulipOutboundWriter:
                 for _signature, client in clients.values()
             )
         )
+        if self._outgoing_files is not None:
+            await self._outgoing_files.close()
 
     async def apply(
         self,
@@ -660,6 +680,7 @@ class ZulipOutboundWriter:
             content = await self._workspace_message_content(
                 str(target_payload.get("content", "")),
                 actor,
+                UUID(str(target["stream_uuid"])),
             )
         topic = None
         if target.get("topic_uuid") != source.get("topic_uuid"):
@@ -694,7 +715,11 @@ class ZulipOutboundWriter:
                 "Zulip event queue is unavailable for message send"
             )
         workspace_content = str(payload.get("content", ""))
-        content = await self._workspace_message_content(workspace_content, actor)
+        content = await self._workspace_message_content(
+            workspace_content,
+            actor,
+            stream_uuid,
+        )
         message_link = await self._pool.fetchrow(
             """
             INSERT INTO workspace_zulip_bridge.zulip_entity_links (
@@ -1095,7 +1120,8 @@ class ZulipOutboundWriter:
     ) -> _Actor:
         row = await self._pool.fetchrow(
             """
-            SELECT connection.uuid AS connection_uuid, connection.realm_uuid,
+            SELECT connection.uuid AS connection_uuid,
+                   connection.external_account_uuid, connection.realm_uuid,
                    connection.zulip_user_uuid AS user_uuid,
                    zulip_user.zulip_user_id, zulip_user.role,
                    realm.identity_key AS endpoint,
@@ -1121,7 +1147,8 @@ class ZulipOutboundWriter:
         if row is None and stream_uuid is not None:
             row = await self._pool.fetchrow(
                 """
-                SELECT connection.uuid AS connection_uuid, connection.realm_uuid,
+                SELECT connection.uuid AS connection_uuid,
+                       connection.external_account_uuid, connection.realm_uuid,
                        connection.zulip_user_uuid AS user_uuid,
                        zulip_user.zulip_user_id, zulip_user.role,
                        realm.identity_key AS endpoint,
@@ -1216,6 +1243,7 @@ class ZulipOutboundWriter:
         self,
         content: str,
         actor: _Actor,
+        stream_uuid: UUID,
     ) -> str:
         endpoint = getattr(actor, "endpoint", None)
         if endpoint is None:
@@ -1352,6 +1380,25 @@ class ZulipOutboundWriter:
                 list(file_uuids),
             )
             files = {row["uuid"]: row["source_path"] for row in rows}
+            missing_file_uuids = file_uuids - files.keys()
+            if missing_file_uuids:
+                file_urns: dict[UUID, str] = {}
+                for kind in ("file", "image", "video"):
+                    for file_uuid in references.get(kind, ()):
+                        urn = f"urn:{kind}:{file_uuid}"
+                        if file_uuid in file_urns and file_urns[file_uuid] != urn:
+                            raise ZulipOutboundError(
+                                "Workspace file has conflicting URN kinds"
+                            )
+                        file_urns[file_uuid] = urn
+                files.update(
+                    await self._workspace_native_file_paths(
+                        actor,
+                        stream_uuid,
+                        file_urns,
+                        missing_file_uuids,
+                    )
+                )
 
         return workspace_to_zulip(
             content,
@@ -1364,6 +1411,120 @@ class ZulipOutboundWriter:
                 files=files,
             ),
         ).content
+
+    async def _workspace_native_file_paths(
+        self,
+        actor: _Actor,
+        stream_uuid: UUID,
+        file_urns: dict[UUID, str],
+        file_uuids: set[UUID],
+    ) -> dict[UUID, str]:
+        if self._outgoing_files is None:
+            raise ZulipOutboundError("Workspace file control is unavailable")
+        stream = await self._required_stream(stream_uuid)
+        authorization = await self._pool.fetchrow(
+            """
+            SELECT connection.external_account_uuid
+            FROM workspace_zulip_bridge.zulip_connections AS connection
+            WHERE connection.uuid = $1
+              AND connection.external_account_uuid IS NOT NULL
+              AND connection.sync_enabled
+            """,
+            stream["source_connection_uuid"],
+        )
+        if authorization is None:
+            raise ZulipOutboundError("Zulip chat supplier account is unavailable")
+        authorization_account_uuid = UUID(str(authorization["external_account_uuid"]))
+        external_chat_uuid = stable_external_chat_uuid(
+            authorization_account_uuid,
+            str(stream["chat_key"]),
+        )
+        rows = await self._pool.fetch(
+            """
+            SELECT workspace_file_uuid, source_path
+            FROM workspace_zulip_bridge.workspace_native_file_links
+            WHERE realm_uuid = $1
+              AND external_account_uuid = $2
+              AND external_chat_uuid = $3
+              AND workspace_file_uuid = ANY($4::uuid[])
+            """,
+            actor.realm_uuid,
+            authorization_account_uuid,
+            external_chat_uuid,
+            list(file_uuids),
+        )
+        resolved = {
+            UUID(str(row["workspace_file_uuid"])): str(row["source_path"])
+            for row in rows
+        }
+        for file_uuid in sorted(file_uuids - resolved.keys(), key=str):
+            async with self._pool.acquire() as connection, connection.transaction():
+                await connection.execute(
+                    """
+                    SELECT pg_advisory_xact_lock(
+                        hashtextextended(
+                            'workspace-native-file:' || ($1::uuid)::text || ':' ||
+                            ($2::uuid)::text || ':' || ($3::uuid)::text || ':' ||
+                            ($4::uuid)::text,
+                            0
+                        )
+                    )
+                    """,
+                    actor.realm_uuid,
+                    authorization_account_uuid,
+                    external_chat_uuid,
+                    file_uuid,
+                )
+                existing = await connection.fetchval(
+                    """
+                    SELECT source_path
+                    FROM workspace_zulip_bridge.workspace_native_file_links
+                    WHERE realm_uuid = $1
+                      AND external_account_uuid = $2
+                      AND external_chat_uuid = $3
+                      AND workspace_file_uuid = $4
+                    """,
+                    actor.realm_uuid,
+                    authorization_account_uuid,
+                    external_chat_uuid,
+                    file_uuid,
+                )
+                if existing is not None:
+                    resolved[file_uuid] = str(existing)
+                    continue
+                file_urn = file_urns.get(file_uuid)
+                if file_urn is None:
+                    raise ZulipOutboundError("Workspace file URN is unavailable")
+                name, content_type, content = await self._outgoing_files.read(
+                    file_urn,
+                    authorization_account_uuid,
+                    external_chat_uuid,
+                )
+                source_path = await asyncio.to_thread(
+                    self._client(actor).upload_file,
+                    name,
+                    content,
+                    content_type,
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO workspace_zulip_bridge.workspace_native_file_links (
+                        realm_uuid, external_account_uuid, external_chat_uuid,
+                        workspace_file_uuid, source_path,
+                        name, content_type, size_bytes
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    """,
+                    actor.realm_uuid,
+                    authorization_account_uuid,
+                    external_chat_uuid,
+                    file_uuid,
+                    source_path,
+                    name,
+                    content_type,
+                    len(content),
+                )
+                resolved[file_uuid] = source_path
+        return resolved
 
     async def _stream(self, stream_uuid: UUID) -> asyncpg.Record | None:
         return await self._pool.fetchrow(

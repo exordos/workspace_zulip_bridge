@@ -17,6 +17,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import IO
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import UUID
 
 import asyncpg
@@ -26,6 +27,7 @@ from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.message_history import message_content_hash
 from workspace_zulip_bridge.stable_ids import stable_external_chat_uuid
 from workspace_zulip_bridge.stable_ids import stable_file_projection_uuid
+from workspace_zulip_bridge.stable_ids import stable_outgoing_file_transfer_uuid
 
 LOG = logging.getLogger(__name__)
 MAX_FILE_BYTES = 50 * 1024 * 1024
@@ -104,6 +106,188 @@ def workspace_file_name(name: str) -> str:
             return encoded.decode("utf-8")
         except UnicodeDecodeError:
             encoded = encoded[:-1]
+
+
+class WorkspaceOutgoingFileReader:
+    """Authorize and read one Workspace-native file for a Zulip actor."""
+
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        control_transport: httpx.AsyncBaseTransport | None = None,
+        download_transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        if settings.workspace_control_url is None:
+            raise ValueError("Workspace control must be configured")
+        self._settings = settings
+        self._control_url = settings.workspace_control_url.rstrip("/")
+        self._state = settings.workspace_control_state_dir
+        self._control_transport = control_transport
+        self._download_transport = download_transport
+        self._control_http: httpx.AsyncClient | None = None
+        self._download_http: httpx.AsyncClient | None = None
+
+    async def close(self) -> None:
+        clients = (self._control_http, self._download_http)
+        self._control_http = None
+        self._download_http = None
+        for client in clients:
+            if client is not None:
+                await client.aclose()
+
+    async def read(
+        self,
+        file_urn: str,
+        external_account_uuid: UUID,
+        external_chat_uuid: UUID,
+    ) -> tuple[str, str, bytes]:
+        match = _WORKSPACE_URN.fullmatch(file_urn)
+        if match is None:
+            raise FileTransferError("invalid_workspace_urn", retryable=False)
+        file_uuid = UUID(file_urn.rsplit(":", 1)[1])
+        transfer_uuid = stable_outgoing_file_transfer_uuid(
+            file_uuid,
+            external_account_uuid,
+            external_chat_uuid,
+        )
+        async with asyncio.timeout(self._settings.workspace_request_timeout_seconds):
+            response = await self._control().put(
+                f"/v1/file-transfers/outgoing/{transfer_uuid}",
+                json={
+                    "operation_uuid": str(transfer_uuid),
+                    "external_account_uuid": str(external_account_uuid),
+                    "external_chat_uuid": str(external_chat_uuid),
+                    "file_urn": file_urn,
+                },
+            )
+        authorization = WorkspaceFileTransferWorker._response(response)
+        name, content_type, size_bytes, expected_sha256, download = self._authorization(
+            authorization,
+            transfer_uuid=transfer_uuid,
+            file_uuid=file_uuid,
+            file_urn=file_urn,
+        )
+        url = str(download["url"])
+        client = (
+            self._control()
+            if self._origin(url) == self._origin(self._control_url)
+            else self._download()
+        )
+        async with asyncio.timeout(
+            max(300.0, self._settings.workspace_request_timeout_seconds)
+        ):
+            result = await client.get(url, headers=download["headers"])
+        if result.is_error:
+            raise FileTransferError(
+                f"workspace_file_download_http_{result.status_code}",
+                retryable=result.status_code == 429 or result.status_code >= 500,
+            )
+        content = result.content
+        if (
+            len(content) != size_bytes
+            or hashlib.sha256(content).hexdigest() != expected_sha256
+        ):
+            raise FileTransferError("workspace_file_integrity_mismatch")
+        return name, content_type, content
+
+    def _control(self) -> httpx.AsyncClient:
+        if self._control_http is None:
+            if self._control_transport is None:
+                ca = self._state / "control-ca.pem"
+                certificate = self._state / "bridge.crt"
+                key = self._state / "bridge.key"
+                for path in (ca, certificate, key):
+                    if not path.is_file():
+                        raise FileTransferError("bridge_identity_not_ready")
+                ssl_context = ssl.create_default_context(cafile=str(ca))
+                ssl_context.load_cert_chain(str(certificate), str(key))
+                context: ssl.SSLContext | bool = ssl_context
+            else:
+                context = False
+            self._control_http = httpx.AsyncClient(
+                base_url=self._control_url,
+                verify=context,
+                transport=self._control_transport,
+                follow_redirects=False,
+                trust_env=False,
+                timeout=httpx.Timeout(self._settings.workspace_request_timeout_seconds),
+                limits=httpx.Limits(
+                    max_connections=_CONTROL_MAX_CONNECTIONS,
+                    max_keepalive_connections=_CONTROL_MAX_CONNECTIONS,
+                ),
+                headers={"Accept": "application/json"},
+            )
+        return self._control_http
+
+    def _download(self) -> httpx.AsyncClient:
+        if self._download_http is None:
+            self._download_http = httpx.AsyncClient(
+                transport=self._download_transport,
+                follow_redirects=False,
+                trust_env=False,
+                timeout=httpx.Timeout(
+                    max(300.0, self._settings.workspace_request_timeout_seconds)
+                ),
+            )
+        return self._download_http
+
+    @staticmethod
+    def _origin(url: str) -> tuple[str, str, int | None]:
+        parsed = urlsplit(url)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or parsed.hostname is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+        ):
+            raise FileTransferError("invalid_workspace_file_response")
+        port = parsed.port
+        if port is None:
+            port = 443 if parsed.scheme == "https" else 80
+        return parsed.scheme, parsed.hostname.lower(), port
+
+    @staticmethod
+    def _authorization(
+        response: dict[str, Any],
+        *,
+        transfer_uuid: UUID,
+        file_uuid: UUID,
+        file_urn: str,
+    ) -> tuple[str, str, int, str, dict[str, Any]]:
+        name = response.get("name")
+        content_type = response.get("content_type")
+        size_bytes = response.get("size_bytes")
+        sha256 = response.get("sha256")
+        download = response.get("download")
+        if (
+            response.get("status") != "ready"
+            or response.get("transfer_uuid") != str(transfer_uuid)
+            or response.get("operation_uuid") != str(transfer_uuid)
+            or response.get("file_uuid") != str(file_uuid)
+            or response.get("file_urn") != file_urn
+            or not isinstance(name, str)
+            or not name
+            or len(name.encode("utf-8")) > 255
+            or not isinstance(content_type, str)
+            or _CONTENT_TYPE.fullmatch(content_type) is None
+            or not isinstance(size_bytes, int)
+            or not 0 <= size_bytes <= MAX_FILE_BYTES
+            or not isinstance(sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+            or not isinstance(download, dict)
+            or download.get("method") != "GET"
+            or not isinstance(download.get("url"), str)
+            or not isinstance(download.get("headers"), dict)
+            or not all(
+                isinstance(key, str) and isinstance(value, str)
+                for key, value in download.get("headers", {}).items()
+            )
+        ):
+            raise FileTransferError("invalid_workspace_file_response")
+        WorkspaceOutgoingFileReader._origin(str(download["url"]))
+        return name, content_type, size_bytes, sha256, download
 
 
 class WorkspaceFileTransferWorker:

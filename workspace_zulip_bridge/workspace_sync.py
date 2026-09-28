@@ -34,6 +34,7 @@ from workspace_zulip_bridge.stable_ids import stable_topic_uuid
 from workspace_zulip_bridge.workspace_auth import WorkspaceTokenManager
 from workspace_zulip_bridge.workspace_entities import project_entity
 from workspace_zulip_bridge.workspace_entities import validate_entity
+from workspace_zulip_bridge.workspace_file_transfer import FileTransferError
 from workspace_zulip_bridge.zulip_api import ZulipApiError
 from workspace_zulip_bridge.zulip_outbound import ZulipOutboundError
 from workspace_zulip_bridge.zulip_outbound import ZulipOutboundPending
@@ -4566,6 +4567,14 @@ class WorkspaceDiffWorker:
                 await self._mark(
                     [row],
                     status,
+                    exc.code[:2048],
+                    retry_base_seconds=self._settings.zulip_retry_base_seconds,
+                    retry_cap_seconds=self._settings.zulip_retry_cap_seconds,
+                )
+            except FileTransferError as exc:
+                await self._mark(
+                    [row],
+                    "failed" if exc.retryable else "blocked",
                     exc.code[:2048],
                     retry_base_seconds=self._settings.zulip_retry_base_seconds,
                     retry_cap_seconds=self._settings.zulip_retry_cap_seconds,

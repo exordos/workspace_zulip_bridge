@@ -95,6 +95,19 @@ def stable_file_projection_uuid(file_uuid: UUID, stream_uuid: UUID) -> UUID:
     return uuid5(file_uuid, f"workspace-file\0{stream_uuid}")
 
 
+def stable_outgoing_file_transfer_uuid(
+    file_uuid: UUID,
+    external_account_uuid: UUID,
+    external_chat_uuid: UUID,
+) -> UUID:
+    """Return the idempotency identity for a Workspace-to-Zulip file copy."""
+
+    return uuid5(
+        file_uuid,
+        f"zulip-file\0{external_account_uuid}\0{external_chat_uuid}",
+    )
+
+
 def stable_external_chat_uuid(account_uuid: UUID, chat_key: str) -> UUID:
     """Return the account-scoped identity used by Workspace control state."""
 

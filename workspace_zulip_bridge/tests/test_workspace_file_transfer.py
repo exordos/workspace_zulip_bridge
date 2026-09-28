@@ -15,7 +15,9 @@ import pytest
 from workspace_zulip_bridge import workspace_file_transfer
 from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.stable_ids import stable_external_chat_uuid
+from workspace_zulip_bridge.stable_ids import stable_outgoing_file_transfer_uuid
 from workspace_zulip_bridge.workspace_file_transfer import WorkspaceFileTransferWorker
+from workspace_zulip_bridge.workspace_file_transfer import WorkspaceOutgoingFileReader
 from workspace_zulip_bridge.workspace_file_transfer import replace_source_file_urn
 from workspace_zulip_bridge.workspace_file_transfer import workspace_file_name
 
@@ -113,6 +115,71 @@ def test_external_chat_identity_stays_compatible_with_existing_catalogs() -> Non
         UUID("10000000-0000-0000-0000-000000000003"),
         "channel:42",
     ) == UUID("2a239a52-7e3f-5db9-9631-996c5d7581c4")
+
+
+def test_outgoing_workspace_file_is_authorized_and_verified() -> None:
+    account_uuid = UUID("10000000-0000-0000-0000-000000000003")
+    chat_uuid = UUID("10000000-0000-0000-0000-000000000004")
+    content = b"native workspace file"
+    file_urn = f"urn:file:{SOURCE_UUID}"
+    transfer_uuid = stable_outgoing_file_transfer_uuid(
+        SOURCE_UUID,
+        account_uuid,
+        chat_uuid,
+    )
+    requests: list[httpx.Request] = []
+
+    def control_handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.method == "PUT"
+        assert request.url.path.endswith(f"/v1/file-transfers/outgoing/{transfer_uuid}")
+        return httpx.Response(
+            200,
+            json={
+                "transfer_uuid": str(transfer_uuid),
+                "operation_uuid": str(transfer_uuid),
+                "status": "ready",
+                "authorization_generation": 1,
+                "file_uuid": str(SOURCE_UUID),
+                "file_urn": file_urn,
+                "name": "test.txt",
+                "size_bytes": len(content),
+                "content_type": "text/plain",
+                "sha256": hashlib.sha256(content).hexdigest(),
+                "download": {
+                    "method": "GET",
+                    "url": "https://files.example.invalid/object",
+                    "headers": {"x-test-token": "signed"},
+                },
+            },
+        )
+
+    def download_handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.method == "GET"
+        assert request.headers["x-test-token"] == "signed"
+        return httpx.Response(200, content=content)
+
+    async def run() -> None:
+        reader = WorkspaceOutgoingFileReader(
+            Settings(
+                database_dsn="postgresql:///unused",
+                workspace_control_url="https://control.example.invalid",
+            ),
+            control_transport=httpx.MockTransport(control_handler),
+            download_transport=httpx.MockTransport(download_handler),
+        )
+        try:
+            assert await reader.read(file_urn, account_uuid, chat_uuid) == (
+                "test.txt",
+                "text/plain",
+                content,
+            )
+        finally:
+            await reader.close()
+
+    asyncio.run(run())
+    assert len(requests) == 2
 
 
 @pytest.mark.parametrize("kind", ("file", "image", "video"))

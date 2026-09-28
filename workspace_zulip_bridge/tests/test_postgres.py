@@ -8440,6 +8440,127 @@ async def _insert_user(
     return connection_uuid
 
 
+def test_workspace_native_file_upload_is_cached_per_account_and_chat() -> None:
+    asyncio.run(_workspace_native_file_upload_is_cached_per_account_and_chat(_dsn()))
+
+
+async def _workspace_native_file_upload_is_cached_per_account_and_chat(
+    dsn: str,
+) -> None:
+    pool = await _pool(dsn)
+    realm_uuid = stable_realm_uuid(ENDPOINT)
+    stream_uuid = stable_chat_uuid(ENDPOINT, "channel:42")
+    file_uuid = UUID("10000000-0000-0000-0000-000000000042")
+    supplier_account_uuid = UUID("20000000-0000-0000-0000-000000000041")
+    actor_account_uuid = UUID("20000000-0000-0000-0000-000000000042")
+    try:
+        async with pool.acquire() as connection:
+            supplier_connection_uuid = await _insert_user(
+                connection,
+                41,
+                400,
+                queue_id="queue-41",
+                status="active",
+            )
+            actor_connection_uuid = await _insert_user(
+                connection,
+                42,
+                400,
+                queue_id="queue-42",
+                status="active",
+            )
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_connections
+                SET external_account_uuid = $2
+                WHERE uuid = $1
+                """,
+                supplier_connection_uuid,
+                supplier_account_uuid,
+            )
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_connections
+                SET external_account_uuid = $2
+                WHERE uuid = $1
+                """,
+                actor_connection_uuid,
+                actor_account_uuid,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_streams (
+                    uuid, realm_uuid, chat_type, chat_key, name,
+                    content_hash, source_connection_uuid
+                ) VALUES ($1, $2, 'channel', 'channel:42', 'Files', $3, $4)
+                """,
+                stream_uuid,
+                realm_uuid,
+                b"s" * 32,
+                supplier_connection_uuid,
+            )
+
+        outgoing_files = SimpleNamespace(
+            read=AsyncMock(return_value=("test.txt", "text/plain", b"content")),
+            close=AsyncMock(),
+        )
+        uploads: list[tuple[str, bytes, str]] = []
+        writer = ZulipOutboundWriter(
+            pool,
+            Settings(database_dsn=dsn),
+            outgoing_files=outgoing_files,  # type: ignore[arg-type]
+        )
+        actor = await writer._actor(stable_user_uuid(ENDPOINT, 42))
+        writer._client = lambda _actor: SimpleNamespace(  # type: ignore[method-assign]
+            upload_file=lambda name, content, content_type: (
+                uploads.append((name, content, content_type))
+                or "/user_uploads/42/test.txt"
+            )
+        )
+        file_urns = {file_uuid: f"urn:file:{file_uuid}"}
+
+        first = await writer._workspace_native_file_paths(
+            actor,
+            stream_uuid,
+            file_urns,
+            {file_uuid},
+        )
+        second = await writer._workspace_native_file_paths(
+            actor,
+            stream_uuid,
+            file_urns,
+            {file_uuid},
+        )
+
+        assert first == second == {file_uuid: "/user_uploads/42/test.txt"}
+        assert outgoing_files.read.await_count == 1
+        assert outgoing_files.read.await_args.args == (
+            f"urn:file:{file_uuid}",
+            supplier_account_uuid,
+            stable_external_chat_uuid(
+                supplier_account_uuid,
+                "channel:42",
+            ),
+        )
+        assert uploads == [("test.txt", b"content", "text/plain")]
+        row = await pool.fetchrow(
+            """
+            SELECT external_account_uuid, external_chat_uuid, workspace_file_uuid
+            FROM workspace_zulip_bridge.workspace_native_file_links
+            """
+        )
+        assert row is not None
+        assert row["external_account_uuid"] == supplier_account_uuid
+        assert row["external_chat_uuid"] == stable_external_chat_uuid(
+            supplier_account_uuid,
+            "channel:42",
+        )
+        assert row["workspace_file_uuid"] == file_uuid
+        await writer.close()
+    finally:
+        await pool.close()
+
+
 def _catalog(
     own_user_id: int,
     channels: list[tuple[int, str]],

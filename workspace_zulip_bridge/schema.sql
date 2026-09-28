@@ -436,6 +436,26 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_file_projections (
         )
     )
 );
+CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_native_file_links (
+    realm_uuid uuid NOT NULL
+        REFERENCES workspace_zulip_bridge.zulip_realms (uuid) ON DELETE CASCADE,
+    external_account_uuid uuid NOT NULL,
+    external_chat_uuid uuid NOT NULL,
+    workspace_file_uuid uuid NOT NULL,
+    source_path text NOT NULL CHECK (source_path LIKE '/user_uploads/%'),
+    name text NOT NULL CHECK (name <> ''),
+    content_type text NOT NULL CHECK (content_type <> ''),
+    size_bytes bigint NOT NULL CHECK (size_bytes >= 0),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (
+        realm_uuid, external_account_uuid, external_chat_uuid,
+        workspace_file_uuid
+    ),
+    UNIQUE (
+        realm_uuid, external_account_uuid, external_chat_uuid, source_path
+    )
+);
 CREATE INDEX IF NOT EXISTS workspace_file_projections_pending_idx
     ON workspace_zulip_bridge.workspace_file_projections
         (delivery_priority, available_at, created_at, uuid)

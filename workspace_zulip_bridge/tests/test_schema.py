@@ -55,6 +55,7 @@ def test_schema_normalizes_workspace_like_entities_and_personal_state() -> None:
         "zulip_files",
         "zulip_message_files",
         "workspace_file_projections",
+        "workspace_native_file_links",
         "workspace_chat_catalog_reports",
     ):
         assert f"workspace_zulip_bridge.{table}" in schema
