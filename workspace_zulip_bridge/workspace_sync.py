@@ -3701,7 +3701,10 @@ class WorkspaceDiffWorker:
         await self._repair_blocked_workspace_topic_dependencies(client)
         async with self._pool.acquire() as connection, connection.transaction():
             if getattr(self, "_delivery_priority", None) == 1:
-                await lock_historical_stage(connection)
+                if not await lock_historical_stage(connection):
+                    # Exit the transaction/pool slot; run() takes the bounded
+                    # idle poll after this no-claim pass.
+                    return 0
                 # Recheck inside every claim transaction: a retry can become
                 # ready while a previous delivery batch is on the network.
                 # An active entity batch owns the stage until it finishes.

@@ -288,6 +288,9 @@ async def _stage_switch() -> None:
             jobs = await asyncio.gather(
                 file_worker._claim_job(), file_worker._claim_job()
             )
+            # A concurrent stage contender now yields instead of waiting while
+            # occupying a pool slot. Its next pass may claim the second file.
+            jobs = [job or await file_worker._claim_job() for job in jobs]
             assert all(jobs) and jobs[0] != jobs[1]
             assert await second.process_once(client) == 0
             for job in jobs:

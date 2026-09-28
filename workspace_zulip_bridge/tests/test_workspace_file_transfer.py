@@ -60,6 +60,11 @@ class ClaimPool(SeedPool):
         super().__init__(has_reserve=False)
         self.fetchrow_calls: list[tuple[str, tuple[object, ...]]] = []
 
+    async def fetchval(self, query: str, *args: object) -> bool:
+        if "pg_try_advisory_xact_lock" in query:
+            return True
+        return await super().fetchval(query, *args)
+
     async def fetchrow(self, query: str, *args: object) -> None:
         self.fetchrow_calls.append((query, args))
         return None

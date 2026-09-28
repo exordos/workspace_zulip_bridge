@@ -9,12 +9,15 @@ from asyncpg.pool import PoolConnectionProxy
 
 async def lock_historical_stage(
     connection: asyncpg.Connection | PoolConnectionProxy,
-) -> None:
-    # Hold only while selecting/claiming rows, never across network I/O. Both
-    # file and entity workers inspect in-flight rows under this same lock.
-    await connection.execute(
-        "SELECT pg_advisory_xact_lock("
-        "hashtextextended('workspace_zulip_bridge:historical-stage', 0))"
+) -> bool:
+    # Contenders must release their claim transaction/pool slot and idle before
+    # retrying. Blocking here can fill the shared pool with historical waiters.
+    # Successful callers still hold the same global lock through the full claim.
+    return bool(
+        await connection.fetchval(
+            "SELECT pg_try_advisory_xact_lock("
+            "hashtextextended('workspace_zulip_bridge:historical-stage', 0))"
+        )
     )
 
 

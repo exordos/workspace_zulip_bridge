@@ -49,6 +49,7 @@ _BACKFILL_LOW_WATERMARK = 1_000
 _CONTROL_MAX_CONNECTIONS = 2
 _FILE_MAX_ATTEMPTS = 12
 _FILE_HEARTBEAT_SECONDS = 30.0
+_FILE_CLAIM_IDLE_SECONDS = 0.1
 
 
 class FileTransferError(RuntimeError):
@@ -353,6 +354,9 @@ class WorkspaceFileTransferWorker:
             completed = await self._complete_file_outbox()
         job = await self._claim_job()
         if job is None:
+            # _claim_job has released its transaction and pool slot. Yield even
+            # when coordinator progress would otherwise trigger a busy retry.
+            await asyncio.sleep(_FILE_CLAIM_IDLE_SECONDS)
             return seeded + completed
         staged: _StagedSource | None = None
         heartbeat = asyncio.create_task(self._heartbeat_job(job))
@@ -564,7 +568,8 @@ class WorkspaceFileTransferWorker:
 
     async def _claim_job(self) -> _Job | None:
         async with self._pool.acquire() as connection, connection.transaction():
-            await lock_historical_stage(connection)
+            if not await lock_historical_stage(connection):
+                return None
             await connection.execute(
                 """
                 WITH expired AS (
