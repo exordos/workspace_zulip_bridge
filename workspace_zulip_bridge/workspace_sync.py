@@ -5131,8 +5131,8 @@ class WorkspaceDiffWorker:
         topic_uuids = [value[0] for value in values]
         stream_uuids = [value[1] for value in values]
         content_hashes = [value[2] for value in values]
-        async with self._pool.acquire() as connection, connection.transaction():
-            if values:
+        if values:
+            async with self._pool.acquire() as connection, connection.transaction():
                 await connection.execute(
                     """
                     WITH inserted AS (
@@ -5162,6 +5162,7 @@ class WorkspaceDiffWorker:
                     content_hashes,
                     realm_uuid,
                 )
+        async with self._pool.acquire() as connection, connection.transaction():
             result = await connection.execute(
                 """
                 WITH pending AS MATERIALIZED (

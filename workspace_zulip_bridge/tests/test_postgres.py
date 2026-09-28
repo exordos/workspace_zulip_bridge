@@ -10086,6 +10086,13 @@ async def _event_processor_materializes_live_catalog_changes(dsn: str) -> None:
                 "FROM workspace_zulip_bridge.zulip_streams "
                 "WHERE chat_key = 'direct:10,20'"
             )
+            direct_topic = await connection.fetchrow(
+                "SELECT topic.uuid, topic.name "
+                "FROM workspace_zulip_bridge.zulip_topics AS topic "
+                "JOIN workspace_zulip_bridge.zulip_streams AS stream "
+                "ON stream.uuid = topic.zulip_stream_uuid "
+                "WHERE stream.chat_key = 'direct:10,20'"
+            )
             directory_user = await connection.fetchrow(
                 "SELECT full_name, is_bot FROM workspace_zulip_bridge.zulip_users "
                 "WHERE zulip_user_id = 30"
@@ -10105,6 +10112,14 @@ async def _event_processor_materializes_live_catalog_changes(dsn: str) -> None:
         assert lifecycle == "filling"
         assert direct_stream is not None
         assert direct_stream["source_connection_uuid"] is None
+        assert direct_topic is not None
+        assert dict(direct_topic) == {
+            "uuid": stable_topic_uuid(
+                stable_chat_uuid(ENDPOINT, "direct:10,20"),
+                "General",
+            ),
+            "name": "General",
+        }
         assert directory_user is not None
         assert dict(directory_user) == {"full_name": "User 30", "is_bot": False}
         assert statuses == {"applied": 2, "pending": 1}

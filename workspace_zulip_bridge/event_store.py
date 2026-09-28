@@ -3857,4 +3857,44 @@ async def _store_chats(
     )
     if row is None:
         raise RuntimeError("stream catalog query returned no row")
+    direct_stream_uuids = [
+        stream_uuid
+        for stream_uuid, chat in zip(stream_uuids, chats, strict=True)
+        if chat.chat_type != "channel"
+    ]
+    if direct_stream_uuids:
+        topic_uuids = [
+            stable_topic_uuid(stream_uuid, "General")
+            for stream_uuid in direct_stream_uuids
+        ]
+        await connection.execute(
+            """
+            WITH inserted AS (
+                INSERT INTO workspace_zulip_bridge.zulip_topics (
+                    uuid, zulip_stream_uuid, name, content_hash
+                )
+                SELECT input.topic_uuid, input.stream_uuid, 'General', $3
+                FROM unnest($1::uuid[], $2::uuid[])
+                    AS input(topic_uuid, stream_uuid)
+                ON CONFLICT (uuid) DO NOTHING
+                RETURNING uuid
+            ), outbox AS (
+                INSERT INTO workspace_zulip_bridge.workspace_outbox (
+                    realm_uuid, entity_type, action, entity_uuid
+                )
+                SELECT $4, 'topic', 'upsert', uuid FROM inserted
+                ON CONFLICT (realm_uuid, entity_type, entity_uuid)
+                    WHERE delivery_status = 'pending'
+                DO UPDATE SET action = 'upsert',
+                              available_at = clock_timestamp(),
+                              updated_at = clock_timestamp()
+                RETURNING 1
+            )
+            SELECT count(*) FROM inserted
+            """,
+            topic_uuids,
+            direct_stream_uuids,
+            hashlib.sha256(b"General").digest(),
+            realm_uuid,
+        )
     return row["changed_count"], row["deleted_count"]
