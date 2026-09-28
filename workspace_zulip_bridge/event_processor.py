@@ -29,6 +29,7 @@ from workspace_zulip_bridge.models import ZulipUserPresence
 from workspace_zulip_bridge.models import ZulipUserProfileStatus
 from workspace_zulip_bridge.models import ZulipUserTopic
 from workspace_zulip_bridge.stable_ids import stable_chat_uuid
+from workspace_zulip_bridge.stable_ids import stable_file_uuid
 from workspace_zulip_bridge.workspace_entities import validate_description
 from workspace_zulip_bridge.workspace_file_transfer import replace_source_file_urn
 from workspace_zulip_bridge.zulip_api import ZulipApiError
@@ -1477,6 +1478,10 @@ class ZulipEventProcessor:
                 replace(message, write_flags=False) for message in built.messages
             )
         )
+        messages = await self._replace_finalized_file_urns_in_messages(
+            item.event.endpoint,
+            messages,
+        )
         result = await self._store.apply_live_messages(
             item.event.user_uuid,
             item.event.queue_id,
@@ -1580,9 +1585,17 @@ class ZulipEventProcessor:
                 )
                 continue
             messages.extend(
-                built.messages
-                if write_flags
-                else (replace(message, write_flags=False) for message in built.messages)
+                await self._replace_finalized_file_urns_in_messages(
+                    item.event.endpoint,
+                    (
+                        built.messages
+                        if write_flags
+                        else tuple(
+                            replace(message, write_flags=False)
+                            for message in built.messages
+                        )
+                    ),
+                )
             )
             outcomes.append(_Outcome(item.event.uuid, "applied", "message"))
         if not messages:
@@ -2209,6 +2222,77 @@ class ZulipEventProcessor:
                 str(row["workspace_urn"]),
             )
         return workspace_content
+
+    async def _replace_finalized_file_urns_in_messages(
+        self,
+        endpoint: str,
+        messages: tuple[ZulipMessage, ...],
+    ) -> tuple[ZulipMessage, ...]:
+        requested = [
+            (message.chat_key, stable_file_uuid(endpoint, file.source_path))
+            for message in messages
+            for file in message.files
+        ]
+        if not requested:
+            return messages
+        rows = await self._pool.fetch(
+            """
+            WITH requested(chat_key, file_uuid) AS (
+                SELECT * FROM unnest($2::text[], $3::uuid[])
+            )
+            SELECT requested.chat_key, requested.file_uuid,
+                   projection.workspace_urn
+            FROM requested
+            JOIN workspace_zulip_bridge.zulip_realms AS realm
+              ON realm.identity_key = $1
+            JOIN workspace_zulip_bridge.zulip_streams AS stream
+              ON stream.realm_uuid = realm.uuid
+             AND stream.chat_key = requested.chat_key
+            JOIN workspace_zulip_bridge.workspace_file_projections AS projection
+              ON projection.zulip_stream_uuid = stream.uuid
+             AND projection.file_uuid = requested.file_uuid
+             AND projection.processing_status = 'finalized'
+            ORDER BY requested.chat_key, requested.file_uuid
+            """,
+            endpoint,
+            [chat_key for chat_key, _ in requested],
+            [file_uuid for _, file_uuid in requested],
+        )
+        finalized = {
+            (str(row["chat_key"]), UUID(str(row["file_uuid"]))): str(
+                row["workspace_urn"]
+            )
+            for row in rows
+        }
+        resolved: list[ZulipMessage] = []
+        for message in messages:
+            workspace_content = message.workspace_content or message.content
+            for file in message.files:
+                source_uuid = stable_file_uuid(endpoint, file.source_path)
+                workspace_urn = finalized.get((message.chat_key, source_uuid))
+                if workspace_urn is not None:
+                    workspace_content = replace_source_file_urn(
+                        workspace_content,
+                        source_uuid,
+                        workspace_urn,
+                    )
+            if workspace_content == message.workspace_content:
+                resolved.append(message)
+                continue
+            resolved.append(
+                replace(
+                    message,
+                    workspace_content=workspace_content,
+                    content_hash=message_content_hash(
+                        sender_user_uuid=message.sender_user_uuid,
+                        chat_key=message.chat_key,
+                        topic_name=message.topic_name,
+                        content=workspace_content,
+                        sent_at=message.sent_at,
+                    ),
+                )
+            )
+        return tuple(resolved)
 
     async def _load_user_message_ids(self, user_uuid: UUID) -> tuple[int, ...]:
         async with self._pool.acquire() as connection:

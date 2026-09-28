@@ -2,13 +2,19 @@
 # Licensed under the Apache License, Version 2.0 (the "License").
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 from typing import cast
 from unittest.mock import AsyncMock
 from unittest.mock import patch
+from uuid import UUID
 
 from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.event_processor import ZulipEventProcessor
+from workspace_zulip_bridge.message_history import message_content_hash
+from workspace_zulip_bridge.models import ZulipFileMetadata
+from workspace_zulip_bridge.models import ZulipMessage
+from workspace_zulip_bridge.stable_ids import stable_file_uuid
 
 
 def test_claim_scope_uses_a_plan_specific_timestamp_predicate() -> None:
@@ -34,6 +40,70 @@ def test_claim_scope_uses_a_plan_specific_timestamp_predicate() -> None:
         "event.created_at >= "
         "(statement_timestamp() - make_interval(secs => $5::double precision))"
     )
+
+
+def test_new_message_reuses_an_already_finalized_file_projection() -> None:
+    async def run() -> None:
+        endpoint = "https://zulip.example.test"
+        source_path = "/user_uploads/a/test.png"
+        source_uuid = stable_file_uuid(endpoint, source_path)
+        workspace_urn = "urn:image:11111111-2222-4333-8444-555555555555"
+        pool = SimpleNamespace(
+            fetch=AsyncMock(
+                return_value=[
+                    {
+                        "chat_key": "channel:7",
+                        "file_uuid": source_uuid,
+                        "workspace_urn": workspace_urn,
+                    }
+                ]
+            )
+        )
+        processor = ZulipEventProcessor(
+            cast(Any, pool),
+            cast(Any, object()),
+            Settings.from_env({}),
+        )
+        sender_uuid = UUID("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+        placeholder = f"![test.png](urn:file:{source_uuid})"
+        message = ZulipMessage(
+            message_id=42,
+            chat_key="channel:7",
+            topic_name="test",
+            sender_user_uuid=sender_uuid,
+            content="![test.png](/user_uploads/a/test.png)",
+            workspace_content=placeholder,
+            is_read=False,
+            is_starred=False,
+            is_collapsed=False,
+            is_mentioned=False,
+            is_stream_wildcard_mentioned=False,
+            is_topic_wildcard_mentioned=False,
+            has_alert_word=False,
+            is_historical=False,
+            reactions_json="[]",
+            message_hash=b"m" * 32,
+            content_hash=b"c" * 32,
+            sent_at=123,
+            files=(ZulipFileMetadata(source_path, "test.png"),),
+        )
+
+        (resolved,) = await processor._replace_finalized_file_urns_in_messages(
+            endpoint,
+            (message,),
+        )
+
+        assert resolved.workspace_content == f"![test.png]({workspace_urn})"
+        assert resolved.content_hash == message_content_hash(
+            sender_user_uuid=sender_uuid,
+            chat_key="channel:7",
+            topic_name="test",
+            content=f"![test.png]({workspace_urn})",
+            sent_at=123,
+        )
+        pool.fetch.assert_awaited_once()
+
+    asyncio.run(run())
 
 
 def test_processing_timeout_keeps_processor_alive() -> None:
