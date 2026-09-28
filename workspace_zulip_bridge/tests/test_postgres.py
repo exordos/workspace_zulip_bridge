@@ -2337,7 +2337,32 @@ async def _live_topic_pruning_enqueues_tombstone(dsn: str) -> None:
         assert (await store.reconcile_chat_schedules()).assigned == 1
         stream_uuid = stable_chat_uuid(ENDPOINT, "channel:67")
         topic_uuid = stable_topic_uuid(stream_uuid, "Empty")
+        direct_stream_uuid = stable_chat_uuid(ENDPOINT, "direct:67,68")
+        direct_topic_uuid = stable_topic_uuid(direct_stream_uuid, "General")
         async with pool.acquire() as connection:
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_streams (
+                    uuid, realm_uuid, chat_type, chat_key, name, private,
+                    content_hash, source_connection_uuid
+                ) VALUES ($1, $2, 'direct', 'direct:67,68', 'Direct', true,
+                          $3, $4)
+                """,
+                direct_stream_uuid,
+                stable_realm_uuid(ENDPOINT),
+                b"d" * 32,
+                connection_uuid,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_topics (
+                    uuid, zulip_stream_uuid, name, content_hash
+                ) VALUES ($1, $2, 'General', $3)
+                """,
+                direct_topic_uuid,
+                direct_stream_uuid,
+                b"g" * 32,
+            )
             await connection.execute(
                 """
                 UPDATE workspace_zulip_bridge.zulip_realms
@@ -2396,6 +2421,11 @@ async def _live_topic_pruning_enqueues_tombstone(dsn: str) -> None:
             "SELECT EXISTS (SELECT 1 FROM workspace_zulip_bridge.zulip_topics "
             "WHERE uuid = $1)",
             topic_uuid,
+        )
+        assert await pool.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM workspace_zulip_bridge.zulip_topics "
+            "WHERE uuid = $1)",
+            direct_topic_uuid,
         )
         diff = await pool.fetchrow(
             """

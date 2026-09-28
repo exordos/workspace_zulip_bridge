@@ -442,13 +442,25 @@ async def _run_workspace_diff_worker_file_stage_test(
         }
     )
     worker = WorkspaceDiffWorker(object(), settings)  # type: ignore[arg-type]
+    calls: list[str] = []
 
     async def file_backfill_pending() -> bool:
+        return True
+
+    async def fake_link_realm() -> UUID:
+        calls.append("link")
+        return UUID("30000000-0000-0000-0000-000000000001")
+
+    async def fake_ensure_direct_topics(realm_uuid: UUID) -> bool:
+        assert realm_uuid == UUID("30000000-0000-0000-0000-000000000001")
+        calls.append("direct_topics")
         return True
 
     async def fail_plan() -> int:
         raise AssertionError("historical planning ran during the file stage")
 
+    monkeypatch.setattr(worker, "_link_realm", fake_link_realm)
+    monkeypatch.setattr(worker, "_ensure_direct_topics", fake_ensure_direct_topics)
     monkeypatch.setattr(
         worker,
         "_historical_file_work_pending",
@@ -457,6 +469,7 @@ async def _run_workspace_diff_worker_file_stage_test(
     monkeypatch.setattr(worker, "plan", fail_plan)
 
     assert await worker._plan_and_drain(object()) == 0  # type: ignore[arg-type]
+    assert calls == ["link", "direct_topics"]
 
 
 async def _run_workspace_diff_worker_completion_test(

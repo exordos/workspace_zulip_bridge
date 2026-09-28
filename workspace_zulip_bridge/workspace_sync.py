@@ -1714,6 +1714,15 @@ class WorkspaceDiffWorker:
         # every source cursor and turns a handful of rejected legacy entities
         # into a global synchronization pause.
         if await self._historical_file_work_pending():
+            # Direct chats still need their synthetic topic while the
+            # historical file stage is active: catalog publication and
+            # realtime delivery both depend on it, and the repair is bounded.
+            if not self._direct_topics_repair_done:
+                realm_uuid = await self._link_realm()
+                if realm_uuid is not None:
+                    self._direct_topics_repair_done = await self._ensure_direct_topics(
+                        realm_uuid
+                    )
             return 0
         planned = await self.plan()
         if planned is None:

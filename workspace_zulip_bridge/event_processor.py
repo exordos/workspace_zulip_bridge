@@ -2033,6 +2033,7 @@ class ZulipEventProcessor:
                     JOIN workspace_zulip_bridge.zulip_streams AS stream
                       ON stream.uuid = topic.zulip_stream_uuid
                     WHERE stream.source_connection_uuid = $1
+                      AND stream.chat_type = 'channel'
                       AND NOT EXISTS (
                           SELECT 1
                           FROM workspace_zulip_bridge.zulip_messages AS message

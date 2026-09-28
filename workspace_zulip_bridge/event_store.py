@@ -858,15 +858,11 @@ class EventStore:
                            winners.color AS new_color
                     FROM workspace_zulip_bridge.zulip_streams AS stream
                     JOIN winners ON winners.stream_uuid = stream.uuid
+                    -- The stream switches to the winner only in the same
+                    -- transaction that proves no old message owner remains.
+                    -- Its mismatch is therefore the bounded work cursor.
                     WHERE stream.source_connection_uuid IS DISTINCT FROM
                           winners.connection_uuid
-                       OR EXISTS (
-                           SELECT 1
-                           FROM workspace_zulip_bridge.zulip_messages AS message
-                           WHERE message.zulip_stream_uuid = stream.uuid
-                             AND message.source_connection_uuid IS DISTINCT FROM
-                                 winners.connection_uuid
-                       )
                     ORDER BY stream.uuid
                     FOR UPDATE OF stream SKIP LOCKED
                     LIMIT 1
@@ -878,9 +874,13 @@ class EventStore:
                         SELECT message.uuid
                         FROM workspace_zulip_bridge.zulip_messages AS message
                         WHERE message.zulip_stream_uuid = changed.uuid
-                          AND message.source_connection_uuid IS DISTINCT FROM
-                              changed.new_connection_uuid
-                        ORDER BY message.uuid
+                          AND (
+                              message.source_connection_uuid IS NULL
+                              OR message.source_connection_uuid <
+                                 changed.new_connection_uuid
+                              OR message.source_connection_uuid >
+                                 changed.new_connection_uuid
+                          )
                         FOR UPDATE OF message SKIP LOCKED
                         LIMIT $1
                     ) AS candidate
@@ -899,8 +899,13 @@ class EventStore:
                         SELECT message.uuid
                         FROM workspace_zulip_bridge.zulip_messages AS message
                         WHERE message.zulip_stream_uuid = changed.uuid
-                          AND message.source_connection_uuid IS DISTINCT FROM
-                              changed.new_connection_uuid
+                          AND (
+                              message.source_connection_uuid IS NULL
+                              OR message.source_connection_uuid <
+                                 changed.new_connection_uuid
+                              OR message.source_connection_uuid >
+                                 changed.new_connection_uuid
+                          )
                           AND NOT EXISTS (
                               SELECT 1
                               FROM adopted
@@ -3036,6 +3041,7 @@ class HistorySession:
                     JOIN workspace_zulip_bridge.zulip_streams AS stream
                       ON stream.uuid = topic.zulip_stream_uuid
                     WHERE topic.zulip_stream_uuid = ANY($1::uuid[])
+                      AND stream.chat_type = 'channel'
                       AND NOT EXISTS (
                           SELECT 1
                           FROM workspace_zulip_bridge.zulip_messages AS message
