@@ -52,6 +52,31 @@ from workspace_zulip_bridge.stable_ids import stable_user_uuid
 from workspace_zulip_bridge.workspace_file_transfer import replace_source_file_urn
 
 
+async def _complete_attachment_file_uuids(
+    connection: asyncpg.Connection | PoolConnectionProxy,
+    realm_uuid: UUID,
+    source_paths: Sequence[str],
+    stored_file_uuids: Mapping[str, object],
+) -> dict[str, object]:
+    """Resolve rows committed by a concurrent attachment metadata event."""
+    resolved = dict(stored_file_uuids)
+    missing_paths = [path for path in source_paths if path not in resolved]
+    if missing_paths:
+        rows = await connection.fetch(
+            """
+            SELECT uuid, source_path
+            FROM workspace_zulip_bridge.zulip_files
+            WHERE realm_uuid = $1 AND source_path = ANY($2::text[])
+            """,
+            realm_uuid,
+            missing_paths,
+        )
+        resolved.update({str(row["source_path"]): row["uuid"] for row in rows})
+    if any(path not in resolved for path in source_paths):
+        raise RuntimeError("attachment metadata was not persisted")
+    return resolved
+
+
 class EventStore:
     SCHEDULE_STREAM_BATCH_SIZE = 64
     # A 10k adoption transaction exceeds the command timeout on multi-million
@@ -1357,6 +1382,13 @@ class EventStore:
             stored_file_uuids = row["stored_file_uuids"]
             if isinstance(stored_file_uuids, str):
                 stored_file_uuids = json.loads(stored_file_uuids)
+            source_paths = [attachment.source_path for attachment in attachments]
+            stored_file_uuids = await _complete_attachment_file_uuids(
+                connection,
+                UUID(str(owner["realm_uuid"])),
+                source_paths,
+                cast(Mapping[str, object], stored_file_uuids),
+            )
             file_uuids = [
                 UUID(str(stored_file_uuids[attachment.source_path]))
                 for attachment in attachments

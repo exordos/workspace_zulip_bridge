@@ -196,6 +196,33 @@ def _catalog_topic_provider_id(
     return f"{chat_key}:default"
 
 
+def _catalog_projection_stream_uuid(
+    catalog: Mapping[str, Any],
+    external_chat_uuid: UUID,
+) -> UUID:
+    source = catalog.get("source")
+    if isinstance(source, Mapping) and source.get("projection_stream_uuid") is not None:
+        return UUID(str(source["projection_stream_uuid"]))
+    return stable_external_chat_stream_uuid(external_chat_uuid)
+
+
+def _catalog_projection_topic_uuid(
+    catalog: Mapping[str, Any],
+    external_chat_uuid: UUID,
+    provider_topic_id: str,
+) -> UUID:
+    topics = catalog.get("topics")
+    if isinstance(topics, list):
+        for topic in topics:
+            if (
+                isinstance(topic, Mapping)
+                and topic.get("provider_topic_id") == provider_topic_id
+                and topic.get("projection_topic_uuid") is not None
+            ):
+                return UUID(str(topic["projection_topic_uuid"]))
+    return stable_external_chat_topic_uuid(external_chat_uuid, provider_topic_id)
+
+
 def _bootstrap_error(error: BaseException) -> RuntimeError:
     if isinstance(error, RuntimeError) and str(error).startswith(
         "Workspace Provider API returned "
@@ -1279,7 +1306,8 @@ class WorkspaceEventProcessor:
             )
         rows = await self._pool.fetch(
             """
-            SELECT report.resource_uuid, stream.uuid AS stream_uuid,
+            SELECT report.resource_uuid, report.catalog,
+                   stream.uuid AS stream_uuid,
                    stream.chat_type, stream.chat_key,
                    topic.uuid AS topic_uuid, topic.name AS topic_name
             FROM workspace_zulip_bridge.workspace_chat_catalog_reports AS report
@@ -1301,19 +1329,22 @@ class WorkspaceEventProcessor:
         for row in rows:
             external_chat_uuid = UUID(str(row["resource_uuid"]))
             source_stream_uuid = UUID(str(row["stream_uuid"]))
-            stream_ids[stable_external_chat_stream_uuid(external_chat_uuid)] = (
+            catalog = _json_object(row["catalog"])
+            stream_ids[_catalog_projection_stream_uuid(catalog, external_chat_uuid)] = (
                 source_stream_uuid
             )
             if row["topic_uuid"] is None:
                 continue
+            provider_topic_id = _catalog_topic_provider_id(
+                str(row["chat_type"]),
+                str(row["chat_key"]),
+                str(row["topic_name"]),
+            )
             topic_ids[
-                stable_external_chat_topic_uuid(
+                _catalog_projection_topic_uuid(
+                    catalog,
                     external_chat_uuid,
-                    _catalog_topic_provider_id(
-                        str(row["chat_type"]),
-                        str(row["chat_key"]),
-                        str(row["topic_name"]),
-                    ),
+                    provider_topic_id,
                 )
             ] = UUID(str(row["topic_uuid"]))
         self._catalog_project_uuid = project_uuid
@@ -4175,7 +4206,9 @@ class WorkspaceDiffWorker:
             return ready
         rows = await self._pool.fetch(
             """
-            SELECT report.resource_uuid, stream.chat_type, stream.chat_key,
+            SELECT report.resource_uuid, report.catalog,
+                   stream.uuid AS stream_uuid, stream.chat_type, stream.chat_key,
+                   topic.uuid AS topic_uuid,
                    topic.name AS topic_name
             FROM workspace_zulip_bridge.zulip_messages AS message
             JOIN workspace_zulip_bridge.zulip_streams AS stream
@@ -4211,17 +4244,20 @@ class WorkspaceDiffWorker:
         )
         for row in rows:
             external_chat_uuid = UUID(str(row["resource_uuid"]))
-            ready["streams"].add(stable_external_chat_stream_uuid(external_chat_uuid))
+            catalog = _json_object(row["catalog"])
+            ready["streams"].add(
+                _catalog_projection_stream_uuid(catalog, external_chat_uuid)
+            )
+            provider_topic_id = _catalog_topic_provider_id(
+                str(row["chat_type"]),
+                str(row["chat_key"]),
+                str(row["topic_name"]) if row["topic_name"] is not None else None,
+            )
             ready["topics"].add(
-                stable_external_chat_topic_uuid(
+                _catalog_projection_topic_uuid(
+                    catalog,
                     external_chat_uuid,
-                    _catalog_topic_provider_id(
-                        str(row["chat_type"]),
-                        str(row["chat_key"]),
-                        str(row["topic_name"])
-                        if row["topic_name"] is not None
-                        else None,
-                    ),
+                    provider_topic_id,
                 )
             )
         return ready
@@ -5253,19 +5289,20 @@ class WorkspaceDiffWorker:
             data = _json_object(row["data"])
             if entity_type == "messages" and row["catalog_resource_uuid"] is not None:
                 external_chat_uuid = UUID(str(row["catalog_resource_uuid"]))
+                catalog = _json_object(row["catalog"])
                 data["stream_uuid"] = str(
-                    stable_external_chat_stream_uuid(external_chat_uuid)
+                    _catalog_projection_stream_uuid(catalog, external_chat_uuid)
+                )
+                provider_topic_id = _catalog_topic_provider_id(
+                    str(row["chat_type"]),
+                    str(row["chat_key"]),
+                    str(row["topic_name"]) if row["topic_name"] is not None else None,
                 )
                 data["topic_uuid"] = str(
-                    stable_external_chat_topic_uuid(
+                    _catalog_projection_topic_uuid(
+                        catalog,
                         external_chat_uuid,
-                        _catalog_topic_provider_id(
-                            str(row["chat_type"]),
-                            str(row["chat_key"]),
-                            str(row["topic_name"])
-                            if row["topic_name"] is not None
-                            else None,
-                        ),
+                        provider_topic_id,
                     )
                 )
             result[(entity_type, UUID(str(row["entity_uuid"])))] = project_entity(
@@ -5706,6 +5743,8 @@ _ENTITY_QUERIES = {
         ) AS data,
         CASE WHEN report.processing_status = 'reported'
              THEN report.resource_uuid END AS catalog_resource_uuid,
+        CASE WHEN report.processing_status = 'reported'
+             THEN report.catalog END AS catalog,
         stream.chat_type, stream.chat_key, topic.name AS topic_name
         FROM workspace_zulip_bridge.zulip_messages AS message
         JOIN workspace_zulip_bridge.zulip_users AS sender

@@ -103,8 +103,9 @@ class WorkspaceChatCatalogWorker:
 
     async def run(self) -> None:
         while True:
+            changed = 0
             try:
-                await self.process_once()
+                changed = await self.process_once()
             except asyncio.CancelledError:
                 raise
             except (TimeoutError, asyncpg.PostgresError, httpx.HTTPError) as error:
@@ -117,16 +118,27 @@ class WorkspaceChatCatalogWorker:
                     "Workspace chat catalog data is not ready: error=%s",
                     type(error).__name__,
                 )
-            # Catalog application can materialize chat bindings and notification
-            # state in Workspace. Keep the producer deliberately paced even when
-            # more reports are ready so a large file backlog cannot overwhelm the
-            # control service's database pool.
-            await asyncio.sleep(self._settings.workspace_control_poll_seconds)
+            # A catalog report is already serialized through the shared control
+            # semaphore.  Drain ready work without an artificial two-second gap;
+            # only the idle path needs polling backoff.
+            await asyncio.sleep(
+                0 if changed else self._settings.workspace_control_poll_seconds
+            )
 
     async def process_once(self) -> int:
-        refreshed = await self._refresh_catalogs() if self._coordinate else 0
-        retired = await self._retire_unneeded_reports() if self._coordinate else 0
+        refreshed = 0
+        retired = 0
+        if self._coordinate:
+            # Do not let an old report backlog hide newly discovered chats or
+            # a projection-format upgrade.  Only the coordinator performs this
+            # bounded, newest-first refresh; the remaining workers keep
+            # delivering reports in parallel.
+            refreshed = await self._refresh_catalogs(priority_only=True)
         report = await self._claim_report()
+        if report is None and self._coordinate:
+            refreshed += await self._refresh_catalogs()
+            retired = await self._retire_unneeded_reports()
+            report = await self._claim_report()
         if report is None:
             return refreshed + retired
         report_uuid = UUID(str(report["report_uuid"]))
@@ -150,7 +162,7 @@ class WorkspaceChatCatalogWorker:
             await self._finish_report(report_uuid, outcome)
         return refreshed + retired + 1
 
-    async def _refresh_catalogs(self) -> int:
+    async def _refresh_catalogs(self, *, priority_only: bool = False) -> int:
         changed = await self._reactivate_needed_reports()
         # Newly discovered and reassigned chats must not wait for the complete
         # historical catalog comparison. Select that small realtime lane first,
@@ -279,7 +291,7 @@ class WorkspaceChatCatalogWorker:
             """,
             CATALOG_PROJECTION_REVISION,
         )
-        if not rows:
+        if not rows and not priority_only:
             rows = await self._pool.fetch(
                 """
                 SELECT connection.external_account_uuid AS account_uuid,
@@ -501,6 +513,11 @@ class WorkspaceChatCatalogWorker:
                 "kind": "zulip",
                 "chat_type": catalog_chat_type,
                 "provider_chat_key": source.chat_key,
+                # Reuse the stable source identities that already own the
+                # imported history.  Older catalog revisions omitted these
+                # hints, so Workspace materialized a second empty projection
+                # for the same provider chat.
+                "projection_stream_uuid": str(source.stream_uuid),
                 "provider_realm_uuid": str(source.realm_uuid),
                 "provider_owner_user_id": str(source.owner_zulip_user_id),
                 "original_url": None,
@@ -589,16 +606,29 @@ class WorkspaceChatCatalogWorker:
 
     async def _topics(self, source: _CatalogSource) -> list[dict[str, object]]:
         if source.chat_type != "channel":
+            topic_uuid = await self._pool.fetchval(
+                """
+                SELECT uuid
+                FROM workspace_zulip_bridge.zulip_topics
+                WHERE zulip_stream_uuid = $1
+                ORDER BY created_at, uuid
+                LIMIT 1
+                """,
+                source.stream_uuid,
+            )
+            if topic_uuid is None:
+                raise CatalogReportError("catalog_topic_missing", retryable=True)
             return [
                 {
                     "provider_topic_id": f"{source.chat_key}:default",
+                    "projection_topic_uuid": str(topic_uuid),
                     "name": "Zulip",
                     "is_default": True,
                 }
             ]
         rows = await self._pool.fetch(
             """
-            SELECT name
+            SELECT uuid, name
             FROM workspace_zulip_bridge.zulip_topics
             WHERE zulip_stream_uuid = $1
             ORDER BY name, uuid
@@ -609,6 +639,7 @@ class WorkspaceChatCatalogWorker:
         return [
             {
                 "provider_topic_id": f"{provider_stream_id}:{row['name']}",
+                "projection_topic_uuid": str(row["uuid"]),
                 "name": str(row["name"]),
                 "is_default": False,
             }
@@ -620,6 +651,15 @@ class WorkspaceChatCatalogWorker:
         source: _CatalogSource,
         catalog: dict[str, object],
     ) -> int:
+        previous_projection_revision = await self._pool.fetchval(
+            """
+            SELECT projection_revision
+            FROM workspace_zulip_bridge.workspace_chat_catalog_reports
+            WHERE external_account_uuid = $1 AND zulip_stream_uuid = $2
+            """,
+            source.account_uuid,
+            source.stream_uuid,
+        )
         catalog_hash = _canonical_hash(
             {
                 "projection_revision": CATALOG_PROJECTION_REVISION,
@@ -758,34 +798,76 @@ class WorkspaceChatCatalogWorker:
             source.source_activity_at,
             source.source_updated_at,
         )
+        if (
+            previous_projection_revision is not None
+            and previous_projection_revision < CATALOG_PROJECTION_REVISION
+        ):
+            await self._requeue_moved_projection_messages(source)
         return int(result.endswith(" 1"))
+
+    async def _requeue_moved_projection_messages(
+        self,
+        source: _CatalogSource,
+    ) -> int:
+        """Reproject only rows that landed in the superseded chat projection."""
+        result = await self._pool.fetchrow(
+            """
+            WITH moved_messages AS MATERIALIZED (
+                SELECT message.uuid
+                FROM workspace_zulip_bridge.zulip_realms AS realm
+                JOIN workspace_zulip_bridge.workspace_mirror_state AS state
+                  ON state.provider_uuid = realm.workspace_provider_uuid
+                 AND state.active_generation IS NOT NULL
+                JOIN workspace_zulip_bridge.zulip_messages AS message
+                  ON message.realm_uuid = realm.uuid
+                 AND message.zulip_stream_uuid = $1
+                JOIN workspace_zulip_bridge.workspace_messages AS target
+                  ON target.provider_uuid = realm.workspace_provider_uuid
+                 AND target.snapshot_generation = state.active_generation
+                 AND target.uuid = message.uuid
+                WHERE realm.uuid = $2
+                  AND target.data->>'stream_uuid' IS DISTINCT FROM $1::text
+            ), queued_messages AS (
+                INSERT INTO workspace_zulip_bridge.workspace_outbox (
+                    realm_uuid, entity_type, action, entity_uuid
+                )
+                SELECT $2, 'message', 'upsert', uuid
+                FROM moved_messages
+                ON CONFLICT (realm_uuid, entity_type, entity_uuid)
+                    WHERE delivery_status = 'pending'
+                DO UPDATE SET action = 'upsert', entity_hash = NULL,
+                              available_at = clock_timestamp(),
+                              attempt_count = 0, last_error = NULL,
+                              updated_at = clock_timestamp()
+                RETURNING 1
+            ), queued_flags AS (
+                INSERT INTO workspace_zulip_bridge.workspace_outbox (
+                    realm_uuid, entity_type, action, entity_uuid
+                )
+                SELECT $2, 'message_flag', 'upsert', flag.uuid
+                FROM workspace_zulip_bridge.zulip_message_flags AS flag
+                JOIN moved_messages ON moved_messages.uuid = flag.message_uuid
+                ON CONFLICT (realm_uuid, entity_type, entity_uuid)
+                    WHERE delivery_status = 'pending'
+                DO UPDATE SET action = 'upsert', entity_hash = NULL,
+                              available_at = clock_timestamp(),
+                              attempt_count = 0, last_error = NULL,
+                              updated_at = clock_timestamp()
+                RETURNING 1
+            )
+            SELECT (SELECT count(*) FROM queued_messages) AS messages,
+                   (SELECT count(*) FROM queued_flags) AS flags
+            """,
+            source.stream_uuid,
+            source.realm_uuid,
+        )
+        assert result is not None
+        return int(result["messages"]) + int(result["flags"])
 
     async def _claim_report(self) -> asyncpg.Record | None:
         return await self._pool.fetchrow(
             """
-            WITH active_file_work AS (
-                SELECT connection.external_account_uuid,
-                       projection.zulip_stream_uuid,
-                       min(projection.delivery_priority) AS delivery_priority,
-                       max(file.source_created_at) AS newest_file_at
-                FROM workspace_zulip_bridge.workspace_file_projections AS projection
-                JOIN workspace_zulip_bridge.zulip_files AS file
-                  ON file.uuid = projection.file_uuid
-                JOIN workspace_zulip_bridge.zulip_streams AS stream
-                  ON stream.uuid = projection.zulip_stream_uuid
-                JOIN workspace_zulip_bridge.zulip_connections AS connection
-                  ON connection.uuid = stream.source_connection_uuid
-                WHERE projection.processing_status IN (
-                          'pending', 'processing', 'failed'
-                      )
-                  AND (
-                      projection.delivery_priority = 0
-                      OR projection.last_error = 'workspace_file_http_403'
-                  )
-                  AND connection.external_account_uuid IS NOT NULL
-                GROUP BY connection.external_account_uuid,
-                         projection.zulip_stream_uuid
-            ), expired AS (
+            WITH expired AS (
                 UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports
                 SET processing_status = 'failed', claimed_at = NULL,
                     available_at = clock_timestamp(), last_error = 'claim_expired',
@@ -795,15 +877,23 @@ class WorkspaceChatCatalogWorker:
             ), candidate AS (
                 SELECT report.external_account_uuid, report.zulip_stream_uuid
                 FROM workspace_zulip_bridge.workspace_chat_catalog_reports AS report
-                LEFT JOIN active_file_work AS file_work
-                  ON file_work.external_account_uuid = report.external_account_uuid
-                 AND file_work.zulip_stream_uuid = report.zulip_stream_uuid
                 WHERE report.processing_status IN ('pending', 'failed')
                   AND report.available_at <= clock_timestamp()
+                  AND EXISTS (
+                      SELECT 1
+                      FROM workspace_zulip_bridge.zulip_streams AS stream
+                      JOIN workspace_zulip_bridge.zulip_connections AS connection
+                        ON connection.uuid = stream.source_connection_uuid
+                      JOIN workspace_zulip_bridge.zulip_users AS zulip_user
+                        ON zulip_user.uuid = connection.zulip_user_uuid
+                      WHERE stream.uuid = report.zulip_stream_uuid
+                        AND connection.external_account_uuid =
+                            report.external_account_uuid
+                        AND connection.sync_enabled
+                        AND NOT zulip_user.disabled
+                  )
                 ORDER BY report.source_activity_at DESC,
                          report.source_updated_at DESC,
-                         coalesce(file_work.delivery_priority, 1),
-                         file_work.newest_file_at DESC NULLS LAST,
                          report.available_at, report.updated_at,
                          report.external_account_uuid, report.zulip_stream_uuid
                 LIMIT 1 FOR UPDATE SKIP LOCKED

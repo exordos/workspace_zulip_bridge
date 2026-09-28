@@ -31,7 +31,7 @@ LOG = logging.getLogger(__name__)
 MAX_FILE_BYTES = 50 * 1024 * 1024
 # Increment when a catalog replay is required before files may be projected.
 # The catalog and file workers share this readiness contract.
-CATALOG_PROJECTION_REVISION = 3
+CATALOG_PROJECTION_REVISION = 4
 _CONTENT_TYPE = re.compile(r"^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$")
 _WORKSPACE_URN = re.compile(r"^urn:(?:file|image|video):[0-9a-f-]{36}$")
 _BACKFILL_CANDIDATE_BATCH_SIZE = 20_000
