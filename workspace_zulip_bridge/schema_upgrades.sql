@@ -204,6 +204,55 @@ BEGIN
             NOT NULL DEFAULT '{}'::bigint[];
     END IF;
 
+    IF to_regclass(
+        'workspace_zulip_bridge.workspace_chat_catalog_reports'
+    ) IS NOT NULL THEN
+        ALTER TABLE workspace_zulip_bridge.workspace_chat_catalog_reports
+            ADD COLUMN IF NOT EXISTS projection_revision integer
+            NOT NULL DEFAULT 1;
+        ALTER TABLE workspace_zulip_bridge.workspace_chat_catalog_reports
+            ADD COLUMN IF NOT EXISTS source_activity_at timestamptz;
+        IF to_regclass('workspace_zulip_bridge.zulip_streams') IS NOT NULL
+           AND to_regclass('workspace_zulip_bridge.zulip_messages') IS NOT NULL
+        THEN
+            UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports
+                AS report
+            SET source_activity_at = GREATEST(
+                stream.created_at,
+                COALESCE((
+                    SELECT message.created_at
+                    FROM workspace_zulip_bridge.zulip_messages AS message
+                    WHERE message.zulip_stream_uuid = stream.uuid
+                    ORDER BY message.created_at DESC, message.uuid DESC
+                    LIMIT 1
+                ), '-infinity'::timestamptz)
+            )
+            FROM workspace_zulip_bridge.zulip_streams AS stream
+            WHERE stream.uuid = report.zulip_stream_uuid
+              AND report.source_activity_at IS NULL;
+        END IF;
+        UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports
+        SET source_activity_at = created_at
+        WHERE source_activity_at IS NULL;
+        ALTER TABLE workspace_zulip_bridge.workspace_chat_catalog_reports
+            ALTER COLUMN source_activity_at SET DEFAULT clock_timestamp();
+        ALTER TABLE workspace_zulip_bridge.workspace_chat_catalog_reports
+            ALTER COLUMN source_activity_at SET NOT NULL;
+        IF NOT EXISTS (
+            SELECT 1
+            FROM pg_constraint
+            WHERE conrelid =
+                    'workspace_zulip_bridge.workspace_chat_catalog_reports'::regclass
+              AND conname =
+                    'workspace_chat_catalog_reports_projection_revision_check'
+        ) THEN
+            ALTER TABLE workspace_zulip_bridge.workspace_chat_catalog_reports
+                ADD CONSTRAINT
+                    workspace_chat_catalog_reports_projection_revision_check
+                CHECK (projection_revision > 0) NOT VALID;
+        END IF;
+    END IF;
+
     IF to_regclass('workspace_zulip_bridge.workspace_events') IS NOT NULL
        AND NOT EXISTS (
             SELECT 1
@@ -253,6 +302,38 @@ BEGIN
                 ADD CONSTRAINT sync_diffs_dependency_wait_count_check
                 CHECK (dependency_wait_count >= 0);
         END IF;
+    END IF;
+END;
+$upgrade$;
+
+DO $upgrade$
+BEGIN
+    IF to_regclass(
+        'workspace_zulip_bridge.workspace_chat_catalog_reports'
+    ) IS NOT NULL THEN
+        EXECUTE $index$
+            CREATE INDEX IF NOT EXISTS
+                workspace_chat_catalog_reports_activity_pending_idx
+            ON workspace_zulip_bridge.workspace_chat_catalog_reports (
+                source_activity_at DESC, source_updated_at DESC, available_at,
+                external_account_uuid, zulip_stream_uuid
+            )
+            WHERE processing_status IN ('pending', 'failed')
+        $index$;
+    END IF;
+END;
+$upgrade$;
+
+DO $upgrade$
+BEGIN
+    IF to_regclass('workspace_zulip_bridge.zulip_events') IS NOT NULL THEN
+        EXECUTE $index$
+            CREATE INDEX IF NOT EXISTS zulip_events_pending_queue_head_idx
+            ON workspace_zulip_bridge.zulip_events (
+                zulip_connection_uuid, queue_id, event_id
+            )
+            WHERE processing_status = 'pending'
+        $index$;
     END IF;
 END;
 $upgrade$;

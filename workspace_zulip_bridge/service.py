@@ -125,15 +125,16 @@ class BridgeService:
                         name="workspace-control",
                     )
                 )
-                supervised_tasks.append(
+                supervised_tasks.extend(
                     asyncio.create_task(
                         WorkspaceChatCatalogWorker(
                             pool,
                             self._settings,
                             control_semaphore=file_control_semaphore,
                         ).run(),
-                        name="workspace-chat-catalog",
+                        name=f"workspace-chat-catalog-{index}",
                     )
+                    for index in range(self._settings.workspace_chat_catalog_workers)
                 )
                 supervised_tasks.extend(
                     asyncio.create_task(

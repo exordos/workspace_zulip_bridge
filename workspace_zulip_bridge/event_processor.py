@@ -722,7 +722,7 @@ class ZulipEventProcessor:
                             AND inflight.queue_id = queue.queue_id
                             AND inflight.processing_status = 'processing'
                       )
-                    ORDER BY head.head_created_at,
+                    ORDER BY head.head_created_at DESC,
                              queue.zulip_connection_uuid,
                              queue.queue_id
                     LIMIT $6
@@ -757,7 +757,7 @@ class ZulipEventProcessor:
                            row_number() OVER (
                                PARTITION BY candidate.dependency_head
                                ORDER BY
-                                        candidate.head_created_at,
+                                        candidate.head_created_at DESC,
                                         candidate.zulip_connection_uuid,
                                         candidate.queue_id,
                                         candidate.event_id
@@ -792,7 +792,7 @@ class ZulipEventProcessor:
                                  ELSE 1
                              END,
                              candidate.dependency_head,
-                             candidate.head_created_at,
+                             candidate.head_created_at DESC,
                              candidate.zulip_connection_uuid,
                              candidate.queue_id,
                              candidate.event_id

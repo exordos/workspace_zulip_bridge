@@ -452,6 +452,8 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_chat_catalog_reports
     observed_generation bigint NOT NULL CHECK (observed_generation > 0),
     catalog jsonb NOT NULL CHECK (jsonb_typeof(catalog) = 'object'),
     catalog_hash bytea NOT NULL CHECK (octet_length(catalog_hash) = 32),
+    projection_revision integer NOT NULL DEFAULT 1
+        CHECK (projection_revision > 0),
     report_uuid uuid NOT NULL UNIQUE,
     report jsonb NOT NULL CHECK (jsonb_typeof(report) = 'object'),
     processing_status text NOT NULL DEFAULT 'pending'
@@ -462,6 +464,7 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_chat_catalog_reports
     available_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     claimed_at timestamptz,
     reported_at timestamptz,
+    source_activity_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     source_updated_at timestamptz NOT NULL,
     last_error text,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
@@ -471,6 +474,11 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_chat_catalog_reports
 CREATE INDEX IF NOT EXISTS workspace_chat_catalog_reports_pending_idx
     ON workspace_zulip_bridge.workspace_chat_catalog_reports
         (available_at, updated_at, external_account_uuid, zulip_stream_uuid)
+    WHERE processing_status IN ('pending', 'failed');
+CREATE INDEX IF NOT EXISTS workspace_chat_catalog_reports_activity_pending_idx
+    ON workspace_zulip_bridge.workspace_chat_catalog_reports
+        (source_activity_at DESC, source_updated_at DESC, available_at,
+         external_account_uuid, zulip_stream_uuid)
     WHERE processing_status IN ('pending', 'failed');
 
 CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_events (
@@ -503,6 +511,11 @@ CREATE INDEX IF NOT EXISTS zulip_events_pending_queue_idx
     ON workspace_zulip_bridge.zulip_events (
         zulip_connection_uuid, queue_id, event_id
     ) INCLUDE (uuid, available_at, created_at, outcome_reason)
+    WHERE processing_status = 'pending';
+CREATE INDEX IF NOT EXISTS zulip_events_pending_queue_head_idx
+    ON workspace_zulip_bridge.zulip_events (
+        zulip_connection_uuid, queue_id, event_id
+    )
     WHERE processing_status = 'pending';
 CREATE INDEX IF NOT EXISTS zulip_events_pending_queue_schedule_idx
     ON workspace_zulip_bridge.zulip_events (

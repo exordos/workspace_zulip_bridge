@@ -7584,6 +7584,7 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
     provider_uuid = UUID("10000000-0000-4000-8000-0000000000c4")
     bridge_uuid = UUID("10000000-0000-4000-8000-0000000000c5")
     stream_uuid = stable_chat_uuid(ENDPOINT, "channel:42")
+    later_created_stream_uuid = stable_chat_uuid(ENDPOINT, "channel:43")
     owner_uuid = stable_user_uuid(ENDPOINT, 10)
     member_uuid = stable_user_uuid(ENDPOINT, 11)
     topic_uuid = stable_topic_uuid(stream_uuid, "deployments")
@@ -7761,7 +7762,8 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
         )
         stored = await pool.fetchrow(
             """
-            SELECT catalog, report, report_uuid, processing_status
+            SELECT catalog, report, report_uuid, processing_status,
+                   projection_revision, source_activity_at
             FROM workspace_zulip_bridge.workspace_chat_catalog_reports
             WHERE external_account_uuid = $1 AND zulip_stream_uuid = $2
             """,
@@ -7789,7 +7791,77 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
             "external_chat_catalog"
         )
         assert stored["processing_status"] == "pending"
+        assert stored["projection_revision"] == 2
+        assert stored["source_activity_at"] is not None
         assert await transfer_worker._claim_job() is None
+
+        # Real chat activity must win over a later technical catalog refresh.
+        # Discovery and projection timestamps can be recent for old history,
+        # so they must not displace a chat with a newer source message.
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.zulip_streams
+            SET created_at = clock_timestamp() - interval '2 hours'
+            WHERE uuid = $1
+            """,
+            stream_uuid,
+        )
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports
+            SET source_activity_at = clock_timestamp(),
+                source_updated_at = clock_timestamp() - interval '2 hours',
+                reported_at = clock_timestamp()
+            WHERE external_account_uuid = $1 AND zulip_stream_uuid = $2
+            """,
+            account_uuid,
+            stream_uuid,
+        )
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.zulip_streams (
+                uuid, realm_uuid, chat_type, chat_key, name, description,
+                content_hash, source_connection_uuid, created_at
+            ) VALUES ($1, $2, 'channel', 'channel:43', 'Later created',
+                      '', $3, $4,
+                      clock_timestamp() - interval '1 hour')
+            """,
+            later_created_stream_uuid,
+            stable_realm_uuid(ENDPOINT),
+            b"l" * 32,
+            owner_uuid,
+        )
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.zulip_stream_bindings (
+                uuid, zulip_stream_uuid, zulip_user_uuid, role,
+                membership_kind, content_hash
+            ) VALUES ($1, $2, $3, 'owner', 'subscriber', $4)
+            """,
+            stable_stream_binding_uuid(later_created_stream_uuid, owner_uuid),
+            later_created_stream_uuid,
+            owner_uuid,
+            b"l" * 32,
+        )
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.workspace_chat_catalog_reports (
+                external_account_uuid, zulip_stream_uuid, resource_uuid,
+                observed_generation, catalog, catalog_hash, report_uuid,
+                report, source_activity_at, source_updated_at
+            )
+            SELECT external_account_uuid, $1, $2, observed_generation,
+                   catalog, catalog_hash, $3, report,
+                   clock_timestamp() - interval '1 hour', clock_timestamp()
+            FROM workspace_zulip_bridge.workspace_chat_catalog_reports
+            WHERE external_account_uuid = $4 AND zulip_stream_uuid = $5
+            """,
+            later_created_stream_uuid,
+            UUID("10000000-0000-4000-8000-0000000000ca"),
+            UUID("10000000-0000-4000-8000-0000000000cb"),
+            account_uuid,
+            stream_uuid,
+        )
 
         # Simulate rows produced by the earlier all-members implementation.
         # The worker must retire reports that no longer belong to the selected
@@ -7799,10 +7871,11 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
             INSERT INTO workspace_zulip_bridge.workspace_chat_catalog_reports (
                 external_account_uuid, zulip_stream_uuid, resource_uuid,
                 observed_generation, catalog, catalog_hash, report_uuid,
-                report, source_updated_at
+                report, source_activity_at, source_updated_at
             )
             SELECT $1, zulip_stream_uuid, $2, observed_generation, catalog,
-                   catalog_hash, $3, report, source_updated_at
+                   catalog_hash, $3, report, source_activity_at,
+                   source_updated_at
             FROM workspace_zulip_bridge.workspace_chat_catalog_reports
             WHERE external_account_uuid = $4 AND zulip_stream_uuid = $5
             """,
@@ -7827,10 +7900,15 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
         await pool.execute(
             """
             UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports
-            SET processing_status = 'pending', claimed_at = NULL
+            SET processing_status = 'pending', claimed_at = NULL,
+                source_updated_at = clock_timestamp()
             WHERE report_uuid = $1
             """,
             stored["report_uuid"],
+        )
+        await pool.execute(
+            "DELETE FROM workspace_zulip_bridge.zulip_streams WHERE uuid = $1",
+            later_created_stream_uuid,
         )
         assert await worker._retire_unneeded_reports() == 1
         assert (
@@ -7905,6 +7983,47 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
         assert unchanged is not None
         assert unchanged["report"] == original_report
         assert unchanged["processing_status"] == "reported"
+
+        previous_report_uuid = UUID("10000000-0000-4000-8000-0000000000ca")
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports
+            SET projection_revision = 1,
+                catalog_hash = $3,
+                report_uuid = $4,
+                processing_status = 'reported'
+            WHERE external_account_uuid = $1 AND zulip_stream_uuid = $2
+            """,
+            account_uuid,
+            stream_uuid,
+            b"l" * 32,
+            previous_report_uuid,
+        )
+        assert await worker._refresh_catalogs() == 1
+        upgraded = await pool.fetchrow(
+            """
+            SELECT report_uuid, processing_status, projection_revision,
+                   reported_at
+            FROM workspace_zulip_bridge.workspace_chat_catalog_reports
+            WHERE external_account_uuid = $1 AND zulip_stream_uuid = $2
+            """,
+            account_uuid,
+            stream_uuid,
+        )
+        assert upgraded is not None
+        assert upgraded["projection_revision"] == 2
+        assert upgraded["processing_status"] == "pending"
+        assert upgraded["report_uuid"] != previous_report_uuid
+        assert upgraded["reported_at"] is None
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports
+            SET processing_status = 'reported'
+            WHERE external_account_uuid = $1 AND zulip_stream_uuid = $2
+            """,
+            account_uuid,
+            stream_uuid,
+        )
 
         await pool.execute(
             """
@@ -10457,8 +10576,12 @@ def test_backlog_processors_claim_distinct_queues_concurrently() -> None:
     asyncio.run(_backlog_processors_claim_distinct_queues_concurrently(_dsn()))
 
 
-def test_realtime_processor_claims_oldest_recent_queue_first() -> None:
-    asyncio.run(_realtime_processor_claims_oldest_recent_queue_first(_dsn()))
+def test_realtime_processor_claims_newest_recent_queue_first() -> None:
+    asyncio.run(_realtime_processor_claims_newest_recent_queue_first(_dsn()))
+
+
+def test_backlog_processor_claims_newest_historical_queue_first() -> None:
+    asyncio.run(_backlog_processor_claims_newest_historical_queue_first(_dsn()))
 
 
 def test_event_processor_recovers_expired_claims_periodically() -> None:
@@ -10629,7 +10752,7 @@ async def _backlog_processors_claim_distinct_queues_concurrently(dsn: str) -> No
         await pool.close()
 
 
-async def _realtime_processor_claims_oldest_recent_queue_first(dsn: str) -> None:
+async def _realtime_processor_claims_newest_recent_queue_first(dsn: str) -> None:
     pool = await _pool(dsn)
     try:
         store = EventStore(pool)
@@ -10677,7 +10800,68 @@ async def _realtime_processor_claims_oldest_recent_queue_first(dsn: str) -> None
         claims = await processor._claim_events()
 
         assert len(claims) == 1
-        assert claims[0].user_uuid == older_uuid
+        assert claims[0].user_uuid == newer_uuid
+    finally:
+        await pool.close()
+
+
+async def _backlog_processor_claims_newest_historical_queue_first(
+    dsn: str,
+) -> None:
+    pool = await _pool(dsn)
+    try:
+        store = EventStore(pool)
+        async with pool.acquire() as connection:
+            older_uuid = await _insert_user(
+                connection, 10, 100, queue_id="queue-older", status="active"
+            )
+            newer_uuid = await _insert_user(
+                connection, 11, 100, queue_id="queue-newer", status="active"
+            )
+        for user_uuid, queue_id in (
+            (older_uuid, "queue-older"),
+            (newer_uuid, "queue-newer"),
+        ):
+            assert await store.store_events(
+                user_uuid,
+                queue_id,
+                (
+                    ZulipEvent(
+                        event_id=1,
+                        event_type="heartbeat",
+                        payload_json=json.dumps({"id": 1, "type": "heartbeat"}),
+                    ),
+                ),
+                1,
+            ) == (1, True)
+        await pool.execute(
+            "UPDATE workspace_zulip_bridge.zulip_events "
+            "SET created_at = clock_timestamp() - interval '10 minutes' "
+            "WHERE zulip_connection_uuid = $1",
+            older_uuid,
+        )
+        await pool.execute(
+            "UPDATE workspace_zulip_bridge.zulip_events "
+            "SET created_at = clock_timestamp() - interval '8 minutes' "
+            "WHERE zulip_connection_uuid = $1",
+            newer_uuid,
+        )
+        processor = ZulipEventProcessor(
+            pool,
+            store,
+            Settings.from_env(
+                {
+                    "WZB_DATABASE_DSN": dsn,
+                    "WZB_EVENT_PROCESSOR_BATCH_SIZE": "1",
+                }
+            ),
+            claim_scope="backlog",
+        )
+
+        claims = await processor._claim_events()
+
+        assert len(claims) == 1
+        assert claims[0].user_uuid == newer_uuid
     finally:
         await pool.close()
 

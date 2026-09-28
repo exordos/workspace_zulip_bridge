@@ -39,7 +39,8 @@ def test_defaults_use_local_postgresql_socket() -> None:
     assert settings.workspace_sync_batch_size == 500
     assert settings.workspace_sync_workers == 2
     assert settings.workspace_file_transfer_workers == 32
-    assert settings.workspace_file_control_concurrency == 2
+    assert settings.workspace_file_control_concurrency == 8
+    assert settings.workspace_chat_catalog_workers == 4
     assert settings.zulip_queue_gap_reconciliation_seconds == 86400.0
     assert settings.workspace_dependency_retry_base_seconds == 2.0
     assert settings.workspace_dependency_retry_cap_seconds == 300.0
@@ -91,7 +92,8 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
             "WZB_WORKSPACE_SYNC_BATCH_SIZE": "250",
             "WZB_WORKSPACE_SYNC_WORKERS": "4",
             "WZB_WORKSPACE_FILE_TRANSFER_WORKERS": "3",
-            "WZB_WORKSPACE_FILE_CONTROL_CONCURRENCY": "2",
+            "WZB_WORKSPACE_FILE_CONTROL_CONCURRENCY": "6",
+            "WZB_WORKSPACE_CHAT_CATALOG_WORKERS": "3",
             "WZB_ZULIP_QUEUE_GAP_RECONCILIATION_SECONDS": "7200",
             "WZB_WORKSPACE_DEPENDENCY_RETRY_BASE_SECONDS": "4",
             "WZB_WORKSPACE_DEPENDENCY_RETRY_CAP_SECONDS": "90",
@@ -133,7 +135,8 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
     assert settings.workspace_sync_batch_size == 250
     assert settings.workspace_sync_workers == 4
     assert settings.workspace_file_transfer_workers == 3
-    assert settings.workspace_file_control_concurrency == 2
+    assert settings.workspace_file_control_concurrency == 6
+    assert settings.workspace_chat_catalog_workers == 3
     assert settings.zulip_queue_gap_reconciliation_seconds == 7200.0
     assert settings.workspace_dependency_retry_base_seconds == 4.0
     assert settings.workspace_dependency_retry_cap_seconds == 90.0
@@ -186,6 +189,8 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
         ("WZB_WORKSPACE_FILE_TRANSFER_WORKERS", "33"),
         ("WZB_WORKSPACE_FILE_CONTROL_CONCURRENCY", "0"),
         ("WZB_WORKSPACE_FILE_CONTROL_CONCURRENCY", "33"),
+        ("WZB_WORKSPACE_CHAT_CATALOG_WORKERS", "0"),
+        ("WZB_WORKSPACE_CHAT_CATALOG_WORKERS", "9"),
         ("WZB_ZULIP_RETRY_CAP_SECONDS", "0"),
     ],
 )

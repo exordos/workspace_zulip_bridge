@@ -25,6 +25,8 @@ from workspace_zulip_bridge.workspace_file_transfer import MAX_FILE_BYTES
 
 LOG = logging.getLogger(__name__)
 
+_CATALOG_PROJECTION_REVISION = 2
+
 _CHANNEL_CAPABILITIES = frozenset(
     {
         "messenger.membership.write",
@@ -71,6 +73,7 @@ class _CatalogSource:
     display_name: str
     description: str
     chat_parameters: Mapping[str, object]
+    source_activity_at: datetime.datetime
     source_updated_at: datetime.datetime
 
 
@@ -167,6 +170,7 @@ class WorkspaceChatCatalogWorker:
                        stream.chat_type, stream.chat_key,
                        stream.name AS display_name, stream.description,
                        stream.chat_parameters,
+                       stream.created_at AS stream_created_at,
                        stream.updated_at AS stream_updated_at,
                        owner_binding.updated_at AS owner_binding_updated_at,
                        owner.updated_at AS owner_updated_at
@@ -195,6 +199,7 @@ class WorkspaceChatCatalogWorker:
                       report.external_account_uuid IS NULL
                       OR report.observed_generation <>
                          connection.desired_generation
+                      OR report.projection_revision <> $1
                   )
                 ORDER BY (report.external_account_uuid IS NULL) DESC,
                          stream.updated_at DESC,
@@ -210,6 +215,16 @@ class WorkspaceChatCatalogWorker:
                    candidate.chat_type, candidate.chat_key,
                    candidate.display_name, candidate.description,
                    candidate.chat_parameters,
+                   GREATEST(
+                       candidate.stream_created_at,
+                       COALESCE((
+                           SELECT message.created_at
+                           FROM workspace_zulip_bridge.zulip_messages AS message
+                           WHERE message.zulip_stream_uuid = candidate.stream_uuid
+                           ORDER BY message.created_at DESC, message.uuid DESC
+                           LIMIT 1
+                       ), '-infinity'::timestamptz)
+                   ) AS source_activity_at,
                    EXISTS (
                        SELECT 1
                        FROM workspace_zulip_bridge.workspace_file_projections
@@ -256,7 +271,8 @@ class WorkspaceChatCatalogWorker:
             FROM candidates AS candidate
             ORDER BY candidate.stream_updated_at DESC,
                      candidate.account_uuid, candidate.stream_uuid
-            """
+            """,
+            _CATALOG_PROJECTION_REVISION,
         )
         if not rows:
             rows = await self._pool.fetch(
@@ -272,6 +288,16 @@ class WorkspaceChatCatalogWorker:
                    stream.chat_type, stream.chat_key,
                    stream.name AS display_name, stream.description,
                    stream.chat_parameters,
+                   GREATEST(
+                       stream.created_at,
+                       COALESCE((
+                           SELECT message.created_at
+                           FROM workspace_zulip_bridge.zulip_messages AS message
+                           WHERE message.zulip_stream_uuid = stream.uuid
+                           ORDER BY message.created_at DESC, message.uuid DESC
+                           LIMIT 1
+                       ), '-infinity'::timestamptz)
+                   ) AS source_activity_at,
                    EXISTS (
                        SELECT 1
                        FROM workspace_zulip_bridge.workspace_file_projections
@@ -334,6 +360,7 @@ class WorkspaceChatCatalogWorker:
               AND (
                   report.external_account_uuid IS NULL
                   OR report.observed_generation <> connection.desired_generation
+                  OR report.projection_revision <> $1
                   OR report.source_updated_at < GREATEST(
                        stream.updated_at,
                        owner_binding.updated_at,
@@ -357,7 +384,8 @@ class WorkspaceChatCatalogWorker:
                      newest_live_file_at DESC NULLS LAST,
                      connection.external_account_uuid, stream.uuid
                 LIMIT 20
-                """
+                """,
+                _CATALOG_PROJECTION_REVISION,
             )
         for row in rows:
             source = _CatalogSource(
@@ -374,6 +402,7 @@ class WorkspaceChatCatalogWorker:
                 display_name=str(row["display_name"]),
                 description=str(row["description"]),
                 chat_parameters=_object(row["chat_parameters"]),
+                source_activity_at=row["source_activity_at"],
                 source_updated_at=row["source_updated_at"],
             )
             try:
@@ -586,7 +615,12 @@ class WorkspaceChatCatalogWorker:
         source: _CatalogSource,
         catalog: dict[str, object],
     ) -> int:
-        catalog_hash = _canonical_hash(catalog)
+        catalog_hash = _canonical_hash(
+            {
+                "projection_revision": _CATALOG_PROJECTION_REVISION,
+                "catalog": catalog,
+            }
+        )
         resource_uuid = stable_external_chat_uuid(source.account_uuid, source.chat_key)
         report_uuid = uuid5(
             self._bridge_uuid,
@@ -607,9 +641,13 @@ class WorkspaceChatCatalogWorker:
             """
             INSERT INTO workspace_zulip_bridge.workspace_chat_catalog_reports (
                 external_account_uuid, zulip_stream_uuid, resource_uuid,
-                observed_generation, catalog, catalog_hash, report_uuid, report,
-                source_updated_at, processing_status
-            ) VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8::jsonb, $9, 'pending')
+                observed_generation, catalog, catalog_hash, projection_revision,
+                report_uuid, report, source_activity_at, source_updated_at,
+                processing_status
+            ) VALUES (
+                $1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9::jsonb, $10, $11,
+                'pending'
+            )
             ON CONFLICT (external_account_uuid, zulip_stream_uuid) DO UPDATE
             SET resource_uuid = EXCLUDED.resource_uuid,
                 observed_generation = CASE
@@ -636,6 +674,7 @@ class WorkspaceChatCatalogWorker:
                     THEN EXCLUDED.catalog_hash
                     ELSE workspace_chat_catalog_reports.catalog_hash
                 END,
+                projection_revision = EXCLUDED.projection_revision,
                 report_uuid = CASE
                     WHEN workspace_chat_catalog_reports.catalog_hash
                          IS DISTINCT FROM EXCLUDED.catalog_hash
@@ -652,6 +691,7 @@ class WorkspaceChatCatalogWorker:
                     THEN EXCLUDED.report
                     ELSE workspace_chat_catalog_reports.report
                 END,
+                source_activity_at = EXCLUDED.source_activity_at,
                 source_updated_at = EXCLUDED.source_updated_at,
                 processing_status = CASE
                     WHEN workspace_chat_catalog_reports.catalog_hash
@@ -683,7 +723,14 @@ class WorkspaceChatCatalogWorker:
                          IS DISTINCT FROM EXCLUDED.observed_generation
                     THEN NULL ELSE workspace_chat_catalog_reports.claimed_at
                 END,
-                reported_at = workspace_chat_catalog_reports.reported_at,
+                reported_at = CASE
+                    WHEN workspace_chat_catalog_reports.catalog_hash
+                         IS DISTINCT FROM EXCLUDED.catalog_hash
+                      OR workspace_chat_catalog_reports.observed_generation
+                         IS DISTINCT FROM EXCLUDED.observed_generation
+                    THEN NULL
+                    ELSE workspace_chat_catalog_reports.reported_at
+                END,
                 last_error = CASE
                     WHEN workspace_chat_catalog_reports.catalog_hash
                          IS DISTINCT FROM EXCLUDED.catalog_hash
@@ -700,8 +747,10 @@ class WorkspaceChatCatalogWorker:
             source.desired_generation,
             json.dumps(catalog, ensure_ascii=False),
             catalog_hash,
+            _CATALOG_PROJECTION_REVISION,
             report_uuid,
             json.dumps(report, ensure_ascii=False),
+            source.source_activity_at,
             source.source_updated_at,
         )
         return int(result.endswith(" 1"))
@@ -741,35 +790,15 @@ class WorkspaceChatCatalogWorker:
             ), candidate AS (
                 SELECT report.external_account_uuid, report.zulip_stream_uuid
                 FROM workspace_zulip_bridge.workspace_chat_catalog_reports AS report
-                JOIN workspace_zulip_bridge.zulip_streams AS source_stream
-                  ON source_stream.uuid = report.zulip_stream_uuid
                 LEFT JOIN active_file_work AS file_work
                   ON file_work.external_account_uuid = report.external_account_uuid
                  AND file_work.zulip_stream_uuid = report.zulip_stream_uuid
                 WHERE report.processing_status IN ('pending', 'failed')
                   AND report.available_at <= clock_timestamp()
-                ORDER BY CASE
-                             WHEN report.reported_at IS NULL
-                              AND source_stream.created_at >=
-                                  clock_timestamp() - interval '1 day'
-                             THEN 0
-                             WHEN report.source_updated_at >= clock_timestamp()
-                                  - make_interval(secs => $1::double precision)
-                             THEN 1
-                             WHEN report.reported_at IS NULL THEN 2
-                             ELSE 3
-                         END,
-                         CASE
-                             WHEN report.reported_at IS NULL
-                             THEN source_stream.created_at
-                         END DESC NULLS LAST,
-                         (
-                             report.source_updated_at >= clock_timestamp()
-                             - make_interval(secs => $1::double precision)
-                         ) DESC,
+                ORDER BY report.source_activity_at DESC,
+                         report.source_updated_at DESC,
                          coalesce(file_work.delivery_priority, 1),
                          file_work.newest_file_at DESC NULLS LAST,
-                         report.source_updated_at DESC,
                          report.available_at, report.updated_at,
                          report.external_account_uuid, report.zulip_stream_uuid
                 LIMIT 1 FOR UPDATE SKIP LOCKED
@@ -783,7 +812,6 @@ class WorkspaceChatCatalogWorker:
               AND report.zulip_stream_uuid = candidate.zulip_stream_uuid
             RETURNING report.report_uuid, report.report
             """,
-            self._settings.event_processor_realtime_window_seconds,
         )
 
     def _client(self) -> httpx.AsyncClient:

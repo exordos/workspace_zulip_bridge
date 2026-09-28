@@ -106,6 +106,8 @@ resources:
           WZB_ZULIP_HISTORY_CONCURRENCY=4
           WZB_ZULIP_MESSAGE_PAGE_SIZE=2000
           WZB_WORKSPACE_SYNC_WORKERS=2
+          WZB_WORKSPACE_FILE_CONTROL_CONCURRENCY=8
+          WZB_WORKSPACE_CHAT_CATALOG_WORKERS=4
           WZB_ZULIP_CA_FILE=/var/lib/workspace_zulip_bridge/control/zulip-ca.pem
           WZB_WORKSPACE_WEBSOCKET_URL=ws://workspace-backend.{$workspace_zulip_bridge.imports.$core_local_domain:name}/api/workspace/v1/events/ws
           WZB_WORKSPACE_API_URL=http://workspace-backend.{$workspace_zulip_bridge.imports.$core_local_domain:name}/api/workspace/v1/messenger

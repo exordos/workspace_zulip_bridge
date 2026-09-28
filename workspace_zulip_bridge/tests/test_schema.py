@@ -80,6 +80,9 @@ def test_schema_normalizes_workspace_like_entities_and_personal_state() -> None:
     assert "zulip_files_newest_idx" in schema
     assert "sync_diffs_backfill_delivery_pending_idx" in schema
     assert "workspace_chat_catalog_reports_pending_idx" in schema
+    assert "workspace_chat_catalog_reports_activity_pending_idx" in schema
+    assert "source_activity_at timestamptz NOT NULL" in schema
+    assert "projection_revision integer NOT NULL DEFAULT 1" in schema
     assert "zulip_message_flags_history_cleanup_idx" in schema
     assert "bytea" not in schema[
         schema.index(
@@ -126,6 +129,7 @@ def test_schema_contains_event_retention_and_workspace_outbox_state() -> None:
     assert "zulip_events_pending_idx" in schema
     assert "zulip_events_pending_queue_scope_idx" in schema
     assert "zulip_events_pending_queue_idx" in schema
+    assert "zulip_events_pending_queue_head_idx" in schema
     assert "zulip_events_pending_queue_schedule_idx" in schema
     assert "zulip_events_processing_queue_idx" in schema
     assert "zulip_events_terminal_retention_idx" in schema
@@ -163,3 +167,4 @@ def test_schema_upgrades_preserve_older_persistent_volumes() -> None:
     assert "zulip_users" in upgrades
     assert "workspace_mirror_state" in upgrades
     assert "sync_diffs" in upgrades
+    assert "ADD COLUMN IF NOT EXISTS projection_revision integer" in upgrades
