@@ -1634,6 +1634,8 @@ class WorkspaceDiffWorker:
     PROVIDER_BATCH_SPLIT_AFTER_ATTEMPTS = 3
     PROVIDER_BATCH_SPLIT_MAX_DEPTH = 2
     PROVIDER_ENTITY_FALLBACK_AFTER_ATTEMPTS = 3
+    TOPIC_HYDRATION_BATCH_SIZE = 50
+    MISSING_TOPIC_ERROR = "Zulip topic identity is unavailable"
 
     def __init__(
         self,
@@ -2306,6 +2308,11 @@ class WorkspaceDiffWorker:
                   AND mirror.active_generation IS NOT NULL
                   AND diff.direction = 'to_zulip'
                   AND diff.processing_status = 'blocked'
+                  AND NOT (
+                      diff.entity_type IN ('messages', 'topic_bindings')
+                      AND diff.last_error =
+                          'Zulip topic identity is unavailable'
+                  )
                   AND (
                     (
                       diff.entity_type = 'topic_bindings'
@@ -2352,33 +2359,6 @@ class WorkspaceDiffWorker:
                                   target.snapshot_generation
                               AND parent.uuid =
                                   (target.data ->> 'message_uuid')::uuid
-                          )
-                      )
-                    )
-                    OR (
-                      diff.entity_type = 'messages'
-                      AND diff.last_error =
-                          'Zulip topic identity is unavailable'
-                      AND EXISTS (
-                        SELECT 1
-                        FROM workspace_zulip_bridge.workspace_messages AS target
-                        WHERE target.provider_uuid = diff.provider_uuid
-                          AND target.snapshot_generation = mirror.active_generation
-                          AND target.uuid = diff.entity_uuid
-                          AND NOT EXISTS (
-                            SELECT 1
-                            FROM workspace_zulip_bridge.workspace_topics AS parent
-                            WHERE parent.provider_uuid = target.provider_uuid
-                              AND parent.snapshot_generation =
-                                  target.snapshot_generation
-                              AND parent.uuid =
-                                  (target.data ->> 'topic_uuid')::uuid
-                          )
-                          AND NOT EXISTS (
-                            SELECT 1
-                            FROM workspace_zulip_bridge.zulip_topics AS parent
-                            WHERE parent.uuid =
-                                  (target.data ->> 'topic_uuid')::uuid
                           )
                       )
                     )
@@ -3718,6 +3698,7 @@ class WorkspaceDiffWorker:
             return len(rows)
 
     async def process_once(self, client: httpx.AsyncClient) -> int:
+        await self._repair_blocked_workspace_topic_dependencies(client)
         async with self._pool.acquire() as connection, connection.transaction():
             if getattr(self, "_delivery_priority", None) == 1:
                 await lock_historical_stage(connection)
@@ -3834,7 +3815,13 @@ class WorkspaceDiffWorker:
         to_workspace = [row for row in rows if row["direction"] == "to_workspace"]
         to_zulip = [row for row in rows if row["direction"] == "to_zulip"]
         if to_zulip:
-            await self._write_to_zulip(to_zulip)
+            to_zulip, deferred = await self._hydrate_workspace_topic_dependencies(
+                client,
+                to_zulip,
+            )
+            await self._defer_for_dependencies(deferred)
+            if to_zulip:
+                await self._write_to_zulip(to_zulip)
         if not to_workspace:
             return len(rows)
         candidates: list[
@@ -4816,6 +4803,285 @@ class WorkspaceDiffWorker:
             in active_keys
         ]
 
+    async def _missing_workspace_topic_dependencies(
+        self,
+        message_uuids: list[UUID],
+        topic_binding_uuids: list[UUID],
+    ) -> dict[tuple[str, UUID], UUID]:
+        if not message_uuids and not topic_binding_uuids:
+            return {}
+        rows = await self._pool.fetch(
+            """
+            SELECT 'messages' AS entity_type, message.uuid AS entity_uuid,
+                   (message.data ->> 'topic_uuid')::uuid AS topic_uuid
+            FROM workspace_zulip_bridge.workspace_messages AS message
+            JOIN workspace_zulip_bridge.workspace_mirror_state AS mirror
+              ON mirror.provider_uuid = message.provider_uuid
+             AND mirror.active_generation = message.snapshot_generation
+            LEFT JOIN workspace_zulip_bridge.workspace_topics AS workspace_topic
+              ON workspace_topic.provider_uuid = message.provider_uuid
+             AND workspace_topic.snapshot_generation = message.snapshot_generation
+             AND workspace_topic.uuid =
+                    (message.data ->> 'topic_uuid')::uuid
+            LEFT JOIN workspace_zulip_bridge.zulip_topics AS zulip_topic
+              ON zulip_topic.uuid = (message.data ->> 'topic_uuid')::uuid
+            WHERE message.provider_uuid = $1
+              AND message.uuid = ANY($2::uuid[])
+              AND workspace_topic.uuid IS NULL
+              AND zulip_topic.uuid IS NULL
+            UNION ALL
+            SELECT 'topic_bindings', binding.uuid,
+                   (binding.data ->> 'topic_uuid')::uuid
+            FROM workspace_zulip_bridge.workspace_topic_bindings AS binding
+            JOIN workspace_zulip_bridge.workspace_mirror_state AS mirror
+              ON mirror.provider_uuid = binding.provider_uuid
+             AND mirror.active_generation = binding.snapshot_generation
+            LEFT JOIN workspace_zulip_bridge.workspace_topics AS workspace_topic
+              ON workspace_topic.provider_uuid = binding.provider_uuid
+             AND workspace_topic.snapshot_generation = binding.snapshot_generation
+             AND workspace_topic.uuid =
+                    (binding.data ->> 'topic_uuid')::uuid
+            LEFT JOIN workspace_zulip_bridge.zulip_topics AS zulip_topic
+              ON zulip_topic.uuid = (binding.data ->> 'topic_uuid')::uuid
+            WHERE binding.provider_uuid = $1
+              AND binding.uuid = ANY($3::uuid[])
+              AND workspace_topic.uuid IS NULL
+              AND zulip_topic.uuid IS NULL
+            """,
+            self._provider_uuid,
+            message_uuids,
+            topic_binding_uuids,
+        )
+        return {
+            (str(row["entity_type"]), UUID(str(row["entity_uuid"]))): UUID(
+                str(row["topic_uuid"])
+            )
+            for row in rows
+        }
+
+    async def _hydrate_workspace_topic(
+        self,
+        client: httpx.AsyncClient,
+        topic_uuid: UUID,
+    ) -> bool:
+        if topic_uuid.int == 0:
+            return False
+        response = await self._get(
+            client,
+            f"{workspace_api_url(self._settings)}/provider/entities/topics",
+            params={
+                "limit": "1",
+                "snapshot_after_uuid": str(UUID(int=topic_uuid.int - 1)),
+            },
+        )
+        if response.is_error:
+            raise _provider_api_error(response)
+        page = _json_object(response.json())
+        items = page.get("items")
+        if not isinstance(items, list):
+            raise ValueError("invalid Workspace topic bootstrap page")
+        if not items:
+            return False
+        record = _json_object(items[0])
+        if record.get("type") != "topics" or UUID(str(record["uuid"])) != topic_uuid:
+            return False
+        data = _json_object(record["data"])
+        validate_entity("topics", data)
+        content_hash = canonical_hash(data)
+        if content_hash != bytes.fromhex(str(record["content_hash"])):
+            raise ValueError("Workspace topic bootstrap hash mismatch")
+        source_updated_at = _timestamp(str(record["source_updated_at"]))
+        # Paged bootstrap rows are current canonical entities. The active
+        # generation is the local mirror generation and is also updated by
+        # realtime events; source_updated_at keeps either path from replacing
+        # a newer value.
+        stored = await self._pool.fetchval(
+            """
+            INSERT INTO workspace_zulip_bridge.workspace_topics (
+                provider_uuid, snapshot_generation, uuid,
+                workspace_project_id, content_hash, source_updated_at, data
+            )
+            SELECT mirror.provider_uuid, mirror.active_generation, $2,
+                   mirror.workspace_project_id, $3, $4, $5::jsonb
+            FROM workspace_zulip_bridge.workspace_mirror_state AS mirror
+            WHERE mirror.provider_uuid = $1
+              AND mirror.active_generation IS NOT NULL
+              AND mirror.bootstrap_status = 'ready'
+            ON CONFLICT (provider_uuid, snapshot_generation, uuid)
+            DO UPDATE SET content_hash = EXCLUDED.content_hash,
+                source_updated_at = EXCLUDED.source_updated_at,
+                data = EXCLUDED.data, updated_at = clock_timestamp()
+            WHERE workspace_topics.source_updated_at <= EXCLUDED.source_updated_at
+            RETURNING uuid
+            """,
+            self._provider_uuid,
+            topic_uuid,
+            content_hash,
+            source_updated_at,
+            json.dumps(data, separators=(",", ":")),
+        )
+        return stored is not None
+
+    async def _hydrate_workspace_topic_dependencies(
+        self,
+        client: httpx.AsyncClient,
+        rows: list[asyncpg.Record],
+    ) -> tuple[list[asyncpg.Record], list[asyncpg.Record]]:
+        entities = {
+            (str(row["entity_type"]), UUID(str(row["entity_uuid"]))): row
+            for row in rows
+            if row["entity_type"] in {"messages", "topic_bindings"}
+        }
+        missing = await self._missing_workspace_topic_dependencies(
+            [uuid for (entity_type, uuid) in entities if entity_type == "messages"],
+            [
+                uuid
+                for (entity_type, uuid) in entities
+                if entity_type == "topic_bindings"
+            ],
+        )
+        topic_uuids = sorted(set(missing.values()), key=lambda value: value.int)
+        for topic_uuid in topic_uuids[: self.TOPIC_HYDRATION_BATCH_SIZE]:
+            await self._hydrate_workspace_topic(client, topic_uuid)
+        unresolved = await self._missing_workspace_topic_dependencies(
+            [uuid for (entity_type, uuid) in entities if entity_type == "messages"],
+            [
+                uuid
+                for (entity_type, uuid) in entities
+                if entity_type == "topic_bindings"
+            ],
+        )
+        deferred_ids = set(unresolved)
+        return (
+            [
+                row
+                for row in rows
+                if (str(row["entity_type"]), UUID(str(row["entity_uuid"])))
+                not in deferred_ids
+            ],
+            [entities[key] for key in deferred_ids],
+        )
+
+    async def _repair_blocked_workspace_topic_dependencies(
+        self,
+        client: httpx.AsyncClient,
+    ) -> int:
+        entity_types = getattr(self, "_entity_types", None)
+        if getattr(self, "_delivery_priority", None) != 0 or (
+            entity_types is not None
+            and not {"messages", "topic_bindings"}.intersection(entity_types)
+        ):
+            return 0
+        rows = await self._pool.fetch(
+            f"""
+            SELECT diff.*
+            FROM workspace_zulip_bridge.sync_diffs AS diff
+            JOIN workspace_zulip_bridge.workspace_mirror_state AS mirror
+              ON mirror.provider_uuid = diff.provider_uuid
+             AND mirror.active_generation IS NOT NULL
+            WHERE diff.provider_uuid = $1
+              AND diff.entity_type IN ('messages', 'topic_bindings')
+              AND diff.direction = 'to_zulip'
+              AND diff.processing_status = 'blocked'
+              AND diff.last_error = $2
+              AND (
+                  diff.available_at IS NULL
+                  OR diff.available_at <= clock_timestamp()
+              )
+              AND (
+                  (diff.entity_type = 'messages' AND EXISTS (
+                      SELECT 1
+                      FROM workspace_zulip_bridge.workspace_messages AS target
+                      WHERE target.provider_uuid = diff.provider_uuid
+                        AND target.snapshot_generation = mirror.active_generation
+                        AND target.uuid = diff.entity_uuid
+                  ))
+                  OR (diff.entity_type = 'topic_bindings' AND EXISTS (
+                      SELECT 1
+                      FROM workspace_zulip_bridge.workspace_topic_bindings AS target
+                      WHERE target.provider_uuid = diff.provider_uuid
+                        AND target.snapshot_generation = mirror.active_generation
+                        AND target.uuid = diff.entity_uuid
+                  ))
+              )
+              AND {self._delivery_priority_filter}
+              AND {self._entity_type_filter}
+              AND {self._partition_filter}
+            ORDER BY diff.updated_at, diff.entity_uuid
+            LIMIT {self.TOPIC_HYDRATION_BATCH_SIZE}
+            """,
+            self._provider_uuid,
+            self.MISSING_TOPIC_ERROR,
+        )
+        if not rows:
+            return 0
+        _, unresolved = await self._hydrate_workspace_topic_dependencies(client, rows)
+        unresolved_keys = {
+            (str(row["entity_type"]), UUID(str(row["entity_uuid"])))
+            for row in unresolved
+        }
+        if unresolved:
+            await self._pool.executemany(
+                """
+                UPDATE workspace_zulip_bridge.sync_diffs
+                SET dependency_wait_count = dependency_wait_count + 1,
+                    available_at = clock_timestamp() + make_interval(
+                        secs => LEAST(
+                            $5::double precision,
+                            $4::double precision * power(
+                                2::double precision,
+                                LEAST(dependency_wait_count, 16)
+                            )
+                        )
+                    ),
+                    updated_at = clock_timestamp()
+                WHERE provider_uuid = $1 AND entity_type = $2
+                  AND entity_uuid = $3 AND direction = 'to_zulip'
+                  AND processing_status = 'blocked' AND last_error = $6
+                """,
+                [
+                    (
+                        self._provider_uuid,
+                        row["entity_type"],
+                        row["entity_uuid"],
+                        self._settings.workspace_dependency_retry_base_seconds,
+                        self._settings.workspace_dependency_retry_cap_seconds,
+                        self.MISSING_TOPIC_ERROR,
+                    )
+                    for row in unresolved
+                ],
+            )
+        repaired = [
+            row
+            for row in rows
+            if (str(row["entity_type"]), UUID(str(row["entity_uuid"])))
+            not in unresolved_keys
+        ]
+        if not repaired:
+            return 0
+        result = await self._pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.sync_diffs AS diff
+            SET processing_status = 'pending', claimed_at = NULL,
+                available_at = clock_timestamp(), processed_at = NULL,
+                last_error = 'requeued_hydrated_workspace_topic',
+                updated_at = clock_timestamp()
+            FROM unnest($2::text[], $3::uuid[])
+                AS repaired(entity_type, entity_uuid)
+            WHERE diff.provider_uuid = $1
+              AND diff.entity_type = repaired.entity_type
+              AND diff.entity_uuid = repaired.entity_uuid
+              AND diff.direction = 'to_zulip'
+              AND diff.processing_status = 'blocked'
+              AND diff.last_error = $4
+            """,
+            self._provider_uuid,
+            [str(row["entity_type"]) for row in repaired],
+            [row["entity_uuid"] for row in repaired],
+            self.MISSING_TOPIC_ERROR,
+        )
+        return int(result.rsplit(" ", 1)[-1])
+
     async def _post(
         self,
         client: httpx.AsyncClient,
@@ -4831,6 +5097,22 @@ class WorkspaceDiffWorker:
             f"Bearer {await self._tokens.access_token(force_refresh=True)}"
         )
         return await client.post(url, json=json)
+
+    async def _get(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        *,
+        params: dict[str, str],
+    ) -> httpx.Response:
+        client.headers["Authorization"] = f"Bearer {await self._tokens.access_token()}"
+        response = await client.get(url, params=params)
+        if response.status_code != 401:
+            return response
+        client.headers["Authorization"] = (
+            f"Bearer {await self._tokens.access_token(force_refresh=True)}"
+        )
+        return await client.get(url, params=params)
 
     async def _put(
         self,

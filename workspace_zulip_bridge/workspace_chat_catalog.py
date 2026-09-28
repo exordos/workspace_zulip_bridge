@@ -857,12 +857,37 @@ class WorkspaceChatCatalogWorker:
             await self._ensure_topic_catalog_identities(connection, source)
             rows = await connection.fetch(
                 """
-                SELECT topic.uuid, topic.name, identity.provider_topic_id
+                SELECT topic.uuid, topic.name, identity.provider_topic_id,
+                       workspace_topic.uuid IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1
+                           FROM workspace_zulip_bridge.workspace_chat_catalog_reports
+                               AS report,
+                           LATERAL jsonb_array_elements(COALESCE(
+                               report.assignment #>
+                                   '{workspace_projection,topics}',
+                               '[]'::jsonb
+                           )) AS assigned_topic
+                           WHERE report.zulip_stream_uuid = topic.zulip_stream_uuid
+                             AND assigned_topic ->> 'provider_topic_id' =
+                                   identity.provider_topic_id
+                       ) AS preserves_projection
                 FROM workspace_zulip_bridge.zulip_topics AS topic
                 LEFT JOIN
                     workspace_zulip_bridge.zulip_topic_catalog_identities
                     AS identity
                   ON identity.topic_uuid = topic.uuid
+                LEFT JOIN workspace_zulip_bridge.zulip_streams AS stream
+                  ON stream.uuid = topic.zulip_stream_uuid
+                LEFT JOIN workspace_zulip_bridge.zulip_realms AS realm
+                  ON realm.uuid = stream.realm_uuid
+                LEFT JOIN workspace_zulip_bridge.workspace_mirror_state AS mirror
+                  ON mirror.provider_uuid = realm.workspace_provider_uuid
+                 AND mirror.active_generation IS NOT NULL
+                LEFT JOIN workspace_zulip_bridge.workspace_topics AS workspace_topic
+                  ON workspace_topic.provider_uuid = mirror.provider_uuid
+                 AND workspace_topic.snapshot_generation = mirror.active_generation
+                 AND workspace_topic.uuid = topic.uuid
                 WHERE topic.zulip_stream_uuid = $1
                 ORDER BY topic.name, topic.uuid
                 """,
@@ -878,6 +903,11 @@ class WorkspaceChatCatalogWorker:
                 "provider_topic_id": str(row["provider_topic_id"]),
                 "name": str(row["name"]),
                 "is_default": False,
+                **(
+                    {"projection_topic_uuid": str(row["uuid"])}
+                    if row["preserves_projection"]
+                    else {}
+                ),
             }
             for row in rows
         ]

@@ -4918,6 +4918,416 @@ def test_workspace_diff_dependencies_gate_children_and_batch_errors_isolate(
     )
 
 
+def test_workspace_outbound_hydrates_new_topic_dependencies_and_retries_blocked_diff(
+    tmp_path: Path,
+) -> None:
+    asyncio.run(
+        _workspace_outbound_hydrates_new_topic_dependencies_and_retries_blocked_diff(
+            _dsn(),
+            tmp_path,
+        )
+    )
+
+
+async def _workspace_outbound_hydrates_new_topic_dependencies_and_retries_blocked_diff(
+    dsn: str,
+    tmp_path: Path,
+) -> None:
+    pool = await _pool(dsn)
+    provider_uuid = UUID("10000000-0000-0000-0000-0000000000d1")
+    project_uuid = UUID("10000000-0000-0000-0000-0000000000d2")
+    generation = UUID("10000000-0000-0000-0000-0000000000d3")
+    stream_uuid = UUID("10000000-0000-0000-0000-0000000000d4")
+    topic_uuid = UUID("10000000-0000-0000-0000-0000000000d5")
+    message_uuid = UUID("10000000-0000-0000-0000-0000000000d6")
+    unrelated_uuid = UUID("10000000-0000-0000-0000-0000000000d7")
+    binding_topic_uuid = UUID("10000000-0000-0000-0000-0000000000d8")
+    binding_uuid = UUID("10000000-0000-0000-0000-0000000000d9")
+    unresolved_uuid = UUID("10000000-0000-0000-0000-0000000000db")
+    unresolved_topic_uuid = UUID("10000000-0000-0000-0000-0000000000dc")
+    token_file = tmp_path / "workspace-topic-hydration.token"
+    token_file.write_text("integration-token")
+    topic_data = {
+        "stream_uuid": str(stream_uuid),
+        "name": "Fresh topic",
+        "is_done": False,
+        "version": 0,
+        "created_at": "2026-09-28T19:00:00Z",
+        "updated_at": "2026-09-28T19:00:00Z",
+    }
+    topic_hash = hashlib.sha256(
+        json.dumps(
+            topic_data,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    try:
+        async with pool.acquire() as connection:
+            realm_uuid = stable_realm_uuid(ENDPOINT)
+            owner_uuid = await _insert_user(connection, 113, 400)
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_realms
+                SET workspace_project_id = $2, workspace_provider_uuid = $3
+                WHERE uuid = $1
+                """,
+                realm_uuid,
+                project_uuid,
+                provider_uuid,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.workspace_mirror_state (
+                    provider_uuid, workspace_project_id, active_generation,
+                    bootstrap_status
+                ) VALUES ($1, $2, $3, 'ready')
+                """,
+                provider_uuid,
+                project_uuid,
+                generation,
+            )
+            message_data = {
+                "stream_uuid": str(stream_uuid),
+                "topic_uuid": str(topic_uuid),
+            }
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.workspace_messages (
+                    provider_uuid, snapshot_generation, uuid,
+                    workspace_project_id, content_hash, source_updated_at, data
+                ) VALUES ($1, $2, $3, $4, $5, clock_timestamp(), $6::jsonb)
+                """,
+                provider_uuid,
+                generation,
+                message_uuid,
+                project_uuid,
+                b"m" * 32,
+                json.dumps(message_data),
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.workspace_messages (
+                    provider_uuid, snapshot_generation, uuid,
+                    workspace_project_id, content_hash, source_updated_at, data
+                ) VALUES ($1, $2, $3, $4, $5, clock_timestamp(), $6::jsonb)
+                """,
+                provider_uuid,
+                generation,
+                unresolved_uuid,
+                project_uuid,
+                b"u" * 32,
+                json.dumps(
+                    {
+                        "stream_uuid": str(stream_uuid),
+                        "topic_uuid": str(unresolved_topic_uuid),
+                    }
+                ),
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.sync_diffs (
+                    provider_uuid, entity_type, entity_uuid, realm_uuid,
+                    partition_key, direction, processing_status,
+                    delivery_priority, target_hash, target_updated_at, source_updated_at,
+                    attempt_count, processed_at, last_error
+                ) VALUES ($1, 'messages', $2, $3, $4, 'to_zulip',
+                          'blocked', 0, $5, clock_timestamp(), clock_timestamp(),
+                          1, clock_timestamp(), $6)
+                """,
+                provider_uuid,
+                message_uuid,
+                realm_uuid,
+                stream_uuid,
+                b"m" * 32,
+                WorkspaceDiffWorker.MISSING_TOPIC_ERROR,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.sync_diffs (
+                    provider_uuid, entity_type, entity_uuid, realm_uuid,
+                    partition_key, direction, processing_status,
+                    delivery_priority, source_updated_at, attempt_count,
+                    processed_at, last_error
+                ) VALUES ($1, 'messages', $2, $3, $4, 'to_zulip',
+                          'blocked', 0, clock_timestamp(), 1, clock_timestamp(), $5)
+                """,
+                provider_uuid,
+                unresolved_uuid,
+                realm_uuid,
+                stream_uuid,
+                WorkspaceDiffWorker.MISSING_TOPIC_ERROR,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.sync_diffs (
+                    provider_uuid, entity_type, entity_uuid, realm_uuid,
+                    partition_key, direction, processing_status,
+                    delivery_priority, source_updated_at, attempt_count,
+                    processed_at, last_error
+                ) VALUES ($1, 'messages', $2, $3, $4, 'to_zulip',
+                          'blocked', 0, clock_timestamp(), 4, clock_timestamp(),
+                          'unrelated_error')
+                """,
+                provider_uuid,
+                unrelated_uuid,
+                realm_uuid,
+                stream_uuid,
+            )
+        settings = Settings.from_env(
+            {
+                "WZB_DATABASE_DSN": dsn,
+                "WZB_DB_POOL_MIN_SIZE": "1",
+                "WZB_DB_POOL_MAX_SIZE": "4",
+                "WZB_ZULIP_HISTORY_CONCURRENCY": "2",
+                "WZB_WORKSPACE_WEBSOCKET_URL": (
+                    "ws://workspace.test/api/workspace/v1/events/ws"
+                ),
+                "WZB_WORKSPACE_API_URL": "http://workspace.test/api/workspace/v1",
+                "WZB_WORKSPACE_PROJECT_ID": str(project_uuid),
+                "WZB_WORKSPACE_PROVIDER_UUID": str(provider_uuid),
+                "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+            }
+        )
+        worker = WorkspaceDiffWorker(pool, settings, delivery_priority=0)
+        delivered: list[UUID] = []
+
+        async def capture(rows: list[asyncpg.Record]) -> None:
+            delivered.extend(UUID(str(row["entity_uuid"])) for row in rows)
+            for row in rows:
+                await worker._accept_to_zulip(row, "created")
+
+        worker._write_to_zulip = capture  # type: ignore[method-assign]
+        requests = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal requests
+            requests += 1
+            assert request.headers["authorization"] == "Bearer integration-token"
+            assert request.url.params["limit"] == "1"
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {
+                            "type": "topics",
+                            "uuid": str(topic_uuid),
+                            "content_hash": topic_hash,
+                            "source_updated_at": "2026-09-28T19:00:00Z",
+                            "data": topic_data,
+                        }
+                    ],
+                    "next_cursor": None,
+                },
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            assert await worker.process_once(client) == 1
+        assert requests == 2
+        assert delivered == [message_uuid]
+        topic = await pool.fetchrow(
+            """
+            SELECT uuid, data, content_hash
+            FROM workspace_zulip_bridge.workspace_topics
+            WHERE provider_uuid = $1 AND snapshot_generation = $2 AND uuid = $3
+            """,
+            provider_uuid,
+            generation,
+            topic_uuid,
+        )
+        assert topic is not None
+        assert topic["uuid"] == topic_uuid
+        assert json.loads(topic["data"])["name"] == "Fresh topic"
+        assert bytes(topic["content_hash"]).hex() == topic_hash
+        diff = await pool.fetchrow(
+            """
+            SELECT processing_status, attempt_count, last_error
+            FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1 AND entity_type = 'messages'
+              AND entity_uuid = $2
+            """,
+            provider_uuid,
+            message_uuid,
+        )
+        assert diff is not None
+        assert tuple(diff) == ("applied", 2, "created")
+        unrelated = await pool.fetchrow(
+            """
+            SELECT processing_status, attempt_count, last_error
+            FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1 AND entity_type = 'messages'
+              AND entity_uuid = $2
+            """,
+            provider_uuid,
+            unrelated_uuid,
+        )
+        assert unrelated is not None
+        assert tuple(unrelated) == ("blocked", 4, "unrelated_error")
+        unresolved = await pool.fetchrow(
+            """
+            SELECT processing_status, dependency_wait_count,
+                   available_at > clock_timestamp() AS backed_off, last_error
+            FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1 AND entity_type = 'messages'
+              AND entity_uuid = $2
+            """,
+            provider_uuid,
+            unresolved_uuid,
+        )
+        assert unresolved is not None
+        assert tuple(unresolved) == (
+            "blocked",
+            1,
+            True,
+            WorkspaceDiffWorker.MISSING_TOPIC_ERROR,
+        )
+        binding_topic_data = {
+            **topic_data,
+            "name": "Fresh preference topic",
+        }
+        binding_topic_hash = hashlib.sha256(
+            json.dumps(
+                binding_topic_data,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.workspace_topic_bindings (
+                provider_uuid, snapshot_generation, uuid,
+                workspace_project_id, content_hash, source_updated_at, data
+            ) VALUES ($1, $2, $3, $4, $5, clock_timestamp(), $6::jsonb)
+            """,
+            provider_uuid,
+            generation,
+            binding_uuid,
+            project_uuid,
+            b"b" * 32,
+            json.dumps(
+                {
+                    "stream_uuid": str(stream_uuid),
+                    "topic_uuid": str(binding_topic_uuid),
+                }
+            ),
+        )
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.sync_diffs (
+                provider_uuid, entity_type, entity_uuid, realm_uuid,
+                partition_key, direction, processing_status, delivery_priority,
+                target_hash, target_updated_at, source_updated_at
+            ) VALUES ($1, 'topic_bindings', $2, $3, $4, 'to_zulip',
+                      'pending', 0, $5, clock_timestamp(), clock_timestamp())
+            """,
+            provider_uuid,
+            binding_uuid,
+            realm_uuid,
+            stream_uuid,
+            b"b" * 32,
+        )
+
+        binding_requests = 0
+
+        async def binding_handler(request: httpx.Request) -> httpx.Response:
+            nonlocal binding_requests
+            binding_requests += 1
+            assert request.headers["authorization"] == "Bearer integration-token"
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {
+                            "type": "topics",
+                            "uuid": str(binding_topic_uuid),
+                            "content_hash": binding_topic_hash,
+                            "source_updated_at": "2026-09-28T19:00:00Z",
+                            "data": binding_topic_data,
+                        }
+                    ],
+                    "next_cursor": None,
+                },
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(binding_handler),
+        ) as client:
+            assert await worker.process_once(client) == 1
+        assert binding_requests == 1
+        assert delivered == [message_uuid, binding_uuid]
+        assert await pool.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM workspace_zulip_bridge.workspace_topics
+                WHERE provider_uuid = $1 AND snapshot_generation = $2
+                  AND uuid = $3
+            )
+            """,
+            provider_uuid,
+            generation,
+            binding_topic_uuid,
+        )
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.zulip_streams (
+                uuid, realm_uuid, chat_type, chat_key, name,
+                content_hash, source_connection_uuid
+            ) VALUES ($1, $2, 'channel', 'channel:113', 'Hydration', $3, $4)
+            """,
+            stream_uuid,
+            realm_uuid,
+            b"s" * 32,
+            owner_uuid,
+        )
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.zulip_topics (
+                uuid, zulip_stream_uuid, name, content_hash
+            ) VALUES ($1, $2, $3, $4)
+            """,
+            topic_uuid,
+            stream_uuid,
+            topic_data["name"],
+            bytes.fromhex(topic_hash),
+        )
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.zulip_topic_catalog_identities (
+                topic_uuid, zulip_stream_uuid, catalog_topic_key,
+                provider_topic_id
+            ) VALUES ($1, $2, $3, $4)
+            """,
+            topic_uuid,
+            stream_uuid,
+            topic_data["name"],
+            f"113:{topic_data['name']}",
+        )
+        catalog_worker = WorkspaceChatCatalogWorker.__new__(WorkspaceChatCatalogWorker)
+        catalog_worker._pool = pool
+        topics = await catalog_worker._topics(
+            SimpleNamespace(
+                chat_type="channel",
+                stream_uuid=stream_uuid,
+                chat_key="channel:113",
+                account_uuid=UUID("10000000-0000-0000-0000-0000000000da"),
+            )
+        )
+        assert topics == [
+            {
+                "provider_topic_id": f"113:{topic_data['name']}",
+                "projection_topic_uuid": str(topic_uuid),
+                "name": topic_data["name"],
+                "is_default": False,
+            }
+        ]
+    finally:
+        await pool.close()
+
+
 async def _workspace_diff_dependencies_gate_children_and_batch_errors_isolate(
     dsn: str,
     tmp_path: Path,
