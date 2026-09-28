@@ -17,6 +17,8 @@ import asyncpg
 
 from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.event_store import EventStore
+from workspace_zulip_bridge.message_conversion import ZulipToWorkspaceContext
+from workspace_zulip_bridge.message_conversion import zulip_to_workspace
 from workspace_zulip_bridge.message_history import build_message_page
 from workspace_zulip_bridge.message_history import extract_file_metadata
 from workspace_zulip_bridge.message_history import message_content_hash
@@ -27,7 +29,9 @@ from workspace_zulip_bridge.models import ZulipUserPresence
 from workspace_zulip_bridge.models import ZulipUserProfileStatus
 from workspace_zulip_bridge.models import ZulipUserTopic
 from workspace_zulip_bridge.stable_ids import stable_chat_uuid
+from workspace_zulip_bridge.stable_ids import stable_file_uuid
 from workspace_zulip_bridge.workspace_entities import validate_description
+from workspace_zulip_bridge.workspace_file_transfer import replace_source_file_urn
 from workspace_zulip_bridge.zulip_api import ZulipApiError
 from workspace_zulip_bridge.zulip_api import parse_attachment
 
@@ -131,6 +135,7 @@ class _MessageSnapshot:
     topic_name: str | None
     sender_user_uuid: UUID
     content: str
+    workspace_content: str
     is_read: bool
     is_starred: bool
     is_collapsed: bool
@@ -155,6 +160,9 @@ class _Outcome:
 
 
 class ZulipEventProcessor:
+    MIN_CLEANUP_BATCH_SIZE = 100
+    MAX_REDUNDANT_UPDATE_BATCH_SIZE = 5000
+
     def __init__(
         self,
         pool: asyncpg.Pool,
@@ -162,11 +170,13 @@ class ZulipEventProcessor:
         settings: Settings,
         *,
         claim_scope: _ClaimScope = "all",
+        run_maintenance: bool = True,
     ) -> None:
         self._pool = pool
         self._store = store
         self._settings = settings
         self._claim_scope = claim_scope
+        self._run_maintenance = run_maintenance
         self._batch_size = (
             settings.event_processor_realtime_batch_size
             if claim_scope == "realtime"
@@ -179,10 +189,27 @@ class ZulipEventProcessor:
         self._queue_batch_size = self._batch_size
         self._next_claim_recovery_at = 0.0
         self._next_cleanup_at = 0.0
+        self._next_redundant_update_skip_at = 0.0
         self._next_presence_expiry_at = 0.0
+        self._cleanup_batch_size = settings.event_cleanup_batch_size
+        self._redundant_update_batch_size = min(
+            self.MAX_REDUNDANT_UPDATE_BATCH_SIZE,
+            settings.event_cleanup_batch_size,
+        )
+
+    def _claim_scope_clause(self, alias: str) -> str:
+        if self._claim_scope == "all":
+            # Keep the window parameter typed for the compatibility-only
+            # unscoped processor without reintroducing a data-dependent OR.
+            return "$5::double precision > 0"
+        operator = ">=" if self._claim_scope == "realtime" else "<"
+        return (
+            f"{alias}.created_at {operator} "
+            "(statement_timestamp() - make_interval(secs => $5::double precision))"
+        )
 
     async def run(self) -> None:
-        if self._claim_scope != "realtime":
+        if self._claim_scope != "realtime" and self._run_maintenance:
             await self._maybe_requeue_expired_claims()
             recovered = await self._requeue_preparation_deadlocks()
             if recovered:
@@ -191,13 +218,30 @@ class ZulipEventProcessor:
                     recovered,
                 )
         while True:
-            deleted = 0
-            expired_presences = 0
-            if self._claim_scope != "realtime":
-                await self._maybe_requeue_expired_claims()
-                deleted = await self._maybe_cleanup_expired_events()
-                expired_presences = await self._maybe_expire_user_presences()
-            stats = await self.process_once()
+            try:
+                deleted = 0
+                redundant_updates_skipped = 0
+                expired_presences = 0
+                if self._claim_scope != "realtime" and self._run_maintenance:
+                    await self._maybe_requeue_expired_claims()
+                    redundant_updates_skipped = (
+                        await self._maybe_skip_redundant_update_events()
+                    )
+                    deleted = await self._maybe_cleanup_expired_events()
+                    expired_presences = await self._maybe_expire_user_presences()
+                stats = await self.process_once()
+            except asyncio.CancelledError:
+                raise
+            except (TimeoutError, asyncpg.PostgresError) as error:
+                LOG.warning(
+                    "Zulip event processor pass failed scope=%s error=%s",
+                    self._claim_scope,
+                    type(error).__name__,
+                )
+                await asyncio.sleep(
+                    max(1.0, self._settings.event_processor_poll_seconds)
+                )
+                continue
             if stats.claimed:
                 LOG.info(
                     "Zulip event batch processed scope=%s claimed=%s applied=%s skipped=%s "
@@ -216,11 +260,81 @@ class ZulipEventProcessor:
                     stats.events_per_second,
                 )
                 continue
-            if deleted == self._settings.event_cleanup_batch_size:
+            if redundant_updates_skipped == self._redundant_update_batch_size:
+                continue
+            if deleted == self._cleanup_batch_size:
                 continue
             if expired_presences == self._settings.event_cleanup_batch_size:
                 continue
             await asyncio.sleep(self._settings.event_processor_poll_seconds)
+
+    async def _maybe_skip_redundant_update_events(self) -> int:
+        if time.monotonic() < self._next_redundant_update_skip_at:
+            return 0
+        try:
+            async with self._pool.acquire() as connection, connection.transaction():
+                skipped = await connection.fetchval(
+                    """
+                    WITH candidates AS MATERIALIZED (
+                        SELECT event.uuid
+                        FROM workspace_zulip_bridge.zulip_events AS event
+                        JOIN workspace_zulip_bridge.zulip_connections AS connection
+                          ON connection.uuid = event.zulip_connection_uuid
+                        JOIN workspace_zulip_bridge.zulip_messages AS message
+                          ON message.realm_uuid = connection.realm_uuid
+                         AND message.zulip_message_id = CASE
+                             WHEN jsonb_typeof(event.payload->'message_id') =
+                                  'number'
+                             THEN (event.payload->>'message_id')::bigint
+                             ELSE NULL
+                         END
+                        WHERE event.processing_status = 'pending'
+                          AND event.event_type = 'update_message'
+                          AND NOT event.payload ? 'new_stream_id'
+                          AND message.source_connection_uuid IS NOT NULL
+                          AND message.source_connection_uuid <>
+                              event.zulip_connection_uuid
+                        ORDER BY event.available_at, event.created_at, event.uuid
+                        LIMIT $1
+                        FOR UPDATE OF event SKIP LOCKED
+                    ), updated AS (
+                        UPDATE workspace_zulip_bridge.zulip_events AS event
+                        SET processing_status = 'skipped', claimed_at = NULL,
+                            processed_at = clock_timestamp(),
+                            outcome_reason = 'not_chat_supplier'
+                        FROM candidates
+                        WHERE event.uuid = candidates.uuid
+                        RETURNING 1
+                    )
+                    SELECT count(*)::bigint FROM updated
+                    """,
+                    self._redundant_update_batch_size,
+                )
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            self._redundant_update_batch_size = max(
+                self.MIN_CLEANUP_BATCH_SIZE,
+                self._redundant_update_batch_size // 2,
+            )
+            self._next_redundant_update_skip_at = time.monotonic() + 1.0
+            LOG.warning(
+                "Redundant Zulip message update compaction timed out; "
+                "reducing batch size to %s",
+                self._redundant_update_batch_size,
+            )
+            return 0
+        skipped_count = int(skipped)
+        if skipped_count == self._redundant_update_batch_size:
+            self._next_redundant_update_skip_at = 0.0
+        else:
+            self._next_redundant_update_skip_at = time.monotonic() + 60.0
+        if skipped_count:
+            LOG.info(
+                "Redundant Zulip message update events compacted count=%s",
+                skipped_count,
+            )
+        return skipped_count
 
     async def _maybe_requeue_expired_claims(self) -> int:
         if self._claim_scope == "realtime":
@@ -322,15 +436,44 @@ class ZulipEventProcessor:
                 FROM deleted
                 """,
                 self._settings.event_retention_seconds,
-                self._settings.event_cleanup_batch_size,
+                self._cleanup_batch_size,
             )
         return int(deleted)
 
     async def _maybe_cleanup_expired_events(self) -> int:
         if time.monotonic() < self._next_cleanup_at:
             return 0
-        deleted = await self.cleanup_expired_events()
-        if deleted == self._settings.event_cleanup_batch_size:
+        try:
+            deleted = await self.cleanup_expired_events()
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            reduced = max(
+                self.MIN_CLEANUP_BATCH_SIZE,
+                self._cleanup_batch_size // 2,
+            )
+            self._cleanup_batch_size = reduced
+            self._next_cleanup_at = time.monotonic() + max(
+                1.0,
+                min(60.0, self._settings.event_cleanup_interval_seconds),
+            )
+            LOG.warning(
+                "Zulip event cleanup timed out; keeping event processing alive "
+                "and reducing batch size to %s",
+                reduced,
+            )
+            return 0
+        except asyncpg.PostgresError as error:
+            self._next_cleanup_at = time.monotonic() + max(
+                1.0,
+                min(60.0, self._settings.event_cleanup_interval_seconds),
+            )
+            LOG.warning(
+                "Zulip event cleanup failed; keeping event processing alive error=%s",
+                type(error).__name__,
+            )
+            return 0
+        if deleted == self._cleanup_batch_size:
             self._next_cleanup_at = 0.0
         else:
             self._next_cleanup_at = (
@@ -522,9 +665,11 @@ class ZulipEventProcessor:
     async def _claim_events(self) -> list[_ClaimedEvent]:
         if self._claim_scope == "all":
             await self._requeue_expired_claims()
+        head_scope = self._claim_scope_clause("event")
+        candidate_scope = self._claim_scope_clause("candidate")
         async with self._pool.acquire() as connection, connection.transaction():
             rows = await connection.fetch(
-                """
+                f"""
                 WITH claimable_queues AS MATERIALIZED (
                     SELECT queue.zulip_connection_uuid,
                            queue.queue_id,
@@ -544,27 +689,9 @@ class ZulipEventProcessor:
                               queue.zulip_connection_uuid
                           AND event.queue_id = queue.queue_id
                           AND event.processing_status = 'pending'
+                          AND ({head_scope})
                           AND (
-                              $5::text = 'all'
-                              OR (
-                                  $5::text = 'realtime'
-                                  AND event.created_at >= (
-                                      clock_timestamp() - make_interval(
-                                          secs => $6::double precision
-                                      )
-                                  )
-                              )
-                              OR (
-                                  $5::text = 'backlog'
-                                  AND event.created_at < (
-                                      clock_timestamp() - make_interval(
-                                          secs => $6::double precision
-                                      )
-                                  )
-                              )
-                          )
-                          AND (
-                              event.available_at <= clock_timestamp()
+                              event.available_at <= statement_timestamp()
                               OR NOT COALESCE(
                                   event.outcome_reason = ANY($2::text[]),
                                   false
@@ -580,32 +707,14 @@ class ZulipEventProcessor:
                               queue.zulip_connection_uuid
                           AND event.queue_id = queue.queue_id
                           AND event.processing_status = 'pending'
-                          AND event.available_at > clock_timestamp()
+                          AND event.available_at > statement_timestamp()
                           AND NOT COALESCE(
                               event.outcome_reason = ANY($2::text[]),
                               false
                           )
-                          AND (
-                              $5::text = 'all'
-                              OR (
-                                  $5::text = 'realtime'
-                                  AND event.created_at >= (
-                                      clock_timestamp() - make_interval(
-                                          secs => $6::double precision
-                                      )
-                                  )
-                              )
-                              OR (
-                                  $5::text = 'backlog'
-                                  AND event.created_at < (
-                                      clock_timestamp() - make_interval(
-                                          secs => $6::double precision
-                                      )
-                                  )
-                              )
-                          )
+                          AND ({head_scope})
                     ) AS blocker ON true
-                    WHERE head.available_at <= clock_timestamp()
+                    WHERE head.available_at <= statement_timestamp()
                       AND NOT EXISTS (
                           SELECT 1
                           FROM workspace_zulip_bridge.zulip_events AS inflight
@@ -614,10 +723,10 @@ class ZulipEventProcessor:
                             AND inflight.queue_id = queue.queue_id
                             AND inflight.processing_status = 'processing'
                       )
-                    ORDER BY head.head_created_at,
+                    ORDER BY head.head_created_at DESC,
                              queue.zulip_connection_uuid,
                              queue.queue_id
-                    LIMIT $7
+                    LIMIT $6
                     FOR UPDATE OF queue SKIP LOCKED
                 ), ranked_candidates AS MATERIALIZED (
                     SELECT event.uuid,
@@ -634,31 +743,13 @@ class ZulipEventProcessor:
                               queue.zulip_connection_uuid
                           AND candidate.queue_id = queue.queue_id
                           AND candidate.processing_status = 'pending'
-                          AND candidate.available_at <= clock_timestamp()
+                          AND candidate.available_at <= statement_timestamp()
                           AND (
                               queue.first_blocking_event_id IS NULL
                               OR candidate.event_id <
                                  queue.first_blocking_event_id
                           )
-                          AND (
-                              $5::text = 'all'
-                              OR (
-                                  $5::text = 'realtime'
-                                  AND candidate.created_at >= (
-                                      clock_timestamp() - make_interval(
-                                          secs => $6::double precision
-                                      )
-                                  )
-                              )
-                              OR (
-                                  $5::text = 'backlog'
-                                  AND candidate.created_at < (
-                                      clock_timestamp() - make_interval(
-                                          secs => $6::double precision
-                                      )
-                                  )
-                              )
-                          )
+                          AND ({candidate_scope})
                         ORDER BY candidate.event_id
                         LIMIT $3
                     ) AS event
@@ -667,7 +758,7 @@ class ZulipEventProcessor:
                            row_number() OVER (
                                PARTITION BY candidate.dependency_head
                                ORDER BY
-                                        candidate.head_created_at,
+                                        candidate.head_created_at DESC,
                                         candidate.zulip_connection_uuid,
                                         candidate.queue_id,
                                         candidate.event_id
@@ -702,7 +793,7 @@ class ZulipEventProcessor:
                                  ELSE 1
                              END,
                              candidate.dependency_head,
-                             candidate.head_created_at,
+                             candidate.head_created_at DESC,
                              candidate.zulip_connection_uuid,
                              candidate.queue_id,
                              candidate.event_id
@@ -748,7 +839,6 @@ class ZulipEventProcessor:
                 list(_DEPENDENCY_DEFERRAL_REASONS),
                 _EVENTS_PER_QUEUE_BATCH,
                 _DEPENDENCY_RETRY_SHARE_DIVISOR,
-                self._claim_scope,
                 self._settings.event_processor_realtime_window_seconds,
                 self._queue_batch_size,
             )
@@ -807,18 +897,12 @@ class ZulipEventProcessor:
                 (event, raw_message),
             )
 
-        direct_changed = False
         for event, raw_message in direct_messages.values():
-            direct_changed = (
-                await self._store.store_direct_message_chat(
-                    event.user_uuid,
-                    event.queue_id,
-                    raw_message,
-                )
-                or direct_changed
+            await self._store.store_direct_message_chat(
+                event.user_uuid,
+                event.queue_id,
+                raw_message,
             )
-        if direct_changed:
-            await self._store.reconcile_chat_schedules()
 
     async def _resolve_local_message_links(
         self,
@@ -1292,19 +1376,14 @@ class ZulipEventProcessor:
                 "applied" if refreshed else "retry",
                 "directory_refresh_requested",
             )
-        result = await self._store.store_user_directory(
+        await self._store.store_user_directory(
             item.event.endpoint,
             (directory_user,),
-        )
-        schedule = (
-            await self._store.reconcile_chat_schedules() if result.changed else None
         )
         return _Outcome(
             item.event.uuid,
             "applied",
             "directory_user",
-            messages_deleted=schedule.messages_deleted if schedule else 0,
-            chats_changed=(schedule.invalidated + schedule.assigned if schedule else 0),
         )
 
     async def _apply_attachment(self, item: _RoutedEvent) -> _Outcome:
@@ -1363,6 +1442,7 @@ class ZulipEventProcessor:
                 return _Outcome(item.event.uuid, "retry", "local_message_link_retry")
         message_payload, write_flags = _normalize_live_message(raw_message)
         user_uuids = await self._load_user_uuids(item.event.endpoint)
+        stream_ids_by_name = await self._load_stream_ids_by_name(item.event.endpoint)
         sender_id = raw_message.get("sender_id")
         if isinstance(sender_id, int) and sender_id not in user_uuids:
             await self._store.request_catalog_refresh(
@@ -1374,8 +1454,9 @@ class ZulipEventProcessor:
             [message_payload],
             own_user_id=item.event.own_user_id,
             user_uuids=user_uuids,
-            stream_ids_by_name={},
+            stream_ids_by_name=stream_ids_by_name,
             allowed_chat_keys={item.chat_key} if item.chat_key is not None else set(),
+            endpoint=item.event.endpoint,
         )
         if not built.messages:
             return _Outcome(item.event.uuid, "skipped", "message_filtered")
@@ -1385,6 +1466,10 @@ class ZulipEventProcessor:
             else tuple(
                 replace(message, write_flags=False) for message in built.messages
             )
+        )
+        messages = await self._replace_finalized_file_urns_in_messages(
+            item.event.endpoint,
+            messages,
         )
         result = await self._store.apply_live_messages(
             item.event.user_uuid,
@@ -1411,6 +1496,7 @@ class ZulipEventProcessor:
                 for item in items
             ]
         user_uuids = await self._load_user_uuids(first.event.endpoint)
+        stream_ids_by_name = await self._load_stream_ids_by_name(first.event.endpoint)
         messages: list[ZulipMessage] = []
         outcomes: list[_Outcome] = []
         for item_index, item in enumerate(items):
@@ -1478,8 +1564,9 @@ class ZulipEventProcessor:
                 [message_payload],
                 own_user_id=first.event.own_user_id,
                 user_uuids=user_uuids,
-                stream_ids_by_name={},
+                stream_ids_by_name=stream_ids_by_name,
                 allowed_chat_keys={item.chat_key},
+                endpoint=item.event.endpoint,
             )
             if not built.messages:
                 outcomes.append(
@@ -1487,9 +1574,17 @@ class ZulipEventProcessor:
                 )
                 continue
             messages.extend(
-                built.messages
-                if write_flags
-                else (replace(message, write_flags=False) for message in built.messages)
+                await self._replace_finalized_file_urns_in_messages(
+                    item.event.endpoint,
+                    (
+                        built.messages
+                        if write_flags
+                        else tuple(
+                            replace(message, write_flags=False)
+                            for message in built.messages
+                        )
+                    ),
+                )
             )
             outcomes.append(_Outcome(item.event.uuid, "applied", "message"))
         if not messages:
@@ -1702,6 +1797,14 @@ class ZulipEventProcessor:
             item.event.endpoint,
             item.message_ids,
         )
+        if item.event.own_user_id is None:
+            return _Outcome(item.event.uuid, "failed", "invalid_message_event")
+        projection_context = ZulipToWorkspaceContext(
+            endpoint=item.event.endpoint,
+            own_user_id=item.event.own_user_id,
+            user_uuids=await self._load_user_uuids(item.event.endpoint),
+            stream_ids_by_name=await self._load_stream_ids_by_name(item.event.endpoint),
+        )
         messages: list[ZulipMessage] = []
         for snapshot in snapshots:
             changes: dict[str, object] = {}
@@ -1721,7 +1824,24 @@ class ZulipEventProcessor:
                 content = payload.get("content")
                 if isinstance(content, str):
                     changes["content"] = content
-            messages.append(_snapshot_message(snapshot, **changes))
+            workspace_content = snapshot.workspace_content
+            if "content" in changes:
+                workspace_content = zulip_to_workspace(
+                    str(changes["content"]),
+                    context=projection_context,
+                ).content
+                workspace_content = await self._replace_finalized_file_urns(
+                    item.event.endpoint,
+                    snapshot.message_id,
+                    workspace_content,
+                )
+            messages.append(
+                _snapshot_message(
+                    snapshot,
+                    workspace_content=workspace_content,
+                    **changes,
+                )
+            )
         return await self._store_messages(item, messages, "message_update")
 
     async def _apply_delete(self, item: _RoutedEvent) -> _Outcome:
@@ -1913,6 +2033,7 @@ class ZulipEventProcessor:
                     JOIN workspace_zulip_bridge.zulip_streams AS stream
                       ON stream.uuid = topic.zulip_stream_uuid
                     WHERE stream.source_connection_uuid = $1
+                      AND stream.chat_type = 'channel'
                       AND NOT EXISTS (
                           SELECT 1
                           FROM workspace_zulip_bridge.zulip_messages AS message
@@ -1978,6 +2099,23 @@ class ZulipEventProcessor:
             )
         return {row["zulip_user_id"]: row["uuid"] for row in rows}
 
+    async def _load_stream_ids_by_name(self, endpoint: str) -> dict[str, int]:
+        async with self._pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT stream.name,
+                       substring(stream.chat_key FROM '^channel:([0-9]+)$')::bigint
+                           AS zulip_stream_id
+                FROM workspace_zulip_bridge.zulip_streams AS stream
+                JOIN workspace_zulip_bridge.zulip_realms AS realm
+                  ON realm.uuid = stream.realm_uuid
+                WHERE realm.identity_key = $1
+                  AND stream.chat_key ~ '^channel:[0-9]+$'
+                """,
+                endpoint,
+            )
+        return {row["name"]: row["zulip_stream_id"] for row in rows}
+
     async def _load_message_snapshots(
         self,
         endpoint: str,
@@ -1993,6 +2131,8 @@ class ZulipEventProcessor:
                        topic.name AS topic_name,
                        message.sender_user_uuid,
                        message.content,
+                       COALESCE(message.workspace_content, message.content)
+                           AS workspace_content,
                        message.reactions::text AS reactions_json,
                        extract(epoch FROM message.created_at)::bigint AS sent_at,
                        extract(epoch FROM message.source_updated_at)::bigint
@@ -2025,6 +2165,7 @@ class ZulipEventProcessor:
                     topic_name=row["topic_name"],
                     sender_user_uuid=row["sender_user_uuid"],
                     content=row["content"],
+                    workspace_content=row["workspace_content"],
                     is_read=False,
                     is_starred=False,
                     is_collapsed=False,
@@ -2039,6 +2180,109 @@ class ZulipEventProcessor:
                 )
             )
         return snapshots
+
+    async def _replace_finalized_file_urns(
+        self,
+        endpoint: str,
+        message_id: int,
+        workspace_content: str,
+    ) -> str:
+        rows = await self._pool.fetch(
+            """
+            SELECT link.file_uuid, projection.workspace_urn
+            FROM workspace_zulip_bridge.zulip_messages AS message
+            JOIN workspace_zulip_bridge.zulip_realms AS realm
+              ON realm.uuid = message.realm_uuid
+            JOIN workspace_zulip_bridge.zulip_message_files AS link
+              ON link.message_uuid = message.uuid
+            JOIN workspace_zulip_bridge.workspace_file_projections AS projection
+              ON projection.file_uuid = link.file_uuid
+             AND projection.zulip_stream_uuid = message.zulip_stream_uuid
+             AND projection.processing_status = 'finalized'
+            WHERE realm.identity_key = $1 AND message.zulip_message_id = $2
+            ORDER BY link.position, link.file_uuid
+            """,
+            endpoint,
+            message_id,
+        )
+        for row in rows:
+            workspace_content = replace_source_file_urn(
+                workspace_content,
+                UUID(str(row["file_uuid"])),
+                str(row["workspace_urn"]),
+            )
+        return workspace_content
+
+    async def _replace_finalized_file_urns_in_messages(
+        self,
+        endpoint: str,
+        messages: tuple[ZulipMessage, ...],
+    ) -> tuple[ZulipMessage, ...]:
+        requested = [
+            (message.chat_key, stable_file_uuid(endpoint, file.source_path))
+            for message in messages
+            for file in message.files
+        ]
+        if not requested:
+            return messages
+        rows = await self._pool.fetch(
+            """
+            WITH requested(chat_key, file_uuid) AS (
+                SELECT * FROM unnest($2::text[], $3::uuid[])
+            )
+            SELECT requested.chat_key, requested.file_uuid,
+                   projection.workspace_urn
+            FROM requested
+            JOIN workspace_zulip_bridge.zulip_realms AS realm
+              ON realm.identity_key = $1
+            JOIN workspace_zulip_bridge.zulip_streams AS stream
+              ON stream.realm_uuid = realm.uuid
+             AND stream.chat_key = requested.chat_key
+            JOIN workspace_zulip_bridge.workspace_file_projections AS projection
+              ON projection.zulip_stream_uuid = stream.uuid
+             AND projection.file_uuid = requested.file_uuid
+             AND projection.processing_status = 'finalized'
+            ORDER BY requested.chat_key, requested.file_uuid
+            """,
+            endpoint,
+            [chat_key for chat_key, _ in requested],
+            [file_uuid for _, file_uuid in requested],
+        )
+        finalized = {
+            (str(row["chat_key"]), UUID(str(row["file_uuid"]))): str(
+                row["workspace_urn"]
+            )
+            for row in rows
+        }
+        resolved: list[ZulipMessage] = []
+        for message in messages:
+            workspace_content = message.workspace_content or message.content
+            for file in message.files:
+                source_uuid = stable_file_uuid(endpoint, file.source_path)
+                workspace_urn = finalized.get((message.chat_key, source_uuid))
+                if workspace_urn is not None:
+                    workspace_content = replace_source_file_urn(
+                        workspace_content,
+                        source_uuid,
+                        workspace_urn,
+                    )
+            if workspace_content == message.workspace_content:
+                resolved.append(message)
+                continue
+            resolved.append(
+                replace(
+                    message,
+                    workspace_content=workspace_content,
+                    content_hash=message_content_hash(
+                        sender_user_uuid=message.sender_user_uuid,
+                        chat_key=message.chat_key,
+                        topic_name=message.topic_name,
+                        content=workspace_content,
+                        sent_at=message.sent_at,
+                    ),
+                )
+            )
+        return tuple(resolved)
 
     async def _load_user_message_ids(self, user_uuid: UUID) -> tuple[int, ...]:
         async with self._pool.acquire() as connection:
@@ -2417,9 +2661,14 @@ def _event_chat_key(
 
 def _snapshot_message(
     snapshot: _MessageSnapshot,
+    *,
+    workspace_content: str | None = None,
     **changes: Any,
 ) -> ZulipMessage:
     updated = replace(snapshot, **changes)
+    projected_content = (
+        updated.workspace_content if workspace_content is None else workspace_content
+    )
     reactions = [dict(reaction) for reaction in updated.reactions]
     reaction_users: dict[str, list[str]] = {}
     for reaction in reactions:
@@ -2430,7 +2679,7 @@ def _snapshot_message(
         sender_user_uuid=updated.sender_user_uuid,
         chat_key=updated.chat_key,
         topic_name=updated.topic_name,
-        content=updated.content,
+        content=projected_content,
         sent_at=updated.sent_at,
     )
     message_hash = message_state_hash(
@@ -2473,6 +2722,7 @@ def _snapshot_message(
         write_flags=False,
         sent_at=updated.sent_at,
         source_updated_at=updated.source_updated_at,
+        workspace_content=projected_content,
     )
 
 

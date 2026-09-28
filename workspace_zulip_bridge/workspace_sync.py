@@ -24,11 +24,18 @@ import httpx
 from asyncpg.pool import PoolConnectionProxy
 
 from workspace_zulip_bridge.config import Settings
+from workspace_zulip_bridge.stable_ids import stable_external_chat_stream_uuid
+from workspace_zulip_bridge.stable_ids import stable_external_chat_topic_uuid
+from workspace_zulip_bridge.stable_ids import stable_message_flag_uuid
+from workspace_zulip_bridge.stable_ids import stable_reaction_uuid
+from workspace_zulip_bridge.stable_ids import stable_stream_binding_uuid
 from workspace_zulip_bridge.stable_ids import stable_topic_binding_uuid
 from workspace_zulip_bridge.stable_ids import stable_topic_uuid
 from workspace_zulip_bridge.workspace_auth import WorkspaceTokenManager
 from workspace_zulip_bridge.workspace_entities import project_entity
 from workspace_zulip_bridge.workspace_entities import validate_entity
+from workspace_zulip_bridge.workspace_file_transfer import CATALOG_PROJECTION_REVISION
+from workspace_zulip_bridge.workspace_file_transfer import FileTransferError
 from workspace_zulip_bridge.zulip_api import ZulipApiError
 from workspace_zulip_bridge.zulip_outbound import ZulipOutboundError
 from workspace_zulip_bridge.zulip_outbound import ZulipOutboundPending
@@ -58,6 +65,7 @@ WORKSPACE_EVENT_PRIORITY = {
     "topic": 7,
 }
 RECONCILIATION_VERSION = 19
+UNMAPPED_SCOPE_RECONCILIATION_VERSION = 1
 
 
 class ProviderApiError(RuntimeError):
@@ -102,6 +110,12 @@ def _json_object(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("expected a JSON object")
     return value
+
+
+def _optional_uuid(value: object) -> UUID | None:
+    if value is None:
+        return None
+    return UUID(str(value))
 
 
 def _entity_dependencies(
@@ -170,6 +184,67 @@ def _provider_api_error(response: httpx.Response) -> ProviderApiError:
         ):
             item_index = candidate_index
     return ProviderApiError(response.status_code, error_code, item_index)
+
+
+def _catalog_topic_provider_id(
+    chat_type: str,
+    chat_key: str,
+    topic_name: str | None,
+) -> str:
+    if chat_type == "channel":
+        if topic_name is None:
+            raise ValueError("channel message must have a catalog topic")
+        return f"{chat_key.removeprefix('channel:')}:{topic_name}"
+    return f"{chat_key}:default"
+
+
+def _catalog_projection_stream_uuid(
+    catalog: Mapping[str, Any],
+    external_chat_uuid: UUID,
+    assignment: Mapping[str, Any] | None = None,
+) -> UUID:
+    if assignment is not None:
+        projection = assignment.get("workspace_projection")
+        if isinstance(projection, Mapping):
+            stream = projection.get("stream")
+            if isinstance(stream, Mapping) and stream.get("uuid") is not None:
+                return UUID(str(stream["uuid"]))
+        raise ValueError("Workspace chat assignment stream mapping is missing")
+    source = catalog.get("source")
+    if isinstance(source, Mapping) and source.get("projection_stream_uuid") is not None:
+        return UUID(str(source["projection_stream_uuid"]))
+    return stable_external_chat_stream_uuid(external_chat_uuid)
+
+
+def _catalog_projection_topic_uuid(
+    catalog: Mapping[str, Any],
+    external_chat_uuid: UUID,
+    provider_topic_id: str,
+    assignment: Mapping[str, Any] | None = None,
+) -> UUID:
+    if assignment is not None:
+        projection = assignment.get("workspace_projection")
+        if isinstance(projection, Mapping):
+            assigned_topics = projection.get("topics")
+            if isinstance(assigned_topics, list):
+                for topic in assigned_topics:
+                    if (
+                        isinstance(topic, Mapping)
+                        and topic.get("provider_topic_id") == provider_topic_id
+                        and topic.get("topic_uuid") is not None
+                    ):
+                        return UUID(str(topic["topic_uuid"]))
+        raise ValueError("Workspace chat assignment topic mapping is missing")
+    topics = catalog.get("topics")
+    if isinstance(topics, list):
+        for topic in topics:
+            if (
+                isinstance(topic, Mapping)
+                and topic.get("provider_topic_id") == provider_topic_id
+                and topic.get("projection_topic_uuid") is not None
+            ):
+                return UUID(str(topic["projection_topic_uuid"]))
+    return stable_external_chat_topic_uuid(external_chat_uuid, provider_topic_id)
 
 
 def _bootstrap_error(error: BaseException) -> RuntimeError:
@@ -833,16 +908,55 @@ class WorkspaceBootstrapper:
 
 
 class WorkspaceEventProcessor:
-    def __init__(self, pool: asyncpg.Pool, settings: Settings) -> None:
+    REALTIME_OBJECT_TYPES = ("message", "message_flag", "message_reaction")
+    REALTIME_BATCH_SIZE = 16
+
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        settings: Settings,
+        *,
+        scope: Literal["all", "realtime", "background"] = "all",
+    ) -> None:
         assert settings.workspace_provider_uuid is not None
+        if scope not in {"all", "realtime", "background"}:
+            raise ValueError("invalid Workspace event processor scope")
         self._pool = pool
         self._settings = settings
         self._provider_uuid = settings.workspace_provider_uuid
+        self._scope = scope
         self._next_cleanup_at = 0.0
+        self._catalog_project_uuid: UUID | None = None
+        self._catalog_stream_ids: dict[UUID, UUID] = {}
+        self._catalog_topic_ids: dict[UUID, UUID] = {}
+        self._zulip_user_ids: dict[tuple[UUID, UUID], UUID] = {}
+
+    @property
+    def _object_type_filter(self) -> str:
+        scope = getattr(self, "_scope", "all")
+        values = ", ".join(f"'{value}'" for value in self.REALTIME_OBJECT_TYPES)
+        if scope == "realtime":
+            return f"object_type IN ({values})"
+        if scope == "background":
+            return f"object_type NOT IN ({values})"
+        return "TRUE"
+
+    @property
+    def _claim_batch_size(self) -> int:
+        if getattr(self, "_scope", "all") == "realtime":
+            return min(
+                self._settings.workspace_event_batch_size,
+                self.REALTIME_BATCH_SIZE,
+            )
+        return self._settings.workspace_event_batch_size
 
     async def run(self) -> None:
         while True:
-            deleted = await self._maybe_cleanup_expired_events()
+            deleted = (
+                0
+                if getattr(self, "_scope", "all") == "realtime"
+                else await self._maybe_cleanup_expired_events()
+            )
             changed = await self.process_once()
             if not changed and deleted != self._settings.event_cleanup_batch_size:
                 await asyncio.sleep(self._settings.workspace_sync_poll_seconds)
@@ -901,13 +1015,14 @@ class WorkspaceEventProcessor:
     async def process_once(self) -> int:
         async with self._pool.acquire() as connection, connection.transaction():
             await connection.execute(
-                """
+                f"""
                 UPDATE workspace_zulip_bridge.workspace_events
                 SET processing_status = 'pending', claimed_at = NULL,
                     available_at = clock_timestamp(), processed_at = NULL,
                     last_error = 'claim_expired'
                 WHERE provider_uuid = $1
                   AND processing_status = 'processing'
+                  AND {self._object_type_filter}
                   AND claimed_at < (
                       clock_timestamp()
                       - make_interval(secs => $2::double precision)
@@ -917,12 +1032,13 @@ class WorkspaceEventProcessor:
                 self._settings.event_processor_claim_timeout_seconds,
             )
             rows = await connection.fetch(
-                """
+                f"""
                 WITH claim AS (
                     SELECT sequence
                     FROM workspace_zulip_bridge.workspace_events
                     WHERE provider_uuid = $1 AND processing_status = 'pending'
                       AND available_at <= clock_timestamp()
+                      AND {self._object_type_filter}
                     ORDER BY CASE object_type
                         WHEN 'message' THEN 0
                         WHEN 'message_flag' THEN 1
@@ -945,7 +1061,7 @@ class WorkspaceEventProcessor:
                 RETURNING event.*
                 """,
                 self._provider_uuid,
-                self._settings.workspace_event_batch_size,
+                self._claim_batch_size,
             )
         if not rows:
             return 0
@@ -1037,11 +1153,17 @@ class WorkspaceEventProcessor:
             raw_uuid = value.get("uuid") or row["entity_uuid"]
             if raw_uuid is None:
                 continue
-            entity_uuid = UUID(str(raw_uuid))
-            if await self._newer_entity_event_applied(row, entity_uuid):
+            workspace_entity_uuid = UUID(str(raw_uuid))
+            if await self._newer_entity_event_applied(row, workspace_entity_uuid):
                 continue
             data = {key: item for key, item in value.items() if key != "kind"}
             validate_entity(entity_type, data)
+            entity_uuid, data = await self._canonicalize_catalog_entity(
+                entity_type,
+                workspace_entity_uuid,
+                data,
+                UUID(str(row["workspace_project_id"])),
+            )
             if row["action"] == "deleted":
                 await self._pool.execute(
                     f"DELETE FROM workspace_zulip_bridge.workspace_{entity_type} "
@@ -1104,6 +1226,214 @@ class WorkspaceEventProcessor:
             )
             applied = True
         return applied
+
+    async def _canonicalize_catalog_entity(
+        self,
+        entity_type: str,
+        entity_uuid: UUID,
+        data: dict[str, Any],
+        project_uuid: UUID,
+    ) -> tuple[UUID, dict[str, Any]]:
+        """Translate Workspace catalog projection IDs back to Zulip IDs."""
+
+        stream_ids, topic_ids = await self._catalog_identity_maps(project_uuid)
+        workspace_stream_uuid = _optional_uuid(data.get("stream_uuid"))
+        workspace_topic_uuid = _optional_uuid(data.get("topic_uuid"))
+        if (
+            workspace_stream_uuid is not None
+            and workspace_stream_uuid not in stream_ids
+        ) or (
+            workspace_topic_uuid is not None and workspace_topic_uuid not in topic_ids
+        ):
+            stream_ids, topic_ids = await self._catalog_identity_maps(
+                project_uuid,
+                refresh=True,
+            )
+
+        translated = dict(data)
+        stream_uuid = (
+            None
+            if workspace_stream_uuid is None
+            else stream_ids.get(workspace_stream_uuid, workspace_stream_uuid)
+        )
+        topic_uuid = (
+            None
+            if workspace_topic_uuid is None
+            else topic_ids.get(workspace_topic_uuid, workspace_topic_uuid)
+        )
+        if stream_uuid is not None:
+            translated["stream_uuid"] = str(stream_uuid)
+        if topic_uuid is not None:
+            translated["topic_uuid"] = str(topic_uuid)
+
+        mapped_users: dict[str, UUID] = {}
+        for field in ("user_uuid", "author_uuid", "who_uuid"):
+            workspace_user_uuid = _optional_uuid(translated.get(field))
+            if workspace_user_uuid is None:
+                continue
+            zulip_user_uuid = await self._zulip_user_uuid(
+                workspace_user_uuid,
+                project_uuid,
+            )
+            mapped_users[field] = zulip_user_uuid
+            translated[field] = str(zulip_user_uuid)
+
+        canonical_uuid = entity_uuid
+        if entity_type == "users":
+            canonical_uuid = await self._zulip_user_uuid(entity_uuid, project_uuid)
+        elif entity_type == "streams":
+            canonical_uuid = stream_ids.get(entity_uuid, entity_uuid)
+        elif entity_type == "topics":
+            canonical_uuid = topic_ids.get(entity_uuid, entity_uuid)
+        elif entity_type == "stream_bindings" and stream_uuid is not None:
+            user_uuid = mapped_users.get("user_uuid")
+            if user_uuid is not None:
+                canonical_uuid = stable_stream_binding_uuid(stream_uuid, user_uuid)
+        elif entity_type == "topic_bindings" and topic_uuid is not None:
+            user_uuid = mapped_users.get("user_uuid")
+            if user_uuid is not None:
+                canonical_uuid = stable_topic_binding_uuid(topic_uuid, user_uuid)
+        elif entity_type == "message_flags":
+            message_uuid = _optional_uuid(translated.get("message_uuid"))
+            user_uuid = mapped_users.get("user_uuid")
+            if message_uuid is not None and user_uuid is not None:
+                canonical_uuid = stable_message_flag_uuid(message_uuid, user_uuid)
+        elif entity_type == "message_reactions":
+            message_uuid = _optional_uuid(translated.get("message_uuid"))
+            user_uuid = mapped_users.get("user_uuid")
+            reaction_type = translated.get("reaction_type")
+            emoji_code = translated.get("emoji_code")
+            if (
+                message_uuid is not None
+                and user_uuid is not None
+                and isinstance(reaction_type, str)
+                and isinstance(emoji_code, str)
+            ):
+                canonical_uuid = stable_reaction_uuid(
+                    message_uuid,
+                    user_uuid,
+                    reaction_type,
+                    emoji_code,
+                )
+        return canonical_uuid, translated
+
+    async def _catalog_identity_maps(
+        self,
+        project_uuid: UUID,
+        *,
+        refresh: bool = False,
+    ) -> tuple[dict[UUID, UUID], dict[UUID, UUID]]:
+        if getattr(self, "_catalog_project_uuid", None) == project_uuid and not refresh:
+            return (
+                getattr(self, "_catalog_stream_ids", {}),
+                getattr(self, "_catalog_topic_ids", {}),
+            )
+        rows = await self._pool.fetch(
+            """
+            SELECT report.resource_uuid, report.catalog, report.assignment,
+                   stream.uuid AS stream_uuid,
+                   stream.chat_type, stream.chat_key,
+                   topic.uuid AS topic_uuid, topic.name AS topic_name
+            FROM workspace_zulip_bridge.workspace_chat_catalog_reports AS report
+            JOIN workspace_zulip_bridge.zulip_streams AS stream
+              ON stream.uuid = report.zulip_stream_uuid
+            JOIN workspace_zulip_bridge.zulip_realms AS realm
+              ON realm.uuid = stream.realm_uuid
+            LEFT JOIN workspace_zulip_bridge.zulip_topics AS topic
+              ON topic.zulip_stream_uuid = stream.uuid
+            WHERE realm.workspace_provider_uuid = $1
+              AND realm.workspace_project_id = $2
+              AND report.processing_status = 'reported'
+              AND report.assignment IS NOT NULL
+            """,
+            self._provider_uuid,
+            project_uuid,
+        )
+        stream_ids: dict[UUID, UUID] = {}
+        topic_ids: dict[UUID, UUID] = {}
+        for row in rows:
+            external_chat_uuid = UUID(str(row["resource_uuid"]))
+            source_stream_uuid = UUID(str(row["stream_uuid"]))
+            catalog = _json_object(row["catalog"])
+            assignment = _json_object(row["assignment"])
+            stream_ids[
+                _catalog_projection_stream_uuid(
+                    catalog,
+                    external_chat_uuid,
+                    assignment,
+                )
+            ] = source_stream_uuid
+            if row["topic_uuid"] is None:
+                continue
+            provider_topic_id = _catalog_topic_provider_id(
+                str(row["chat_type"]),
+                str(row["chat_key"]),
+                str(row["topic_name"]),
+            )
+            projection = assignment.get("workspace_projection")
+            assigned_topics = (
+                projection.get("topics") if isinstance(projection, Mapping) else None
+            )
+            if not isinstance(assigned_topics, list) or not any(
+                isinstance(topic, Mapping)
+                and topic.get("provider_topic_id") == provider_topic_id
+                and topic.get("topic_uuid") is not None
+                for topic in assigned_topics
+            ):
+                # The source topic table may contain historical topics that
+                # are not part of the current catalog/assignment.  They must
+                # not invalidate identity maps for the assigned topics or
+                # fall back to a source-only UUID.
+                continue
+            workspace_topic_uuid = _catalog_projection_topic_uuid(
+                catalog,
+                external_chat_uuid,
+                provider_topic_id,
+                assignment,
+            )
+            topic_ids[workspace_topic_uuid] = UUID(str(row["topic_uuid"]))
+        self._catalog_project_uuid = project_uuid
+        self._catalog_stream_ids = stream_ids
+        self._catalog_topic_ids = topic_ids
+        return stream_ids, topic_ids
+
+    async def _zulip_user_uuid(
+        self,
+        workspace_user_uuid: UUID,
+        project_uuid: UUID,
+    ) -> UUID:
+        cache_key = (project_uuid, workspace_user_uuid)
+        user_ids: dict[tuple[UUID, UUID], UUID] = getattr(
+            self,
+            "_zulip_user_ids",
+            {},
+        )
+        cached = user_ids.get(cache_key)
+        if cached is not None:
+            return cached
+        value = await self._pool.fetchval(
+            """
+            SELECT zulip_user.uuid
+            FROM workspace_zulip_bridge.zulip_users AS zulip_user
+            JOIN workspace_zulip_bridge.zulip_realms AS realm
+              ON realm.uuid = zulip_user.realm_uuid
+            WHERE realm.workspace_provider_uuid = $1
+              AND realm.workspace_project_id = $2
+              AND (
+                  zulip_user.uuid = $3
+                  OR zulip_user.workspace_user_uuid = $3
+              )
+            ORDER BY (zulip_user.uuid = $3) DESC
+            LIMIT 1
+            """,
+            self._provider_uuid,
+            project_uuid,
+            workspace_user_uuid,
+        )
+        result = workspace_user_uuid if value is None else UUID(str(value))
+        user_ids[cache_key] = result
+        self._zulip_user_ids = user_ids
+        return result
 
     async def _newer_entity_event_applied(
         self,
@@ -1334,6 +1664,8 @@ class WorkspaceDiffWorker:
         self._direct_topics_repair_done = False
         self._topic_bindings_repair_done = False
         self._moved_flag_repair_batch_size = self.MOVED_FLAG_REPAIR_MESSAGE_BATCH_SIZE
+        self._workspace_entity_ids: dict[tuple[str, UUID], UUID] = {}
+        self._assignment_blocked_entities: set[tuple[str, UUID]] = set()
         self._zulip_writer = ZulipOutboundWriter(pool, settings)
 
     @property
@@ -1427,6 +1759,17 @@ class WorkspaceDiffWorker:
         # planner must never wait for a slow Provider API batch: doing so stalls
         # every source cursor and turns a handful of rejected legacy entities
         # into a global synchronization pause.
+        if await self._historical_file_work_pending():
+            # Direct chats still need their synthetic topic while the
+            # historical file stage is active: catalog publication and
+            # realtime delivery both depend on it, and the repair is bounded.
+            if not self._direct_topics_repair_done:
+                realm_uuid = await self._link_realm()
+                if realm_uuid is not None:
+                    self._direct_topics_repair_done = await self._ensure_direct_topics(
+                        realm_uuid
+                    )
+            return 0
         planned = await self.plan()
         if planned is None:
             return 0
@@ -1435,10 +1778,52 @@ class WorkspaceDiffWorker:
         return planned
 
     async def _drain(self, client: httpx.AsyncClient) -> int:
+        if (
+            getattr(self, "_delivery_priority", None) == 1
+            and await self._historical_file_work_pending()
+        ):
+            return 0
         processed = 0
         while changed := await self.process_once(client):
             processed += changed
         return processed
+
+    async def _historical_file_work_pending(self) -> bool:
+        """Keep historical delivery on the file stage until it is drained."""
+
+        return bool(
+            await self._pool.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM workspace_zulip_bridge.workspace_file_projections
+                    WHERE delivery_priority = 1
+                      AND processing_status IN (
+                          'pending', 'processing', 'failed'
+                      )
+                    LIMIT 1
+                ) OR EXISTS (
+                    SELECT 1
+                    FROM workspace_zulip_bridge.workspace_outbox AS outbox
+                    JOIN workspace_zulip_bridge.zulip_message_files AS link
+                      ON link.file_uuid = outbox.entity_uuid
+                    JOIN workspace_zulip_bridge.zulip_messages AS message
+                      ON message.uuid = link.message_uuid
+                     AND message.workspace_content IS NOT NULL
+                    LEFT JOIN workspace_zulip_bridge.workspace_file_projections
+                        AS projection
+                      ON projection.file_uuid = link.file_uuid
+                     AND projection.zulip_stream_uuid =
+                            message.zulip_stream_uuid
+                    WHERE outbox.entity_type = 'file'
+                      AND outbox.action = 'upsert'
+                      AND outbox.delivery_status IN ('pending', 'failed')
+                      AND projection.uuid IS NULL
+                    LIMIT 1
+                )
+                """
+            )
+        )
 
     async def plan(self) -> int | None:
         realm_uuid = await self._link_realm()
@@ -1464,14 +1849,15 @@ class WorkspaceDiffWorker:
             state.get("initial_sync_completed_at") is not None
             and state.get("target_scan_generation", generation) != generation
         )
+        current_reconciliation_version = int(state.get("reconciliation_version", 0))
+        total = await self._plan_source_outbox(realm_uuid, generation)
         if (
             state.get("initial_sync_completed_at") is not None
+            and current_reconciliation_version < UNMAPPED_SCOPE_RECONCILIATION_VERSION
             and not self._unmapped_cleanup_done
         ):
             await self._skip_unmapped_target_diffs(realm_uuid, generation)
             self._unmapped_cleanup_done = True
-        total = await self._plan_source_outbox(realm_uuid, generation)
-        current_reconciliation_version = int(state.get("reconciliation_version", 0))
         if not self._topic_bindings_repair_done:
             self._topic_bindings_repair_done = await self._ensure_topic_bindings(
                 realm_uuid
@@ -1774,7 +2160,8 @@ class WorkspaceDiffWorker:
                     message.zulip_stream_uuid
                   AND (target.data ->> 'topic_uuid')::uuid = message.topic_uuid
                   AND target.data -> 'payload' = jsonb_build_object(
-                    'kind', 'markdown', 'content', message.content
+                    'kind', 'markdown', 'content',
+                    COALESCE(message.workspace_content, message.content)
                   )
                   AND (target.data ->> 'created_at')::timestamptz =
                     message.created_at
@@ -1822,7 +2209,8 @@ class WorkspaceDiffWorker:
                     message.zulip_stream_uuid
                   AND (target.data ->> 'topic_uuid')::uuid = message.topic_uuid
                   AND target.data -> 'payload' = jsonb_build_object(
-                    'kind', 'markdown', 'content', message.content
+                    'kind', 'markdown', 'content',
+                    COALESCE(message.workspace_content, message.content)
                   )
                   AND (target.data ->> 'created_at')::timestamptz =
                     message.created_at
@@ -2763,32 +3151,38 @@ class WorkspaceDiffWorker:
         """Turn committed Zulip changes into diffs without a cursor race."""
         async with self._pool.acquire() as connection, connection.transaction():
             rows = []
-            remaining = self._settings.workspace_sync_plan_batch_size
-            outbox_types = tuple(_OUTBOX_SOURCE_TYPES)
-            for index, outbox_type in enumerate(outbox_types):
-                if remaining <= 0:
-                    break
-                remaining_types = len(outbox_types) - index
-                type_limit = max(1, remaining // remaining_types)
+            for outbox_type, entity_type in _OUTBOX_SOURCE_TYPES.items():
+                source_table = _OUTBOX_SOURCE_BASE_TABLES[outbox_type]
+                source_timestamp = (
+                    "source.source_updated_at"
+                    if entity_type in {"topic_bindings", "messages"}
+                    else "source.updated_at"
+                )
                 selected = await connection.fetch(
-                    """
-                    SELECT sequence, entity_type, entity_uuid
-                    FROM workspace_zulip_bridge.workspace_outbox
-                    WHERE realm_uuid = $1
-                      AND delivery_status = 'pending'
-                      AND action = 'upsert'
-                      AND entity_type = $2
-                      AND available_at <= clock_timestamp()
-                    ORDER BY sequence
+                    f"""
+                    SELECT outbox.sequence, outbox.entity_type,
+                           outbox.entity_uuid
+                    FROM workspace_zulip_bridge.workspace_outbox AS outbox
+                    LEFT JOIN workspace_zulip_bridge.{source_table} AS source
+                      ON source.uuid = outbox.entity_uuid
+                    WHERE outbox.realm_uuid = $1
+                      AND outbox.delivery_status = 'pending'
+                      AND outbox.action = 'upsert'
+                      AND outbox.entity_type = $2
+                      AND outbox.available_at <= clock_timestamp()
+                    ORDER BY {source_timestamp} DESC NULLS LAST,
+                             source.uuid DESC NULLS LAST,
+                             outbox.sequence DESC
                     LIMIT $3
-                    FOR UPDATE SKIP LOCKED
+                    FOR UPDATE OF outbox SKIP LOCKED
                     """,
                     realm_uuid,
                     outbox_type,
-                    type_limit,
+                    self._settings.workspace_sync_plan_batch_size,
                 )
-                rows.extend(selected)
-                remaining -= len(selected)
+                if selected:
+                    rows.extend(selected)
+                    break
             if not rows:
                 return 0
             if any(row["entity_type"] == "topic" for row in rows):
@@ -3394,9 +3788,27 @@ class WorkspaceDiffWorker:
                 )
             if delivery_priority is None:
                 return 0
+            source_order = (
+                "DESC" if getattr(self, "_delivery_priority", None) == 1 else "ASC"
+            )
             rows = await connection.fetch(
                 f"""
-                WITH claim AS (
+                WITH selected_type AS MATERIALIZED (
+                    SELECT entity_type
+                    FROM workspace_zulip_bridge.sync_diffs
+                    WHERE provider_uuid = $1
+                      AND processing_status IN ('pending', 'failed')
+                      AND available_at <= clock_timestamp()
+                      AND delivery_priority = $3
+                      AND {self._entity_type_filter}
+                      AND {self._partition_filter}
+                    ORDER BY CASE entity_type
+                        WHEN 'users' THEN 0 WHEN 'streams' THEN 1
+                        WHEN 'stream_bindings' THEN 2 WHEN 'topics' THEN 3
+                        WHEN 'topic_bindings' THEN 4 WHEN 'messages' THEN 5
+                        WHEN 'message_flags' THEN 6 ELSE 7 END
+                    LIMIT 1
+                ), claim AS (
                     SELECT provider_uuid, entity_type, entity_uuid
                     FROM workspace_zulip_bridge.sync_diffs
                     WHERE provider_uuid = $1
@@ -3405,13 +3817,9 @@ class WorkspaceDiffWorker:
                       AND delivery_priority = $3
                       AND {self._entity_type_filter}
                       AND {self._partition_filter}
-                    ORDER BY delivery_priority,
-                        CASE entity_type
-                        WHEN 'users' THEN 0 WHEN 'streams' THEN 1
-                        WHEN 'stream_bindings' THEN 2 WHEN 'topics' THEN 3
-                        WHEN 'topic_bindings' THEN 4 WHEN 'messages' THEN 5
-                        WHEN 'message_flags' THEN 6 ELSE 7 END,
-                        source_updated_at, entity_uuid
+                      AND entity_type = (SELECT entity_type FROM selected_type)
+                    ORDER BY source_updated_at {source_order},
+                             entity_uuid {source_order}
                     FOR UPDATE SKIP LOCKED LIMIT $2
                 )
                 UPDATE workspace_zulip_bridge.sync_diffs AS diff
@@ -3428,6 +3836,8 @@ class WorkspaceDiffWorker:
             )
         if not rows:
             return 0
+        self._workspace_entity_ids = {}
+        self._assignment_blocked_entities = set()
         delivery_class = "live" if int(delivery_priority) == 0 else "backfill"
         to_workspace = [row for row in rows if row["direction"] == "to_workspace"]
         to_zulip = [row for row in rows if row["direction"] == "to_zulip"]
@@ -3455,11 +3865,15 @@ class WorkspaceDiffWorker:
         ]
         reaction_owners = await self._workspace_reaction_owners(reaction_sources)
         skipped: list[asyncpg.Record] = []
+        assignment_deferred: list[asyncpg.Record] = []
         equivalent: list[tuple[asyncpg.Record, dict[str, Any], bytes]] = []
         for row in to_workspace:
             key = (row["entity_type"], row["entity_uuid"])
             data = loaded.get(key)
             target = targets.get(key)
+            if key in self._assignment_blocked_entities:
+                assignment_deferred.append(row)
+                continue
             if _equivalent_entity(row["entity_type"], data, target):
                 equivalent.append(
                     (row, data or {}, canonical_hash(data) if data else b"")
@@ -3474,22 +3888,23 @@ class WorkspaceDiffWorker:
                         {
                             "action": "delete",
                             "type": row["entity_type"],
-                            "uuid": str(row["entity_uuid"]),
+                            "uuid": str(self._workspace_entity_uuid(row)),
                         },
                     )
                 )
                 continue
             if row["entity_type"] == "message_reactions":
                 identity = _reaction_identity(data)
-                owner = reaction_owners.setdefault(identity, row["entity_uuid"])
-                if owner != row["entity_uuid"]:
+                workspace_entity_uuid = self._workspace_entity_uuid(row)
+                owner = reaction_owners.setdefault(identity, workspace_entity_uuid)
+                if owner != workspace_entity_uuid:
                     skipped.append(row)
                     continue
             content_hash = canonical_hash(data)
             operation = {
                 "action": "upsert",
                 "type": row["entity_type"],
-                "uuid": str(row["entity_uuid"]),
+                "uuid": str(self._workspace_entity_uuid(row)),
                 "content_hash": content_hash.hex(),
                 "source_updated_at": row["source_updated_at"]
                 .isoformat()
@@ -3511,6 +3926,8 @@ class WorkspaceDiffWorker:
                 "skipped",
                 "workspace_reaction_identity_duplicate",
             )
+        if assignment_deferred:
+            await self._defer_for_dependencies(assignment_deferred)
         if not candidates:
             return len(rows)
         ready, deferred = await self._partition_dependency_ready(candidates)
@@ -3521,6 +3938,16 @@ class WorkspaceDiffWorker:
         ready.sort(key=lambda item: PRIORITY[item[0]["entity_type"]])
         await self._apply_workspace_batch(client, delivery_class, ready)
         return len(rows)
+
+    def _workspace_entity_uuid(
+        self,
+        row: asyncpg.Record | Mapping[str, Any],
+    ) -> UUID:
+        source_uuid = UUID(str(row["entity_uuid"]))
+        return self._workspace_entity_ids.get(
+            (str(row["entity_type"]), source_uuid),
+            source_uuid,
+        )
 
     async def _apply_workspace_batch(
         self,
@@ -3770,6 +4197,7 @@ class WorkspaceDiffWorker:
         list[asyncpg.Record],
     ]:
         dependencies: dict[str, set[UUID]] = defaultdict(set)
+        file_ready_message_ids = await self._load_file_ready_message_ids(candidates)
         message_flag_binding_ids = await self._load_message_flag_binding_ids(candidates)
         topic_binding_stream_binding_ids = (
             await self._load_topic_binding_stream_binding_ids(candidates)
@@ -3792,6 +4220,11 @@ class WorkspaceDiffWorker:
                 if binding_uuid is not None:
                     dependencies["stream_bindings"].add(binding_uuid)
         ready_ids = await self._load_ready_dependency_ids(dependencies)
+        catalog_dependencies = await self._load_catalog_message_dependency_ids(
+            candidates
+        )
+        ready_ids.setdefault("streams", set()).update(catalog_dependencies["streams"])
+        ready_ids.setdefault("topics", set()).update(catalog_dependencies["topics"])
         ready = []
         deferred = []
         for candidate in sorted(
@@ -3817,6 +4250,12 @@ class WorkspaceDiffWorker:
                     deferred.append(row)
                     continue
                 required.append(("stream_bindings", binding_uuid))
+            if (
+                row["entity_type"] == "messages"
+                and row["entity_uuid"] not in file_ready_message_ids
+            ):
+                deferred.append(row)
+                continue
             if all(
                 dependency_uuid in ready_ids[dependency_type]
                 for dependency_type, dependency_uuid in required
@@ -3827,6 +4266,116 @@ class WorkspaceDiffWorker:
             else:
                 deferred.append(row)
         return ready, deferred
+
+    async def _load_catalog_message_dependency_ids(
+        self,
+        candidates: list[tuple[asyncpg.Record, dict[str, Any], bytes, dict[str, Any]]],
+    ) -> dict[str, set[UUID]]:
+        ready: dict[str, set[UUID]] = defaultdict(set)
+        message_uuids = [
+            UUID(str(row["entity_uuid"]))
+            for row, _, _, operation in candidates
+            if row["entity_type"] == "messages" and operation.get("action") != "delete"
+        ]
+        if not message_uuids:
+            return ready
+        rows = await self._pool.fetch(
+            """
+            SELECT report.resource_uuid, report.catalog, report.assignment,
+                   stream.uuid AS stream_uuid, stream.chat_type, stream.chat_key,
+                   topic.uuid AS topic_uuid,
+                   topic.name AS topic_name
+            FROM workspace_zulip_bridge.zulip_messages AS message
+            JOIN workspace_zulip_bridge.zulip_streams AS stream
+              ON stream.uuid = message.zulip_stream_uuid
+            JOIN workspace_zulip_bridge.zulip_connections AS connection
+              ON connection.uuid = stream.source_connection_uuid
+            JOIN workspace_zulip_bridge.zulip_realms AS realm
+              ON realm.uuid = message.realm_uuid
+            JOIN workspace_zulip_bridge.workspace_mirror_state AS mirror
+              ON mirror.provider_uuid = realm.workspace_provider_uuid
+             AND mirror.bootstrap_status = 'ready'
+             AND mirror.active_generation IS NOT NULL
+            JOIN workspace_zulip_bridge.workspace_chat_catalog_reports AS report
+              ON report.external_account_uuid = connection.external_account_uuid
+             AND report.zulip_stream_uuid = stream.uuid
+             AND report.processing_status = 'reported'
+             AND report.assignment IS NOT NULL
+            LEFT JOIN workspace_zulip_bridge.zulip_topics AS topic
+              ON topic.uuid = message.topic_uuid
+            WHERE message.uuid = ANY($1::uuid[])
+              AND EXISTS (
+                  SELECT 1
+                  FROM jsonb_array_elements(report.catalog -> 'topics')
+                      AS catalog_topic
+                  WHERE catalog_topic ->> 'provider_topic_id' = CASE
+                      WHEN stream.chat_type = 'channel'
+                      THEN regexp_replace(stream.chat_key, '^channel:', '')
+                           || ':' || topic.name
+                      ELSE stream.chat_key || ':default'
+                  END
+              )
+            """,
+            message_uuids,
+        )
+        for row in rows:
+            external_chat_uuid = UUID(str(row["resource_uuid"]))
+            catalog = _json_object(row["catalog"])
+            assignment = _json_object(row["assignment"])
+            ready["streams"].add(
+                _catalog_projection_stream_uuid(
+                    catalog,
+                    external_chat_uuid,
+                    assignment,
+                )
+            )
+            provider_topic_id = _catalog_topic_provider_id(
+                str(row["chat_type"]),
+                str(row["chat_key"]),
+                str(row["topic_name"]) if row["topic_name"] is not None else None,
+            )
+            ready["topics"].add(
+                _catalog_projection_topic_uuid(
+                    catalog,
+                    external_chat_uuid,
+                    provider_topic_id,
+                    assignment,
+                )
+            )
+        return ready
+
+    async def _load_file_ready_message_ids(
+        self,
+        candidates: list[tuple[asyncpg.Record, dict[str, Any], bytes, dict[str, Any]]],
+    ) -> set[UUID]:
+        message_uuids = [
+            UUID(str(row["entity_uuid"]))
+            for row, _, _, operation in candidates
+            if row["entity_type"] == "messages" and operation.get("action") != "delete"
+        ]
+        if not message_uuids:
+            return set()
+        rows = await self._pool.fetch(
+            """
+            SELECT candidate.uuid
+            FROM unnest($1::uuid[]) AS candidate(uuid)
+            LEFT JOIN workspace_zulip_bridge.zulip_messages AS message
+              ON message.uuid = candidate.uuid
+            WHERE message.uuid IS NULL OR NOT EXISTS (
+                  SELECT 1
+                  FROM workspace_zulip_bridge.zulip_message_files AS link
+                  LEFT JOIN workspace_zulip_bridge.workspace_file_projections
+                    AS projection
+                    ON projection.file_uuid = link.file_uuid
+                   AND projection.zulip_stream_uuid = message.zulip_stream_uuid
+                   AND projection.processing_status = 'finalized'
+                  WHERE link.message_uuid = message.uuid
+                    AND projection.uuid IS NULL
+              )
+            """,
+            message_uuids,
+        )
+        return {UUID(str(row["uuid"])) for row in rows}
 
     async def _load_message_flag_binding_ids(
         self,
@@ -3951,7 +4500,10 @@ class WorkspaceDiffWorker:
                 dependency_wait_count = dependency_wait_count + 1,
                 available_at = clock_timestamp() + make_interval(
                     secs => LEAST(
-                        $6::double precision,
+                        CASE WHEN delivery_priority = 0
+                            THEN 5::double precision
+                            ELSE $6::double precision
+                        END,
                         $5::double precision * power(
                             2::double precision,
                             LEAST(dependency_wait_count, 16)
@@ -4042,6 +4594,7 @@ class WorkspaceDiffWorker:
     async def _write_to_zulip(self, rows: list[asyncpg.Record]) -> None:
         source_entities: dict[tuple[str, UUID], dict[str, Any]] = {}
         target_entities: dict[tuple[str, UUID], dict[str, Any]] = {}
+        assignment_deferred: list[asyncpg.Record] = []
         grouped: dict[str, list[UUID]] = defaultdict(list)
         for row in rows:
             grouped[row["entity_type"]].append(row["entity_uuid"])
@@ -4061,6 +4614,9 @@ class WorkspaceDiffWorker:
             key = (row["entity_type"], row["entity_uuid"])
             source = source_entities.get(key)
             target = target_entities.get(key)
+            if key in self._assignment_blocked_entities:
+                assignment_deferred.append(row)
+                continue
             if key in identity_rebinds:
                 await self._redirect_identity_rebind(row)
                 continue
@@ -4100,6 +4656,14 @@ class WorkspaceDiffWorker:
                     retry_base_seconds=self._settings.zulip_retry_base_seconds,
                     retry_cap_seconds=self._settings.zulip_retry_cap_seconds,
                 )
+            except FileTransferError as exc:
+                await self._mark(
+                    [row],
+                    "failed" if exc.retryable else "blocked",
+                    exc.code[:2048],
+                    retry_base_seconds=self._settings.zulip_retry_base_seconds,
+                    retry_cap_seconds=self._settings.zulip_retry_cap_seconds,
+                )
             except Exception as exc:
                 error_category = f"unexpected_error:{type(exc).__name__}"
                 LOG.error(
@@ -4115,6 +4679,8 @@ class WorkspaceDiffWorker:
                 )
             else:
                 await self._accept_to_zulip(row, "written")
+        if assignment_deferred:
+            await self._defer_for_dependencies(assignment_deferred)
 
     async def _message_identity_rebinds(
         self,
@@ -4364,7 +4930,7 @@ class WorkspaceDiffWorker:
                             (
                                 self._provider_uuid,
                                 generation,
-                                row["entity_uuid"],
+                                self._workspace_entity_uuid(row),
                                 self._project_uuid,
                                 content_hash,
                                 row["source_updated_at"],
@@ -4382,7 +4948,7 @@ class WorkspaceDiffWorker:
                         """,
                         self._provider_uuid,
                         generation,
-                        [item[0]["entity_uuid"] for item in deletes],
+                        [self._workspace_entity_uuid(item[0]) for item in deletes],
                     )
             await connection.execute(
                 """
@@ -4443,7 +5009,7 @@ class WorkspaceDiffWorker:
                         (
                             self._provider_uuid,
                             generation,
-                            row["entity_uuid"],
+                            self._workspace_entity_uuid(row),
                             content_hash,
                             row["source_updated_at"],
                         )
@@ -4505,7 +5071,10 @@ class WorkspaceDiffWorker:
                                 $8::double precision,
                                 $7::double precision * power(
                                     2::double precision,
-                                    GREATEST(attempt_count - 1, 0)
+                                    LEAST(
+                                        GREATEST(attempt_count - 1, 0),
+                                        16
+                                    )
                                 )
                             )
                         )
@@ -4649,8 +5218,8 @@ class WorkspaceDiffWorker:
         topic_uuids = [value[0] for value in values]
         stream_uuids = [value[1] for value in values]
         content_hashes = [value[2] for value in values]
-        async with self._pool.acquire() as connection, connection.transaction():
-            if values:
+        if values:
+            async with self._pool.acquire() as connection, connection.transaction():
                 await connection.execute(
                     """
                     WITH inserted AS (
@@ -4680,6 +5249,7 @@ class WorkspaceDiffWorker:
                     content_hashes,
                     realm_uuid,
                 )
+        async with self._pool.acquire() as connection, connection.transaction():
             result = await connection.execute(
                 """
                 WITH pending AS MATERIALIZED (
@@ -4811,17 +5381,91 @@ class WorkspaceDiffWorker:
         self, entity_type: str, entity_uuids: list[UUID]
     ) -> dict[tuple[str, UUID], dict[str, Any]]:
         rows = await self._pool.fetch(_ENTITY_QUERIES[entity_type], entity_uuids)
-        return {
-            (entity_type, UUID(str(row["entity_uuid"]))): project_entity(
-                entity_type,
-                _json_object(row["data"]),
+        result: dict[tuple[str, UUID], dict[str, Any]] = {}
+        for row in rows:
+            data = _json_object(row["data"])
+            source_entity_uuid = UUID(str(row["entity_uuid"]))
+            workspace_entity_uuid = source_entity_uuid
+            catalog_resource_uuid = row.get("catalog_resource_uuid")
+            if catalog_resource_uuid is not None and (
+                row.get("catalog_projection_revision") != CATALOG_PROJECTION_REVISION
+                or row.get("assignment") is None
+            ):
+                self._assignment_blocked_entities.add((entity_type, source_entity_uuid))
+                continue
+            if catalog_resource_uuid is not None:
+                external_chat_uuid = UUID(str(catalog_resource_uuid))
+                catalog = _json_object(row["catalog"])
+                assignment = _json_object(row["assignment"])
+                workspace_stream_uuid = _catalog_projection_stream_uuid(
+                    catalog,
+                    external_chat_uuid,
+                    assignment,
+                )
+                if "stream_uuid" in data:
+                    data["stream_uuid"] = str(workspace_stream_uuid)
+                if entity_type == "streams":
+                    workspace_entity_uuid = workspace_stream_uuid
+                if entity_type in {"topics", "topic_bindings", "messages"}:
+                    provider_topic_id = _catalog_topic_provider_id(
+                        str(row["chat_type"]),
+                        str(row["chat_key"]),
+                        (
+                            str(row["topic_name"])
+                            if row["topic_name"] is not None
+                            else None
+                        ),
+                    )
+                    workspace_topic_uuid = _catalog_projection_topic_uuid(
+                        catalog,
+                        external_chat_uuid,
+                        provider_topic_id,
+                        assignment,
+                    )
+                    if "topic_uuid" in data:
+                        data["topic_uuid"] = str(workspace_topic_uuid)
+                    if entity_type == "topics":
+                        workspace_entity_uuid = workspace_topic_uuid
+                if entity_type == "stream_bindings":
+                    workspace_entity_uuid = stable_stream_binding_uuid(
+                        workspace_stream_uuid,
+                        UUID(str(data["user_uuid"])),
+                    )
+                elif entity_type == "topic_bindings":
+                    workspace_entity_uuid = stable_topic_binding_uuid(
+                        UUID(str(data["topic_uuid"])),
+                        UUID(str(data["user_uuid"])),
+                    )
+                elif entity_type == "message_flags":
+                    workspace_entity_uuid = stable_message_flag_uuid(
+                        UUID(str(data["message_uuid"])),
+                        UUID(str(data["user_uuid"])),
+                    )
+            if entity_type == "message_reactions":
+                workspace_entity_uuid = stable_reaction_uuid(
+                    UUID(str(data["message_uuid"])),
+                    UUID(str(data["user_uuid"])),
+                    str(row["reaction_type"]),
+                    str(row["emoji_code"]),
+                )
+            self._workspace_entity_ids[(entity_type, source_entity_uuid)] = (
+                workspace_entity_uuid
             )
-            for row in rows
-        }
+            result[(entity_type, source_entity_uuid)] = project_entity(
+                entity_type,
+                data,
+            )
+        return result
 
     async def _load_workspace_entities(
         self, entity_type: str, entity_uuids: list[UUID]
     ) -> dict[tuple[str, UUID], dict[str, Any]]:
+        workspace_to_source = {
+            self._workspace_entity_ids.get(
+                (entity_type, source_uuid), source_uuid
+            ): source_uuid
+            for source_uuid in entity_uuids
+        }
         rows = await self._pool.fetch(
             f"""
             SELECT entity.uuid AS entity_uuid, entity.data
@@ -4833,10 +5477,13 @@ class WorkspaceDiffWorker:
               AND entity.uuid = ANY($2::uuid[])
             """,
             self._provider_uuid,
-            entity_uuids,
+            list(workspace_to_source),
         )
         return {
-            (entity_type, UUID(str(row["entity_uuid"]))): _json_object(row["data"])
+            (
+                entity_type,
+                workspace_to_source[UUID(str(row["entity_uuid"]))],
+            ): _json_object(row["data"])
             for row in rows
         }
 
@@ -5055,6 +5702,18 @@ _SOURCE_TABLES = {
         """,
         "where": """
             source.realm_uuid = $3
+            AND NOT EXISTS (
+                SELECT 1
+                FROM workspace_zulip_bridge.zulip_message_files AS file_link
+                LEFT JOIN workspace_zulip_bridge.workspace_file_projections
+                    AS file_projection
+                  ON file_projection.file_uuid = file_link.file_uuid
+                 AND file_projection.zulip_stream_uuid =
+                        source.zulip_stream_uuid
+                 AND file_projection.processing_status = 'finalized'
+                WHERE file_link.message_uuid = source.uuid
+                  AND file_projection.uuid IS NULL
+            )
         """,
         "hash": "source.content_hash",
         "partition": "source.zulip_stream_uuid",
@@ -5088,17 +5747,21 @@ _SOURCE_TABLES = {
 }
 
 _OUTBOX_SOURCE_TYPES = {
-    # Dependencies must be planned before their consumers. Any unused share
-    # then flows into the remaining high-volume types instead of wasting the
-    # batch.
+    # Drain exactly one historical type per pass. Dependencies precede their
+    # consumers; messages precede the personal flags and reactions that refer
+    # to them. Each selected type is processed newest-first.
+    "stream": "streams",
+    "stream_binding": "stream_bindings",
     "topic": "topics",
     "topic_binding": "topic_bindings",
-    "message_reaction": "message_reactions",
-    "message_flag": "message_flags",
     "message": "messages",
+    "message_flag": "message_flags",
+    "message_reaction": "message_reactions",
 }
 
 _OUTBOX_SOURCE_BASE_TABLES = {
+    "stream": "zulip_streams",
+    "stream_binding": "zulip_stream_bindings",
     "topic": "zulip_topics",
     "topic_binding": "zulip_topic_bindings",
     "message_reaction": "zulip_message_reactions",
@@ -5164,7 +5827,16 @@ _ENTITY_QUERIES = {
             'history_public_to_subscribers',
                 COALESCE((stream.chat_parameters ->> 'history_public_to_subscribers')::boolean, true),
             'created_at', stream.created_at
-        ) AS data
+        ) AS data,
+        report.resource_uuid AS catalog_resource_uuid,
+        report.projection_revision AS catalog_projection_revision,
+        CASE WHEN report.processing_status = 'reported'
+                   AND report.assignment IS NOT NULL
+             THEN report.catalog END AS catalog,
+        CASE WHEN report.processing_status = 'reported'
+                   AND report.assignment IS NOT NULL
+             THEN report.assignment END AS assignment,
+        stream.chat_type, stream.chat_key, NULL::text AS topic_name
         FROM workspace_zulip_bridge.zulip_streams AS stream
         LEFT JOIN workspace_zulip_bridge.zulip_connections AS connection
           ON connection.uuid = stream.source_connection_uuid
@@ -5174,6 +5846,9 @@ _ENTITY_QUERIES = {
           ON owner_user.uuid = stream.owner_user_uuid
         LEFT JOIN workspace_zulip_bridge.zulip_users AS direct_user
           ON direct_user.uuid = stream.direct_user_uuid
+        LEFT JOIN workspace_zulip_bridge.workspace_chat_catalog_reports AS report
+          ON report.external_account_uuid = connection.external_account_uuid
+         AND report.zulip_stream_uuid = stream.uuid
         WHERE stream.uuid = ANY($1::uuid[])
     """,
     "stream_bindings": """
@@ -5189,7 +5864,16 @@ _ENTITY_QUERIES = {
             'role', binding.role,
             'notification_mode', binding.notification_mode,
             'created_at', binding.created_at
-        ) AS data
+        ) AS data,
+        report.resource_uuid AS catalog_resource_uuid,
+        report.projection_revision AS catalog_projection_revision,
+        CASE WHEN report.processing_status = 'reported'
+                   AND report.assignment IS NOT NULL
+             THEN report.catalog END AS catalog,
+        CASE WHEN report.processing_status = 'reported'
+                   AND report.assignment IS NOT NULL
+             THEN report.assignment END AS assignment,
+        stream.chat_type, stream.chat_key, NULL::text AS topic_name
         FROM workspace_zulip_bridge.zulip_stream_bindings AS binding
         JOIN workspace_zulip_bridge.zulip_streams AS stream
           ON stream.uuid = binding.zulip_stream_uuid
@@ -5201,14 +5885,35 @@ _ENTITY_QUERIES = {
           ON connection_user.uuid = connection.zulip_user_uuid
         LEFT JOIN workspace_zulip_bridge.zulip_users AS owner_user
           ON owner_user.uuid = stream.owner_user_uuid
+        LEFT JOIN workspace_zulip_bridge.workspace_chat_catalog_reports AS report
+          ON report.external_account_uuid = connection.external_account_uuid
+         AND report.zulip_stream_uuid = stream.uuid
         WHERE binding.uuid = ANY($1::uuid[])
     """,
     "topics": """
-        SELECT uuid AS entity_uuid, jsonb_build_object(
-            'stream_uuid', zulip_stream_uuid, 'name', name,
-            'is_done', is_done, 'version', version, 'created_at', created_at
-        ) AS data FROM workspace_zulip_bridge.zulip_topics
-        WHERE uuid = ANY($1::uuid[])
+        SELECT topic.uuid AS entity_uuid, jsonb_build_object(
+            'stream_uuid', topic.zulip_stream_uuid, 'name', topic.name,
+            'is_done', topic.is_done, 'version', topic.version,
+            'created_at', topic.created_at
+        ) AS data,
+        report.resource_uuid AS catalog_resource_uuid,
+        report.projection_revision AS catalog_projection_revision,
+        CASE WHEN report.processing_status = 'reported'
+                   AND report.assignment IS NOT NULL
+             THEN report.catalog END AS catalog,
+        CASE WHEN report.processing_status = 'reported'
+                   AND report.assignment IS NOT NULL
+             THEN report.assignment END AS assignment,
+        stream.chat_type, stream.chat_key, topic.name AS topic_name
+        FROM workspace_zulip_bridge.zulip_topics AS topic
+        JOIN workspace_zulip_bridge.zulip_streams AS stream
+          ON stream.uuid = topic.zulip_stream_uuid
+        LEFT JOIN workspace_zulip_bridge.zulip_connections AS connection
+          ON connection.uuid = stream.source_connection_uuid
+        LEFT JOIN workspace_zulip_bridge.workspace_chat_catalog_reports AS report
+          ON report.external_account_uuid = connection.external_account_uuid
+         AND report.zulip_stream_uuid = stream.uuid
+        WHERE topic.uuid = ANY($1::uuid[])
     """,
     "topic_bindings": """
         SELECT binding.uuid AS entity_uuid, jsonb_build_object(
@@ -5218,10 +5923,28 @@ _ENTITY_QUERIES = {
                 zulip_user.workspace_user_uuid, binding.zulip_user_uuid
             ), 'notification_mode', binding.notification_mode,
             'created_at', binding.created_at
-        ) AS data
+        ) AS data,
+        report.resource_uuid AS catalog_resource_uuid,
+        report.projection_revision AS catalog_projection_revision,
+        CASE WHEN report.processing_status = 'reported'
+                   AND report.assignment IS NOT NULL
+             THEN report.catalog END AS catalog,
+        CASE WHEN report.processing_status = 'reported'
+                   AND report.assignment IS NOT NULL
+             THEN report.assignment END AS assignment,
+        stream.chat_type, stream.chat_key, topic.name AS topic_name
         FROM workspace_zulip_bridge.zulip_topic_bindings AS binding
         JOIN workspace_zulip_bridge.zulip_users AS zulip_user
           ON zulip_user.uuid = binding.zulip_user_uuid
+        JOIN workspace_zulip_bridge.zulip_topics AS topic
+          ON topic.uuid = binding.topic_uuid
+        JOIN workspace_zulip_bridge.zulip_streams AS stream
+          ON stream.uuid = binding.zulip_stream_uuid
+        LEFT JOIN workspace_zulip_bridge.zulip_connections AS connection
+          ON connection.uuid = stream.source_connection_uuid
+        LEFT JOIN workspace_zulip_bridge.workspace_chat_catalog_reports AS report
+          ON report.external_account_uuid = connection.external_account_uuid
+         AND report.zulip_stream_uuid = stream.uuid
         WHERE binding.uuid = ANY($1::uuid[])
     """,
     "messages": """
@@ -5232,13 +5955,38 @@ _ENTITY_QUERIES = {
                 sender.workspace_user_uuid, message.sender_user_uuid
             ),
             'payload', jsonb_build_object(
-                'kind', 'markdown', 'content', message.content
+                'kind', 'markdown', 'content',
+                COALESCE(message.workspace_content, message.content)
             ),
             'created_at', message.created_at
-        ) AS data
+        ) AS data,
+        report.resource_uuid AS catalog_resource_uuid,
+        report.projection_revision AS catalog_projection_revision,
+        CASE WHEN report.processing_status = 'reported'
+                   AND report.assignment IS NOT NULL
+             THEN report.catalog END AS catalog,
+        CASE WHEN report.processing_status = 'reported'
+                   AND report.assignment IS NOT NULL
+             THEN report.assignment END AS assignment,
+        stream.chat_type, stream.chat_key, topic.name AS topic_name
         FROM workspace_zulip_bridge.zulip_messages AS message
         JOIN workspace_zulip_bridge.zulip_users AS sender
           ON sender.uuid = message.sender_user_uuid
+        JOIN workspace_zulip_bridge.zulip_streams AS stream
+          ON stream.uuid = message.zulip_stream_uuid
+        JOIN workspace_zulip_bridge.zulip_connections AS connection
+          ON connection.uuid = stream.source_connection_uuid
+        JOIN workspace_zulip_bridge.zulip_realms AS realm
+          ON realm.uuid = message.realm_uuid
+        JOIN workspace_zulip_bridge.workspace_mirror_state AS mirror
+          ON mirror.provider_uuid = realm.workspace_provider_uuid
+         AND mirror.bootstrap_status = 'ready'
+         AND mirror.active_generation IS NOT NULL
+        LEFT JOIN workspace_zulip_bridge.zulip_topics AS topic
+          ON topic.uuid = message.topic_uuid
+        LEFT JOIN workspace_zulip_bridge.workspace_chat_catalog_reports AS report
+          ON report.external_account_uuid = connection.external_account_uuid
+         AND report.zulip_stream_uuid = stream.uuid
         WHERE message.uuid = ANY($1::uuid[])
     """,
     "message_flags": """
@@ -5250,10 +5998,26 @@ _ENTITY_QUERIES = {
             ), 'read', flag.is_read,
             'pinned', false, 'starred', flag.is_starred,
             'mentioned', flag.is_mentioned
-        ) AS data
+        ) AS data,
+        report.resource_uuid AS catalog_resource_uuid,
+        report.projection_revision AS catalog_projection_revision,
+        CASE WHEN report.processing_status = 'reported'
+                   AND report.assignment IS NOT NULL
+             THEN report.catalog END AS catalog,
+        CASE WHEN report.processing_status = 'reported'
+                   AND report.assignment IS NOT NULL
+             THEN report.assignment END AS assignment,
+        stream.chat_type, stream.chat_key, NULL::text AS topic_name
         FROM workspace_zulip_bridge.zulip_message_flags AS flag
         JOIN workspace_zulip_bridge.zulip_users AS flag_user
           ON flag_user.uuid = flag.zulip_user_uuid
+        JOIN workspace_zulip_bridge.zulip_streams AS stream
+          ON stream.uuid = flag.zulip_stream_uuid
+        JOIN workspace_zulip_bridge.zulip_connections AS connection
+          ON connection.uuid = stream.source_connection_uuid
+        LEFT JOIN workspace_zulip_bridge.workspace_chat_catalog_reports AS report
+          ON report.external_account_uuid = connection.external_account_uuid
+         AND report.zulip_stream_uuid = stream.uuid
         WHERE flag.uuid = ANY($1::uuid[])
     """,
     "message_reactions": """
@@ -5264,7 +6028,8 @@ _ENTITY_QUERIES = {
             ),
             'emoji_name', reaction.emoji_name,
             'created_at', reaction.created_at
-        ) AS data
+        ) AS data,
+        reaction.reaction_type, reaction.emoji_code
         FROM workspace_zulip_bridge.zulip_message_reactions AS reaction
         JOIN workspace_zulip_bridge.zulip_users AS reaction_user
           ON reaction_user.uuid = reaction.zulip_user_uuid

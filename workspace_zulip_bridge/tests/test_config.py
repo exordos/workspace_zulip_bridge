@@ -20,6 +20,7 @@ def test_defaults_use_local_postgresql_socket() -> None:
     assert settings.zulip_history_concurrency == 4
     assert settings.zulip_message_page_size == 2000
     assert settings.event_processor_batch_size == 128
+    assert settings.event_processor_backlog_workers == 4
     assert settings.event_processor_realtime_batch_size == 16
     assert settings.event_processor_realtime_workers == 4
     assert settings.event_processor_realtime_window_seconds == 300.0
@@ -37,6 +38,9 @@ def test_defaults_use_local_postgresql_socket() -> None:
     assert settings.workspace_sync_plan_batch_size == 5000
     assert settings.workspace_sync_batch_size == 500
     assert settings.workspace_sync_workers == 2
+    assert settings.workspace_file_transfer_workers == 32
+    assert settings.workspace_file_control_concurrency == 8
+    assert settings.workspace_chat_catalog_workers == 4
     assert settings.zulip_queue_gap_reconciliation_seconds == 86400.0
     assert settings.workspace_dependency_retry_base_seconds == 2.0
     assert settings.workspace_dependency_retry_cap_seconds == 300.0
@@ -62,6 +66,7 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
             "WZB_ZULIP_CHAT_FILL_TIMEOUT_SECONDS": "240",
             "WZB_ZULIP_MESSAGE_PAGE_SIZE": "4000",
             "WZB_EVENT_PROCESSOR_BATCH_SIZE": "750",
+            "WZB_EVENT_PROCESSOR_BACKLOG_WORKERS": "5",
             "WZB_EVENT_PROCESSOR_REALTIME_BATCH_SIZE": "24",
             "WZB_EVENT_PROCESSOR_REALTIME_WORKERS": "6",
             "WZB_EVENT_PROCESSOR_REALTIME_WINDOW_SECONDS": "180",
@@ -86,6 +91,9 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
             "WZB_WORKSPACE_SYNC_PLAN_BATCH_SIZE": "2500",
             "WZB_WORKSPACE_SYNC_BATCH_SIZE": "250",
             "WZB_WORKSPACE_SYNC_WORKERS": "4",
+            "WZB_WORKSPACE_FILE_TRANSFER_WORKERS": "3",
+            "WZB_WORKSPACE_FILE_CONTROL_CONCURRENCY": "6",
+            "WZB_WORKSPACE_CHAT_CATALOG_WORKERS": "3",
             "WZB_ZULIP_QUEUE_GAP_RECONCILIATION_SECONDS": "7200",
             "WZB_WORKSPACE_DEPENDENCY_RETRY_BASE_SECONDS": "4",
             "WZB_WORKSPACE_DEPENDENCY_RETRY_CAP_SECONDS": "90",
@@ -105,6 +113,7 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
     assert settings.zulip_chat_fill_timeout_seconds == 240
     assert settings.zulip_message_page_size == 4000
     assert settings.event_processor_batch_size == 750
+    assert settings.event_processor_backlog_workers == 5
     assert settings.event_processor_realtime_batch_size == 24
     assert settings.event_processor_realtime_workers == 6
     assert settings.event_processor_realtime_window_seconds == 180.0
@@ -125,6 +134,9 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
     assert settings.workspace_sync_plan_batch_size == 2500
     assert settings.workspace_sync_batch_size == 250
     assert settings.workspace_sync_workers == 4
+    assert settings.workspace_file_transfer_workers == 3
+    assert settings.workspace_file_control_concurrency == 6
+    assert settings.workspace_chat_catalog_workers == 3
     assert settings.zulip_queue_gap_reconciliation_seconds == 7200.0
     assert settings.workspace_dependency_retry_base_seconds == 4.0
     assert settings.workspace_dependency_retry_cap_seconds == 90.0
@@ -145,6 +157,8 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
         ("WZB_ZULIP_MESSAGE_PAGE_SIZE", "5001"),
         ("WZB_EVENT_PROCESSOR_BATCH_SIZE", "0"),
         ("WZB_EVENT_PROCESSOR_BATCH_SIZE", "10001"),
+        ("WZB_EVENT_PROCESSOR_BACKLOG_WORKERS", "0"),
+        ("WZB_EVENT_PROCESSOR_BACKLOG_WORKERS", "9"),
         ("WZB_EVENT_PROCESSOR_REALTIME_BATCH_SIZE", "0"),
         ("WZB_EVENT_PROCESSOR_REALTIME_BATCH_SIZE", "10001"),
         ("WZB_EVENT_PROCESSOR_REALTIME_WORKERS", "0"),
@@ -171,6 +185,12 @@ def test_environment_overrides_are_parsed(tmp_path: Path) -> None:
         ("WZB_WORKSPACE_SYNC_PLAN_BATCH_SIZE", "100001"),
         ("WZB_WORKSPACE_SYNC_WORKERS", "0"),
         ("WZB_WORKSPACE_SYNC_WORKERS", "9"),
+        ("WZB_WORKSPACE_FILE_TRANSFER_WORKERS", "0"),
+        ("WZB_WORKSPACE_FILE_TRANSFER_WORKERS", "33"),
+        ("WZB_WORKSPACE_FILE_CONTROL_CONCURRENCY", "0"),
+        ("WZB_WORKSPACE_FILE_CONTROL_CONCURRENCY", "33"),
+        ("WZB_WORKSPACE_CHAT_CATALOG_WORKERS", "0"),
+        ("WZB_WORKSPACE_CHAT_CATALOG_WORKERS", "9"),
         ("WZB_ZULIP_RETRY_CAP_SECONDS", "0"),
     ],
 )
@@ -190,7 +210,7 @@ def test_pool_maximum_cannot_be_smaller_than_minimum() -> None:
 
 
 def test_history_concurrency_reserves_pool_connections() -> None:
-    with pytest.raises(ValueError, match="realtime"):
+    with pytest.raises(ValueError, match="event processors"):
         Settings.from_env(
             {
                 "WZB_DB_POOL_MAX_SIZE": "16",

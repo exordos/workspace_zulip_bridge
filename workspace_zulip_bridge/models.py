@@ -186,6 +186,7 @@ class ZulipMessage:
     content_hash: bytes = b"\0" * 32
     files: tuple["ZulipFileMetadata", ...] = ()
     write_flags: bool = True
+    workspace_content: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

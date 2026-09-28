@@ -27,6 +27,9 @@ INSTANCE_UUID = UUID("10000000-0000-0000-0000-000000000002")
 ACCOUNT_UUID = UUID("10000000-0000-0000-0000-000000000003")
 OWNER_UUID = UUID("10000000-0000-0000-0000-000000000004")
 PROJECT_UUID = UUID("10000000-0000-0000-0000-000000000005")
+CHAT_UUID = UUID("10000000-0000-0000-0000-000000000006")
+STREAM_UUID = UUID("10000000-0000-0000-0000-000000000007")
+TOPIC_UUID = UUID("10000000-0000-0000-0000-000000000008")
 
 
 def _worker(tmp_path: Path) -> WorkspaceControlWorker:
@@ -147,6 +150,65 @@ async def _control_reports_retryable_network_failure(
             },
         )
     ]
+
+
+def test_control_persists_backend_owned_chat_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asyncio.run(_control_persists_backend_owned_chat_projection(tmp_path, monkeypatch))
+
+
+async def _control_persists_backend_owned_chat_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = _worker(tmp_path)
+    calls: list[tuple[object, ...]] = []
+    reports: list[str] = []
+
+    class Pool:
+        async def execute(self, query: str, *args: object) -> str:
+            assert "assignment_generation" in query
+            calls.append(args)
+            return "UPDATE 1"
+
+    resource = {
+        "resource_type": "external_chat_assignment",
+        "uuid": str(CHAT_UUID),
+        "generation": 4,
+        "external_account_uuid": str(ACCOUNT_UUID),
+        "provider_chat": {
+            "kind": "zulip",
+            "chat_type": "channel",
+            "provider_chat_key": "channel:7",
+        },
+        "project_id": str(PROJECT_UUID),
+        "selected": True,
+        "workspace_projection": {
+            "stream": {"uuid": str(STREAM_UUID)},
+            "participants": [],
+            "topics": [
+                {
+                    "provider_topic_id": "7:General",
+                    "topic_uuid": str(TOPIC_UUID),
+                }
+            ],
+        },
+    }
+
+    async def report_observed(candidate: object, status: str) -> None:
+        assert candidate is resource
+        reports.append(status)
+
+    worker._pool = Pool()  # type: ignore[assignment]
+    monkeypatch.setattr(worker, "_report_observed", report_observed)
+
+    assert await worker._apply_resource(resource) is False
+    assert calls[0][0] == 4
+    assert json.loads(str(calls[0][1])) == resource
+    assert calls[0][2:] == (CHAT_UUID, ACCOUNT_UUID)
+    assert reports == ["live_ready"]
 
 
 def test_control_certificate_is_renewed_before_expiry(

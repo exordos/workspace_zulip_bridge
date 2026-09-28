@@ -466,6 +466,42 @@ def test_message_write_endpoints_preserve_actor_and_provider_ids() -> None:
     ]
 
 
+def test_upload_file_uses_native_zulip_upload_and_returns_path() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.method == "POST"
+        assert request.url.path.endswith("/user_uploads")
+        assert request.headers["authorization"].startswith("Basic ")
+        content_type = request.headers["content-type"]
+        assert content_type.startswith("multipart/form-data; boundary=")
+        assert b"test.png" in request.content
+        assert b"image/png" in request.content
+        assert b"\x89PNG\r\n\x1a\n" in request.content
+        return httpx.Response(
+            200,
+            json={
+                "result": "success",
+                "msg": "",
+                "uri": "/user_uploads/1/ab/test.png",
+            },
+        )
+
+    client = _client(handler)
+    try:
+        path = client.upload_file(
+            "test.png",
+            b"\x89PNG\r\n\x1a\n",
+            "image/png",
+        )
+    finally:
+        client.close()
+
+    assert path == "/user_uploads/1/ab/test.png"
+    assert len(requests) == 1
+
+
 def _client(handler: object) -> ZulipApiClient:
     return ZulipApiClient(
         "https://zulip.example.test",

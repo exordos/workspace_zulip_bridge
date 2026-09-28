@@ -15,8 +15,10 @@ from workspace_zulip_bridge.database import probe_database
 from workspace_zulip_bridge.event_processor import ZulipEventProcessor
 from workspace_zulip_bridge.event_store import EventStore
 from workspace_zulip_bridge.workspace_auth import WorkspaceTokenManager
+from workspace_zulip_bridge.workspace_chat_catalog import WorkspaceChatCatalogWorker
 from workspace_zulip_bridge.workspace_control import WorkspaceControlWorker
 from workspace_zulip_bridge.workspace_events import WorkspaceEventReceiver
+from workspace_zulip_bridge.workspace_file_transfer import WorkspaceFileTransferWorker
 from workspace_zulip_bridge.workspace_sync import WorkspaceBootstrapper
 from workspace_zulip_bridge.workspace_sync import WorkspaceDiffWorker
 from workspace_zulip_bridge.workspace_sync import WorkspaceEventProcessor
@@ -58,12 +60,16 @@ class BridgeService:
                 asyncio.get_running_loop(),
                 self._settings,
             )
-            backlog_event_processor = ZulipEventProcessor(
-                pool,
-                store,
-                self._settings,
-                claim_scope="backlog",
-            )
+            backlog_event_processors = [
+                ZulipEventProcessor(
+                    pool,
+                    store,
+                    self._settings,
+                    claim_scope="backlog",
+                    run_maintenance=index == 0,
+                )
+                for index in range(self._settings.event_processor_backlog_workers)
+            ]
             realtime_event_processors = [
                 ZulipEventProcessor(
                     pool,
@@ -77,14 +83,21 @@ class BridgeService:
                 self._probe_loop(pool),
                 name="database-probe",
             )
+            projection_task = asyncio.create_task(
+                self._message_projection_loop(store),
+                name="message-projection",
+            )
             supervisor_task = asyncio.create_task(
                 supervisor.run(),
                 name="zulip-thread-supervisor",
             )
-            backlog_event_processor_task = asyncio.create_task(
-                backlog_event_processor.run(),
-                name="zulip-event-processor-backlog",
-            )
+            backlog_event_processor_tasks = [
+                asyncio.create_task(
+                    processor.run(),
+                    name=f"zulip-event-processor-backlog-{index}",
+                )
+                for index, processor in enumerate(backlog_event_processors)
+            ]
             realtime_event_processor_tasks = [
                 asyncio.create_task(
                     processor.run(),
@@ -95,18 +108,46 @@ class BridgeService:
             stop_task = asyncio.create_task(stop.wait(), name="stop-signal")
             supervised_tasks = [
                 probe_task,
+                projection_task,
                 supervisor_task,
-                backlog_event_processor_task,
+                *backlog_event_processor_tasks,
                 *realtime_event_processor_tasks,
                 stop_task,
             ]
             if self._settings.workspace_control_enabled:
+                file_control_semaphore = asyncio.Semaphore(
+                    self._settings.workspace_file_control_concurrency
+                )
                 control_worker = WorkspaceControlWorker(pool, self._settings)
                 supervised_tasks.append(
                     asyncio.create_task(
                         control_worker.run(),
                         name="workspace-control",
                     )
+                )
+                supervised_tasks.extend(
+                    asyncio.create_task(
+                        WorkspaceChatCatalogWorker(
+                            pool,
+                            self._settings,
+                            coordinate=index == 0,
+                            control_semaphore=file_control_semaphore,
+                        ).run(),
+                        name=f"workspace-chat-catalog-{index}",
+                    )
+                    for index in range(self._settings.workspace_chat_catalog_workers)
+                )
+                supervised_tasks.extend(
+                    asyncio.create_task(
+                        WorkspaceFileTransferWorker(
+                            pool,
+                            self._settings,
+                            coordinate=index == 0,
+                            control_semaphore=file_control_semaphore,
+                        ).run(),
+                        name=f"workspace-file-transfer-{index}",
+                    )
+                    for index in range(self._settings.workspace_file_transfer_workers)
                 )
             if self._settings.workspace_events_enabled:
                 content_worker_partitions = self.content_worker_partitions(
@@ -117,8 +158,11 @@ class BridgeService:
                 bootstrapper = WorkspaceBootstrapper(pool, self._settings, tokens)
                 if await self._ensure_bootstrap(bootstrapper, stop):
                     receiver = WorkspaceEventReceiver(pool, self._settings, tokens)
-                    workspace_event_processor = WorkspaceEventProcessor(
-                        pool, self._settings
+                    workspace_realtime_event_processor = WorkspaceEventProcessor(
+                        pool, self._settings, scope="realtime"
+                    )
+                    workspace_background_event_processor = WorkspaceEventProcessor(
+                        pool, self._settings, scope="background"
                     )
                     workspace_diff_planner = WorkspaceDiffWorker(
                         pool,
@@ -129,36 +173,22 @@ class BridgeService:
                         scope="unpartitioned",
                         tokens=tokens,
                     )
-                    workspace_diff_workers = [
-                        WorkspaceDiffWorker(
-                            pool,
-                            self._settings,
-                            plan_enabled=False,
-                            partition=partition,
-                            partition_count=partition_count,
-                            scope="partitioned",
-                            delivery_priority=1,
-                            entity_types=frozenset({"messages", "message_flags"}),
-                            tokens=tokens,
-                        )
-                        for partition, partition_count in content_worker_partitions
-                    ]
-                    workspace_unpartitioned_drainers = [
+                    # Historical delivery uses one homogeneous worker group.
+                    # Each pass selects one entity type globally, so workers can
+                    # parallelize that type without messages, flags, reactions,
+                    # and catalog rows all competing for the same database.
+                    workspace_background_drainers = [
                         WorkspaceDiffWorker(
                             pool,
                             self._settings,
                             plan_enabled=False,
                             partition=0,
-                            partition_count=content_partition_count,
-                            scope="unpartitioned",
+                            partition_count=1,
+                            scope="both",
                             delivery_priority=1,
                             tokens=tokens,
                         )
-                        for _ in range(
-                            self.unpartitioned_worker_count(
-                                self._settings.workspace_sync_workers
-                            )
-                        )
+                        for _ in range(self._settings.workspace_sync_workers)
                     ]
                     workspace_realtime_catalog_drainer = WorkspaceDiffWorker(
                         pool,
@@ -209,17 +239,6 @@ class BridgeService:
                         entity_types=frozenset({"message_reactions"}),
                         tokens=tokens,
                     )
-                    workspace_reaction_drainer = WorkspaceDiffWorker(
-                        pool,
-                        self._settings,
-                        plan_enabled=False,
-                        partition=0,
-                        partition_count=1,
-                        scope="partitioned",
-                        delivery_priority=1,
-                        entity_types=frozenset({"message_reactions"}),
-                        tokens=tokens,
-                    )
                     supervised_tasks.extend(
                         (
                             asyncio.create_task(
@@ -231,8 +250,12 @@ class BridgeService:
                                 name="workspace-event-receiver",
                             ),
                             asyncio.create_task(
-                                workspace_event_processor.run(),
-                                name="workspace-event-processor",
+                                workspace_realtime_event_processor.run(),
+                                name="workspace-event-processor-realtime",
+                            ),
+                            asyncio.create_task(
+                                workspace_background_event_processor.run(),
+                                name="workspace-event-processor-background",
                             ),
                         )
                     )
@@ -242,25 +265,12 @@ class BridgeService:
                             name="workspace-diff-planner",
                         )
                     )
-                    supervised_tasks.append(
-                        asyncio.create_task(
-                            workspace_reaction_drainer.run(),
-                            name="workspace-diff-reactions",
-                        )
-                    )
                     supervised_tasks.extend(
                         asyncio.create_task(
                             worker.run(),
-                            name=f"workspace-diff-worker-{index}",
+                            name=f"workspace-diff-background-{index}",
                         )
-                        for index, worker in enumerate(workspace_diff_workers)
-                    )
-                    supervised_tasks.extend(
-                        asyncio.create_task(
-                            worker.run(),
-                            name=f"workspace-diff-unpartitioned-{index}",
-                        )
-                        for index, worker in enumerate(workspace_unpartitioned_drainers)
+                        for index, worker in enumerate(workspace_background_drainers)
                     )
                     supervised_tasks.extend(
                         (
@@ -346,6 +356,23 @@ class BridgeService:
         while True:
             await asyncio.sleep(self._settings.db_probe_seconds)
             await probe_database(pool)
+
+    async def _message_projection_loop(self, store: EventStore) -> None:
+        await asyncio.sleep(1.0)
+        while True:
+            try:
+                changed = await store.reproject_message_batch()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOG.exception("Stored message projection upgrade failed; retrying")
+                await asyncio.sleep(5.0)
+                continue
+            if changed:
+                LOG.info("Stored message projections upgraded count=%s", changed)
+                await asyncio.sleep(0)
+                continue
+            await asyncio.sleep(1.0)
 
     async def _bootstrap_loop(self, bootstrapper: _Bootstrapper) -> None:
         attempt = 0

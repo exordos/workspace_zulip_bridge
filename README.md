@@ -223,6 +223,7 @@ deployment.
 | `WZB_ZULIP_CHAT_FILL_TIMEOUT_SECONDS` | `120` | Read timeout for a catalog API page |
 | `WZB_ZULIP_MESSAGE_PAGE_SIZE` | `2000` | Combined message-history page size; bounds each history write transaction |
 | `WZB_EVENT_PROCESSOR_BATCH_SIZE` | `128` | Maximum events claimed per processor pass |
+| `WZB_EVENT_PROCESSOR_BACKLOG_WORKERS` | `4` | Concurrent historical processors; queue claims remain mutually exclusive |
 | `WZB_EVENT_PROCESSOR_REALTIME_BATCH_SIZE` | `16` | Maximum recent events claimed by the dedicated realtime processor |
 | `WZB_EVENT_PROCESSOR_REALTIME_WORKERS` | `4` | Concurrent realtime processors; queue claims remain mutually exclusive |
 | `WZB_EVENT_PROCESSOR_REALTIME_WINDOW_SECONDS` | `300` | Age window reserved for the realtime processor before events join backlog processing |
@@ -243,6 +244,8 @@ deployment.
 | `WZB_WORKSPACE_EVENT_BATCH_SIZE` | `500` | Events written per inbox transaction |
 | `WZB_WORKSPACE_EVENT_FLUSH_SECONDS` | `0.01` | Maximum low-volume persistence delay |
 | `WZB_WORKSPACE_EVENT_MAX_ATTEMPTS` | `8` | Attempts before a transient Workspace event failure becomes terminal |
+| `WZB_WORKSPACE_FILE_CONTROL_CONCURRENCY` | `8` | Shared bridge-control request budget for catalog and file operations |
+| `WZB_WORKSPACE_CHAT_CATALOG_WORKERS` | `4` | Concurrent newest-first chat catalog publishers |
 | `WZB_WORKSPACE_RETRY_BASE_SECONDS` | `1` | Initial reconnect window |
 | `WZB_WORKSPACE_RETRY_CAP_SECONDS` | `60` | Maximum reconnect window |
 | `WZB_WORKSPACE_LEASE_RETRY_SECONDS` | `5` | Standby receiver lease retry interval |

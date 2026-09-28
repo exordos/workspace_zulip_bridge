@@ -14,12 +14,74 @@ import pytest
 from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.workspace_sync import ProviderApiError
 from workspace_zulip_bridge.workspace_sync import WorkspaceDiffWorker
+from workspace_zulip_bridge.workspace_sync import _catalog_projection_stream_uuid
+from workspace_zulip_bridge.workspace_sync import _catalog_projection_topic_uuid
 from workspace_zulip_bridge.workspace_sync import _entity_dependencies
 from workspace_zulip_bridge.workspace_sync import _equivalent_entity
 from workspace_zulip_bridge.workspace_sync import _provider_api_error
 from workspace_zulip_bridge.workspace_sync import _reaction_identity
 from workspace_zulip_bridge.workspace_sync import identity_rebind_required
 from workspace_zulip_bridge.workspace_sync import workspace_directory_url
+
+
+def test_catalog_projection_prefers_imported_source_identities() -> None:
+    chat_uuid = UUID("10000000-0000-0000-0000-000000000001")
+    stream_uuid = UUID("10000000-0000-0000-0000-000000000002")
+    topic_uuid = UUID("10000000-0000-0000-0000-000000000003")
+    catalog = {
+        "source": {"projection_stream_uuid": str(stream_uuid)},
+        "topics": [
+            {
+                "provider_topic_id": "7:General",
+                "projection_topic_uuid": str(topic_uuid),
+            }
+        ],
+    }
+
+    assert _catalog_projection_stream_uuid(catalog, chat_uuid) == stream_uuid
+    assert _catalog_projection_topic_uuid(catalog, chat_uuid, "7:General") == topic_uuid
+
+
+def test_catalog_projection_prefers_backend_assignment() -> None:
+    chat_uuid = UUID("10000000-0000-0000-0000-000000000001")
+    imported_stream_uuid = UUID("10000000-0000-0000-0000-000000000002")
+    imported_topic_uuid = UUID("10000000-0000-0000-0000-000000000003")
+    assigned_stream_uuid = UUID("10000000-0000-0000-0000-000000000004")
+    assigned_topic_uuid = UUID("10000000-0000-0000-0000-000000000005")
+    catalog = {
+        "source": {"projection_stream_uuid": str(imported_stream_uuid)},
+        "topics": [
+            {
+                "provider_topic_id": "7:General",
+                "projection_topic_uuid": str(imported_topic_uuid),
+            }
+        ],
+    }
+    assignment = {
+        "workspace_projection": {
+            "stream": {"uuid": str(assigned_stream_uuid)},
+            "topics": [
+                {
+                    "provider_topic_id": "7:General",
+                    "topic_uuid": str(assigned_topic_uuid),
+                }
+            ],
+        }
+    }
+
+    assert (
+        _catalog_projection_stream_uuid(catalog, chat_uuid, assignment)
+        == assigned_stream_uuid
+    )
+    assert (
+        _catalog_projection_topic_uuid(
+            catalog,
+            chat_uuid,
+            "7:General",
+            assignment,
+        )
+        == assigned_topic_uuid
+    )
 
 
 def test_provider_api_error_omits_response_body() -> None:

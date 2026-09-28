@@ -135,6 +135,23 @@ def test_upload_links_create_metadata_without_file_content() -> None:
     ]
 
 
+def test_original_and_workspace_projection_are_kept_separately() -> None:
+    raw = _channel_message()
+    raw["content"] = "hello @**Owner|10**"
+    result = build_message_page(
+        [raw],
+        own_user_id=10,
+        user_uuids={10: USER_ONE},
+        stream_ids_by_name={"Engineering": 7},
+        allowed_chat_keys={"channel:7"},
+        endpoint="https://zulip.example.test",
+    )
+
+    message = result.messages[0]
+    assert message.content == "hello @**Owner|10**"
+    assert message.workspace_content == f"hello [Owner](urn:user:{USER_ONE})"
+
+
 def test_direct_message_with_bot_participant_is_imported() -> None:
     result = build_message_page(
         [

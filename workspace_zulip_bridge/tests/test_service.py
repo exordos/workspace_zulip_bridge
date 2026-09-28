@@ -41,6 +41,7 @@ class FakeSupervisor:
 
 class FakeEventProcessor:
     calls: list[str]
+    backlog_maintenance: list[bool] = []
 
     def __init__(
         self,
@@ -49,8 +50,11 @@ class FakeEventProcessor:
         settings: Settings,
         *,
         claim_scope: str = "all",
+        run_maintenance: bool = True,
     ) -> None:
         self.claim_scope = claim_scope
+        if claim_scope == "backlog":
+            self.backlog_maintenance.append(run_maintenance)
         self.calls.append(f"event-processor-init-{claim_scope}")
 
     async def run(self) -> None:
@@ -311,6 +315,7 @@ async def _run_workspace_diff_worker_fair_plan_test(
             return {
                 "active_generation": UUID("20000000-0000-0000-0000-000000000001"),
                 "reconciliation_version": 19,
+                "initial_sync_completed_at": object(),
             }
 
     worker = WorkspaceDiffWorker(PlanningPool(), settings)  # type: ignore[arg-type]
@@ -396,9 +401,13 @@ async def _run_workspace_diff_worker_drain_test(
         calls.append("complete")
         return True
 
+    async def no_file_backfill() -> bool:
+        return False
+
     monkeypatch.setattr(worker, "plan", fake_plan)
     monkeypatch.setattr(worker, "process_once", fake_process_once)
     monkeypatch.setattr(worker, "_complete_initial_sync", fake_complete)
+    monkeypatch.setattr(worker, "_historical_file_work_pending", no_file_backfill)
 
     assert await worker._plan_and_drain(object()) == 200  # type: ignore[arg-type]
     assert calls == ["plan"]
@@ -409,6 +418,58 @@ def test_workspace_diff_worker_completes_only_after_empty_plan(
     tmp_path: Path,
 ) -> None:
     asyncio.run(_run_workspace_diff_worker_completion_test(monkeypatch, tmp_path))
+
+
+def test_workspace_diff_worker_pauses_historical_plan_for_file_stage(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    asyncio.run(_run_workspace_diff_worker_file_stage_test(monkeypatch, tmp_path))
+
+
+async def _run_workspace_diff_worker_file_stage_test(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    token_file = tmp_path / "workspace.token"
+    token_file.write_text("token")
+    settings = Settings.from_env(
+        {
+            "WZB_WORKSPACE_WEBSOCKET_URL": "wss://workspace.example/events/ws",
+            "WZB_WORKSPACE_PROJECT_ID": "10000000-0000-0000-0000-000000000001",
+            "WZB_WORKSPACE_PROVIDER_UUID": "10000000-0000-0000-0000-000000000002",
+            "WZB_WORKSPACE_TOKEN_FILE": str(token_file),
+        }
+    )
+    worker = WorkspaceDiffWorker(object(), settings)  # type: ignore[arg-type]
+    calls: list[str] = []
+
+    async def file_backfill_pending() -> bool:
+        return True
+
+    async def fake_link_realm() -> UUID:
+        calls.append("link")
+        return UUID("30000000-0000-0000-0000-000000000001")
+
+    async def fake_ensure_direct_topics(realm_uuid: UUID) -> bool:
+        assert realm_uuid == UUID("30000000-0000-0000-0000-000000000001")
+        calls.append("direct_topics")
+        return True
+
+    async def fail_plan() -> int:
+        raise AssertionError("historical planning ran during the file stage")
+
+    monkeypatch.setattr(worker, "_link_realm", fake_link_realm)
+    monkeypatch.setattr(worker, "_ensure_direct_topics", fake_ensure_direct_topics)
+    monkeypatch.setattr(
+        worker,
+        "_historical_file_work_pending",
+        file_backfill_pending,
+    )
+    monkeypatch.setattr(worker, "plan", fail_plan)
+
+    assert await worker._plan_and_drain(object()) == 0  # type: ignore[arg-type]
+    assert calls == ["link", "direct_topics"]
 
 
 async def _run_workspace_diff_worker_completion_test(
@@ -440,9 +501,13 @@ async def _run_workspace_diff_worker_completion_test(
         calls.append("complete")
         return True
 
+    async def no_file_backfill() -> bool:
+        return False
+
     monkeypatch.setattr(worker, "plan", fake_plan)
     monkeypatch.setattr(worker, "process_once", fake_process_once)
     monkeypatch.setattr(worker, "_complete_initial_sync", fake_complete)
+    monkeypatch.setattr(worker, "_historical_file_work_pending", no_file_backfill)
 
     assert await worker._plan_and_drain(object()) == 0  # type: ignore[arg-type]
     assert calls == ["plan", "complete"]
@@ -508,9 +573,13 @@ async def _run_workspace_diff_worker_realm_wait_test(
     async def fail_complete() -> bool:
         raise AssertionError("initial sync completed before realm readiness")
 
+    async def no_file_backfill() -> bool:
+        return False
+
     monkeypatch.setattr(worker, "plan", fake_plan)
     monkeypatch.setattr(worker, "process_once", fail_process_once)
     monkeypatch.setattr(worker, "_complete_initial_sync", fail_complete)
+    monkeypatch.setattr(worker, "_historical_file_work_pending", no_file_backfill)
 
     assert await worker._plan_and_drain(object()) == 0  # type: ignore[arg-type]
     assert calls == ["plan"]
@@ -547,6 +616,7 @@ async def _run_daemon_lifecycle_test(monkeypatch: object) -> None:
     FakeSupervisor.stop = stop
     FakeSupervisor.calls = calls
     FakeEventProcessor.calls = calls
+    FakeEventProcessor.backlog_maintenance = []
     monkeypatch.setattr(  # type: ignore[attr-defined]
         service_module, "ZulipThreadSupervisor", FakeSupervisor
     )
@@ -562,17 +632,24 @@ async def _run_daemon_lifecycle_test(monkeypatch: object) -> None:
         "probe",
         "supervisor-init",
         "event-processor-init-backlog",
+        "event-processor-init-backlog",
+        "event-processor-init-backlog",
+        "event-processor-init-backlog",
         "event-processor-init-realtime",
         "event-processor-init-realtime",
         "event-processor-init-realtime",
         "event-processor-init-realtime",
         "supervisor-run",
         "event-processor-run-backlog",
+        "event-processor-run-backlog",
+        "event-processor-run-backlog",
+        "event-processor-run-backlog",
         "event-processor-run-realtime",
         "event-processor-run-realtime",
         "event-processor-run-realtime",
         "event-processor-run-realtime",
     ]
+    assert FakeEventProcessor.backlog_maintenance == [True, False, False, False]
     assert pool.closed
 
 
@@ -706,16 +783,12 @@ async def _run_workspace_receiver_test(
     assert "workspace-receiver-init" in calls
     assert "workspace-receiver-run" in calls
     assert "workspace-bootstrap-ensure" in calls
-    assert "workspace-event-processor-run" in calls
-    assert calls.count("workspace-diff-worker-run") == 11
+    assert calls.count("workspace-event-processor-run") == 2
+    assert "workspace-event-processor-init-True-0/1-realtime-None-all" in calls
+    assert "workspace-event-processor-init-True-0/1-background-None-all" in calls
+    assert calls.count("workspace-diff-worker-run") == 9
     assert "workspace-diff-worker-init-True-0/2-unpartitioned-None-all" in calls
-    assert (
-        "workspace-diff-worker-init-False-0/2-partitioned-1-message_flags,messages"
-    ) in calls
-    assert (
-        "workspace-diff-worker-init-False-1/2-partitioned-1-message_flags,messages"
-    ) in calls
-    assert "workspace-diff-worker-init-False-0/2-unpartitioned-1-all" in calls
+    assert calls.count("workspace-diff-worker-init-False-0/1-both-1-all") == 2
     assert "workspace-diff-worker-init-False-0/2-unpartitioned-0-all" in calls
     assert "workspace-diff-worker-init-False-0/2-partitioned-0-messages" in calls
     assert "workspace-diff-worker-init-False-1/2-partitioned-0-messages" in calls
@@ -724,7 +797,4 @@ async def _run_workspace_receiver_test(
     assert (
         "workspace-diff-worker-init-False-0/1-partitioned-0-message_reactions" in calls
     )
-    assert (
-        "workspace-diff-worker-init-False-0/1-partitioned-1-message_reactions"
-    ) in calls
     assert pool.closed

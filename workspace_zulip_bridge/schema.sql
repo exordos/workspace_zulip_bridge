@@ -234,6 +234,9 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_messages (
         REFERENCES workspace_zulip_bridge.zulip_users (uuid),
     zulip_message_id bigint NOT NULL,
     content text NOT NULL,
+    workspace_content text,
+    converter_version integer NOT NULL DEFAULT 0
+        CHECK (converter_version >= 0),
     reactions jsonb NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(reactions) = 'array'),
     reaction_users jsonb NOT NULL DEFAULT '{}'::jsonb
         CHECK (jsonb_typeof(reaction_users) = 'object'),
@@ -281,6 +284,12 @@ CREATE INDEX IF NOT EXISTS zulip_messages_updated_at_brin
 CREATE INDEX IF NOT EXISTS zulip_messages_sync_plan_idx
     ON workspace_zulip_bridge.zulip_messages
         (realm_uuid, source_updated_at, uuid);
+CREATE INDEX IF NOT EXISTS zulip_messages_projection_upgrade_idx
+    ON workspace_zulip_bridge.zulip_messages (uuid)
+    WHERE converter_version < 1 OR workspace_content IS NULL;
+CREATE INDEX IF NOT EXISTS zulip_messages_unsupported_quote_projection_idx
+    ON workspace_zulip_bridge.zulip_messages (uuid)
+    WHERE workspace_content LIKE '%urn:quote:%';
 CREATE INDEX IF NOT EXISTS zulip_messages_missing_topic_idx
     ON workspace_zulip_bridge.zulip_messages
         (realm_uuid, zulip_stream_uuid, uuid)
@@ -376,6 +385,9 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_files (
 );
 CREATE INDEX IF NOT EXISTS zulip_files_message_ids_idx
     ON workspace_zulip_bridge.zulip_files USING gin (message_ids);
+CREATE INDEX IF NOT EXISTS zulip_files_newest_idx
+    ON workspace_zulip_bridge.zulip_files
+        (source_created_at DESC, uuid DESC);
 
 CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_message_files (
     message_uuid uuid NOT NULL
@@ -388,6 +400,115 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_message_files (
 );
 CREATE INDEX IF NOT EXISTS zulip_message_files_file_idx
     ON workspace_zulip_bridge.zulip_message_files (file_uuid, message_uuid);
+
+CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_file_projections (
+    uuid uuid PRIMARY KEY,
+    file_uuid uuid NOT NULL
+        REFERENCES workspace_zulip_bridge.zulip_files (uuid) ON DELETE CASCADE,
+    zulip_stream_uuid uuid NOT NULL
+        REFERENCES workspace_zulip_bridge.zulip_streams (uuid) ON DELETE CASCADE,
+    operation_uuid uuid NOT NULL,
+    delivery_priority smallint NOT NULL DEFAULT 1
+        CHECK (delivery_priority IN (0, 1)),
+    processing_status text NOT NULL DEFAULT 'pending'
+        CHECK (processing_status IN (
+            'pending', 'processing', 'finalized', 'failed', 'blocked'
+        )),
+    workspace_urn text,
+    content_type text,
+    size_bytes bigint CHECK (size_bytes IS NULL OR size_bytes >= 0),
+    sha256 text CHECK (sha256 IS NULL OR sha256 ~ '^[0-9a-f]{64}$'),
+    attempt_count integer NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    available_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    claimed_at timestamptz,
+    finalized_at timestamptz,
+    last_error text,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    UNIQUE (file_uuid, zulip_stream_uuid),
+    CHECK (
+        processing_status <> 'finalized'
+        OR (
+            workspace_urn ~ '^urn:(file|image|video):[0-9a-f-]{36}$'
+            AND content_type IS NOT NULL
+            AND size_bytes IS NOT NULL
+            AND sha256 IS NOT NULL
+        )
+    )
+);
+CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_native_file_links (
+    realm_uuid uuid NOT NULL
+        REFERENCES workspace_zulip_bridge.zulip_realms (uuid) ON DELETE CASCADE,
+    external_account_uuid uuid NOT NULL,
+    external_chat_uuid uuid NOT NULL,
+    workspace_file_uuid uuid NOT NULL,
+    source_path text NOT NULL CHECK (source_path LIKE '/user_uploads/%'),
+    name text NOT NULL CHECK (name <> ''),
+    content_type text NOT NULL CHECK (content_type <> ''),
+    size_bytes bigint NOT NULL CHECK (size_bytes >= 0),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (
+        realm_uuid, external_account_uuid, external_chat_uuid,
+        workspace_file_uuid
+    ),
+    UNIQUE (
+        realm_uuid, external_account_uuid, external_chat_uuid, source_path
+    )
+);
+CREATE INDEX IF NOT EXISTS workspace_file_projections_pending_idx
+    ON workspace_zulip_bridge.workspace_file_projections
+        (delivery_priority, available_at, created_at, uuid)
+    WHERE processing_status IN ('pending', 'failed');
+CREATE INDEX IF NOT EXISTS workspace_file_projections_pending_stream_idx
+    ON workspace_zulip_bridge.workspace_file_projections (zulip_stream_uuid)
+    WHERE processing_status IN ('pending', 'failed');
+
+CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_chat_catalog_reports (
+    external_account_uuid uuid NOT NULL,
+    zulip_stream_uuid uuid NOT NULL
+        REFERENCES workspace_zulip_bridge.zulip_streams (uuid) ON DELETE CASCADE,
+    resource_uuid uuid NOT NULL UNIQUE,
+    observed_generation bigint NOT NULL CHECK (observed_generation > 0),
+    catalog jsonb NOT NULL CHECK (jsonb_typeof(catalog) = 'object'),
+    catalog_hash bytea NOT NULL CHECK (octet_length(catalog_hash) = 32),
+    projection_revision integer NOT NULL DEFAULT 1
+        CHECK (projection_revision > 0),
+    assignment_generation bigint CHECK (
+        assignment_generation IS NULL OR assignment_generation > 0
+    ),
+    assignment jsonb CHECK (
+        assignment IS NULL OR jsonb_typeof(assignment) = 'object'
+    ),
+    assignment_reconciled boolean NOT NULL DEFAULT false,
+    assignment_repair_created_at timestamptz,
+    assignment_repair_uuid uuid,
+    report_uuid uuid NOT NULL UNIQUE,
+    report jsonb NOT NULL CHECK (jsonb_typeof(report) = 'object'),
+    processing_status text NOT NULL DEFAULT 'pending'
+        CHECK (processing_status IN (
+            'pending', 'processing', 'reported', 'failed', 'blocked'
+        )),
+    attempt_count integer NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    available_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    claimed_at timestamptz,
+    reported_at timestamptz,
+    source_activity_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    source_updated_at timestamptz NOT NULL,
+    last_error text,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (external_account_uuid, zulip_stream_uuid)
+);
+CREATE INDEX IF NOT EXISTS workspace_chat_catalog_reports_pending_idx
+    ON workspace_zulip_bridge.workspace_chat_catalog_reports
+        (available_at, updated_at, external_account_uuid, zulip_stream_uuid)
+    WHERE processing_status IN ('pending', 'failed');
+CREATE INDEX IF NOT EXISTS workspace_chat_catalog_reports_activity_pending_idx
+    ON workspace_zulip_bridge.workspace_chat_catalog_reports
+        (source_activity_at DESC, source_updated_at DESC, available_at,
+         external_account_uuid, zulip_stream_uuid)
+    WHERE processing_status IN ('pending', 'failed');
 
 CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.zulip_events (
     uuid uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -419,6 +540,11 @@ CREATE INDEX IF NOT EXISTS zulip_events_pending_queue_idx
     ON workspace_zulip_bridge.zulip_events (
         zulip_connection_uuid, queue_id, event_id
     ) INCLUDE (uuid, available_at, created_at, outcome_reason)
+    WHERE processing_status = 'pending';
+CREATE INDEX IF NOT EXISTS zulip_events_pending_queue_head_idx
+    ON workspace_zulip_bridge.zulip_events (
+        zulip_connection_uuid, queue_id, event_id
+    )
     WHERE processing_status = 'pending';
 CREATE INDEX IF NOT EXISTS zulip_events_pending_queue_schedule_idx
     ON workspace_zulip_bridge.zulip_events (
@@ -478,6 +604,9 @@ CREATE INDEX IF NOT EXISTS workspace_outbox_source_claim_idx
     ON workspace_zulip_bridge.workspace_outbox
         (realm_uuid, entity_type, sequence)
     WHERE delivery_status = 'pending' AND action = 'upsert';
+CREATE INDEX IF NOT EXISTS workspace_outbox_file_pending_idx
+    ON workspace_zulip_bridge.workspace_outbox (sequence)
+    WHERE delivery_status IN ('pending', 'failed') AND entity_type = 'file';
 
 CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_sync_cursors (
     realm_uuid uuid PRIMARY KEY
@@ -641,6 +770,24 @@ CREATE INDEX IF NOT EXISTS sync_diffs_live_delivery_pending_idx
          source_updated_at, entity_uuid)
     WHERE processing_status IN ('pending', 'failed')
       AND delivery_priority = 0;
+CREATE INDEX IF NOT EXISTS sync_diffs_backfill_delivery_pending_idx
+    ON workspace_zulip_bridge.sync_diffs
+        (provider_uuid,
+         (CASE entity_type
+            WHEN 'users' THEN 0 WHEN 'streams' THEN 1
+            WHEN 'stream_bindings' THEN 2 WHEN 'topics' THEN 3
+            WHEN 'topic_bindings' THEN 4 WHEN 'messages' THEN 5
+            WHEN 'message_flags' THEN 6 ELSE 7
+         END),
+         entity_type, source_updated_at DESC, entity_uuid DESC)
+    WHERE processing_status IN ('pending', 'failed')
+      AND delivery_priority = 1;
+CREATE INDEX IF NOT EXISTS sync_diffs_live_file_projection_idx
+    ON workspace_zulip_bridge.sync_diffs (entity_uuid)
+    WHERE entity_type = 'messages'
+      AND delivery_priority = 0
+      AND direction = 'to_workspace'
+      AND processing_status IN ('pending', 'processing', 'failed', 'blocked');
 CREATE INDEX IF NOT EXISTS sync_diffs_processing_idx
     ON workspace_zulip_bridge.sync_diffs (claimed_at, entity_uuid)
     WHERE processing_status = 'processing';
@@ -766,7 +913,9 @@ BEGIN
         'zulip_realms', 'zulip_users', 'zulip_connections', 'zulip_streams',
         'zulip_stream_bindings', 'zulip_topics', 'zulip_topic_aliases',
         'zulip_topic_bindings', 'zulip_messages', 'zulip_message_flags',
-        'zulip_message_reactions', 'zulip_files', 'zulip_entity_links',
+        'zulip_message_reactions', 'zulip_files', 'workspace_file_projections',
+        'workspace_chat_catalog_reports',
+        'zulip_entity_links',
         'workspace_outbox',
         'workspace_event_cursors', 'workspace_events', 'workspace_mirror_state',
         'workspace_users', 'workspace_streams', 'workspace_stream_bindings',
@@ -802,3 +951,64 @@ DROP TRIGGER IF EXISTS zulip_streams_reset_history
 CREATE TRIGGER zulip_streams_reset_history
 BEFORE UPDATE ON workspace_zulip_bridge.zulip_streams
 FOR EACH ROW EXECUTE FUNCTION workspace_zulip_bridge.reset_stream_history();
+
+CREATE OR REPLACE FUNCTION workspace_zulip_bridge.touch_catalog_stream()
+RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE parent_uuid uuid;
+BEGIN
+    parent_uuid = CASE WHEN TG_OP = 'DELETE'
+        THEN OLD.zulip_stream_uuid ELSE NEW.zulip_stream_uuid END;
+    UPDATE workspace_zulip_bridge.zulip_streams
+    SET updated_at = clock_timestamp()
+    WHERE uuid = parent_uuid;
+    RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS zulip_stream_bindings_touch_catalog
+    ON workspace_zulip_bridge.zulip_stream_bindings;
+CREATE TRIGGER zulip_stream_bindings_touch_catalog
+AFTER INSERT OR DELETE OR UPDATE OF zulip_stream_uuid, zulip_user_uuid
+ON workspace_zulip_bridge.zulip_stream_bindings
+FOR EACH ROW EXECUTE FUNCTION workspace_zulip_bridge.touch_catalog_stream();
+
+DROP TRIGGER IF EXISTS zulip_topics_touch_catalog
+    ON workspace_zulip_bridge.zulip_topics;
+CREATE TRIGGER zulip_topics_touch_catalog
+AFTER INSERT OR DELETE OR UPDATE OF name, zulip_stream_uuid
+ON workspace_zulip_bridge.zulip_topics
+FOR EACH ROW EXECUTE FUNCTION workspace_zulip_bridge.touch_catalog_stream();
+
+CREATE OR REPLACE FUNCTION workspace_zulip_bridge.touch_user_catalog_streams()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF (NEW.full_name, NEW.login, NEW.avatar_url, NEW.disabled)
+       IS DISTINCT FROM
+       (OLD.full_name, OLD.login, OLD.avatar_url, OLD.disabled) THEN
+        UPDATE workspace_zulip_bridge.zulip_streams AS stream
+        SET updated_at = clock_timestamp()
+        WHERE stream.realm_uuid = NEW.realm_uuid
+          AND (
+              EXISTS (
+                  SELECT 1
+                  FROM workspace_zulip_bridge.zulip_stream_bindings AS binding
+                  WHERE binding.zulip_stream_uuid = stream.uuid
+                    AND binding.zulip_user_uuid = NEW.uuid
+              )
+              OR (
+                  stream.chat_type IN ('direct', 'group_direct')
+                  AND stream.chat_parameters->'participant_user_ids'
+                      @> to_jsonb(ARRAY[NEW.zulip_user_id])
+              )
+          );
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS zulip_users_touch_catalog
+    ON workspace_zulip_bridge.zulip_users;
+CREATE TRIGGER zulip_users_touch_catalog
+AFTER UPDATE OF full_name, login, avatar_url, disabled
+ON workspace_zulip_bridge.zulip_users
+FOR EACH ROW EXECUTE FUNCTION workspace_zulip_bridge.touch_user_catalog_streams();

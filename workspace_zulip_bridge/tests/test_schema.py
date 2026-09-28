@@ -54,6 +54,9 @@ def test_schema_normalizes_workspace_like_entities_and_personal_state() -> None:
         "zulip_message_reactions",
         "zulip_files",
         "zulip_message_files",
+        "workspace_file_projections",
+        "workspace_native_file_links",
+        "workspace_chat_catalog_reports",
     ):
         assert f"workspace_zulip_bridge.{table}" in schema
     assert "source_connection_uuid uuid" in schema
@@ -73,6 +76,14 @@ def test_schema_normalizes_workspace_like_entities_and_personal_state() -> None:
     assert "source_path text NOT NULL" in schema
     assert "message_ids bigint[] NOT NULL DEFAULT '{}'::bigint[]" in schema
     assert "zulip_files_message_ids_idx" in schema
+    assert "workspace_file_projections_pending_idx" in schema
+    assert "workspace_file_projections_pending_stream_idx" in schema
+    assert "zulip_files_newest_idx" in schema
+    assert "sync_diffs_backfill_delivery_pending_idx" in schema
+    assert "workspace_chat_catalog_reports_pending_idx" in schema
+    assert "workspace_chat_catalog_reports_activity_pending_idx" in schema
+    assert "source_activity_at timestamptz NOT NULL" in schema
+    assert "projection_revision integer NOT NULL DEFAULT 1" in schema
     assert "zulip_message_flags_history_cleanup_idx" in schema
     assert "bytea" not in schema[
         schema.index(
@@ -100,6 +111,7 @@ def test_schema_normalizes_workspace_like_entities_and_personal_state() -> None:
     assert "sync_repair_cursors_due_idx" in schema
     assert "partition_key uuid" in schema
     assert "zulip_messages_sync_plan_idx" in schema
+    assert "zulip_messages_projection_upgrade_idx" in schema
     assert "zulip_message_flags_sync_plan_idx" in schema
     assert "zulip_message_reactions_sync_plan_idx" in schema
     assert "sync_diffs_content_partition_0_pending_idx" in schema
@@ -118,6 +130,7 @@ def test_schema_contains_event_retention_and_workspace_outbox_state() -> None:
     assert "zulip_events_pending_idx" in schema
     assert "zulip_events_pending_queue_scope_idx" in schema
     assert "zulip_events_pending_queue_idx" in schema
+    assert "zulip_events_pending_queue_head_idx" in schema
     assert "zulip_events_pending_queue_schedule_idx" in schema
     assert "zulip_events_processing_queue_idx" in schema
     assert "zulip_events_terminal_retention_idx" in schema
@@ -133,6 +146,7 @@ def test_schema_contains_event_retention_and_workspace_outbox_state() -> None:
     assert "recovery_required boolean NOT NULL DEFAULT false" in schema
     assert "maintenance_migrations" in schema
     assert "sync_diffs_live_delivery_pending_idx" in schema
+    assert "sync_diffs_live_file_projection_idx" in schema
     assert "sync_diffs_pending_idx" not in schema
 
 
@@ -154,3 +168,4 @@ def test_schema_upgrades_preserve_older_persistent_volumes() -> None:
     assert "zulip_users" in upgrades
     assert "workspace_mirror_state" in upgrades
     assert "sync_diffs" in upgrades
+    assert "ADD COLUMN IF NOT EXISTS projection_revision integer" in upgrades

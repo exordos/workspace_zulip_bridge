@@ -593,6 +593,25 @@ class ZulipApiClient:
             raise ZulipApiError("invalid_send_message_response", retryable=True)
         return message_id
 
+    def upload_file(
+        self,
+        name: str,
+        content: bytes,
+        content_type: str,
+    ) -> str:
+        if not name or not content_type:
+            raise ValueError("file name and content type are required")
+        response = self._client.post(
+            f"{self._base_url}/api/v1/user_uploads",
+            files={"file": (name, content, content_type)},
+            auth=self._auth,
+        )
+        payload = self._successful_payload(response)
+        uri = payload.get("uri")
+        if not isinstance(uri, str) or not uri.startswith("/user_uploads/"):
+            raise ZulipApiError("invalid_upload_response", retryable=True)
+        return uri
+
     def update_message(
         self,
         message_id: int,

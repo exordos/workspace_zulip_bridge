@@ -132,6 +132,7 @@ class ZulipEventThread(threading.Thread):
         catalog_write_gate: threading.Semaphore | None = None,
         message_scan_gate: threading.Semaphore | None = None,
         history_gate: threading.Semaphore | None = None,
+        bulk_history_pause: threading.Event | None = None,
         api_factory: ApiFactory | None = None,
     ) -> None:
         super().__init__(
@@ -153,6 +154,7 @@ class ZulipEventThread(threading.Thread):
         self._history_gate = history_gate or threading.BoundedSemaphore(
             settings.zulip_history_concurrency
         )
+        self._bulk_history_pause = bulk_history_pause or threading.Event()
         self._api_factory = api_factory or self._default_api_factory
         self._stop_requested = threading.Event()
         self._client_lock = threading.Lock()
@@ -478,6 +480,9 @@ class ZulipEventThread(threading.Thread):
             if user_status == "scheduling":
                 self._stop_requested.wait(self._settings.user_refresh_seconds)
                 continue
+            if self._bulk_history_pause.is_set():
+                self._stop_requested.wait(self._settings.user_refresh_seconds)
+                continue
             pending_history = self._submit(
                 self._store.list_pending_history_chats(self.user.uuid, queue_id)
             )
@@ -740,6 +745,8 @@ class ZulipEventThread(threading.Thread):
     ) -> bool:
         if self._identity is None:
             return False
+        if self._bulk_history_pause.is_set():
+            return True
         started_at = time.monotonic()
         history = self._submit(self._store.begin_history(self.user.uuid, queue_id))
         pages = 0
@@ -759,6 +766,8 @@ class ZulipEventThread(threading.Thread):
             for scheduled_chat in scheduled_chats:
                 if self._stop_requested.is_set():
                     return False
+                if self._bulk_history_pause.is_set():
+                    return True
                 anchor: str | int = "newest"
                 include_anchor = True
                 reconcile_since_epoch = (
@@ -767,6 +776,8 @@ class ZulipEventThread(threading.Thread):
                     else scheduled_chat.reconcile_since.timestamp()
                 )
                 while not self._stop_requested.is_set():
+                    if self._bulk_history_pause.is_set():
+                        return True
                     with self._message_scan_gate:
                         page = client.get_chat_messages_page(
                             scheduled_chat.chat_key,
@@ -802,6 +813,7 @@ class ZulipEventThread(threading.Thread):
                             user_uuids=self._user_uuids,
                             stream_ids_by_name=self._stream_ids_by_name,
                             allowed_chat_keys={scheduled_chat.chat_key},
+                            endpoint=self.user.endpoint,
                         )
                         page_write = self._submit(
                             history.store_page(built_page.messages)
@@ -825,6 +837,8 @@ class ZulipEventThread(threading.Thread):
                         )
                         del built_page
                         del page
+                    if self._bulk_history_pause.is_set():
+                        return True
                     if found_oldest:
                         break
                     anchor = next_anchor
@@ -1123,6 +1137,7 @@ class ZulipThreadSupervisor:
         self._history_gate = threading.BoundedSemaphore(
             settings.zulip_history_concurrency
         )
+        self._bulk_history_pause = threading.Event()
         self._worker_factory = worker_factory or self._new_worker
         self._workers: dict[UUID, tuple[bytes, Worker]] = {}
 
@@ -1137,6 +1152,7 @@ class ZulipThreadSupervisor:
 
     async def _reconcile_once(self) -> bool:
         try:
+            await self._refresh_bulk_stage()
             await self.reconcile()
         except (TimeoutError, asyncpg.PostgresError) as exc:
             LOG.warning(
@@ -1146,21 +1162,22 @@ class ZulipThreadSupervisor:
             return False
         return True
 
+    async def _refresh_bulk_stage(self) -> None:
+        active = self._settings.workspace_control_enabled and (
+            await self._store.file_transfer_stage_active()
+        )
+        previous = self._bulk_history_pause.is_set()
+        if active:
+            self._bulk_history_pause.set()
+        else:
+            self._bulk_history_pause.clear()
+        if active != previous:
+            LOG.info(
+                "Zulip historical bulk stage %s for file transfer",
+                "paused" if active else "resumed",
+            )
+
     async def reconcile(self) -> None:
-        if await self._store.chat_schedule_reconciliation_requested():
-            await asyncio.to_thread(self._catalog_write_gate.acquire)
-            try:
-                schedule = await self._store.reconcile_chat_schedules()
-            finally:
-                self._catalog_write_gate.release()
-            if schedule.invalidated or schedule.assigned or schedule.messages_deleted:
-                LOG.info(
-                    "Zulip chat schedules reconciled invalidated=%s assigned=%s "
-                    "messages_deleted=%s",
-                    schedule.invalidated,
-                    schedule.assigned,
-                    schedule.messages_deleted,
-                )
         users = {user.uuid: user for user in await self._store.list_users()}
         stale_ids = [
             user_uuid
@@ -1182,6 +1199,25 @@ class ZulipThreadSupervisor:
             worker.start()
             self._workers[user_uuid] = (self._signature(user), worker)
             LOG.info("Zulip worker started user_uuid=%s", user_uuid)
+
+        # Realtime workers must recover independently of catalog maintenance.
+        # A large chat schedule reconciliation can time out while adopting
+        # historical messages; running it before worker ownership used to leave
+        # every dead long-poll thread offline until that maintenance completed.
+        if await self._store.chat_schedule_reconciliation_requested():
+            await asyncio.to_thread(self._catalog_write_gate.acquire)
+            try:
+                schedule = await self._store.reconcile_chat_schedules()
+            finally:
+                self._catalog_write_gate.release()
+            if schedule.invalidated or schedule.assigned or schedule.messages_deleted:
+                LOG.info(
+                    "Zulip chat schedules reconciled invalidated=%s assigned=%s "
+                    "messages_deleted=%s",
+                    schedule.invalidated,
+                    schedule.assigned,
+                    schedule.messages_deleted,
+                )
 
     async def _stop_workers(self, workers: list[Worker]) -> None:
         if not workers:
@@ -1211,6 +1247,7 @@ class ZulipThreadSupervisor:
             self._catalog_write_gate,
             self._message_scan_gate,
             self._history_gate,
+            self._bulk_history_pause,
         )
 
     @staticmethod

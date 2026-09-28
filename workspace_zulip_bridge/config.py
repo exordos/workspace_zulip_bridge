@@ -64,6 +64,7 @@ class Settings:
     zulip_chat_fill_timeout_seconds: float = 120.0
     zulip_message_page_size: int = 2000
     event_processor_batch_size: int = 128
+    event_processor_backlog_workers: int = 4
     event_processor_realtime_batch_size: int = 16
     event_processor_realtime_workers: int = 4
     event_processor_realtime_window_seconds: float = 300.0
@@ -101,6 +102,15 @@ class Settings:
     workspace_sync_plan_batch_size: int = 5000
     workspace_sync_batch_size: int = 500
     workspace_sync_workers: int = 2
+    # File migration is I/O-bound and each object requires source verification,
+    # allocation, upload, and finalization.  Keep enough bounded concurrency to
+    # drain historical files without making unrelated bulk stages parallel.
+    workspace_file_transfer_workers: int = 32
+    # Bridge-control calls share one bounded remote database pool.  Keep the
+    # client gate equal to that deployed budget while file bytes move outside
+    # the gate.
+    workspace_file_control_concurrency: int = 8
+    workspace_chat_catalog_workers: int = 4
     workspace_dependency_retry_base_seconds: float = 2.0
     workspace_dependency_retry_cap_seconds: float = 300.0
     workspace_control_url: str | None = None
@@ -190,6 +200,9 @@ class Settings:
             ),
             event_processor_batch_size=_read_int(
                 source, "WZB_EVENT_PROCESSOR_BATCH_SIZE", 128
+            ),
+            event_processor_backlog_workers=_read_int(
+                source, "WZB_EVENT_PROCESSOR_BACKLOG_WORKERS", 4
             ),
             event_processor_realtime_batch_size=_read_int(
                 source, "WZB_EVENT_PROCESSOR_REALTIME_BATCH_SIZE", 16
@@ -287,6 +300,15 @@ class Settings:
                 source, "WZB_WORKSPACE_SYNC_BATCH_SIZE", 500
             ),
             workspace_sync_workers=_read_int(source, "WZB_WORKSPACE_SYNC_WORKERS", 2),
+            workspace_file_transfer_workers=_read_int(
+                source, "WZB_WORKSPACE_FILE_TRANSFER_WORKERS", 32
+            ),
+            workspace_file_control_concurrency=_read_int(
+                source, "WZB_WORKSPACE_FILE_CONTROL_CONCURRENCY", 8
+            ),
+            workspace_chat_catalog_workers=_read_int(
+                source, "WZB_WORKSPACE_CHAT_CATALOG_WORKERS", 4
+            ),
             workspace_dependency_retry_base_seconds=_read_float(
                 source, "WZB_WORKSPACE_DEPENDENCY_RETRY_BASE_SECONDS", 2.0
             ),
@@ -421,23 +443,29 @@ class Settings:
             raise ValueError("WZB_ZULIP_MESSAGE_SCAN_CONCURRENCY must be positive")
         if self.zulip_history_concurrency < 1:
             raise ValueError("WZB_ZULIP_HISTORY_CONCURRENCY must be positive")
-        realtime_pool_reserve = min(
-            self.event_processor_realtime_workers + 2,
+        event_processor_pool_reserve = min(
+            self.event_processor_backlog_workers
+            + self.event_processor_realtime_workers
+            + 2,
             max(1, self.db_pool_max_size // 2),
         )
         if (
-            self.zulip_history_concurrency + realtime_pool_reserve
+            self.zulip_history_concurrency + event_processor_pool_reserve
             > self.db_pool_max_size
         ):
             raise ValueError(
                 "WZB_ZULIP_HISTORY_CONCURRENCY must reserve database-pool "
-                "connections for realtime and general bridge work"
+                "connections for event processors and general bridge work"
             )
         if not 1 <= self.zulip_message_page_size <= 5000:
             raise ValueError("WZB_ZULIP_MESSAGE_PAGE_SIZE must be between 1 and 5000")
         if not 1 <= self.event_processor_batch_size <= 10000:
             raise ValueError(
                 "WZB_EVENT_PROCESSOR_BATCH_SIZE must be between 1 and 10000"
+            )
+        if not 1 <= self.event_processor_backlog_workers <= 8:
+            raise ValueError(
+                "WZB_EVENT_PROCESSOR_BACKLOG_WORKERS must be between 1 and 8"
             )
         if not 1 <= self.event_processor_realtime_batch_size <= 10000:
             raise ValueError(
@@ -487,6 +515,18 @@ class Settings:
             )
         if not 1 <= self.workspace_sync_workers <= 8:
             raise ValueError("WZB_WORKSPACE_SYNC_WORKERS must be between 1 and 8")
+        if not 1 <= self.workspace_file_transfer_workers <= 32:
+            raise ValueError(
+                "WZB_WORKSPACE_FILE_TRANSFER_WORKERS must be between 1 and 32"
+            )
+        if not 1 <= self.workspace_file_control_concurrency <= 32:
+            raise ValueError(
+                "WZB_WORKSPACE_FILE_CONTROL_CONCURRENCY must be between 1 and 32"
+            )
+        if not 1 <= self.workspace_chat_catalog_workers <= 8:
+            raise ValueError(
+                "WZB_WORKSPACE_CHAT_CATALOG_WORKERS must be between 1 and 8"
+            )
         if self.workspace_retry_cap_seconds < self.workspace_retry_base_seconds:
             raise ValueError(
                 "WZB_WORKSPACE_RETRY_CAP_SECONDS must be at least "

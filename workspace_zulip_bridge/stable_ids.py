@@ -13,6 +13,16 @@ _BRIDGE_NAMESPACE = uuid5(
     "https://exordos.com/workspace-zulip-bridge/entities/v1",
 )
 
+# Workspace already persists catalog identities produced by the previous
+# bridge generation.  Keep this namespace stable while the v3 bridge takes
+# ownership of catalog reporting and native file transfer.
+_EXTERNAL_CHAT_NAMESPACE = UUID("9a1d0e75-50a5-413c-b3e8-d070232ef57f")
+
+# Workspace derives native Messenger entities from an external chat catalog
+# with this public, stable namespace.  The bridge must use the same identities
+# when it sends messages into a chat that was materialized by the catalog path.
+_WORKSPACE_PROJECTION_NAMESPACE = UUID("71bdfd0a-35b6-54ac-83d1-54869e3c7e67")
+
 
 def canonical_endpoint(endpoint: str) -> str:
     parsed = urlsplit(endpoint.strip())
@@ -77,6 +87,55 @@ def stable_reaction_uuid(
 
 def stable_file_uuid(endpoint: str, source_path: str) -> UUID:
     return _stable_uuid(endpoint, "file", source_path)
+
+
+def stable_file_projection_uuid(file_uuid: UUID, stream_uuid: UUID) -> UUID:
+    """Return the immutable Workspace file identity for one stream ACL."""
+
+    return uuid5(file_uuid, f"workspace-file\0{stream_uuid}")
+
+
+def stable_outgoing_file_transfer_uuid(
+    file_uuid: UUID,
+    external_account_uuid: UUID,
+    external_chat_uuid: UUID,
+) -> UUID:
+    """Return the idempotency identity for a Workspace-to-Zulip file copy."""
+
+    return uuid5(
+        file_uuid,
+        f"zulip-file\0{external_account_uuid}\0{external_chat_uuid}",
+    )
+
+
+def stable_external_chat_uuid(account_uuid: UUID, chat_key: str) -> UUID:
+    """Return the account-scoped identity used by Workspace control state."""
+
+    return uuid5(
+        _EXTERNAL_CHAT_NAMESPACE,
+        f"zulip:{account_uuid}:external_chat:{chat_key}",
+    )
+
+
+def stable_external_chat_stream_uuid(external_chat_uuid: UUID) -> UUID:
+    """Return the Workspace stream projected from an external chat catalog."""
+
+    return uuid5(
+        _WORKSPACE_PROJECTION_NAMESPACE,
+        f"{external_chat_uuid}:stream:canonical",
+    )
+
+
+def stable_external_chat_topic_uuid(
+    external_chat_uuid: UUID,
+    provider_topic_id: str,
+) -> UUID:
+    """Return one Workspace topic projected from an external chat catalog."""
+
+    return uuid5(
+        _WORKSPACE_PROJECTION_NAMESPACE,
+        f"{external_chat_uuid}:topic:{provider_topic_id}",
+    )
 
 
 def _stable_uuid(endpoint: str, entity_type: str, provider_key: str) -> UUID:

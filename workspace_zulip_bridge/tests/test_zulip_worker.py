@@ -171,6 +171,10 @@ class FakeStore:
         self.presence_thresholds: list[tuple[str, int]] = []
         self.schedule_reconciliation_requested = False
         self.notification_snapshots: list[tuple[UUID, str, bool]] = []
+        self.file_transfer_active = False
+
+    async def file_transfer_stage_active(self) -> bool:
+        return self.file_transfer_active
 
     async def set_presence_offline_threshold(
         self, endpoint: str, threshold_seconds: int
@@ -590,6 +594,39 @@ class DirectHistoryApi(FakeApi):
         assert chat_key == "direct:10,12"
         assert own_user_id == 10
         return self.get_messages_page(anchor, include_anchor=include_anchor)
+
+
+def test_file_stage_pauses_scheduled_history_before_it_opens_a_session() -> None:
+    asyncio.run(_file_stage_pauses_scheduled_history())
+
+
+async def _file_stage_pauses_scheduled_history() -> None:
+    store = FakeStore()
+    api = DirectHistoryApi()
+    pause = threading.Event()
+    pause.set()
+    worker = ZulipEventThread(
+        USER_ONE,
+        store,  # type: ignore[arg-type]
+        asyncio.get_running_loop(),
+        Settings(database_dsn="postgresql:///test"),
+        threading.BoundedSemaphore(1),
+        bulk_history_pause=pause,
+        api_factory=lambda user: api,  # type: ignore[arg-type]
+    )
+    worker._identity = ZulipIdentity(10, "Current User", 400)
+    worker._queue_id = "queue-1"
+    worker._user_uuids = {10: USER_ONE.uuid, 12: USER_TWO.uuid}
+
+    loaded = await asyncio.to_thread(
+        worker._load_scheduled_history,
+        api,
+        "queue-1",
+        [ScheduledChat("direct:10,12", 1)],
+    )
+
+    assert loaded
+    assert store.history_begins == 0
 
 
 def test_history_finalization_uses_catalog_write_gate() -> None:
@@ -1097,6 +1134,56 @@ async def _schedule_reconciliation_skip_test() -> None:
     assert store.schedule_reconciliations == 0
 
 
+def test_file_stage_controls_the_shared_history_pause() -> None:
+    asyncio.run(_file_stage_controls_the_shared_history_pause())
+
+
+async def _file_stage_controls_the_shared_history_pause() -> None:
+    store = FakeStore()
+    store.file_transfer_active = True
+    supervisor = ZulipThreadSupervisor(
+        store,  # type: ignore[arg-type]
+        asyncio.get_running_loop(),
+        Settings(
+            database_dsn="postgresql:///test",
+            workspace_control_url="https://control.example.test",
+        ),
+        worker_factory=lambda user, gate: FakeWorker(user),  # type: ignore[arg-type]
+    )
+
+    await supervisor._refresh_bulk_stage()
+    assert supervisor._bulk_history_pause.is_set()
+
+    store.file_transfer_active = False
+    await supervisor._refresh_bulk_stage()
+    assert not supervisor._bulk_history_pause.is_set()
+
+
+def test_file_stage_does_not_pause_chat_schedule_reconciliation() -> None:
+    asyncio.run(_file_stage_does_not_pause_chat_schedule_reconciliation())
+
+
+async def _file_stage_does_not_pause_chat_schedule_reconciliation() -> None:
+    store = ScheduleTrackingStore()
+    store.file_transfer_active = True
+    supervisor = ZulipThreadSupervisor(
+        store,  # type: ignore[arg-type]
+        asyncio.get_running_loop(),
+        Settings(
+            database_dsn="postgresql:///test",
+            workspace_control_url="https://control.example.test",
+        ),
+        worker_factory=lambda user, gate: FakeWorker(user),  # type: ignore[arg-type]
+    )
+
+    await supervisor._refresh_bulk_stage()
+    assert supervisor._bulk_history_pause.is_set()
+
+    await supervisor.reconcile()
+
+    assert store.schedule_reconciliations == 1
+
+
 def test_schedule_reconciliation_deadlock_does_not_stop_supervisor() -> None:
     asyncio.run(_schedule_reconciliation_deadlock_test())
 
@@ -1115,7 +1202,8 @@ async def _schedule_reconciliation_deadlock_test() -> None:
 
     assert not await supervisor._reconcile_once()
     assert store.schedule_reconciliations == 1
-    assert not workers
+    assert len(workers) == 2
+    assert all(worker.alive for worker in workers)
 
     assert await supervisor._reconcile_once()
     assert store.schedule_reconciliations == 2
@@ -1129,6 +1217,7 @@ def test_schedule_reconciliation_timeout_does_not_stop_supervisor() -> None:
 
 async def _schedule_reconciliation_timeout_test() -> None:
     store = ScheduleTrackingStore()
+    workers: list[FakeWorker] = []
 
     async def timeout_once() -> ChatScheduleReconcile:
         store.schedule_reconciliations += 1
@@ -1139,11 +1228,15 @@ async def _schedule_reconciliation_timeout_test() -> None:
         store,  # type: ignore[arg-type]
         asyncio.get_running_loop(),
         Settings(database_dsn="postgresql:///test"),
-        worker_factory=lambda user, gate: FakeWorker(user),  # type: ignore[arg-type]
+        worker_factory=lambda user, gate: (
+            workers.append(FakeWorker(user)) or workers[-1]
+        ),
     )
 
     assert not await supervisor._reconcile_once()
     assert store.schedule_reconciliations == 1
+    assert len(workers) == 2
+    assert all(worker.alive for worker in workers)
 
 
 def test_supervisor_owns_exactly_one_thread_per_user() -> None:
