@@ -3285,6 +3285,27 @@ async def _catalog_projected_live_message_uses_workspace_parent_ids(
                 project_uuid,
                 b"u" * 32,
             )
+            # A catalog-projected Workspace event is normalized back to the
+            # source Zulip stream identity for outbound comparison.  That
+            # canonical mirror row must not make later Zulip messages bypass
+            # the catalog projection and carry source-only parent IDs to
+            # Workspace.
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.workspace_streams (
+                    provider_uuid, snapshot_generation, uuid,
+                    workspace_project_id, content_hash, source_updated_at, data
+                ) VALUES (
+                    $1, $2, $3, $4, $5, clock_timestamp(),
+                    jsonb_build_object('name', 'Projected')
+                )
+                """,
+                provider_uuid,
+                generation,
+                stream_uuid,
+                project_uuid,
+                b"s" * 32,
+            )
             await connection.execute(
                 """
                 INSERT INTO workspace_zulip_bridge.workspace_chat_catalog_reports (
@@ -3384,6 +3405,74 @@ async def _catalog_projected_live_message_uses_workspace_parent_ids(
         ready, deferred = await worker._partition_dependency_ready([candidate])
         assert ready == [candidate]
         assert deferred == []
+
+        outbound_message_uuid = UUID("10000000-0000-0000-0000-0000000000d7")
+        event_time = datetime(2026, 9, 28, 4, 0, tzinfo=UTC)
+        outbound_frame = {
+            "updated_at": event_time.isoformat().replace("+00:00", "Z"),
+            "payload": {
+                "kind": "message.created",
+                "uuid": str(outbound_message_uuid),
+                "stream_uuid": str(projected_stream_uuid),
+                "topic_uuid": str(projected_topic_uuid),
+                "author_uuid": str(workspace_user_uuid),
+                "payload": {"kind": "markdown", "content": "outbound"},
+                "created_at": event_time.isoformat().replace("+00:00", "Z"),
+                "updated_at": event_time.isoformat().replace("+00:00", "Z"),
+            },
+        }
+        await pool.execute(
+            """
+            INSERT INTO workspace_zulip_bridge.workspace_events (
+                uuid, provider_uuid, workspace_project_id, epoch_version,
+                object_type, action, entity_uuid, payload
+            ) VALUES ($1, $2, $3, 1, 'message', 'created', $4, $5::jsonb)
+            """,
+            UUID("10000000-0000-0000-0000-0000000000d8"),
+            provider_uuid,
+            project_uuid,
+            outbound_message_uuid,
+            json.dumps(outbound_frame),
+        )
+        event = await pool.fetchrow(
+            "SELECT * FROM workspace_zulip_bridge.workspace_events "
+            "WHERE provider_uuid = $1 AND entity_uuid = $2",
+            provider_uuid,
+            outbound_message_uuid,
+        )
+        assert event is not None
+        processor = WorkspaceEventProcessor(pool, settings)
+        assert await processor._apply(event)
+        mirrored = await pool.fetchrow(
+            """
+            SELECT data FROM workspace_zulip_bridge.workspace_messages
+            WHERE provider_uuid = $1 AND snapshot_generation = $2 AND uuid = $3
+            """,
+            provider_uuid,
+            generation,
+            outbound_message_uuid,
+        )
+        assert mirrored is not None
+        mirrored_data = json.loads(mirrored["data"])
+        assert mirrored_data["stream_uuid"] == str(stream_uuid)
+        assert mirrored_data["topic_uuid"] == str(topic_uuid)
+        assert mirrored_data["author_uuid"] == str(owner_uuid)
+        outbound_diff = await pool.fetchrow(
+            """
+            SELECT direction, processing_status, partition_key
+            FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1 AND entity_type = 'messages'
+              AND entity_uuid = $2
+            """,
+            provider_uuid,
+            outbound_message_uuid,
+        )
+        assert outbound_diff is not None
+        assert tuple(outbound_diff) == (
+            "to_zulip",
+            "pending",
+            stream_uuid,
+        )
     finally:
         await pool.close()
 
