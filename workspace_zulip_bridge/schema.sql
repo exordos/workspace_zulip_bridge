@@ -474,6 +474,15 @@ CREATE TABLE IF NOT EXISTS workspace_zulip_bridge.workspace_chat_catalog_reports
     catalog_hash bytea NOT NULL CHECK (octet_length(catalog_hash) = 32),
     projection_revision integer NOT NULL DEFAULT 1
         CHECK (projection_revision > 0),
+    assignment_generation bigint CHECK (
+        assignment_generation IS NULL OR assignment_generation > 0
+    ),
+    assignment jsonb CHECK (
+        assignment IS NULL OR jsonb_typeof(assignment) = 'object'
+    ),
+    assignment_reconciled boolean NOT NULL DEFAULT false,
+    assignment_repair_created_at timestamptz,
+    assignment_repair_uuid uuid,
     report_uuid uuid NOT NULL UNIQUE,
     report jsonb NOT NULL CHECK (jsonb_typeof(report) = 'object'),
     processing_status text NOT NULL DEFAULT 'pending'

@@ -128,39 +128,237 @@ class WorkspaceChatCatalogWorker:
     async def process_once(self) -> int:
         refreshed = 0
         retired = 0
+        requeued = 0
         if self._coordinate:
+            requeued = await self._requeue_assignment_messages()
             # Do not let an old report backlog hide newly discovered chats or
             # a projection-format upgrade.  Only the coordinator performs this
             # bounded, newest-first refresh; the remaining workers keep
             # delivering reports in parallel.
             refreshed = await self._refresh_catalogs(priority_only=True)
-        report = await self._claim_report()
-        if report is None and self._coordinate:
+        reports = await self._claim_reports()
+        if not reports and self._coordinate:
             refreshed += await self._refresh_catalogs()
             retired = await self._retire_unneeded_reports()
-            report = await self._claim_report()
-        if report is None:
-            return refreshed + retired
-        report_uuid = UUID(str(report["report_uuid"]))
+            reports = await self._claim_reports()
+        if not reports:
+            return refreshed + retired + requeued
         try:
-            outcome = await self._send_report(_object(report["report"]))
+            outcomes = await self._send_reports(
+                [_object(report["report"]) for report in reports]
+            )
         except asyncio.CancelledError:
             raise
         except CatalogReportError as error:
-            await self._fail_report(
-                report_uuid,
-                error.code,
-                retryable=error.retryable,
-            )
+            for report in reports:
+                await self._fail_report(
+                    UUID(str(report["report_uuid"])),
+                    error.code,
+                    retryable=error.retryable,
+                )
         except (TimeoutError, httpx.HTTPError) as error:
-            await self._fail_report(
-                report_uuid,
-                type(error).__name__,
-                retryable=True,
-            )
+            for report in reports:
+                await self._fail_report(
+                    UUID(str(report["report_uuid"])),
+                    type(error).__name__,
+                    retryable=True,
+                )
         else:
-            await self._finish_report(report_uuid, outcome)
-        return refreshed + retired + 1
+            for report in reports:
+                report_uuid = UUID(str(report["report_uuid"]))
+                await self._finish_report(report_uuid, outcomes[report_uuid])
+        return refreshed + retired + requeued + len(reports)
+
+    async def _requeue_assignment_messages(self) -> int:
+        """Reproject one assigned chat newest-first without a global rescan."""
+
+        row = await self._pool.fetchrow(
+            """
+            WITH candidate_report AS MATERIALIZED (
+                SELECT report.external_account_uuid,
+                       report.zulip_stream_uuid,
+                       stream.realm_uuid,
+                       report.assignment_repair_created_at,
+                       report.assignment_repair_uuid,
+                       (report.assignment #>>
+                           '{workspace_projection,stream,uuid}')::uuid
+                           AS projection_stream_uuid
+                FROM workspace_zulip_bridge.workspace_chat_catalog_reports
+                    AS report
+                JOIN workspace_zulip_bridge.zulip_streams AS stream
+                  ON stream.uuid = report.zulip_stream_uuid
+                WHERE report.processing_status = 'reported'
+                  AND report.assignment IS NOT NULL
+                  AND NOT report.assignment_reconciled
+                ORDER BY report.source_activity_at DESC,
+                         report.external_account_uuid,
+                         report.zulip_stream_uuid
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            ), queued_stream AS (
+                INSERT INTO workspace_zulip_bridge.workspace_outbox (
+                    realm_uuid, entity_type, action, entity_uuid
+                )
+                SELECT realm_uuid, 'stream', 'upsert', zulip_stream_uuid
+                FROM candidate_report
+                WHERE assignment_repair_created_at IS NULL
+                  AND assignment_repair_uuid IS NULL
+                ON CONFLICT (realm_uuid, entity_type, entity_uuid)
+                    WHERE delivery_status = 'pending'
+                DO UPDATE SET action = 'upsert', entity_hash = NULL,
+                              available_at = clock_timestamp(),
+                              updated_at = clock_timestamp()
+                RETURNING 1
+            ), queued_stream_bindings AS (
+                INSERT INTO workspace_zulip_bridge.workspace_outbox (
+                    realm_uuid, entity_type, action, entity_uuid
+                )
+                SELECT report.realm_uuid, 'stream_binding', 'upsert', binding.uuid
+                FROM candidate_report AS report
+                JOIN workspace_zulip_bridge.zulip_stream_bindings AS binding
+                  ON binding.zulip_stream_uuid = report.zulip_stream_uuid
+                WHERE report.assignment_repair_created_at IS NULL
+                  AND report.assignment_repair_uuid IS NULL
+                ON CONFLICT (realm_uuid, entity_type, entity_uuid)
+                    WHERE delivery_status = 'pending'
+                DO UPDATE SET action = 'upsert', entity_hash = NULL,
+                              available_at = clock_timestamp(),
+                              updated_at = clock_timestamp()
+                RETURNING 1
+            ), queued_topics AS (
+                INSERT INTO workspace_zulip_bridge.workspace_outbox (
+                    realm_uuid, entity_type, action, entity_uuid
+                )
+                SELECT report.realm_uuid, 'topic', 'upsert', topic.uuid
+                FROM candidate_report AS report
+                JOIN workspace_zulip_bridge.zulip_topics AS topic
+                  ON topic.zulip_stream_uuid = report.zulip_stream_uuid
+                WHERE report.assignment_repair_created_at IS NULL
+                  AND report.assignment_repair_uuid IS NULL
+                ON CONFLICT (realm_uuid, entity_type, entity_uuid)
+                    WHERE delivery_status = 'pending'
+                DO UPDATE SET action = 'upsert', entity_hash = NULL,
+                              available_at = clock_timestamp(),
+                              updated_at = clock_timestamp()
+                RETURNING 1
+            ), queued_topic_bindings AS (
+                INSERT INTO workspace_zulip_bridge.workspace_outbox (
+                    realm_uuid, entity_type, action, entity_uuid
+                )
+                SELECT report.realm_uuid, 'topic_binding', 'upsert', binding.uuid
+                FROM candidate_report AS report
+                JOIN workspace_zulip_bridge.zulip_topic_bindings AS binding
+                  ON binding.zulip_stream_uuid = report.zulip_stream_uuid
+                WHERE report.assignment_repair_created_at IS NULL
+                  AND report.assignment_repair_uuid IS NULL
+                ON CONFLICT (realm_uuid, entity_type, entity_uuid)
+                    WHERE delivery_status = 'pending'
+                DO UPDATE SET action = 'upsert', entity_hash = NULL,
+                              available_at = clock_timestamp(),
+                              updated_at = clock_timestamp()
+                RETURNING 1
+            ), batch AS MATERIALIZED (
+                SELECT message.uuid, message.realm_uuid, message.created_at
+                FROM candidate_report AS report
+                JOIN workspace_zulip_bridge.zulip_messages AS message
+                  ON message.zulip_stream_uuid = report.zulip_stream_uuid
+                JOIN workspace_zulip_bridge.zulip_realms AS realm
+                  ON realm.uuid = message.realm_uuid
+                JOIN workspace_zulip_bridge.workspace_mirror_state AS mirror
+                  ON mirror.provider_uuid = realm.workspace_provider_uuid
+                 AND mirror.active_generation IS NOT NULL
+                LEFT JOIN workspace_zulip_bridge.workspace_messages AS target
+                  ON target.provider_uuid = mirror.provider_uuid
+                 AND target.snapshot_generation = mirror.active_generation
+                 AND target.uuid = message.uuid
+                WHERE (
+                    report.assignment_repair_created_at IS NULL
+                    OR (message.created_at, message.uuid) < (
+                        report.assignment_repair_created_at,
+                        report.assignment_repair_uuid
+                    )
+                )
+                  AND (
+                    target.uuid IS NULL
+                    OR (target.data ->> 'stream_uuid')::uuid IS DISTINCT FROM
+                       report.projection_stream_uuid
+                  )
+                ORDER BY message.created_at DESC, message.uuid DESC
+                LIMIT 1000
+            ), queued_messages AS (
+                INSERT INTO workspace_zulip_bridge.workspace_outbox (
+                    realm_uuid, entity_type, action, entity_uuid
+                )
+                SELECT realm_uuid, 'message', 'upsert', uuid FROM batch
+                ON CONFLICT (realm_uuid, entity_type, entity_uuid)
+                    WHERE delivery_status = 'pending'
+                DO UPDATE SET action = 'upsert', entity_hash = NULL,
+                              available_at = clock_timestamp(),
+                              updated_at = clock_timestamp()
+                RETURNING 1
+            ), queued_flags AS (
+                INSERT INTO workspace_zulip_bridge.workspace_outbox (
+                    realm_uuid, entity_type, action, entity_uuid
+                )
+                SELECT flag.realm_uuid, 'message_flag', 'upsert', flag.uuid
+                FROM workspace_zulip_bridge.zulip_message_flags AS flag
+                JOIN batch ON batch.uuid = flag.message_uuid
+                ON CONFLICT (realm_uuid, entity_type, entity_uuid)
+                    WHERE delivery_status = 'pending'
+                DO UPDATE SET action = 'upsert', entity_hash = NULL,
+                              available_at = clock_timestamp(),
+                              updated_at = clock_timestamp()
+                RETURNING 1
+            ), progress AS (
+                UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports
+                    AS report
+                SET assignment_reconciled = (SELECT count(*) < 1000 FROM batch),
+                    assignment_repair_created_at = COALESCE(
+                        (
+                            SELECT created_at FROM batch
+                            ORDER BY created_at, uuid LIMIT 1
+                        ),
+                        report.assignment_repair_created_at
+                    ),
+                    assignment_repair_uuid = COALESCE(
+                        (
+                            SELECT uuid FROM batch
+                            ORDER BY created_at, uuid LIMIT 1
+                        ),
+                        report.assignment_repair_uuid
+                    ),
+                    updated_at = clock_timestamp()
+                FROM candidate_report AS candidate
+                WHERE report.external_account_uuid =
+                          candidate.external_account_uuid
+                  AND report.zulip_stream_uuid = candidate.zulip_stream_uuid
+                RETURNING report.assignment_reconciled
+            )
+            SELECT (SELECT count(*) FROM queued_stream) AS streams,
+                   (SELECT count(*) FROM queued_stream_bindings)
+                       AS stream_bindings,
+                   (SELECT count(*) FROM queued_topics) AS topics,
+                   (SELECT count(*) FROM queued_topic_bindings)
+                       AS topic_bindings,
+                   (SELECT count(*) FROM queued_messages) AS messages,
+                   (SELECT count(*) FROM queued_flags) AS flags,
+                   COALESCE(
+                       (SELECT assignment_reconciled FROM progress),
+                       true
+                   ) AS reconciled
+            """
+        )
+        if row is None:
+            return 0
+        return (
+            int(row["streams"])
+            + int(row["stream_bindings"])
+            + int(row["topics"])
+            + int(row["topic_bindings"])
+            + int(row["messages"])
+            + int(row["flags"])
+            + int(not row["reconciled"])
+        )
 
     async def _refresh_catalogs(self, *, priority_only: bool = False) -> int:
         changed = await self._reactivate_needed_reports()
@@ -513,11 +711,6 @@ class WorkspaceChatCatalogWorker:
                 "kind": "zulip",
                 "chat_type": catalog_chat_type,
                 "provider_chat_key": source.chat_key,
-                # Reuse the stable source identities that already own the
-                # imported history.  Older catalog revisions omitted these
-                # hints, so Workspace materialized a second empty projection
-                # for the same provider chat.
-                "projection_stream_uuid": str(source.stream_uuid),
                 "provider_realm_uuid": str(source.realm_uuid),
                 "provider_owner_user_id": str(source.owner_zulip_user_id),
                 "original_url": None,
@@ -621,7 +814,6 @@ class WorkspaceChatCatalogWorker:
             return [
                 {
                     "provider_topic_id": f"{source.chat_key}:default",
-                    "projection_topic_uuid": str(topic_uuid),
                     "name": "Zulip",
                     "is_default": True,
                 }
@@ -639,7 +831,6 @@ class WorkspaceChatCatalogWorker:
         return [
             {
                 "provider_topic_id": f"{provider_stream_id}:{row['name']}",
-                "projection_topic_uuid": str(row["uuid"]),
                 "name": str(row["name"]),
                 "is_default": False,
             }
@@ -720,6 +911,46 @@ class WorkspaceChatCatalogWorker:
                     ELSE workspace_chat_catalog_reports.catalog_hash
                 END,
                 projection_revision = EXCLUDED.projection_revision,
+                assignment_generation = CASE
+                    WHEN workspace_chat_catalog_reports.catalog_hash
+                         IS DISTINCT FROM EXCLUDED.catalog_hash
+                      OR workspace_chat_catalog_reports.observed_generation
+                         IS DISTINCT FROM EXCLUDED.observed_generation
+                    THEN NULL
+                    ELSE workspace_chat_catalog_reports.assignment_generation
+                END,
+                assignment = CASE
+                    WHEN workspace_chat_catalog_reports.catalog_hash
+                         IS DISTINCT FROM EXCLUDED.catalog_hash
+                      OR workspace_chat_catalog_reports.observed_generation
+                         IS DISTINCT FROM EXCLUDED.observed_generation
+                    THEN NULL
+                    ELSE workspace_chat_catalog_reports.assignment
+                END,
+                assignment_reconciled = CASE
+                    WHEN workspace_chat_catalog_reports.catalog_hash
+                         IS DISTINCT FROM EXCLUDED.catalog_hash
+                      OR workspace_chat_catalog_reports.observed_generation
+                         IS DISTINCT FROM EXCLUDED.observed_generation
+                    THEN false
+                    ELSE workspace_chat_catalog_reports.assignment_reconciled
+                END,
+                assignment_repair_created_at = CASE
+                    WHEN workspace_chat_catalog_reports.catalog_hash
+                         IS DISTINCT FROM EXCLUDED.catalog_hash
+                      OR workspace_chat_catalog_reports.observed_generation
+                         IS DISTINCT FROM EXCLUDED.observed_generation
+                    THEN NULL
+                    ELSE workspace_chat_catalog_reports.assignment_repair_created_at
+                END,
+                assignment_repair_uuid = CASE
+                    WHEN workspace_chat_catalog_reports.catalog_hash
+                         IS DISTINCT FROM EXCLUDED.catalog_hash
+                      OR workspace_chat_catalog_reports.observed_generation
+                         IS DISTINCT FROM EXCLUDED.observed_generation
+                    THEN NULL
+                    ELSE workspace_chat_catalog_reports.assignment_repair_uuid
+                END,
                 report_uuid = CASE
                     WHEN workspace_chat_catalog_reports.catalog_hash
                          IS DISTINCT FROM EXCLUDED.catalog_hash
@@ -864,8 +1095,8 @@ class WorkspaceChatCatalogWorker:
         assert result is not None
         return int(result["messages"]) + int(result["flags"])
 
-    async def _claim_report(self) -> asyncpg.Record | None:
-        return await self._pool.fetchrow(
+    async def _claim_reports(self, limit: int = 20) -> list[asyncpg.Record]:
+        return await self._pool.fetch(
             """
             WITH expired AS (
                 UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports
@@ -896,7 +1127,7 @@ class WorkspaceChatCatalogWorker:
                          report.source_updated_at DESC,
                          report.available_at, report.updated_at,
                          report.external_account_uuid, report.zulip_stream_uuid
-                LIMIT 1 FOR UPDATE SKIP LOCKED
+                LIMIT $1 FOR UPDATE SKIP LOCKED
             )
             UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports AS report
             SET processing_status = 'processing', claimed_at = clock_timestamp(),
@@ -907,7 +1138,12 @@ class WorkspaceChatCatalogWorker:
               AND report.zulip_stream_uuid = candidate.zulip_stream_uuid
             RETURNING report.report_uuid, report.report
             """,
+            limit,
         )
+
+    async def _claim_report(self) -> asyncpg.Record | None:
+        reports = await self._claim_reports(limit=1)
+        return None if not reports else reports[0]
 
     def _client(self) -> httpx.AsyncClient:
         ca = self._state / "control-ca.pem"
@@ -928,12 +1164,24 @@ class WorkspaceChatCatalogWorker:
         )
 
     async def _send_report(self, report: dict[str, object]) -> str:
+        report_uuid = UUID(str(report["report_uuid"]))
+        return (await self._send_reports([report]))[report_uuid]
+
+    async def _send_reports(
+        self,
+        reports: list[dict[str, object]],
+    ) -> dict[UUID, str]:
         async with self._control_semaphore:
             async with self._client() as client:
                 response = await client.post(
                     "/v1/observed-state/reports",
-                    json={"reports": [report]},
+                    json={"reports": reports},
                 )
+        if response.status_code == 413 and len(reports) > 1:
+            midpoint = len(reports) // 2
+            outcomes = await self._send_reports(reports[:midpoint])
+            outcomes.update(await self._send_reports(reports[midpoint:]))
+            return outcomes
         if response.is_error:
             raise CatalogReportError(
                 f"workspace_catalog_http_{response.status_code}",
@@ -944,17 +1192,19 @@ class WorkspaceChatCatalogWorker:
         except ValueError as error:
             raise CatalogReportError("invalid_catalog_response") from error
         results = payload.get("results") if isinstance(payload, dict) else None
-        if not isinstance(results, list) or len(results) != 1:
+        if not isinstance(results, list) or len(results) != len(reports):
             raise CatalogReportError("invalid_catalog_response")
-        result = results[0]
-        if not isinstance(result, dict) or result.get("report_uuid") != report.get(
-            "report_uuid"
-        ):
-            raise CatalogReportError("invalid_catalog_response")
-        outcome = result.get("status")
-        if outcome not in {"applied", "duplicate", "stale", "rejected"}:
-            raise CatalogReportError("invalid_catalog_response")
-        return str(outcome)
+        outcomes = {}
+        for report, result in zip(reports, results, strict=True):
+            if not isinstance(result, dict) or result.get("report_uuid") != report.get(
+                "report_uuid"
+            ):
+                raise CatalogReportError("invalid_catalog_response")
+            outcome = result.get("status")
+            if outcome not in {"applied", "duplicate", "stale", "rejected"}:
+                raise CatalogReportError("invalid_catalog_response")
+            outcomes[UUID(str(report["report_uuid"]))] = str(outcome)
+        return outcomes
 
     async def _finish_report(self, report_uuid: UUID, outcome: str) -> None:
         await self._pool.execute(

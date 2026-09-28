@@ -211,6 +211,17 @@ BEGIN
             ADD COLUMN IF NOT EXISTS projection_revision integer
             NOT NULL DEFAULT 1;
         ALTER TABLE workspace_zulip_bridge.workspace_chat_catalog_reports
+            ADD COLUMN IF NOT EXISTS assignment_generation bigint;
+        ALTER TABLE workspace_zulip_bridge.workspace_chat_catalog_reports
+            ADD COLUMN IF NOT EXISTS assignment jsonb;
+        ALTER TABLE workspace_zulip_bridge.workspace_chat_catalog_reports
+            ADD COLUMN IF NOT EXISTS assignment_reconciled boolean
+            NOT NULL DEFAULT false;
+        ALTER TABLE workspace_zulip_bridge.workspace_chat_catalog_reports
+            ADD COLUMN IF NOT EXISTS assignment_repair_created_at timestamptz;
+        ALTER TABLE workspace_zulip_bridge.workspace_chat_catalog_reports
+            ADD COLUMN IF NOT EXISTS assignment_repair_uuid uuid;
+        ALTER TABLE workspace_zulip_bridge.workspace_chat_catalog_reports
             ADD COLUMN IF NOT EXISTS source_activity_at timestamptz;
         IF to_regclass('workspace_zulip_bridge.zulip_streams') IS NOT NULL
            AND to_regclass('workspace_zulip_bridge.zulip_messages') IS NOT NULL

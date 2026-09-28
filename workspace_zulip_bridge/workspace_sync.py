@@ -34,6 +34,7 @@ from workspace_zulip_bridge.stable_ids import stable_topic_uuid
 from workspace_zulip_bridge.workspace_auth import WorkspaceTokenManager
 from workspace_zulip_bridge.workspace_entities import project_entity
 from workspace_zulip_bridge.workspace_entities import validate_entity
+from workspace_zulip_bridge.workspace_file_transfer import CATALOG_PROJECTION_REVISION
 from workspace_zulip_bridge.workspace_file_transfer import FileTransferError
 from workspace_zulip_bridge.zulip_api import ZulipApiError
 from workspace_zulip_bridge.zulip_outbound import ZulipOutboundError
@@ -200,7 +201,15 @@ def _catalog_topic_provider_id(
 def _catalog_projection_stream_uuid(
     catalog: Mapping[str, Any],
     external_chat_uuid: UUID,
+    assignment: Mapping[str, Any] | None = None,
 ) -> UUID:
+    if assignment is not None:
+        projection = assignment.get("workspace_projection")
+        if isinstance(projection, Mapping):
+            stream = projection.get("stream")
+            if isinstance(stream, Mapping) and stream.get("uuid") is not None:
+                return UUID(str(stream["uuid"]))
+        raise ValueError("Workspace chat assignment stream mapping is missing")
     source = catalog.get("source")
     if isinstance(source, Mapping) and source.get("projection_stream_uuid") is not None:
         return UUID(str(source["projection_stream_uuid"]))
@@ -211,7 +220,21 @@ def _catalog_projection_topic_uuid(
     catalog: Mapping[str, Any],
     external_chat_uuid: UUID,
     provider_topic_id: str,
+    assignment: Mapping[str, Any] | None = None,
 ) -> UUID:
+    if assignment is not None:
+        projection = assignment.get("workspace_projection")
+        if isinstance(projection, Mapping):
+            assigned_topics = projection.get("topics")
+            if isinstance(assigned_topics, list):
+                for topic in assigned_topics:
+                    if (
+                        isinstance(topic, Mapping)
+                        and topic.get("provider_topic_id") == provider_topic_id
+                        and topic.get("topic_uuid") is not None
+                    ):
+                        return UUID(str(topic["topic_uuid"]))
+        raise ValueError("Workspace chat assignment topic mapping is missing")
     topics = catalog.get("topics")
     if isinstance(topics, list):
         for topic in topics:
@@ -1307,7 +1330,7 @@ class WorkspaceEventProcessor:
             )
         rows = await self._pool.fetch(
             """
-            SELECT report.resource_uuid, report.catalog,
+            SELECT report.resource_uuid, report.catalog, report.assignment,
                    stream.uuid AS stream_uuid,
                    stream.chat_type, stream.chat_key,
                    topic.uuid AS topic_uuid, topic.name AS topic_name
@@ -1321,6 +1344,7 @@ class WorkspaceEventProcessor:
             WHERE realm.workspace_provider_uuid = $1
               AND realm.workspace_project_id = $2
               AND report.processing_status = 'reported'
+              AND report.assignment IS NOT NULL
             """,
             self._provider_uuid,
             project_uuid,
@@ -1331,9 +1355,14 @@ class WorkspaceEventProcessor:
             external_chat_uuid = UUID(str(row["resource_uuid"]))
             source_stream_uuid = UUID(str(row["stream_uuid"]))
             catalog = _json_object(row["catalog"])
-            stream_ids[_catalog_projection_stream_uuid(catalog, external_chat_uuid)] = (
-                source_stream_uuid
-            )
+            assignment = _json_object(row["assignment"])
+            stream_ids[
+                _catalog_projection_stream_uuid(
+                    catalog,
+                    external_chat_uuid,
+                    assignment,
+                )
+            ] = source_stream_uuid
             if row["topic_uuid"] is None:
                 continue
             provider_topic_id = _catalog_topic_provider_id(
@@ -1341,13 +1370,28 @@ class WorkspaceEventProcessor:
                 str(row["chat_key"]),
                 str(row["topic_name"]),
             )
-            topic_ids[
-                _catalog_projection_topic_uuid(
-                    catalog,
-                    external_chat_uuid,
-                    provider_topic_id,
-                )
-            ] = UUID(str(row["topic_uuid"]))
+            projection = assignment.get("workspace_projection")
+            assigned_topics = (
+                projection.get("topics") if isinstance(projection, Mapping) else None
+            )
+            if not isinstance(assigned_topics, list) or not any(
+                isinstance(topic, Mapping)
+                and topic.get("provider_topic_id") == provider_topic_id
+                and topic.get("topic_uuid") is not None
+                for topic in assigned_topics
+            ):
+                # The source topic table may contain historical topics that
+                # are not part of the current catalog/assignment.  They must
+                # not invalidate identity maps for the assigned topics or
+                # fall back to a source-only UUID.
+                continue
+            workspace_topic_uuid = _catalog_projection_topic_uuid(
+                catalog,
+                external_chat_uuid,
+                provider_topic_id,
+                assignment,
+            )
+            topic_ids[workspace_topic_uuid] = UUID(str(row["topic_uuid"]))
         self._catalog_project_uuid = project_uuid
         self._catalog_stream_ids = stream_ids
         self._catalog_topic_ids = topic_ids
@@ -1620,6 +1664,8 @@ class WorkspaceDiffWorker:
         self._direct_topics_repair_done = False
         self._topic_bindings_repair_done = False
         self._moved_flag_repair_batch_size = self.MOVED_FLAG_REPAIR_MESSAGE_BATCH_SIZE
+        self._workspace_entity_ids: dict[tuple[str, UUID], UUID] = {}
+        self._assignment_blocked_entities: set[tuple[str, UUID]] = set()
         self._zulip_writer = ZulipOutboundWriter(pool, settings)
 
     @property
@@ -3790,6 +3836,8 @@ class WorkspaceDiffWorker:
             )
         if not rows:
             return 0
+        self._workspace_entity_ids = {}
+        self._assignment_blocked_entities = set()
         delivery_class = "live" if int(delivery_priority) == 0 else "backfill"
         to_workspace = [row for row in rows if row["direction"] == "to_workspace"]
         to_zulip = [row for row in rows if row["direction"] == "to_zulip"]
@@ -3817,11 +3865,15 @@ class WorkspaceDiffWorker:
         ]
         reaction_owners = await self._workspace_reaction_owners(reaction_sources)
         skipped: list[asyncpg.Record] = []
+        assignment_deferred: list[asyncpg.Record] = []
         equivalent: list[tuple[asyncpg.Record, dict[str, Any], bytes]] = []
         for row in to_workspace:
             key = (row["entity_type"], row["entity_uuid"])
             data = loaded.get(key)
             target = targets.get(key)
+            if key in self._assignment_blocked_entities:
+                assignment_deferred.append(row)
+                continue
             if _equivalent_entity(row["entity_type"], data, target):
                 equivalent.append(
                     (row, data or {}, canonical_hash(data) if data else b"")
@@ -3836,22 +3888,23 @@ class WorkspaceDiffWorker:
                         {
                             "action": "delete",
                             "type": row["entity_type"],
-                            "uuid": str(row["entity_uuid"]),
+                            "uuid": str(self._workspace_entity_uuid(row)),
                         },
                     )
                 )
                 continue
             if row["entity_type"] == "message_reactions":
                 identity = _reaction_identity(data)
-                owner = reaction_owners.setdefault(identity, row["entity_uuid"])
-                if owner != row["entity_uuid"]:
+                workspace_entity_uuid = self._workspace_entity_uuid(row)
+                owner = reaction_owners.setdefault(identity, workspace_entity_uuid)
+                if owner != workspace_entity_uuid:
                     skipped.append(row)
                     continue
             content_hash = canonical_hash(data)
             operation = {
                 "action": "upsert",
                 "type": row["entity_type"],
-                "uuid": str(row["entity_uuid"]),
+                "uuid": str(self._workspace_entity_uuid(row)),
                 "content_hash": content_hash.hex(),
                 "source_updated_at": row["source_updated_at"]
                 .isoformat()
@@ -3873,6 +3926,8 @@ class WorkspaceDiffWorker:
                 "skipped",
                 "workspace_reaction_identity_duplicate",
             )
+        if assignment_deferred:
+            await self._defer_for_dependencies(assignment_deferred)
         if not candidates:
             return len(rows)
         ready, deferred = await self._partition_dependency_ready(candidates)
@@ -3883,6 +3938,16 @@ class WorkspaceDiffWorker:
         ready.sort(key=lambda item: PRIORITY[item[0]["entity_type"]])
         await self._apply_workspace_batch(client, delivery_class, ready)
         return len(rows)
+
+    def _workspace_entity_uuid(
+        self,
+        row: asyncpg.Record | Mapping[str, Any],
+    ) -> UUID:
+        source_uuid = UUID(str(row["entity_uuid"]))
+        return self._workspace_entity_ids.get(
+            (str(row["entity_type"]), source_uuid),
+            source_uuid,
+        )
 
     async def _apply_workspace_batch(
         self,
@@ -4216,7 +4281,7 @@ class WorkspaceDiffWorker:
             return ready
         rows = await self._pool.fetch(
             """
-            SELECT report.resource_uuid, report.catalog,
+            SELECT report.resource_uuid, report.catalog, report.assignment,
                    stream.uuid AS stream_uuid, stream.chat_type, stream.chat_key,
                    topic.uuid AS topic_uuid,
                    topic.name AS topic_name
@@ -4235,6 +4300,7 @@ class WorkspaceDiffWorker:
               ON report.external_account_uuid = connection.external_account_uuid
              AND report.zulip_stream_uuid = stream.uuid
              AND report.processing_status = 'reported'
+             AND report.assignment IS NOT NULL
             LEFT JOIN workspace_zulip_bridge.zulip_topics AS topic
               ON topic.uuid = message.topic_uuid
             WHERE message.uuid = ANY($1::uuid[])
@@ -4255,8 +4321,13 @@ class WorkspaceDiffWorker:
         for row in rows:
             external_chat_uuid = UUID(str(row["resource_uuid"]))
             catalog = _json_object(row["catalog"])
+            assignment = _json_object(row["assignment"])
             ready["streams"].add(
-                _catalog_projection_stream_uuid(catalog, external_chat_uuid)
+                _catalog_projection_stream_uuid(
+                    catalog,
+                    external_chat_uuid,
+                    assignment,
+                )
             )
             provider_topic_id = _catalog_topic_provider_id(
                 str(row["chat_type"]),
@@ -4268,6 +4339,7 @@ class WorkspaceDiffWorker:
                     catalog,
                     external_chat_uuid,
                     provider_topic_id,
+                    assignment,
                 )
             )
         return ready
@@ -4522,6 +4594,7 @@ class WorkspaceDiffWorker:
     async def _write_to_zulip(self, rows: list[asyncpg.Record]) -> None:
         source_entities: dict[tuple[str, UUID], dict[str, Any]] = {}
         target_entities: dict[tuple[str, UUID], dict[str, Any]] = {}
+        assignment_deferred: list[asyncpg.Record] = []
         grouped: dict[str, list[UUID]] = defaultdict(list)
         for row in rows:
             grouped[row["entity_type"]].append(row["entity_uuid"])
@@ -4541,6 +4614,9 @@ class WorkspaceDiffWorker:
             key = (row["entity_type"], row["entity_uuid"])
             source = source_entities.get(key)
             target = target_entities.get(key)
+            if key in self._assignment_blocked_entities:
+                assignment_deferred.append(row)
+                continue
             if key in identity_rebinds:
                 await self._redirect_identity_rebind(row)
                 continue
@@ -4603,6 +4679,8 @@ class WorkspaceDiffWorker:
                 )
             else:
                 await self._accept_to_zulip(row, "written")
+        if assignment_deferred:
+            await self._defer_for_dependencies(assignment_deferred)
 
     async def _message_identity_rebinds(
         self,
@@ -4852,7 +4930,7 @@ class WorkspaceDiffWorker:
                             (
                                 self._provider_uuid,
                                 generation,
-                                row["entity_uuid"],
+                                self._workspace_entity_uuid(row),
                                 self._project_uuid,
                                 content_hash,
                                 row["source_updated_at"],
@@ -4870,7 +4948,7 @@ class WorkspaceDiffWorker:
                         """,
                         self._provider_uuid,
                         generation,
-                        [item[0]["entity_uuid"] for item in deletes],
+                        [self._workspace_entity_uuid(item[0]) for item in deletes],
                     )
             await connection.execute(
                 """
@@ -4931,7 +5009,7 @@ class WorkspaceDiffWorker:
                         (
                             self._provider_uuid,
                             generation,
-                            row["entity_uuid"],
+                            self._workspace_entity_uuid(row),
                             content_hash,
                             row["source_updated_at"],
                         )
@@ -5306,25 +5384,74 @@ class WorkspaceDiffWorker:
         result: dict[tuple[str, UUID], dict[str, Any]] = {}
         for row in rows:
             data = _json_object(row["data"])
-            if entity_type == "messages" and row["catalog_resource_uuid"] is not None:
-                external_chat_uuid = UUID(str(row["catalog_resource_uuid"]))
+            source_entity_uuid = UUID(str(row["entity_uuid"]))
+            workspace_entity_uuid = source_entity_uuid
+            catalog_resource_uuid = row.get("catalog_resource_uuid")
+            if catalog_resource_uuid is not None and (
+                row.get("catalog_projection_revision") != CATALOG_PROJECTION_REVISION
+                or row.get("assignment") is None
+            ):
+                self._assignment_blocked_entities.add((entity_type, source_entity_uuid))
+                continue
+            if catalog_resource_uuid is not None:
+                external_chat_uuid = UUID(str(catalog_resource_uuid))
                 catalog = _json_object(row["catalog"])
-                data["stream_uuid"] = str(
-                    _catalog_projection_stream_uuid(catalog, external_chat_uuid)
+                assignment = _json_object(row["assignment"])
+                workspace_stream_uuid = _catalog_projection_stream_uuid(
+                    catalog,
+                    external_chat_uuid,
+                    assignment,
                 )
-                provider_topic_id = _catalog_topic_provider_id(
-                    str(row["chat_type"]),
-                    str(row["chat_key"]),
-                    str(row["topic_name"]) if row["topic_name"] is not None else None,
-                )
-                data["topic_uuid"] = str(
-                    _catalog_projection_topic_uuid(
+                if "stream_uuid" in data:
+                    data["stream_uuid"] = str(workspace_stream_uuid)
+                if entity_type == "streams":
+                    workspace_entity_uuid = workspace_stream_uuid
+                if entity_type in {"topics", "topic_bindings", "messages"}:
+                    provider_topic_id = _catalog_topic_provider_id(
+                        str(row["chat_type"]),
+                        str(row["chat_key"]),
+                        (
+                            str(row["topic_name"])
+                            if row["topic_name"] is not None
+                            else None
+                        ),
+                    )
+                    workspace_topic_uuid = _catalog_projection_topic_uuid(
                         catalog,
                         external_chat_uuid,
                         provider_topic_id,
+                        assignment,
                     )
+                    if "topic_uuid" in data:
+                        data["topic_uuid"] = str(workspace_topic_uuid)
+                    if entity_type == "topics":
+                        workspace_entity_uuid = workspace_topic_uuid
+                if entity_type == "stream_bindings":
+                    workspace_entity_uuid = stable_stream_binding_uuid(
+                        workspace_stream_uuid,
+                        UUID(str(data["user_uuid"])),
+                    )
+                elif entity_type == "topic_bindings":
+                    workspace_entity_uuid = stable_topic_binding_uuid(
+                        UUID(str(data["topic_uuid"])),
+                        UUID(str(data["user_uuid"])),
+                    )
+                elif entity_type == "message_flags":
+                    workspace_entity_uuid = stable_message_flag_uuid(
+                        UUID(str(data["message_uuid"])),
+                        UUID(str(data["user_uuid"])),
+                    )
+            if entity_type == "message_reactions":
+                workspace_entity_uuid = stable_reaction_uuid(
+                    UUID(str(data["message_uuid"])),
+                    UUID(str(data["user_uuid"])),
+                    str(row["reaction_type"]),
+                    str(row["emoji_code"]),
                 )
-            result[(entity_type, UUID(str(row["entity_uuid"])))] = project_entity(
+            self._workspace_entity_ids[(entity_type, source_entity_uuid)] = (
+                workspace_entity_uuid
+            )
+            result[(entity_type, source_entity_uuid)] = project_entity(
                 entity_type,
                 data,
             )
@@ -5333,6 +5460,12 @@ class WorkspaceDiffWorker:
     async def _load_workspace_entities(
         self, entity_type: str, entity_uuids: list[UUID]
     ) -> dict[tuple[str, UUID], dict[str, Any]]:
+        workspace_to_source = {
+            self._workspace_entity_ids.get(
+                (entity_type, source_uuid), source_uuid
+            ): source_uuid
+            for source_uuid in entity_uuids
+        }
         rows = await self._pool.fetch(
             f"""
             SELECT entity.uuid AS entity_uuid, entity.data
@@ -5344,10 +5477,13 @@ class WorkspaceDiffWorker:
               AND entity.uuid = ANY($2::uuid[])
             """,
             self._provider_uuid,
-            entity_uuids,
+            list(workspace_to_source),
         )
         return {
-            (entity_type, UUID(str(row["entity_uuid"]))): _json_object(row["data"])
+            (
+                entity_type,
+                workspace_to_source[UUID(str(row["entity_uuid"]))],
+            ): _json_object(row["data"])
             for row in rows
         }
 
@@ -5614,6 +5750,8 @@ _OUTBOX_SOURCE_TYPES = {
     # Drain exactly one historical type per pass. Dependencies precede their
     # consumers; messages precede the personal flags and reactions that refer
     # to them. Each selected type is processed newest-first.
+    "stream": "streams",
+    "stream_binding": "stream_bindings",
     "topic": "topics",
     "topic_binding": "topic_bindings",
     "message": "messages",
@@ -5622,6 +5760,8 @@ _OUTBOX_SOURCE_TYPES = {
 }
 
 _OUTBOX_SOURCE_BASE_TABLES = {
+    "stream": "zulip_streams",
+    "stream_binding": "zulip_stream_bindings",
     "topic": "zulip_topics",
     "topic_binding": "zulip_topic_bindings",
     "message_reaction": "zulip_message_reactions",
@@ -5687,7 +5827,16 @@ _ENTITY_QUERIES = {
             'history_public_to_subscribers',
                 COALESCE((stream.chat_parameters ->> 'history_public_to_subscribers')::boolean, true),
             'created_at', stream.created_at
-        ) AS data
+        ) AS data,
+        report.resource_uuid AS catalog_resource_uuid,
+        report.projection_revision AS catalog_projection_revision,
+        CASE WHEN report.processing_status = 'reported'
+                   AND report.assignment IS NOT NULL
+             THEN report.catalog END AS catalog,
+        CASE WHEN report.processing_status = 'reported'
+                   AND report.assignment IS NOT NULL
+             THEN report.assignment END AS assignment,
+        stream.chat_type, stream.chat_key, NULL::text AS topic_name
         FROM workspace_zulip_bridge.zulip_streams AS stream
         LEFT JOIN workspace_zulip_bridge.zulip_connections AS connection
           ON connection.uuid = stream.source_connection_uuid
@@ -5697,6 +5846,9 @@ _ENTITY_QUERIES = {
           ON owner_user.uuid = stream.owner_user_uuid
         LEFT JOIN workspace_zulip_bridge.zulip_users AS direct_user
           ON direct_user.uuid = stream.direct_user_uuid
+        LEFT JOIN workspace_zulip_bridge.workspace_chat_catalog_reports AS report
+          ON report.external_account_uuid = connection.external_account_uuid
+         AND report.zulip_stream_uuid = stream.uuid
         WHERE stream.uuid = ANY($1::uuid[])
     """,
     "stream_bindings": """
@@ -5712,7 +5864,16 @@ _ENTITY_QUERIES = {
             'role', binding.role,
             'notification_mode', binding.notification_mode,
             'created_at', binding.created_at
-        ) AS data
+        ) AS data,
+        report.resource_uuid AS catalog_resource_uuid,
+        report.projection_revision AS catalog_projection_revision,
+        CASE WHEN report.processing_status = 'reported'
+                   AND report.assignment IS NOT NULL
+             THEN report.catalog END AS catalog,
+        CASE WHEN report.processing_status = 'reported'
+                   AND report.assignment IS NOT NULL
+             THEN report.assignment END AS assignment,
+        stream.chat_type, stream.chat_key, NULL::text AS topic_name
         FROM workspace_zulip_bridge.zulip_stream_bindings AS binding
         JOIN workspace_zulip_bridge.zulip_streams AS stream
           ON stream.uuid = binding.zulip_stream_uuid
@@ -5724,14 +5885,35 @@ _ENTITY_QUERIES = {
           ON connection_user.uuid = connection.zulip_user_uuid
         LEFT JOIN workspace_zulip_bridge.zulip_users AS owner_user
           ON owner_user.uuid = stream.owner_user_uuid
+        LEFT JOIN workspace_zulip_bridge.workspace_chat_catalog_reports AS report
+          ON report.external_account_uuid = connection.external_account_uuid
+         AND report.zulip_stream_uuid = stream.uuid
         WHERE binding.uuid = ANY($1::uuid[])
     """,
     "topics": """
-        SELECT uuid AS entity_uuid, jsonb_build_object(
-            'stream_uuid', zulip_stream_uuid, 'name', name,
-            'is_done', is_done, 'version', version, 'created_at', created_at
-        ) AS data FROM workspace_zulip_bridge.zulip_topics
-        WHERE uuid = ANY($1::uuid[])
+        SELECT topic.uuid AS entity_uuid, jsonb_build_object(
+            'stream_uuid', topic.zulip_stream_uuid, 'name', topic.name,
+            'is_done', topic.is_done, 'version', topic.version,
+            'created_at', topic.created_at
+        ) AS data,
+        report.resource_uuid AS catalog_resource_uuid,
+        report.projection_revision AS catalog_projection_revision,
+        CASE WHEN report.processing_status = 'reported'
+                   AND report.assignment IS NOT NULL
+             THEN report.catalog END AS catalog,
+        CASE WHEN report.processing_status = 'reported'
+                   AND report.assignment IS NOT NULL
+             THEN report.assignment END AS assignment,
+        stream.chat_type, stream.chat_key, topic.name AS topic_name
+        FROM workspace_zulip_bridge.zulip_topics AS topic
+        JOIN workspace_zulip_bridge.zulip_streams AS stream
+          ON stream.uuid = topic.zulip_stream_uuid
+        LEFT JOIN workspace_zulip_bridge.zulip_connections AS connection
+          ON connection.uuid = stream.source_connection_uuid
+        LEFT JOIN workspace_zulip_bridge.workspace_chat_catalog_reports AS report
+          ON report.external_account_uuid = connection.external_account_uuid
+         AND report.zulip_stream_uuid = stream.uuid
+        WHERE topic.uuid = ANY($1::uuid[])
     """,
     "topic_bindings": """
         SELECT binding.uuid AS entity_uuid, jsonb_build_object(
@@ -5741,10 +5923,28 @@ _ENTITY_QUERIES = {
                 zulip_user.workspace_user_uuid, binding.zulip_user_uuid
             ), 'notification_mode', binding.notification_mode,
             'created_at', binding.created_at
-        ) AS data
+        ) AS data,
+        report.resource_uuid AS catalog_resource_uuid,
+        report.projection_revision AS catalog_projection_revision,
+        CASE WHEN report.processing_status = 'reported'
+                   AND report.assignment IS NOT NULL
+             THEN report.catalog END AS catalog,
+        CASE WHEN report.processing_status = 'reported'
+                   AND report.assignment IS NOT NULL
+             THEN report.assignment END AS assignment,
+        stream.chat_type, stream.chat_key, topic.name AS topic_name
         FROM workspace_zulip_bridge.zulip_topic_bindings AS binding
         JOIN workspace_zulip_bridge.zulip_users AS zulip_user
           ON zulip_user.uuid = binding.zulip_user_uuid
+        JOIN workspace_zulip_bridge.zulip_topics AS topic
+          ON topic.uuid = binding.topic_uuid
+        JOIN workspace_zulip_bridge.zulip_streams AS stream
+          ON stream.uuid = binding.zulip_stream_uuid
+        LEFT JOIN workspace_zulip_bridge.zulip_connections AS connection
+          ON connection.uuid = stream.source_connection_uuid
+        LEFT JOIN workspace_zulip_bridge.workspace_chat_catalog_reports AS report
+          ON report.external_account_uuid = connection.external_account_uuid
+         AND report.zulip_stream_uuid = stream.uuid
         WHERE binding.uuid = ANY($1::uuid[])
     """,
     "messages": """
@@ -5760,10 +5960,14 @@ _ENTITY_QUERIES = {
             ),
             'created_at', message.created_at
         ) AS data,
+        report.resource_uuid AS catalog_resource_uuid,
+        report.projection_revision AS catalog_projection_revision,
         CASE WHEN report.processing_status = 'reported'
-             THEN report.resource_uuid END AS catalog_resource_uuid,
-        CASE WHEN report.processing_status = 'reported'
+                   AND report.assignment IS NOT NULL
              THEN report.catalog END AS catalog,
+        CASE WHEN report.processing_status = 'reported'
+                   AND report.assignment IS NOT NULL
+             THEN report.assignment END AS assignment,
         stream.chat_type, stream.chat_key, topic.name AS topic_name
         FROM workspace_zulip_bridge.zulip_messages AS message
         JOIN workspace_zulip_bridge.zulip_users AS sender
@@ -5794,10 +5998,26 @@ _ENTITY_QUERIES = {
             ), 'read', flag.is_read,
             'pinned', false, 'starred', flag.is_starred,
             'mentioned', flag.is_mentioned
-        ) AS data
+        ) AS data,
+        report.resource_uuid AS catalog_resource_uuid,
+        report.projection_revision AS catalog_projection_revision,
+        CASE WHEN report.processing_status = 'reported'
+                   AND report.assignment IS NOT NULL
+             THEN report.catalog END AS catalog,
+        CASE WHEN report.processing_status = 'reported'
+                   AND report.assignment IS NOT NULL
+             THEN report.assignment END AS assignment,
+        stream.chat_type, stream.chat_key, NULL::text AS topic_name
         FROM workspace_zulip_bridge.zulip_message_flags AS flag
         JOIN workspace_zulip_bridge.zulip_users AS flag_user
           ON flag_user.uuid = flag.zulip_user_uuid
+        JOIN workspace_zulip_bridge.zulip_streams AS stream
+          ON stream.uuid = flag.zulip_stream_uuid
+        JOIN workspace_zulip_bridge.zulip_connections AS connection
+          ON connection.uuid = stream.source_connection_uuid
+        LEFT JOIN workspace_zulip_bridge.workspace_chat_catalog_reports AS report
+          ON report.external_account_uuid = connection.external_account_uuid
+         AND report.zulip_stream_uuid = stream.uuid
         WHERE flag.uuid = ANY($1::uuid[])
     """,
     "message_reactions": """
@@ -5808,7 +6028,8 @@ _ENTITY_QUERIES = {
             ),
             'emoji_name', reaction.emoji_name,
             'created_at', reaction.created_at
-        ) AS data
+        ) AS data,
+        reaction.reaction_type, reaction.emoji_code
         FROM workspace_zulip_bridge.zulip_message_reactions AS reaction
         JOIN workspace_zulip_bridge.zulip_users AS reaction_user
           ON reaction_user.uuid = reaction.zulip_user_uuid

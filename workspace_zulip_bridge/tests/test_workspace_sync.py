@@ -42,6 +42,48 @@ def test_catalog_projection_prefers_imported_source_identities() -> None:
     assert _catalog_projection_topic_uuid(catalog, chat_uuid, "7:General") == topic_uuid
 
 
+def test_catalog_projection_prefers_backend_assignment() -> None:
+    chat_uuid = UUID("10000000-0000-0000-0000-000000000001")
+    imported_stream_uuid = UUID("10000000-0000-0000-0000-000000000002")
+    imported_topic_uuid = UUID("10000000-0000-0000-0000-000000000003")
+    assigned_stream_uuid = UUID("10000000-0000-0000-0000-000000000004")
+    assigned_topic_uuid = UUID("10000000-0000-0000-0000-000000000005")
+    catalog = {
+        "source": {"projection_stream_uuid": str(imported_stream_uuid)},
+        "topics": [
+            {
+                "provider_topic_id": "7:General",
+                "projection_topic_uuid": str(imported_topic_uuid),
+            }
+        ],
+    }
+    assignment = {
+        "workspace_projection": {
+            "stream": {"uuid": str(assigned_stream_uuid)},
+            "topics": [
+                {
+                    "provider_topic_id": "7:General",
+                    "topic_uuid": str(assigned_topic_uuid),
+                }
+            ],
+        }
+    }
+
+    assert (
+        _catalog_projection_stream_uuid(catalog, chat_uuid, assignment)
+        == assigned_stream_uuid
+    )
+    assert (
+        _catalog_projection_topic_uuid(
+            catalog,
+            chat_uuid,
+            "7:General",
+            assignment,
+        )
+        == assigned_topic_uuid
+    )
+
+
 def test_provider_api_error_omits_response_body() -> None:
     response = httpx.Response(
         422,

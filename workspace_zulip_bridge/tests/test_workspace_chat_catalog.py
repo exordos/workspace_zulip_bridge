@@ -72,10 +72,10 @@ async def _non_coordinator_only_delivers_catalog_reports(tmp_path: Path) -> None
     worker._retire_unneeded_reports = AsyncMock(  # type: ignore[method-assign]
         side_effect=AssertionError("non-coordinator retired reports")
     )
-    worker._claim_report = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    worker._claim_reports = AsyncMock(return_value=[])  # type: ignore[method-assign]
 
     assert await worker.process_once() == 0
-    worker._claim_report.assert_awaited_once()
+    worker._claim_reports.assert_awaited_once()
 
 
 def test_coordinator_refreshes_priority_catalogs_before_pending_reports(
@@ -101,14 +101,20 @@ async def _coordinator_refreshes_priority_catalogs_before_pending_reports(
     )
     report_uuid = UUID("10000000-0000-4000-8000-000000000002")
     worker._refresh_catalogs = AsyncMock(return_value=20)  # type: ignore[method-assign]
-    worker._claim_report = AsyncMock(  # type: ignore[method-assign]
-        return_value={"report_uuid": report_uuid, "report": {}}
+    worker._requeue_assignment_messages = AsyncMock(  # type: ignore[method-assign]
+        return_value=0
     )
-    worker._send_report = AsyncMock(return_value="applied")  # type: ignore[method-assign]
+    worker._claim_reports = AsyncMock(  # type: ignore[method-assign]
+        return_value=[{"report_uuid": report_uuid, "report": {}}]
+    )
+    worker._send_reports = AsyncMock(  # type: ignore[method-assign]
+        return_value={report_uuid: "applied"}
+    )
     worker._finish_report = AsyncMock()  # type: ignore[method-assign]
 
     assert await worker.process_once() == 21
+    worker._requeue_assignment_messages.assert_awaited_once()
     worker._refresh_catalogs.assert_awaited_once_with(priority_only=True)
-    worker._claim_report.assert_awaited_once()
-    worker._send_report.assert_awaited_once_with({})
+    worker._claim_reports.assert_awaited_once()
+    worker._send_reports.assert_awaited_once_with([{}])
     worker._finish_report.assert_awaited_once_with(report_uuid, "applied")

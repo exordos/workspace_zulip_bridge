@@ -47,7 +47,11 @@ _CA_CONTEXT = b"workspace-external-bridge-control-ca-v1\0"
 _CREDENTIAL_INFO = b"workspace-external-credential-zulip-v1"
 _CREDENTIAL_SCHEMA = "workspace.external-credential.zulip/v1"
 _CREDENTIAL_ALGORITHM = "HPKE-v1-BASE-X25519-HKDF-SHA256-AES-256-GCM"
-_RESOURCE_TYPES = ("custom_ca_bundle", "external_account")
+_RESOURCE_TYPES = (
+    "custom_ca_bundle",
+    "external_account",
+    "external_chat_assignment",
+)
 _CERTIFICATE_RENEWAL_WINDOW = datetime.timedelta(days=7)
 _CAPABILITIES = {
     name: {"revision": 1, "limits": {}}
@@ -64,6 +68,11 @@ _CAPABILITIES = {
         "messenger.stream.rename",
         "messenger.topic.rename",
     )
+}
+_RESOURCE_ORDER = {
+    "custom_ca_bundle": 0,
+    "external_account": 1,
+    "external_chat_assignment": 2,
 }
 _CAPABILITIES["messenger.file.transfer"] = {
     "revision": 1,
@@ -99,6 +108,7 @@ class WorkspaceControlWorker:
         self._credential_key = self._state / "credential-x25519.key"
         self._request = self._state / "enrollment-request.json"
         self._cursor = self._state / "desired-state-cursor"
+        self._assignment_snapshot = self._state / "chat-assignment-snapshot-v1"
         self._last_heartbeat = 0.0
         self._enrollment_lock = asyncio.Lock()
 
@@ -414,6 +424,8 @@ class WorkspaceControlWorker:
         )
 
     async def _sync_once(self) -> None:
+        if not self._assignment_snapshot.is_file():
+            self._cursor.unlink(missing_ok=True)
         cursor = self._load_cursor()
         if cursor is None:
             await self._snapshot()
@@ -441,7 +453,7 @@ class WorkspaceControlWorker:
             raise ValueError("invalid desired-state change batch")
         ordered = sorted(
             (_object(change) for change in changes),
-            key=lambda item: item.get("resource_type") != "custom_ca_bundle",
+            key=lambda item: _RESOURCE_ORDER.get(str(item.get("resource_type")), 99),
         )
         retry_required = False
         for change in ordered:
@@ -493,18 +505,28 @@ class WorkspaceControlWorker:
                 page_cursor = next_cursor
         ordered = sorted(
             resources,
-            key=lambda item: item.get("resource_type") != "custom_ca_bundle",
+            key=lambda item: _RESOURCE_ORDER.get(str(item.get("resource_type")), 99),
         )
         account_uuids: set[UUID] = set()
+        assignment_uuids: set[UUID] = set()
+        assignment_resources: list[Mapping[str, Any]] = []
         retry_required = False
         for resource in ordered:
             if resource.get("resource_type") == "external_account":
                 account_uuids.add(UUID(str(resource["uuid"])))
+            elif resource.get("resource_type") == "external_chat_assignment":
+                assignment_uuids.add(UUID(str(resource["uuid"])))
+                await self._apply_chat_assignment(resource)
+                assignment_resources.append(resource)
+                continue
             retry_required = await self._apply_resource(resource) or retry_required
         await self._disable_absent_accounts(account_uuids)
+        await self._clear_absent_chat_assignments(assignment_uuids)
+        await self._report_observed_batch(assignment_resources, "live_ready")
         if retry_required:
             raise _RetryableDesiredStateError
         _atomic_write(self._cursor, anchor.encode("ascii"), 0o600)
+        _atomic_write(self._assignment_snapshot, b"1", 0o600)
         LOG.info(
             "Workspace desired-state snapshot applied: resources=%d accounts=%d",
             len(resources),
@@ -518,6 +540,8 @@ class WorkspaceControlWorker:
         if change.get("operation") == "delete":
             if resource_type == "external_account":
                 await self._disable_account(UUID(str(change["resource_uuid"])))
+            elif resource_type == "external_chat_assignment":
+                await self._clear_chat_assignment(UUID(str(change["resource_uuid"])))
             elif resource_type == "custom_ca_bundle":
                 self._remove_zulip_ca()
             return False
@@ -538,6 +562,9 @@ class WorkspaceControlWorker:
                     if resource.get("synchronization_enabled") is True
                     else "suspended"
                 )
+            elif resource_type == "external_chat_assignment":
+                await self._apply_chat_assignment(resource)
+                status = "live_ready"
             else:
                 return False
         except ZulipApiError as error:
@@ -594,6 +621,100 @@ class WorkspaceControlWorker:
         await self._report_observed(resource, status)
         return False
 
+    async def _apply_chat_assignment(self, resource: Mapping[str, Any]) -> None:
+        if resource["selected"] is not True:
+            raise _DesiredResourceError(
+                "chat_not_selected",
+                "The external chat assignment is not selected.",
+            )
+        project_uuid = UUID(str(resource["project_id"]))
+        configured_project_uuid = self._settings.workspace_project_id
+        if (
+            configured_project_uuid is not None
+            and project_uuid != configured_project_uuid
+        ):
+            raise _DesiredResourceError(
+                "workspace_project_mismatch",
+                "The external chat belongs to another Workspace project.",
+            )
+        provider_chat = _object(resource["provider_chat"])
+        if provider_chat["kind"] != "zulip":
+            raise ValueError("external chat provider mismatch")
+        projection = _object(resource["workspace_projection"])
+        stream = _object(projection["stream"])
+        topics = projection["topics"]
+        if not isinstance(topics, list):
+            raise ValueError("external chat topics are invalid")
+        UUID(str(stream["uuid"]))
+        for topic in topics:
+            value = _object(topic)
+            UUID(str(value["topic_uuid"]))
+            if not isinstance(value["provider_topic_id"], str):
+                raise ValueError("external chat topic identity is invalid")
+        result = await self._pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports
+            SET assignment_generation = $1, assignment = $2::jsonb,
+                assignment_reconciled = CASE
+                    WHEN assignment IS DISTINCT FROM $2::jsonb THEN false
+                    ELSE assignment_reconciled
+                END,
+                assignment_repair_created_at = CASE
+                    WHEN assignment IS DISTINCT FROM $2::jsonb THEN NULL
+                    ELSE assignment_repair_created_at
+                END,
+                assignment_repair_uuid = CASE
+                    WHEN assignment IS DISTINCT FROM $2::jsonb THEN NULL
+                    ELSE assignment_repair_uuid
+                END,
+                updated_at = clock_timestamp()
+            WHERE resource_uuid = $3
+              AND external_account_uuid = $4
+              AND (
+                  assignment_generation IS NULL
+                  OR assignment_generation <= $1
+              )
+            """,
+            int(resource["generation"]),
+            json.dumps(resource, ensure_ascii=False),
+            UUID(str(resource["uuid"])),
+            UUID(str(resource["external_account_uuid"])),
+        )
+        if result == "UPDATE 0":
+            raise _RetryableDesiredStateError("external chat catalog is not ready")
+
+    async def _clear_chat_assignment(self, resource_uuid: UUID) -> None:
+        await self._pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports
+            SET assignment_generation = NULL, assignment = NULL,
+                assignment_reconciled = false,
+                assignment_repair_created_at = NULL,
+                assignment_repair_uuid = NULL,
+                updated_at = clock_timestamp()
+            WHERE resource_uuid = $1
+            """,
+            resource_uuid,
+        )
+
+    async def _clear_absent_chat_assignments(
+        self,
+        resource_uuids: set[UUID],
+    ) -> None:
+        await self._pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports
+            SET assignment_generation = NULL, assignment = NULL,
+                assignment_reconciled = false,
+                assignment_repair_created_at = NULL,
+                assignment_repair_uuid = NULL,
+                updated_at = clock_timestamp()
+            WHERE assignment IS NOT NULL
+              AND NOT (resource_uuid = ANY($1::uuid[]))
+            """,
+            sorted(resource_uuids, key=str),
+        )
+
     async def _report_observed(
         self,
         resource: Mapping[str, Any],
@@ -641,6 +762,61 @@ class WorkspaceControlWorker:
             "status"
         ) not in {"applied", "duplicate", "stale"}:
             raise ValueError("observed-state report was rejected")
+
+    async def _report_observed_batch(
+        self,
+        resources: list[Mapping[str, Any]],
+        status: str,
+    ) -> None:
+        bridge_uuid = self._settings.workspace_bridge_instance_uuid
+        assert bridge_uuid is not None
+        reports = []
+        report_uuids = set()
+        for resource in resources:
+            resource_type = str(resource["resource_type"])
+            resource_uuid = UUID(str(resource["uuid"]))
+            generation = int(resource["generation"])
+            report_uuid = uuid5(
+                bridge_uuid,
+                f"observed:{resource_type}:{resource_uuid}:{generation}:{status}",
+            )
+            observed_at = _utc_now()
+            reports.append(
+                {
+                    "report_uuid": str(report_uuid),
+                    "resource_type": resource_type,
+                    "resource_uuid": str(resource_uuid),
+                    "observed_generation": generation,
+                    "status": status,
+                    "progress": {
+                        "phase": "live" if status == "live_ready" else status,
+                        "completed": 1,
+                        "total": 1,
+                        "last_progress_at": observed_at,
+                    },
+                    "safe_error": None,
+                    "observed_at": observed_at,
+                }
+            )
+            report_uuids.add(str(report_uuid))
+        for offset in range(0, len(reports), 100):
+            batch = reports[offset : offset + 100]
+            async with self._client() as client:
+                response = await client.post(
+                    "/v1/observed-state/reports",
+                    json={"reports": batch},
+                )
+            response.raise_for_status()
+            payload = _object(response.json())
+            results = payload.get("results")
+            if not isinstance(results, list) or len(results) != len(batch):
+                raise ValueError("invalid observed-state response")
+            for result in results:
+                value = _object(result)
+                if value.get("report_uuid") not in report_uuids or value.get(
+                    "status"
+                ) not in {"applied", "duplicate", "stale"}:
+                    raise ValueError("observed-state report was rejected")
 
     def _apply_zulip_ca(self, resource: Mapping[str, Any]) -> None:
         if resource.get("provider_kind") != "zulip":

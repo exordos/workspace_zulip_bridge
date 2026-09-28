@@ -3243,8 +3243,8 @@ async def _catalog_projected_live_message_uses_workspace_parent_ids(
         stream_uuid = stable_chat_uuid(ENDPOINT, "channel:7")
         topic_uuid = stable_topic_uuid(stream_uuid, "Live")
         external_chat_uuid = stable_external_chat_uuid(account_uuid, "channel:7")
-        projected_stream_uuid = stream_uuid
-        projected_topic_uuid = topic_uuid
+        projected_stream_uuid = UUID("10000000-0000-0000-0000-0000000000d9")
+        projected_topic_uuid = UUID("10000000-0000-0000-0000-0000000000da")
         async with pool.acquire() as connection:
             await connection.execute(
                 """
@@ -3289,6 +3289,16 @@ async def _catalog_projected_live_message_uses_workspace_parent_ids(
             )
             await connection.execute(
                 """
+                INSERT INTO workspace_zulip_bridge.zulip_topics (
+                    uuid, zulip_stream_uuid, name, content_hash
+                ) VALUES ($1, $2, 'Historical', $3)
+                """,
+                stable_topic_uuid(stream_uuid, "Historical"),
+                stream_uuid,
+                b"h" * 32,
+            )
+            await connection.execute(
+                """
                 INSERT INTO workspace_zulip_bridge.workspace_mirror_state (
                     provider_uuid, workspace_project_id, active_generation,
                     bootstrap_status
@@ -3328,7 +3338,7 @@ async def _catalog_projected_live_message_uses_workspace_parent_ids(
                 """,
                 provider_uuid,
                 generation,
-                stream_uuid,
+                projected_stream_uuid,
                 project_uuid,
                 b"s" * 32,
             )
@@ -3337,10 +3347,12 @@ async def _catalog_projected_live_message_uses_workspace_parent_ids(
                 INSERT INTO workspace_zulip_bridge.workspace_chat_catalog_reports (
                     external_account_uuid, zulip_stream_uuid, resource_uuid,
                     observed_generation, catalog, catalog_hash, report_uuid,
-                    report, processing_status, reported_at, source_updated_at
+                    report, processing_status, reported_at, source_updated_at,
+                    assignment_generation, assignment, projection_revision
                 ) VALUES (
                     $1, $2, $3, 1, $6::jsonb, $4, $5, '{}'::jsonb,
-                    'reported', clock_timestamp(), clock_timestamp()
+                    'reported', clock_timestamp(), clock_timestamp(), 1,
+                    $7::jsonb, $8
                 )
                 """,
                 account_uuid,
@@ -3350,19 +3362,30 @@ async def _catalog_projected_live_message_uses_workspace_parent_ids(
                 UUID("10000000-0000-0000-0000-0000000000d6"),
                 json.dumps(
                     {
-                        "source": {
-                            "projection_stream_uuid": str(stream_uuid),
-                        },
+                        "source": {},
                         "topics": [
                             {
                                 "provider_topic_id": "7:Live",
-                                "projection_topic_uuid": str(topic_uuid),
                                 "name": "Live",
                                 "is_default": False,
                             }
                         ],
                     }
                 ),
+                json.dumps(
+                    {
+                        "workspace_projection": {
+                            "stream": {"uuid": str(projected_stream_uuid)},
+                            "topics": [
+                                {
+                                    "provider_topic_id": "7:Live",
+                                    "topic_uuid": str(projected_topic_uuid),
+                                }
+                            ],
+                        }
+                    }
+                ),
+                CATALOG_PROJECTION_REVISION,
             )
 
         message = ZulipMessage(
@@ -3422,10 +3445,122 @@ async def _catalog_projected_live_message_uses_workspace_parent_ids(
             }
         )
         worker = WorkspaceDiffWorker(pool, settings)
+        assignment = await pool.fetchval(
+            """
+            UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports
+            SET assignment = NULL
+            WHERE resource_uuid = $1
+            RETURNING assignment
+            """,
+            external_chat_uuid,
+        )
+        assert assignment is None
+        assert await worker._load_zulip_entities("messages", [message_uuid]) == {}
+        assert ("messages", message_uuid) in worker._assignment_blocked_entities
+        claimed_at = datetime.now(UTC)
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.sync_diffs
+            SET direction = 'to_zulip', processing_status = 'processing',
+                claimed_at = $3, attempt_count = 1
+            WHERE provider_uuid = $1 AND entity_type = 'messages'
+              AND entity_uuid = $2
+            """,
+            provider_uuid,
+            message_uuid,
+            claimed_at,
+        )
+        claimed = await pool.fetchrow(
+            """
+            SELECT * FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1 AND entity_type = 'messages'
+              AND entity_uuid = $2
+            """,
+            provider_uuid,
+            message_uuid,
+        )
+        assert claimed is not None
+        worker._assignment_blocked_entities = set()
+        worker._zulip_writer.apply = AsyncMock()  # type: ignore[method-assign]
+        await worker._write_to_zulip([claimed])
+        worker._zulip_writer.apply.assert_not_awaited()  # type: ignore[union-attr]
+        deferred = await pool.fetchrow(
+            """
+            SELECT processing_status, claimed_at, attempt_count,
+                   dependency_wait_count, last_error
+            FROM workspace_zulip_bridge.sync_diffs
+            WHERE provider_uuid = $1 AND entity_type = 'messages'
+              AND entity_uuid = $2
+            """,
+            provider_uuid,
+            message_uuid,
+        )
+        assert dict(deferred) == {
+            "processing_status": "pending",
+            "claimed_at": None,
+            "attempt_count": 0,
+            "dependency_wait_count": 1,
+            "last_error": "waiting_for_workspace_dependencies",
+        }
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports
+            SET assignment = $2::jsonb
+            WHERE resource_uuid = $1
+            """,
+            external_chat_uuid,
+            json.dumps(
+                {
+                    "workspace_projection": {
+                        "stream": {"uuid": str(projected_stream_uuid)},
+                        "topics": [
+                            {
+                                "provider_topic_id": "7:Live",
+                                "topic_uuid": str(projected_topic_uuid),
+                            }
+                        ],
+                    }
+                }
+            ),
+        )
+        worker._assignment_blocked_entities = set()
+        await worker._load_zulip_entities("streams", [stream_uuid])
+        assert worker._workspace_entity_ids[("streams", stream_uuid)] == (
+            projected_stream_uuid
+        )
+        source_binding_uuid = stable_stream_binding_uuid(stream_uuid, owner_uuid)
+        binding = await worker._load_zulip_entities(
+            "stream_bindings",
+            [source_binding_uuid],
+        )
+        assert binding[("stream_bindings", source_binding_uuid)]["stream_uuid"] == str(
+            projected_stream_uuid
+        )
+        assert worker._workspace_entity_ids[
+            ("stream_bindings", source_binding_uuid)
+        ] == stable_stream_binding_uuid(projected_stream_uuid, workspace_user_uuid)
+        topic = await worker._load_zulip_entities("topics", [topic_uuid])
+        assert topic[("topics", topic_uuid)]["stream_uuid"] == str(
+            projected_stream_uuid
+        )
+        assert worker._workspace_entity_ids[("topics", topic_uuid)] == (
+            projected_topic_uuid
+        )
         loaded = await worker._load_zulip_entities("messages", [message_uuid])
         data = loaded[("messages", message_uuid)]
         assert data["stream_uuid"] == str(projected_stream_uuid)
         assert data["topic_uuid"] == str(projected_topic_uuid)
+        source_flag_uuid = stable_message_flag_uuid(message_uuid, owner_uuid)
+        flag = await worker._load_zulip_entities(
+            "message_flags",
+            [source_flag_uuid],
+        )
+        assert flag[("message_flags", source_flag_uuid)]["stream_uuid"] == str(
+            projected_stream_uuid
+        )
+        assert worker._workspace_entity_ids[
+            ("message_flags", source_flag_uuid)
+        ] == stable_message_flag_uuid(message_uuid, workspace_user_uuid)
         operation = {
             "action": "upsert",
             "type": "messages",
@@ -7896,7 +8031,7 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
         assert stored is not None
         catalog = json.loads(stored["catalog"])
         assert catalog["source"]["provider_chat_key"] == "channel:42"
-        assert catalog["source"]["projection_stream_uuid"] == str(stream_uuid)
+        assert "projection_stream_uuid" not in catalog["source"]
         assert catalog["source"]["provider_owner_user_id"] == "10"
         assert [item["provider_user_id"] for item in catalog["participants"]] == [
             "10",
@@ -7906,7 +8041,6 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
         assert catalog["topics"] == [
             {
                 "provider_topic_id": "42:deployments",
-                "projection_topic_uuid": str(topic_uuid),
                 "name": "deployments",
                 "is_default": False,
             }
@@ -8049,9 +8183,11 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
             == "blocked"
         )
 
-        worker._send_report = AsyncMock(return_value="applied")  # type: ignore[method-assign]
+        worker._send_reports = AsyncMock(  # type: ignore[method-assign]
+            return_value={stored["report_uuid"]: "applied"}
+        )
         assert await worker.process_once() == 1
-        assert worker._send_report.await_count == 1  # type: ignore[attr-defined]
+        assert worker._send_reports.await_count == 1  # type: ignore[attr-defined]
         assert (
             await pool.fetchval(
                 """
@@ -8224,6 +8360,60 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
             stream_uuid,
         )
 
+        # Backend-owned chat assignments are the only routing authority.  A
+        # changed assignment must requeue both the message and its flags so a
+        # previously projected parent is repaired newest-first.
+        await pool.execute(
+            """
+            DELETE FROM workspace_zulip_bridge.workspace_outbox
+            WHERE entity_uuid = ANY($1::uuid[])
+            """,
+            [message_uuid, flag_uuid],
+        )
+        await pool.execute(
+            """
+            UPDATE workspace_zulip_bridge.workspace_chat_catalog_reports
+            SET assignment_generation = 1,
+                assignment = $3::jsonb,
+                assignment_reconciled = false,
+                assignment_repair_created_at = NULL,
+                assignment_repair_uuid = NULL
+            WHERE external_account_uuid = $1 AND zulip_stream_uuid = $2
+            """,
+            account_uuid,
+            stream_uuid,
+            json.dumps(
+                {
+                    "workspace_projection": {
+                        "stream": {"uuid": str(stream_uuid)},
+                        "topics": [],
+                    }
+                }
+            ),
+        )
+        assert await worker._requeue_assignment_messages() == 6
+        assert {
+            (row["entity_type"], row["entity_uuid"])
+            for row in await pool.fetch(
+                """
+                SELECT entity_type, entity_uuid
+                FROM workspace_zulip_bridge.workspace_outbox
+                WHERE entity_uuid = ANY($1::uuid[])
+                  AND delivery_status = 'pending'
+                """,
+                [message_uuid, flag_uuid],
+            )
+        } == {("message", message_uuid), ("message_flag", flag_uuid)}
+        assert await pool.fetchval(
+            """
+            SELECT assignment_reconciled
+            FROM workspace_zulip_bridge.workspace_chat_catalog_reports
+            WHERE external_account_uuid = $1 AND zulip_stream_uuid = $2
+            """,
+            account_uuid,
+            stream_uuid,
+        )
+
         await pool.execute(
             """
             DELETE FROM workspace_zulip_bridge.zulip_stream_bindings
@@ -8267,7 +8457,6 @@ async def _workspace_chat_catalog_is_reported(dsn: str, tmp_path: Path) -> None:
         assert json.loads(changed["catalog"])["topics"] == [
             {
                 "provider_topic_id": "channel:42:default",
-                "projection_topic_uuid": str(topic_uuid),
                 "name": "Zulip",
                 "is_default": True,
             }
