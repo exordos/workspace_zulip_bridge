@@ -817,6 +817,15 @@ CREATE INDEX IF NOT EXISTS sync_diffs_live_file_projection_idx
 CREATE INDEX IF NOT EXISTS sync_diffs_processing_idx
     ON workspace_zulip_bridge.sync_diffs (claimed_at, entity_uuid)
     WHERE processing_status = 'processing';
+-- Live topic repair runs before every message claim. Its empty-result path
+-- must not scan the historical diff table while looking for blocked work.
+CREATE INDEX IF NOT EXISTS sync_diffs_live_topic_repair_idx
+    ON workspace_zulip_bridge.sync_diffs
+        (provider_uuid, last_error, updated_at, entity_uuid)
+    WHERE delivery_priority = 0
+      AND processing_status = 'blocked'
+      AND direction = 'to_zulip'
+      AND entity_type IN ('messages', 'topic_bindings');
 -- The default two delivery partitions must not sort the complete historical
 -- flag backlog for every 500-row claim. These partial indexes match the
 -- worker's stable partition predicate and delivery order exactly.
