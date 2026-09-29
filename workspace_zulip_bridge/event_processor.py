@@ -261,7 +261,11 @@ class ZulipEventProcessor:
                 stats = await self.process_once()
             except asyncio.CancelledError:
                 raise
-            except (TimeoutError, asyncpg.PostgresError) as error:
+            except (
+                TimeoutError,
+                asyncpg.PostgresError,
+                asyncpg.InternalClientError,
+            ) as error:
                 LOG.warning(
                     "Zulip event processor pass failed scope=%s error=%s",
                     self._claim_scope,
