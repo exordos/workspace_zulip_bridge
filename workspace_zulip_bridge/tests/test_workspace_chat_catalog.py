@@ -113,7 +113,7 @@ async def _coordinator_refreshes_priority_catalogs_before_pending_reports(
     worker._finish_report = AsyncMock()  # type: ignore[method-assign]
 
     assert await worker.process_once() == 21
-    worker._requeue_assignment_messages.assert_awaited_once()
+    worker._requeue_assignment_messages.assert_not_awaited()
     worker._refresh_catalogs.assert_awaited_once_with(priority_only=True)
     worker._claim_reports.assert_awaited_once()
     worker._send_reports.assert_awaited_once_with([{}])

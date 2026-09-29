@@ -31,6 +31,18 @@ class SeedPool:
         self.fetch_calls: list[tuple[str, tuple[object, ...]]] = []
         self.fetchval_calls: list[tuple[str, tuple[object, ...]]] = []
 
+    async def __aenter__(self) -> "SeedPool":
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    def acquire(self) -> "SeedPool":
+        return self
+
+    def transaction(self) -> "SeedPool":
+        return self
+
     async def fetch(self, query: str, *args: object) -> list[object]:
         self.fetch_calls.append((query, args))
         return []
@@ -47,6 +59,11 @@ class ClaimPool(SeedPool):
     def __init__(self) -> None:
         super().__init__(has_reserve=False)
         self.fetchrow_calls: list[tuple[str, tuple[object, ...]]] = []
+
+    async def fetchval(self, query: str, *args: object) -> bool:
+        if "pg_try_advisory_xact_lock" in query:
+            return True
+        return await super().fetchval(query, *args)
 
     async def fetchrow(self, query: str, *args: object) -> None:
         self.fetchrow_calls.append((query, args))
@@ -66,7 +83,22 @@ class FinalizeConnection:
     def transaction(self) -> "FinalizeConnection":
         return self
 
-    async def fetch(self, _query: str, *_args: object) -> list[dict[str, object]]:
+    async def fetchrow(self, _query: str, *_args: object) -> dict[str, object]:
+        return {
+            "file_uuid": SOURCE_UUID,
+            "zulip_stream_uuid": TARGET_UUID,
+            "processing_status": "processing",
+            "claimed_at": None,
+            "workspace_urn": None,
+        }
+
+    async def fetch(self, query: str, *_args: object) -> list[dict[str, object]]:
+        if "SELECT message.uuid\n" in query:
+            return [{"uuid": SOURCE_UUID}]
+        if "SELECT link.message_uuid, link.file_uuid" in query:
+            return []
+        if "SELECT message_uuid, file_uuid" in query:
+            return [{"message_uuid": SOURCE_UUID, "file_uuid": SOURCE_UUID}]
         return [
             {
                 "uuid": SOURCE_UUID,
@@ -242,12 +274,12 @@ def test_file_backfill_seeds_a_large_newest_first_candidate_page() -> None:
     assert len(pool.fetch_calls) == 2
     candidate_query, candidate_args = pool.fetch_calls[1]
     assert candidate_args == (20_000,)
-    assert "WITH candidate_files AS MATERIALIZED" in candidate_query
-    assert "ORDER BY file.source_created_at DESC, file.uuid DESC" in candidate_query
+    assert "candidate_files AS MATERIALIZED" in candidate_query
+    assert "ORDER BY outbox.sequence" in candidate_query
     assert "LIMIT $1" in candidate_query
 
 
-def test_file_claim_waits_for_current_catalog_and_prefers_newest() -> None:
+def test_file_claim_waits_for_current_catalog_and_uses_ready_index_order() -> None:
     pool = ClaimPool()
 
     assert asyncio.run(_worker(pool)._claim_job()) is None
@@ -256,7 +288,7 @@ def test_file_claim_waits_for_current_catalog_and_prefers_newest() -> None:
     assert args == (workspace_file_transfer.CATALOG_PROJECTION_REVISION,)
     assert "catalog.processing_status = 'reported'" in query
     assert "catalog.projection_revision >= $1" in query
-    assert "file.source_created_at DESC, file.uuid DESC" in query
+    assert "projection.available_at, projection.created_at, projection.uuid" in query
 
 
 def test_staged_source_is_downloaded_once_and_reused_for_upload() -> None:

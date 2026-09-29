@@ -9,6 +9,9 @@ from unittest.mock import AsyncMock
 from unittest.mock import patch
 from uuid import UUID
 
+import asyncpg
+import pytest
+
 from workspace_zulip_bridge.config import Settings
 from workspace_zulip_bridge.event_processor import ZulipEventProcessor
 from workspace_zulip_bridge.message_history import message_content_hash
@@ -139,6 +142,43 @@ def test_processing_timeout_keeps_processor_alive() -> None:
         sleep.assert_awaited_once_with(1.0)
 
     asyncio.run(run())
+
+
+def test_internal_client_error_during_claim_keeps_processor_alive(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def run() -> None:
+        settings = Settings.from_env({})
+        processor = ZulipEventProcessor(
+            cast(Any, object()),
+            cast(Any, object()),
+            settings,
+            claim_scope="realtime",
+        )
+        claim = AsyncMock(
+            side_effect=[
+                asyncpg.InternalClientError("synthetic protocol transition failure"),
+                [],
+                asyncio.CancelledError(),
+            ]
+        )
+        processor._claim_events = claim  # type: ignore[method-assign]
+        with patch(
+            "workspace_zulip_bridge.event_processor.asyncio.sleep",
+            new_callable=AsyncMock,
+        ) as sleep:
+            with pytest.raises(asyncio.CancelledError):
+                await processor.run()
+
+        assert claim.await_count == 3
+        assert [call.args for call in sleep.await_args_list] == [
+            (1.0,),
+            (settings.event_processor_poll_seconds,),
+        ]
+
+    asyncio.run(run())
+    assert "scope=realtime error=InternalClientError" in caplog.text
+    assert "synthetic protocol transition failure" not in caplog.text
 
 
 def test_cleanup_timeout_keeps_processor_alive_and_reduces_batch() -> None:

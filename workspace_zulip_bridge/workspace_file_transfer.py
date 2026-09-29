@@ -14,7 +14,9 @@ import ssl
 import tempfile
 import unicodedata
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime
 from typing import IO
 from typing import Any
 from urllib.parse import urlsplit
@@ -24,10 +26,16 @@ import asyncpg
 import httpx
 
 from workspace_zulip_bridge.config import Settings
-from workspace_zulip_bridge.message_history import message_content_hash
+from workspace_zulip_bridge.import_pipeline import lock_historical_stage
 from workspace_zulip_bridge.stable_ids import stable_external_chat_uuid
 from workspace_zulip_bridge.stable_ids import stable_file_projection_uuid
 from workspace_zulip_bridge.stable_ids import stable_outgoing_file_transfer_uuid
+from workspace_zulip_bridge.workspace_message_content import (
+    preserve_finalized_file_references,
+)
+from workspace_zulip_bridge.workspace_message_content import (
+    replace_source_file_urn as replace_source_file_urn,
+)
 
 LOG = logging.getLogger(__name__)
 MAX_FILE_BYTES = 50 * 1024 * 1024
@@ -39,6 +47,9 @@ _WORKSPACE_URN = re.compile(r"^urn:(?:file|image|video):[0-9a-f-]{36}$")
 _BACKFILL_CANDIDATE_BATCH_SIZE = 20_000
 _BACKFILL_LOW_WATERMARK = 1_000
 _CONTROL_MAX_CONNECTIONS = 2
+_FILE_MAX_ATTEMPTS = 12
+_FILE_HEARTBEAT_SECONDS = 30.0
+_FILE_CLAIM_IDLE_SECONDS = 0.1
 
 
 class FileTransferError(RuntimeError):
@@ -65,6 +76,7 @@ class _Job:
     source_path: str
     name: str
     delivery_priority: int = 1
+    claimed_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,14 +90,6 @@ class _Descriptor:
 class _StagedSource:
     descriptor: _Descriptor
     content: IO[bytes]
-
-
-def replace_source_file_urn(content: str, source_uuid: UUID, target_urn: str) -> str:
-    """Replace only the bridge's unresolved source-file placeholder."""
-
-    if _WORKSPACE_URN.fullmatch(target_urn) is None:
-        raise ValueError("invalid Workspace file URN")
-    return content.replace(f"urn:file:{source_uuid}", target_urn)
 
 
 def workspace_file_name(name: str) -> str:
@@ -350,8 +354,12 @@ class WorkspaceFileTransferWorker:
             completed = await self._complete_file_outbox()
         job = await self._claim_job()
         if job is None:
+            # _claim_job has released its transaction and pool slot. Yield even
+            # when coordinator progress would otherwise trigger a busy retry.
+            await asyncio.sleep(_FILE_CLAIM_IDLE_SECONDS)
             return seeded + completed
         staged: _StagedSource | None = None
+        heartbeat = asyncio.create_task(self._heartbeat_job(job))
         try:
             staged = await self._stage_source(job)
             file_urn = await self._transfer(job, staged)
@@ -363,6 +371,9 @@ class WorkspaceFileTransferWorker:
         except (TimeoutError, httpx.HTTPError) as error:
             await self._fail_job(job, type(error).__name__, retryable=True)
         finally:
+            heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat
             if staged is not None:
                 staged.content.close()
         await self._complete_file_outbox(job.file_uuid)
@@ -406,8 +417,13 @@ class WorkspaceFileTransferWorker:
         if remaining and not await self._has_backfill_reserve():
             backfill_rows = await self._pool.fetch(
                 """
-            WITH candidate_files AS MATERIALIZED (
-                SELECT file.uuid, file.source_created_at
+            WITH scan_cursor AS MATERIALIZED (
+                SELECT sequence
+                FROM workspace_zulip_bridge.import_scan_cursors
+                WHERE name = 'file_projection_seed'
+                FOR UPDATE
+            ), candidate_files AS MATERIALIZED (
+                SELECT file.uuid, file.source_created_at, outbox.sequence
                 FROM workspace_zulip_bridge.zulip_files AS file
                 JOIN workspace_zulip_bridge.workspace_outbox AS outbox
                   ON outbox.realm_uuid = file.realm_uuid
@@ -416,8 +432,15 @@ class WorkspaceFileTransferWorker:
                   AND outbox.action = 'upsert'
                   AND outbox.delivery_status IN ('pending', 'failed')
                   AND outbox.available_at <= clock_timestamp()
-                ORDER BY file.source_created_at DESC, file.uuid DESC
+                  AND outbox.sequence > (SELECT sequence FROM scan_cursor)
+                ORDER BY outbox.sequence
                 LIMIT $1
+            ), progress AS (
+                UPDATE workspace_zulip_bridge.import_scan_cursors
+                SET sequence = COALESCE((SELECT max(sequence) FROM candidate_files), 0),
+                    updated_at = clock_timestamp()
+                WHERE name = 'file_projection_seed'
+                RETURNING sequence
             )
             SELECT DISTINCT file.uuid AS file_uuid,
                    message.zulip_stream_uuid AS stream_uuid,
@@ -544,68 +567,88 @@ class WorkspaceFileTransferWorker:
         )
 
     async def _claim_job(self) -> _Job | None:
-        row = await self._pool.fetchrow(
-            """
-            WITH expired AS (
-                UPDATE workspace_zulip_bridge.workspace_file_projections
-                SET processing_status = 'failed', claimed_at = NULL,
+        async with self._pool.acquire() as connection, connection.transaction():
+            if not await lock_historical_stage(connection):
+                return None
+            await connection.execute(
+                """
+                WITH expired AS (
+                    SELECT uuid
+                    FROM workspace_zulip_bridge.workspace_file_projections
+                    WHERE processing_status = 'processing'
+                      AND COALESCE(heartbeat_at, claimed_at) <
+                          clock_timestamp() - interval '10 minutes'
+                    ORDER BY COALESCE(heartbeat_at, claimed_at), uuid
+                    LIMIT 100 FOR UPDATE SKIP LOCKED
+                )
+                UPDATE workspace_zulip_bridge.workspace_file_projections AS projection
+                SET processing_status = CASE WHEN attempt_count >= $1
+                        THEN 'blocked' ELSE 'failed' END,
+                    claimed_at = NULL, heartbeat_at = NULL,
                     available_at = clock_timestamp(), last_error = 'claim_expired',
                     updated_at = clock_timestamp()
-                WHERE processing_status = 'processing'
-                  AND claimed_at < clock_timestamp() - interval '10 minutes'
-            ), candidate AS (
-                SELECT projection.uuid
-                FROM workspace_zulip_bridge.workspace_file_projections AS projection
+                FROM expired WHERE projection.uuid = expired.uuid
+                """,
+                _FILE_MAX_ATTEMPTS,
+            )
+            row = await connection.fetchrow(
+                """
+                WITH candidate AS (
+                    SELECT projection.uuid
+                    FROM workspace_zulip_bridge.workspace_file_projections AS projection
+                    JOIN workspace_zulip_bridge.zulip_files AS file
+                      ON file.uuid = projection.file_uuid
+                    JOIN workspace_zulip_bridge.zulip_streams AS stream
+                      ON stream.uuid = projection.zulip_stream_uuid
+                    JOIN workspace_zulip_bridge.zulip_connections AS connection
+                      ON connection.uuid = stream.source_connection_uuid
+                    LEFT JOIN workspace_zulip_bridge.workspace_chat_catalog_reports
+                        AS catalog
+                      ON catalog.external_account_uuid =
+                         connection.external_account_uuid
+                     AND catalog.zulip_stream_uuid = stream.uuid
+                    WHERE projection.processing_status IN ('pending', 'failed')
+                      AND projection.available_at <= clock_timestamp()
+                      AND connection.external_account_uuid IS NOT NULL
+                      AND connection.sync_enabled
+                      AND catalog.processing_status = 'reported'
+                      AND catalog.projection_revision >= $1
+                      AND (projection.delivery_priority = 0 OR NOT EXISTS (
+                          SELECT 1 FROM workspace_zulip_bridge.sync_diffs
+                          WHERE delivery_priority = 1 AND processing_status = 'processing'
+                      ))
+                    ORDER BY projection.delivery_priority,
+                             projection.available_at, projection.created_at, projection.uuid
+                    LIMIT 1 FOR UPDATE OF projection SKIP LOCKED
+                ), claimed AS (
+                    UPDATE workspace_zulip_bridge.workspace_file_projections AS projection
+                    SET processing_status = 'processing',
+                        claimed_at = clock_timestamp(), heartbeat_at = clock_timestamp(), attempt_count = attempt_count + 1,
+                        last_error = NULL, updated_at = clock_timestamp()
+                    FROM candidate WHERE projection.uuid = candidate.uuid
+                    RETURNING projection.*
+                )
+                SELECT claimed.uuid AS projection_uuid, claimed.operation_uuid,
+                       claimed.delivery_priority, claimed.claimed_at,
+                       file.uuid AS file_uuid, stream.uuid AS stream_uuid,
+                       file.realm_uuid, connection.external_account_uuid,
+                       stream.chat_key,
+                       realm.endpoint, connection.login, connection.api_key,
+                       file.source_path, file.name
+                FROM claimed
                 JOIN workspace_zulip_bridge.zulip_files AS file
-                  ON file.uuid = projection.file_uuid
+                  ON file.uuid = claimed.file_uuid
                 JOIN workspace_zulip_bridge.zulip_streams AS stream
-                  ON stream.uuid = projection.zulip_stream_uuid
+                  ON stream.uuid = claimed.zulip_stream_uuid
                 JOIN workspace_zulip_bridge.zulip_connections AS connection
                   ON connection.uuid = stream.source_connection_uuid
-                LEFT JOIN workspace_zulip_bridge.workspace_chat_catalog_reports
-                    AS catalog
-                  ON catalog.external_account_uuid =
-                     connection.external_account_uuid
-                 AND catalog.zulip_stream_uuid = stream.uuid
-                WHERE projection.processing_status IN ('pending', 'failed')
-                  AND projection.available_at <= clock_timestamp()
-                  AND connection.external_account_uuid IS NOT NULL
+                JOIN workspace_zulip_bridge.zulip_realms AS realm
+                  ON realm.uuid = file.realm_uuid
+                WHERE connection.external_account_uuid IS NOT NULL
                   AND connection.sync_enabled
-                  AND catalog.processing_status = 'reported'
-                  AND catalog.projection_revision >= $1
-                ORDER BY projection.delivery_priority,
-                         file.source_created_at DESC, file.uuid DESC,
-                         projection.available_at, projection.uuid
-                LIMIT 1 FOR UPDATE OF projection SKIP LOCKED
-            ), claimed AS (
-                UPDATE workspace_zulip_bridge.workspace_file_projections AS projection
-                SET processing_status = 'processing',
-                    claimed_at = clock_timestamp(), attempt_count = attempt_count + 1,
-                    last_error = NULL, updated_at = clock_timestamp()
-                FROM candidate WHERE projection.uuid = candidate.uuid
-                RETURNING projection.*
+                """,
+                CATALOG_PROJECTION_REVISION,
             )
-            SELECT claimed.uuid AS projection_uuid, claimed.operation_uuid,
-                   claimed.delivery_priority,
-                   file.uuid AS file_uuid, stream.uuid AS stream_uuid,
-                   file.realm_uuid, connection.external_account_uuid,
-                   stream.chat_key,
-                   realm.endpoint, connection.login, connection.api_key,
-                   file.source_path, file.name
-            FROM claimed
-            JOIN workspace_zulip_bridge.zulip_files AS file
-              ON file.uuid = claimed.file_uuid
-            JOIN workspace_zulip_bridge.zulip_streams AS stream
-              ON stream.uuid = claimed.zulip_stream_uuid
-            JOIN workspace_zulip_bridge.zulip_connections AS connection
-              ON connection.uuid = stream.source_connection_uuid
-            JOIN workspace_zulip_bridge.zulip_realms AS realm
-              ON realm.uuid = file.realm_uuid
-            WHERE connection.external_account_uuid IS NOT NULL
-              AND connection.sync_enabled
-            """,
-            CATALOG_PROJECTION_REVISION,
-        )
         if row is None:
             return None
         return _Job(
@@ -625,7 +668,28 @@ class WorkspaceFileTransferWorker:
             source_path=str(row["source_path"]),
             name=str(row["name"]),
             delivery_priority=int(row["delivery_priority"]),
+            claimed_at=row["claimed_at"],
         )
+
+    async def _heartbeat_job(self, job: _Job) -> None:
+        while True:
+            await asyncio.sleep(_FILE_HEARTBEAT_SECONDS)
+            try:
+                result = await self._pool.execute(
+                    """
+                    UPDATE workspace_zulip_bridge.workspace_file_projections
+                    SET heartbeat_at = clock_timestamp()
+                    WHERE uuid = $1 AND processing_status = 'processing'
+                      AND claimed_at = $2
+                    """,
+                    job.projection_uuid,
+                    job.claimed_at,
+                )
+            except (TimeoutError, asyncpg.PostgresError):
+                LOG.warning("Workspace file heartbeat deferred")
+                continue
+            if result != "UPDATE 1":
+                return
 
     def _source_verify(self) -> bool | ssl.SSLContext:
         ca_file = self._settings.effective_zulip_ca_file
@@ -879,59 +943,56 @@ class WorkspaceFileTransferWorker:
         file_urn: str,
     ) -> None:
         async with self._pool.acquire() as connection, connection.transaction():
-            rows = await connection.fetch(
+            projection = await connection.fetchrow(
                 """
-                SELECT message.uuid, message.workspace_content,
-                       message.sender_user_uuid, stream.chat_key,
-                       topic.name AS topic_name, message.created_at
+                SELECT file_uuid, zulip_stream_uuid, processing_status,
+                       claimed_at, workspace_urn
+                FROM workspace_zulip_bridge.workspace_file_projections
+                WHERE uuid = $1
+                FOR UPDATE
+                """,
+                job.projection_uuid,
+            )
+            if projection is None:
+                return
+            if (
+                UUID(str(projection["file_uuid"])) != job.file_uuid
+                or UUID(str(projection["zulip_stream_uuid"])) != job.stream_uuid
+            ):
+                return
+            claimed_at = getattr(job, "claimed_at", None)
+            if claimed_at is not None and (
+                projection["processing_status"] != "processing"
+                or projection["claimed_at"] != claimed_at
+            ):
+                return
+            if projection["processing_status"] not in {"processing", "finalized"}:
+                return
+            if (
+                projection["processing_status"] == "finalized"
+                and projection["workspace_urn"] != file_urn
+            ):
+                raise FileTransferError("conflicting_finalized_workspace_urn")
+            message_rows = await connection.fetch(
+                """
+                SELECT message.uuid
                 FROM workspace_zulip_bridge.zulip_message_files AS link
-            JOIN workspace_zulip_bridge.zulip_messages AS message
-              ON message.uuid = link.message_uuid
-             AND message.workspace_content IS NOT NULL
+                JOIN workspace_zulip_bridge.zulip_messages AS message
+                  ON message.uuid = link.message_uuid
+                 AND message.workspace_content IS NOT NULL
                  AND message.zulip_stream_uuid = $2
-                JOIN workspace_zulip_bridge.zulip_streams AS stream
-                  ON stream.uuid = message.zulip_stream_uuid
-                LEFT JOIN workspace_zulip_bridge.zulip_topics AS topic
-                  ON topic.uuid = message.topic_uuid
                 WHERE link.file_uuid = $1
                 ORDER BY message.uuid
                 """,
                 job.file_uuid,
                 job.stream_uuid,
             )
-            changed: list[tuple[UUID, str, bytes]] = []
-            for row in rows:
-                current = str(row["workspace_content"] or "")
-                projected = replace_source_file_urn(
-                    current,
-                    job.file_uuid,
-                    file_urn,
-                )
-                if projected == current:
-                    continue
-                content_hash = message_content_hash(
-                    sender_user_uuid=UUID(str(row["sender_user_uuid"])),
-                    chat_key=str(row["chat_key"]),
-                    topic_name=(
-                        None if row["topic_name"] is None else str(row["topic_name"])
-                    ),
-                    content=projected,
-                    sent_at=int(row["created_at"].timestamp()),
-                )
-                changed.append((UUID(str(row["uuid"])), projected, content_hash))
-            if changed:
-                changed_message_uuids = [message_uuid for message_uuid, _, _ in changed]
-                await connection.executemany(
-                    """
-                    UPDATE workspace_zulip_bridge.zulip_messages
-                    SET workspace_content = $2, content_hash = $3,
-                        source_updated_at = GREATEST(
-                            source_updated_at, clock_timestamp()
-                        ), updated_at = clock_timestamp()
-                    WHERE uuid = $1
-                    """,
-                    changed,
-                )
+            changed_message_uuids = await preserve_finalized_file_references(
+                connection,
+                [UUID(str(row["uuid"])) for row in message_rows],
+                additional_references={job.file_uuid: file_urn},
+            )
+            if changed_message_uuids:
                 await connection.executemany(
                     """
                     INSERT INTO workspace_zulip_bridge.workspace_outbox (
@@ -943,7 +1004,10 @@ class WorkspaceFileTransferWorker:
                                   available_at = clock_timestamp(),
                                   updated_at = clock_timestamp()
                     """,
-                    [(job.realm_uuid, message_uuid) for message_uuid, _, _ in changed],
+                    [
+                        (job.realm_uuid, message_uuid)
+                        for message_uuid in changed_message_uuids
+                    ],
                 )
                 await connection.execute(
                     """
@@ -965,6 +1029,7 @@ class WorkspaceFileTransferWorker:
                 SET processing_status = 'finalized', workspace_urn = $2,
                     content_type = $3, size_bytes = $4, sha256 = $5,
                     finalized_at = clock_timestamp(), claimed_at = NULL,
+                    heartbeat_at = NULL,
                     last_error = NULL, updated_at = clock_timestamp()
                 WHERE uuid = $1
                 """,
@@ -979,20 +1044,26 @@ class WorkspaceFileTransferWorker:
         await self._pool.execute(
             """
             UPDATE workspace_zulip_bridge.workspace_file_projections
-            SET processing_status = CASE WHEN $3 THEN 'failed' ELSE 'blocked' END,
+            SET processing_status = CASE WHEN $3 AND attempt_count < $5
+                    THEN 'failed' ELSE 'blocked' END,
                 available_at = CASE WHEN $3 THEN
                     clock_timestamp() + make_interval(
                         secs => LEAST(300::double precision,
                             power(2::double precision, LEAST(attempt_count, 8)))
                     )
                     ELSE available_at END,
-                claimed_at = NULL, last_error = $2,
+                claimed_at = NULL, heartbeat_at = NULL,
+                last_error = CASE WHEN $3 AND attempt_count >= $5
+                    THEN 'retry_exhausted:' || $2 ELSE $2 END,
                 updated_at = clock_timestamp()
-            WHERE uuid = $1
+            WHERE uuid = $1 AND processing_status = 'processing'
+              AND ($4::timestamptz IS NULL OR claimed_at = $4)
             """,
             job.projection_uuid,
             reason[:128],
             retryable,
+            job.claimed_at,
+            _FILE_MAX_ATTEMPTS,
         )
         LOG.warning(
             "Workspace file transfer deferred projection=%s reason=%s retryable=%s",
@@ -1004,14 +1075,23 @@ class WorkspaceFileTransferWorker:
     async def _complete_file_outbox(self, file_uuid: UUID | None = None) -> int:
         result = await self._pool.execute(
             """
-            WITH candidates AS (
+            WITH scan_cursor AS MATERIALIZED (
+                SELECT sequence FROM workspace_zulip_bridge.import_scan_cursors
+                WHERE name = 'file_outbox_complete' FOR UPDATE
+            ), candidates AS MATERIALIZED (
                 SELECT sequence
                 FROM workspace_zulip_bridge.workspace_outbox
                 WHERE entity_type = 'file' AND action = 'upsert'
                   AND delivery_status IN ('pending', 'failed')
                   AND ($1::uuid IS NULL OR entity_uuid = $1)
+                  AND ($1::uuid IS NOT NULL OR sequence > (SELECT sequence FROM scan_cursor))
                 ORDER BY sequence
                 LIMIT 100
+            ), progress AS (
+                UPDATE workspace_zulip_bridge.import_scan_cursors
+                SET sequence = COALESCE((SELECT max(sequence) FROM candidates), 0),
+                    updated_at = clock_timestamp()
+                WHERE name = 'file_outbox_complete' AND $1::uuid IS NULL
             )
             UPDATE workspace_zulip_bridge.workspace_outbox AS outbox
             SET delivery_status = 'delivered', delivered_at = clock_timestamp(),

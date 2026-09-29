@@ -3,17 +3,21 @@
 
 import hashlib
 import json
+from collections.abc import Collection
 from collections.abc import Mapping
 from collections.abc import Sequence
 from datetime import UTC
 from datetime import datetime
 from typing import cast
 from uuid import UUID
+from uuid import uuid5
 
 import asyncpg
 from asyncpg.pool import PoolConnectionProxy
 
 from workspace_zulip_bridge.chat_catalog import ChatCatalogBuilder
+from workspace_zulip_bridge.chat_catalog import build_chat_catalog
+from workspace_zulip_bridge.chat_catalog import with_stream_notification_default
 from workspace_zulip_bridge.message_conversion import CONVERTER_VERSION
 from workspace_zulip_bridge.message_conversion import ZulipToWorkspaceContext
 from workspace_zulip_bridge.message_conversion import zulip_to_workspace
@@ -49,7 +53,14 @@ from workspace_zulip_bridge.stable_ids import stable_stream_binding_uuid
 from workspace_zulip_bridge.stable_ids import stable_topic_binding_uuid
 from workspace_zulip_bridge.stable_ids import stable_topic_uuid
 from workspace_zulip_bridge.stable_ids import stable_user_uuid
+from workspace_zulip_bridge.topic_state import DONE_PREFIX
+from workspace_zulip_bridge.topic_state import topic_display_name
+from workspace_zulip_bridge.topic_state import topic_state_after_display_change
+from workspace_zulip_bridge.topic_state import topic_state_from_display_name
 from workspace_zulip_bridge.workspace_file_transfer import replace_source_file_urn
+from workspace_zulip_bridge.workspace_message_content import (
+    preserve_finalized_file_references,
+)
 
 
 async def _complete_attachment_file_uuids(
@@ -483,21 +494,71 @@ class EventStore:
         *,
         enable_stream_desktop_notifications: bool,
     ) -> bool:
-        async with self._pool.acquire() as connection:
-            status = await connection.execute(
+        async with self._pool.acquire() as connection, connection.transaction():
+            previous = await connection.fetchval(
+                "SELECT enable_stream_desktop_notifications "
+                "FROM workspace_zulip_bridge.zulip_connections "
+                "WHERE uuid = $1 AND queue_id = $2 AND sync_enabled FOR UPDATE",
+                connection_uuid,
+                queue_id,
+            )
+            if previous is None:
+                return False
+            await connection.execute(
                 """
                 UPDATE workspace_zulip_bridge.zulip_connections
                 SET enable_stream_desktop_notifications = $3,
                     notification_settings_updated_at = clock_timestamp(),
+                    notification_refresh_requested_at = clock_timestamp(),
+                    notification_settings_generation = LEAST(notification_settings_generation, $4),
                     updated_at = clock_timestamp()
                 WHERE uuid = $1 AND queue_id = $2 AND sync_enabled
-                  AND enable_stream_desktop_notifications IS DISTINCT FROM $3
                 """,
                 connection_uuid,
                 queue_id,
                 enable_stream_desktop_notifications,
+                NOTIFICATION_SETTINGS_GENERATION - 1,
             )
-        return status == "UPDATE 1"
+        return bool(previous != enable_stream_desktop_notifications)
+
+    async def request_notification_snapshot(
+        self, connection_uuid: UUID, queue_id: str
+    ) -> bool:
+        # UPDATE takes the owner lock before any later snapshot binding writes.
+        # Unversioned retained-queue hints cannot establish source freshness.
+        async with self._pool.acquire() as connection:
+            result = await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_connections
+                SET notification_settings_generation = LEAST(notification_settings_generation, $3),
+                    notification_refresh_requested_at = clock_timestamp()
+                WHERE uuid = $1 AND queue_id = $2 AND sync_enabled
+                """,
+                connection_uuid,
+                queue_id,
+                NOTIFICATION_SETTINGS_GENERATION - 1,
+            )
+        return result == "UPDATE 1"
+
+    async def notification_snapshot_required(
+        self, connection_uuid: UUID, queue_id: str
+    ) -> bool | None:
+        async with self._pool.acquire() as connection:
+            return cast(
+                bool | None,
+                await connection.fetchval(
+                    """
+                SELECT notification_settings_generation < $3
+                   AND clock_timestamp() >=
+                       date_trunc('second', notification_snapshot_at) + interval '1 second'
+                FROM workspace_zulip_bridge.zulip_connections
+                WHERE uuid = $1 AND queue_id = $2 AND sync_enabled
+                """,
+                    connection_uuid,
+                    queue_id,
+                    NOTIFICATION_SETTINGS_GENERATION,
+                ),
+            )
 
     async def store_notification_snapshot(
         self,
@@ -514,7 +575,10 @@ class EventStore:
                 """
                 SELECT realm_uuid, zulip_user_uuid,
                        notification_settings_generation,
-                       notification_settings_updated_at
+                       notification_settings_updated_at,
+                       notification_snapshot_at,
+                       notification_refresh_requested_at,
+                       enable_stream_desktop_notifications
                 FROM workspace_zulip_bridge.zulip_connections
                 WHERE uuid = $1 AND queue_id = $2 AND sync_enabled
                 FOR UPDATE
@@ -529,6 +593,17 @@ class EventStore:
                 >= NOTIFICATION_SETTINGS_GENERATION
             ):
                 return 0
+            # An ambiguous same-second event requests a snapshot in a later
+            # second, so the retained old queue cannot invalidate it again.
+            if (
+                observed_at.replace(microsecond=0) <= owner["notification_snapshot_at"]
+                or observed_at < owner["notification_refresh_requested_at"]
+            ):
+                return None
+            if owner["notification_settings_updated_at"] > observed_at:
+                channel_chats = with_stream_notification_default(
+                    channel_chats, owner["enable_stream_desktop_notifications"]
+                )
             changed = await _store_channel_notification_modes(
                 connection,
                 owner["realm_uuid"],
@@ -546,25 +621,12 @@ class EventStore:
             )
             if topic_changes is None:
                 return None
-            await connection.execute(
-                """
-                UPDATE workspace_zulip_bridge.zulip_connections
-                SET enable_stream_desktop_notifications = CASE
-                        WHEN notification_settings_updated_at <= $3 THEN $4
-                        ELSE enable_stream_desktop_notifications
-                    END,
-                    notification_settings_updated_at = GREATEST(
-                        notification_settings_updated_at, $3
-                    ),
-                    notification_settings_generation = $5,
-                    updated_at = clock_timestamp()
-                WHERE uuid = $1 AND queue_id = $2
-                """,
+            await _mark_notification_snapshot(
+                connection,
                 connection_uuid,
                 queue_id,
-                observed_at,
                 enable_stream_desktop_notifications,
-                NOTIFICATION_SETTINGS_GENERATION,
+                observed_at,
             )
             return changed + topic_changes
 
@@ -1085,6 +1147,7 @@ class EventStore:
                 FROM workspace_zulip_bridge.zulip_connections AS source
                 WHERE source.uuid = $1 AND source.queue_id = $2
                   AND source.sync_enabled
+                FOR UPDATE OF source
                 """,
                 connection_uuid,
                 queue_id,
@@ -1543,6 +1606,346 @@ class EventStore:
             str(zulip_message_id),
         )
         return row is not None
+
+    async def normalize_prefixed_topics(self, batch_size: int) -> int:
+        """Normalize one bounded batch of topics stored before done-state parsing."""
+
+        async with self._pool.acquire() as connection, connection.transaction():
+            stream_rows = await connection.fetch(
+                """
+                WITH candidate_streams AS MATERIALIZED (
+                    SELECT DISTINCT topic.zulip_stream_uuid
+                    FROM workspace_zulip_bridge.zulip_topics AS topic
+                    WHERE NOT topic.is_done
+                      AND left(topic.name, char_length($1)) = $1
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM workspace_zulip_bridge.zulip_topics AS conflict
+                          WHERE conflict.zulip_stream_uuid =
+                                    topic.zulip_stream_uuid
+                            AND conflict.uuid <> topic.uuid
+                            AND conflict.name = substr(
+                                topic.name, char_length($1) + 1
+                            )
+                            AND conflict.is_done
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM workspace_zulip_bridge.zulip_topic_aliases
+                              AS conflict
+                          WHERE conflict.zulip_stream_uuid =
+                                    topic.zulip_stream_uuid
+                            AND conflict.alias = topic.name
+                            AND conflict.topic_uuid <> topic.uuid
+                      )
+                    ORDER BY topic.zulip_stream_uuid
+                    LIMIT $2
+                )
+                SELECT stream.uuid
+                FROM workspace_zulip_bridge.zulip_streams AS stream
+                JOIN candidate_streams
+                  ON candidate_streams.zulip_stream_uuid = stream.uuid
+                ORDER BY stream.uuid
+                FOR UPDATE OF stream SKIP LOCKED
+                """,
+                DONE_PREFIX,
+                batch_size,
+            )
+            if not stream_rows:
+                return 0
+            rows = await connection.fetch(
+                """
+                SELECT topic.uuid, topic.zulip_stream_uuid,
+                       stream.realm_uuid, topic.name AS display_name,
+                       substr(topic.name, char_length($1) + 1) AS canonical_name
+                FROM workspace_zulip_bridge.zulip_topics AS topic
+                JOIN workspace_zulip_bridge.zulip_streams AS stream
+                  ON stream.uuid = topic.zulip_stream_uuid
+                WHERE NOT topic.is_done
+                  AND left(topic.name, char_length($1)) = $1
+                  AND topic.zulip_stream_uuid = ANY($3::uuid[])
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM workspace_zulip_bridge.zulip_topics AS conflict
+                      WHERE conflict.zulip_stream_uuid = topic.zulip_stream_uuid
+                        AND conflict.uuid <> topic.uuid
+                        AND conflict.name =
+                            substr(topic.name, char_length($1) + 1)
+                        AND conflict.is_done
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM workspace_zulip_bridge.zulip_topic_aliases AS conflict
+                      WHERE conflict.zulip_stream_uuid = topic.zulip_stream_uuid
+                        AND conflict.alias = topic.name
+                        AND conflict.topic_uuid <> topic.uuid
+                  )
+                ORDER BY topic.uuid
+                LIMIT $2
+                FOR UPDATE OF topic SKIP LOCKED
+                """,
+                DONE_PREFIX,
+                batch_size,
+                [UUID(str(row["uuid"])) for row in stream_rows],
+            )
+            if not rows:
+                return 0
+            topic_uuids = [UUID(str(row["uuid"])) for row in rows]
+            canonical_names = [str(row["canonical_name"]) for row in rows]
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_topics AS topic
+                SET name = incoming.name, is_done = true,
+                    version = topic.version + 1,
+                    content_hash = incoming.content_hash,
+                    updated_at = clock_timestamp()
+                FROM unnest($1::uuid[], $2::text[], $3::bytea[])
+                     AS incoming(uuid, name, content_hash)
+                WHERE topic.uuid = incoming.uuid
+                """,
+                topic_uuids,
+                canonical_names,
+                [
+                    hashlib.sha256(name.encode("utf-8")).digest()
+                    for name in canonical_names
+                ],
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_topic_aliases (
+                    zulip_stream_uuid, alias, topic_uuid, active
+                )
+                SELECT *
+                FROM unnest($1::uuid[], $2::text[], $3::uuid[], $4::boolean[])
+                ON CONFLICT (zulip_stream_uuid, alias) DO UPDATE
+                SET active = true, updated_at = clock_timestamp()
+                WHERE zulip_topic_aliases.topic_uuid = EXCLUDED.topic_uuid
+                """,
+                [UUID(str(row["zulip_stream_uuid"])) for row in rows],
+                [str(row["display_name"]) for row in rows],
+                topic_uuids,
+                [True] * len(rows),
+            )
+            topics_by_realm: dict[UUID, list[UUID]] = {}
+            for row, topic_uuid in zip(rows, topic_uuids, strict=True):
+                topics_by_realm.setdefault(UUID(str(row["realm_uuid"])), []).append(
+                    topic_uuid
+                )
+            for realm_uuid, realm_topic_uuids in topics_by_realm.items():
+                await _enqueue_workspace_upserts(
+                    connection,
+                    realm_uuid,
+                    "topic",
+                    realm_topic_uuids,
+                )
+            return len(rows)
+
+    async def prefixed_topic_normalization_status(self) -> tuple[int, int]:
+        """Return eligible and irreducibly conflicting legacy topic counts."""
+
+        row = await self._pool.fetchrow(
+            """
+            WITH prefixed AS (
+                SELECT EXISTS (
+                           SELECT 1
+                           FROM workspace_zulip_bridge.zulip_topics AS conflict
+                           WHERE conflict.zulip_stream_uuid =
+                                     topic.zulip_stream_uuid
+                             AND conflict.uuid <> topic.uuid
+                             AND conflict.name = substr(
+                                 topic.name, char_length($1) + 1
+                             )
+                             AND conflict.is_done
+                       ) AS state_conflict,
+                       EXISTS (
+                           SELECT 1
+                           FROM workspace_zulip_bridge.zulip_topic_aliases
+                               AS conflict
+                           WHERE conflict.zulip_stream_uuid =
+                                     topic.zulip_stream_uuid
+                             AND conflict.alias = topic.name
+                             AND conflict.topic_uuid <> topic.uuid
+                       ) AS alias_conflict
+                FROM workspace_zulip_bridge.zulip_topics AS topic
+                WHERE NOT topic.is_done
+                  AND left(topic.name, char_length($1)) = $1
+            )
+            SELECT count(*) FILTER (
+                       WHERE NOT state_conflict AND NOT alias_conflict
+                   )::bigint AS pending_count,
+                   count(*) FILTER (
+                       WHERE state_conflict OR alias_conflict
+                   )::bigint AS blocked_count
+            FROM prefixed
+            """,
+            DONE_PREFIX,
+        )
+        if row is None:
+            return 0, 0
+        return int(row["pending_count"]), int(row["blocked_count"])
+
+    async def apply_topic_display_change(
+        self,
+        connection_uuid: UUID,
+        queue_id: str,
+        topic_uuid: UUID,
+        expected_display_name: str,
+        display_name: str,
+        source_updated_at: datetime,
+    ) -> str:
+        """Persist one Zulip topic rename and return its effective display name."""
+
+        async with self._pool.acquire() as connection, connection.transaction():
+            stream_uuid = await connection.fetchval(
+                """
+                SELECT stream.uuid
+                FROM workspace_zulip_bridge.zulip_topics AS topic
+                JOIN workspace_zulip_bridge.zulip_streams AS stream
+                  ON stream.uuid = topic.zulip_stream_uuid
+                 AND stream.source_connection_uuid = $1
+                JOIN workspace_zulip_bridge.zulip_connections AS owner
+                  ON owner.uuid = stream.source_connection_uuid
+                 AND owner.queue_id = $2
+                WHERE topic.uuid = $3
+                FOR UPDATE OF stream
+                """,
+                connection_uuid,
+                queue_id,
+                topic_uuid,
+            )
+            if stream_uuid is None:
+                raise RuntimeError("topic display change is not owned by this queue")
+            row = await connection.fetchrow(
+                """
+                SELECT topic.name, topic.is_done, topic.zulip_stream_uuid,
+                       topic.version, topic.source_updated_at, stream.realm_uuid
+                FROM workspace_zulip_bridge.zulip_topics AS topic
+                JOIN workspace_zulip_bridge.zulip_streams AS stream
+                  ON stream.uuid = topic.zulip_stream_uuid
+                 AND stream.source_connection_uuid = $1
+                JOIN workspace_zulip_bridge.zulip_connections AS owner
+                  ON owner.uuid = stream.source_connection_uuid
+                 AND owner.queue_id = $2
+                WHERE topic.uuid = $3 AND topic.zulip_stream_uuid = $4
+                FOR UPDATE OF topic
+                """,
+                connection_uuid,
+                queue_id,
+                topic_uuid,
+                stream_uuid,
+            )
+            if row is None:
+                raise RuntimeError("topic display change is not owned by this queue")
+            current_name = str(row["name"])
+            current_is_done = bool(row["is_done"])
+            current_display_name = topic_display_name(
+                current_name,
+                current_is_done,
+            )
+            if source_updated_at <= row["source_updated_at"]:
+                return current_display_name
+            next_name, next_is_done = topic_state_after_display_change(
+                current_name,
+                current_is_done,
+                display_name,
+            )
+            if display_name == current_display_name and (next_name, next_is_done) == (
+                current_name,
+                current_is_done,
+            ):
+                await connection.execute(
+                    """
+                    UPDATE workspace_zulip_bridge.zulip_topics
+                    SET source_updated_at = $2
+                    WHERE uuid = $1
+                    """,
+                    topic_uuid,
+                    source_updated_at,
+                )
+                return current_display_name
+            if expected_display_name != current_display_name:
+                return current_display_name
+            if (next_name, next_is_done) == (current_name, current_is_done):
+                return current_display_name
+            conflict = await connection.fetchval(
+                """
+                SELECT topic.uuid
+                FROM workspace_zulip_bridge.zulip_topics AS topic
+                LEFT JOIN workspace_zulip_bridge.zulip_topic_aliases AS alias
+                  ON alias.topic_uuid = topic.uuid AND alias.active
+                WHERE topic.zulip_stream_uuid = $1
+                  AND topic.uuid <> $2
+                  AND (
+                      lower(CASE WHEN topic.is_done THEN $3 || topic.name
+                                 ELSE topic.name END) = lower($4)
+                      OR lower(alias.alias) = lower($4)
+                  )
+                LIMIT 1
+                """,
+                row["zulip_stream_uuid"],
+                topic_uuid,
+                DONE_PREFIX,
+                display_name,
+            )
+            if conflict is not None:
+                # Zulip merges a whole-topic rename into an existing display
+                # name. The message rewrite resolves that target identity, and
+                # the event processor prunes the emptied source topic.
+                return display_name
+            old_display_name = topic_display_name(current_name, current_is_done)
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_topic_aliases
+                SET active = false, updated_at = clock_timestamp()
+                WHERE topic_uuid = $1 AND active
+                """,
+                topic_uuid,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_topic_aliases (
+                    zulip_stream_uuid, alias, topic_uuid, active
+                ) VALUES ($1, $2, $3, false)
+                ON CONFLICT (zulip_stream_uuid, alias) DO NOTHING
+                """,
+                row["zulip_stream_uuid"],
+                old_display_name,
+                topic_uuid,
+            )
+            await connection.execute(
+                """
+                INSERT INTO workspace_zulip_bridge.zulip_topic_aliases (
+                    zulip_stream_uuid, alias, topic_uuid, active
+                ) VALUES ($1, $2, $3, true)
+                ON CONFLICT (zulip_stream_uuid, alias) DO UPDATE
+                SET active = true, updated_at = clock_timestamp()
+                WHERE zulip_topic_aliases.topic_uuid = EXCLUDED.topic_uuid
+                """,
+                row["zulip_stream_uuid"],
+                display_name,
+                topic_uuid,
+            )
+            await connection.execute(
+                """
+                UPDATE workspace_zulip_bridge.zulip_topics
+                SET name = $2, is_done = $3, version = version + 1,
+                    content_hash = $4, source_updated_at = $5,
+                    updated_at = clock_timestamp()
+                WHERE uuid = $1
+                """,
+                topic_uuid,
+                next_name,
+                next_is_done,
+                hashlib.sha256(next_name.encode("utf-8")).digest(),
+                source_updated_at,
+            )
+            await _enqueue_workspace_upserts(
+                connection,
+                UUID(str(row["realm_uuid"])),
+                "topic",
+                [topic_uuid],
+            )
+            return display_name
 
     async def apply_live_messages(
         self,
@@ -2081,6 +2484,7 @@ class EventStore:
         *,
         bootstrap_user_topics: Sequence[ZulipUserTopic] | None = None,
         notification_snapshot_at: datetime | None = None,
+        catalog_observed_at: datetime | None = None,
         enable_stream_desktop_notifications: bool = True,
     ) -> ChatCatalogWrite:
         return await self._store_chat_catalog(
@@ -2089,6 +2493,7 @@ class EventStore:
             catalog,
             bootstrap_user_topics=bootstrap_user_topics,
             notification_snapshot_at=notification_snapshot_at,
+            catalog_observed_at=catalog_observed_at,
             enable_stream_desktop_notifications=(enable_stream_desktop_notifications),
         )
 
@@ -2100,13 +2505,17 @@ class EventStore:
         *,
         bootstrap_user_topics: Sequence[ZulipUserTopic] | None = None,
         notification_snapshot_at: datetime | None = None,
+        catalog_observed_at: datetime | None = None,
         enable_stream_desktop_notifications: bool = True,
     ) -> ChatCatalogWrite:
         async with self._pool.acquire() as connection, connection.transaction():
             owner = await connection.fetchrow(
                 """
                 SELECT connection.realm_uuid, connection.zulip_user_uuid,
-                       connection.streams_hash, realm.identity_key AS endpoint
+                       connection.streams_hash,
+                       connection.notification_settings_updated_at,
+                       connection.enable_stream_desktop_notifications,
+                       realm.identity_key AS endpoint
                 FROM workspace_zulip_bridge.zulip_connections AS connection
                 JOIN workspace_zulip_bridge.zulip_realms AS realm
                   ON realm.uuid = connection.realm_uuid
@@ -2119,8 +2528,25 @@ class EventStore:
             if owner is None:
                 return ChatCatalogWrite(False, False, 0, 0)
             topic_changes = 0
-            snapshot_at = notification_snapshot_at or datetime.now(UTC)
+            catalog_at = catalog_observed_at or datetime.now(UTC)
+            snapshot_at = notification_snapshot_at or catalog_at
+            if (
+                bootstrap_user_topics is None
+                or owner["notification_settings_updated_at"] > snapshot_at
+            ):
+                catalog = build_chat_catalog(
+                    with_stream_notification_default(
+                        catalog.chats, owner["enable_stream_desktop_notifications"]
+                    )
+                )
             if owner["streams_hash"] == catalog.content_hash:
+                await _store_channel_notification_modes(
+                    connection,
+                    owner["realm_uuid"],
+                    owner["zulip_user_uuid"],
+                    catalog.chats,
+                    observed_at=catalog_at,
+                )
                 if bootstrap_user_topics is not None:
                     stored = await _store_user_topics(
                         connection,
@@ -2157,6 +2583,7 @@ class EventStore:
                 owner["zulip_user_uuid"],
                 catalog.chats,
                 replace_catalog=True,
+                observed_at=catalog_at,
             )
             if bootstrap_user_topics is not None:
                 stored = await _store_user_topics(
@@ -2316,8 +2743,12 @@ class HistorySession:
             ) ON COMMIT PRESERVE ROWS;
             CREATE TEMP TABLE IF NOT EXISTS wzb_message_page (
                 uuid uuid NOT NULL, zulip_message_id bigint NOT NULL,
-                stream_uuid uuid NOT NULL, topic_uuid uuid, topic_name text,
-                topic_hash bytea,
+                stream_uuid uuid NOT NULL, topic_uuid uuid,
+                topic_fallback_uuid uuid NOT NULL,
+                topic_identity_matched boolean NOT NULL DEFAULT false,
+                topic_name text,
+                topic_hash bytea, topic_display_name text NOT NULL,
+                topic_is_done boolean NOT NULL,
                 sender_user_uuid uuid NOT NULL, content text NOT NULL,
                 workspace_content text NOT NULL,
                 converter_version integer NOT NULL,
@@ -2373,6 +2804,15 @@ class HistorySession:
             int(row["zulip_external_key"]): UUID(str(row["workspace_uuid"]))
             for row in linked_rows
         }
+        first_topic_message_ids: dict[tuple[UUID, str], int] = {}
+        for message in messages:
+            stream_uuid = stable_chat_uuid(self._endpoint, message.chat_key)
+            topic_display_name = message.topic_name or "General"
+            key = (stream_uuid, topic_display_name)
+            first_topic_message_ids[key] = min(
+                message.message_id,
+                first_topic_message_ids.get(key, message.message_id),
+            )
         records = []
         file_records: list[tuple[UUID, UUID, str, str, int]] = []
         reaction_records: list[tuple[UUID, UUID, UUID, str, str, str]] = []
@@ -2382,8 +2822,15 @@ class HistorySession:
                 stable_message_uuid(self._endpoint, message.message_id),
             )
             stream_uuid = stable_chat_uuid(self._endpoint, message.chat_key)
-            topic_name = message.topic_name or "General"
-            topic_uuid = stable_topic_uuid(stream_uuid, topic_name)
+            topic_display_name = message.topic_name or "General"
+            topic_name, topic_is_done = topic_state_from_display_name(
+                topic_display_name
+            )
+            topic_uuid = stable_topic_uuid(stream_uuid, topic_display_name)
+            topic_fallback_uuid = uuid5(
+                topic_uuid,
+                f"source-topic-incarnation\0{first_topic_message_ids[(stream_uuid, topic_display_name)]}",
+            )
             flags_hash = message_flags_hash(
                 is_read=message.is_read,
                 is_starred=message.is_starred,
@@ -2400,8 +2847,12 @@ class HistorySession:
                     message.message_id,
                     stream_uuid,
                     topic_uuid,
+                    topic_fallback_uuid,
+                    False,
                     topic_name,
                     hashlib.sha256(topic_name.encode("utf-8")).digest(),
+                    topic_display_name,
+                    topic_is_done,
                     message.sender_user_uuid,
                     message.content,
                     message.workspace_content or message.content,
@@ -2472,8 +2923,12 @@ class HistorySession:
                     "zulip_message_id",
                     "stream_uuid",
                     "topic_uuid",
+                    "topic_fallback_uuid",
+                    "topic_identity_matched",
                     "topic_name",
                     "topic_hash",
+                    "topic_display_name",
+                    "topic_is_done",
                     "sender_user_uuid",
                     "content",
                     "workspace_content",
@@ -2522,9 +2977,24 @@ class HistorySession:
                         "reaction_type",
                     ),
                 )
+            await self._lock_topic_streams()
             await self._reuse_topic_identities()
+            await self._disambiguate_topic_identity_seeds()
             topics_inserted = await self._store_topics()
+            await self._lock_existing_message_rows(
+                [UUID(str(record[0])) for record in records]
+            )
             counts = await self._store_messages_and_personal_state()
+            restored_message_uuids = await preserve_finalized_file_references(
+                self._connection,
+                [UUID(str(record[0])) for record in records],
+            )
+            await _enqueue_workspace_upserts(
+                self._connection,
+                self._realm_uuid,
+                "message",
+                restored_message_uuids,
+            )
         received = len(messages)
         resolved = counts["resolved_count"]
         if counts["seen_count"] != resolved:
@@ -2540,53 +3010,124 @@ class HistorySession:
             files_changed=counts["files_changed"],
         )
 
+    async def _lock_existing_message_rows(
+        self,
+        message_uuids: Sequence[UUID],
+    ) -> None:
+        """Use the shared deterministic lock order before replacing projections."""
+
+        await self._connection.fetch(
+            """
+            SELECT uuid
+            FROM workspace_zulip_bridge.zulip_messages
+            WHERE uuid = ANY($1::uuid[])
+            ORDER BY uuid
+            FOR UPDATE
+            """,
+            sorted(set(message_uuids)),
+        )
+
+    async def _lock_topic_streams(self) -> None:
+        """Serialize identity allocation in a deterministic stream order."""
+
+        await self._connection.fetch(
+            """
+            SELECT stream.uuid
+            FROM workspace_zulip_bridge.zulip_streams AS stream
+            WHERE stream.uuid IN (
+                SELECT DISTINCT page.stream_uuid FROM wzb_message_page AS page
+            )
+            ORDER BY stream.uuid
+            FOR UPDATE
+            """
+        )
+
     async def _reuse_topic_identities(self) -> None:
         await self._connection.execute(
             """
             WITH matched AS (
                 SELECT DISTINCT ON (page.uuid)
                        page.uuid AS page_uuid, topic.uuid, topic.name,
-                       topic.content_hash
+                       topic.content_hash, topic.is_done
                 FROM wzb_message_page AS page
                 JOIN workspace_zulip_bridge.zulip_topic_aliases AS alias
                   ON alias.zulip_stream_uuid = page.stream_uuid
-                 AND lower(alias.alias) = lower(page.topic_name)
+                 AND lower(alias.alias) = lower(page.topic_display_name)
                  AND alias.active
                 JOIN workspace_zulip_bridge.zulip_topics AS topic
                   ON topic.uuid = alias.topic_uuid
                 ORDER BY page.uuid,
-                         (alias.alias = page.topic_name) DESC,
+                         (alias.alias = page.topic_display_name) DESC,
                          topic.created_at,
                          topic.uuid
             )
             UPDATE wzb_message_page AS page
             SET topic_uuid = matched.uuid,
                 topic_name = matched.name,
-                topic_hash = matched.content_hash
+                topic_hash = matched.content_hash,
+                topic_is_done = matched.is_done,
+                topic_identity_matched = true
             FROM matched
             WHERE matched.page_uuid = page.uuid
-              AND page.topic_uuid IS DISTINCT FROM matched.uuid
             """
         )
         await self._connection.execute(
             """
             WITH matched AS (
                 SELECT DISTINCT ON (page.uuid)
-                       page.uuid AS page_uuid, topic.uuid
+                       page.uuid AS page_uuid, topic.uuid, topic.name,
+                       topic.content_hash, topic.is_done
                 FROM wzb_message_page AS page
                 JOIN workspace_zulip_bridge.zulip_topics AS topic
                   ON topic.zulip_stream_uuid = page.stream_uuid
                  AND lower(topic.name) = lower(page.topic_name)
+                 AND topic.is_done = page.topic_is_done
                 ORDER BY page.uuid,
                          (topic.name = page.topic_name) DESC,
                          topic.created_at,
                          topic.uuid
             )
             UPDATE wzb_message_page AS page
-            SET topic_uuid = matched.uuid
+            SET topic_uuid = matched.uuid,
+                topic_name = matched.name,
+                topic_hash = matched.content_hash,
+                topic_is_done = matched.is_done,
+                topic_identity_matched = true
             FROM matched
             WHERE matched.page_uuid = page.uuid
-              AND page.topic_uuid IS DISTINCT FROM matched.uuid
+              AND NOT page.topic_identity_matched
+            """
+        )
+
+    async def _disambiguate_topic_identity_seeds(self) -> None:
+        """Allocate a fresh source identity when a raw-title seed is retired."""
+
+        await self._connection.execute(
+            """
+            UPDATE wzb_message_page AS page
+            SET topic_uuid = page.topic_fallback_uuid
+            FROM workspace_zulip_bridge.zulip_streams AS stream
+            WHERE stream.uuid = page.stream_uuid
+              AND NOT page.topic_identity_matched
+              AND (
+                  EXISTS (
+                      SELECT 1
+                      FROM workspace_zulip_bridge.zulip_topics AS topic
+                      WHERE topic.uuid = page.topic_uuid
+                  )
+                  OR EXISTS (
+                      SELECT 1
+                      FROM workspace_zulip_bridge.zulip_topic_catalog_identities
+                          AS identity
+                      WHERE identity.topic_uuid = page.topic_uuid
+                         OR (
+                             identity.zulip_stream_uuid = page.stream_uuid
+                             AND identity.provider_topic_id =
+                                 regexp_replace(stream.chat_key, '^channel:', '')
+                                 || ':' || page.topic_display_name
+                         )
+                  )
+              )
             """
         )
 
@@ -2597,7 +3138,8 @@ class HistorySession:
             """
             WITH incoming AS MATERIALIZED (
                 SELECT DISTINCT page.topic_uuid, page.stream_uuid, page.topic_name,
-                       page.topic_hash AS content_hash
+                       page.topic_hash AS content_hash, page.topic_display_name,
+                       page.topic_is_done
                 FROM wzb_message_page AS page
                 JOIN workspace_zulip_bridge.zulip_streams AS stream
                   ON stream.uuid = page.stream_uuid
@@ -2605,16 +3147,45 @@ class HistorySession:
                 WHERE page.topic_uuid IS NOT NULL
             ), topics AS (
                 INSERT INTO workspace_zulip_bridge.zulip_topics
-                    (uuid, zulip_stream_uuid, name, content_hash)
-                SELECT topic_uuid, stream_uuid, topic_name, content_hash FROM incoming
-                ON CONFLICT (uuid) DO UPDATE SET name = EXCLUDED.name,
-                    content_hash = EXCLUDED.content_hash
-                WHERE zulip_topics.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+                    (uuid, zulip_stream_uuid, name, is_done, content_hash)
+                SELECT topic_uuid, stream_uuid, topic_name, topic_is_done,
+                       content_hash
+                FROM incoming
+                ON CONFLICT (uuid) DO NOTHING
                 RETURNING uuid
+            ), identities AS (
+                INSERT INTO
+                    workspace_zulip_bridge.zulip_topic_catalog_identities (
+                        topic_uuid, zulip_stream_uuid, catalog_topic_key,
+                        provider_topic_id
+                    )
+                SELECT incoming.topic_uuid, incoming.stream_uuid,
+                       incoming.topic_display_name,
+                       CASE WHEN EXISTS (
+                           SELECT 1
+                           FROM workspace_zulip_bridge.zulip_topic_catalog_identities
+                               AS reserved
+                           WHERE reserved.zulip_stream_uuid = incoming.stream_uuid
+                             AND reserved.provider_topic_id =
+                                 regexp_replace(stream.chat_key, '^channel:', '')
+                                 || ':' || incoming.topic_display_name
+                       ) THEN 'topic-uuid:' || incoming.topic_uuid::text
+                       ELSE regexp_replace(stream.chat_key, '^channel:', '')
+                            || ':' || incoming.topic_display_name END
+                FROM incoming
+                JOIN topics ON topics.uuid = incoming.topic_uuid
+                JOIN workspace_zulip_bridge.zulip_streams AS stream
+                  ON stream.uuid = incoming.stream_uuid
+                 AND stream.chat_type = 'channel'
+                ON CONFLICT DO NOTHING
+                RETURNING topic_uuid
             ), aliases AS (
                 INSERT INTO workspace_zulip_bridge.zulip_topic_aliases
                     (zulip_stream_uuid, alias, topic_uuid)
-                SELECT stream_uuid, topic_name, topic_uuid FROM incoming
+                SELECT incoming.stream_uuid, incoming.topic_display_name,
+                       incoming.topic_uuid
+                FROM incoming
+                JOIN topics ON topics.uuid = incoming.topic_uuid
                 ON CONFLICT (zulip_stream_uuid, alias) DO UPDATE
                 SET topic_uuid = EXCLUDED.topic_uuid, active = true
                 RETURNING 1
@@ -3304,31 +3875,32 @@ async def _store_channel_notification_modes(
                 chat_key, notification_mode, membership_parameters,
                 membership_hash
             )
+        ), candidates AS MATERIALIZED (
+            SELECT binding.uuid, incoming.*,
+                   (binding.notification_mode, binding.membership_parameters,
+                    binding.content_hash) IS DISTINCT FROM
+                   (incoming.notification_mode, incoming.membership_parameters,
+                    incoming.membership_hash) AS content_changed
+            FROM workspace_zulip_bridge.zulip_stream_bindings AS binding
+            JOIN workspace_zulip_bridge.zulip_streams AS stream
+              ON stream.uuid = binding.zulip_stream_uuid
+            JOIN incoming ON incoming.chat_key = stream.chat_key
+            WHERE stream.realm_uuid = $1 AND binding.zulip_user_uuid = $2
+            FOR UPDATE OF binding
         ), changed AS (
             UPDATE workspace_zulip_bridge.zulip_stream_bindings AS binding
-            SET notification_mode = incoming.notification_mode,
-                membership_parameters = incoming.membership_parameters,
-                content_hash = incoming.membership_hash,
+            SET notification_mode = candidates.notification_mode,
+                membership_parameters = candidates.membership_parameters,
+                content_hash = candidates.membership_hash,
                 source_updated_at = $7,
                 updated_at = clock_timestamp()
-            FROM workspace_zulip_bridge.zulip_streams AS stream
-            JOIN incoming ON incoming.chat_key = stream.chat_key
-            WHERE stream.realm_uuid = $1
-              AND binding.zulip_stream_uuid = stream.uuid
-              AND binding.zulip_user_uuid = $2
+            FROM candidates
+            WHERE binding.uuid = candidates.uuid
               AND binding.source_updated_at <= $7
-              AND (
-                  binding.notification_mode,
-                  binding.membership_parameters,
-                  binding.content_hash
-              ) IS DISTINCT FROM (
-                  incoming.notification_mode,
-                  incoming.membership_parameters,
-                  incoming.membership_hash
-              )
-            RETURNING binding.uuid
+              AND (binding.source_updated_at < $7 OR candidates.content_changed)
+            RETURNING binding.uuid, candidates.content_changed
         )
-        SELECT uuid FROM changed
+        SELECT uuid FROM changed WHERE content_changed
         """,
         realm_uuid,
         user_uuid,
@@ -3364,7 +3936,11 @@ async def _mark_notification_snapshot(
             notification_settings_updated_at = GREATEST(
                 notification_settings_updated_at, $3
             ),
-            notification_settings_generation = $5,
+            notification_snapshot_at = GREATEST(notification_snapshot_at, $3),
+            notification_settings_generation = CASE
+                WHEN date_trunc('second', $3::timestamptz) > notification_snapshot_at
+                     AND notification_refresh_requested_at <= $3
+                THEN $5 ELSE notification_settings_generation END,
             updated_at = clock_timestamp()
         WHERE uuid = $1 AND queue_id = $2
         """,
@@ -3386,14 +3962,56 @@ async def _store_user_topics(
     snapshot_observed_at: datetime | None = None,
 ) -> int | None:
     changed = 0
-    reset_observed_at = snapshot_observed_at or datetime.now(UTC)
-    retained_binding_uuids: list[UUID] = []
-    for topic in topics:
+    observed_at = (snapshot_observed_at or datetime.now(UTC)) if replace_all else None
+    # Zulip user_topic versions have whole-second precision. The old retained
+    # queue may contain an event from either side of snapshot observation within
+    # that second; equality is ambiguous and requires a fresh source snapshot.
+    latest_snapshot = await connection.fetchval(
+        "SELECT max(notification_snapshot_at) "
+        "FROM workspace_zulip_bridge.zulip_connections "
+        "WHERE realm_uuid = $1 AND zulip_user_uuid = $2",
+        realm_uuid,
+        user_uuid,
+    )
+    if observed_at is not None and latest_snapshot and latest_snapshot > observed_at:
+        return 0
+    snapshot_fence = (
+        latest_snapshot.replace(microsecond=0)
+        if latest_snapshot is not None and not replace_all
+        else None
+    )
+    retained_binding_uuids: set[UUID] = set()
+    # Multiple aliases can identify one binding. Apply the latest source entry
+    # once; do not let input order choose a historical preference.
+    ordered_topics = sorted(topics, key=lambda topic: topic.last_updated, reverse=True)
+    for topic in ordered_topics:
+        if (
+            snapshot_fence
+            and datetime.fromtimestamp(topic.last_updated, UTC) < snapshot_fence
+        ):
+            continue
+        if (
+            snapshot_fence
+            and latest_snapshot > datetime.fromtimestamp(0, UTC)
+            and datetime.fromtimestamp(topic.last_updated, UTC) == snapshot_fence
+        ):
+            await connection.execute(
+                "UPDATE workspace_zulip_bridge.zulip_connections "
+                "SET notification_settings_generation = LEAST(notification_settings_generation, $3), "
+                "notification_refresh_requested_at = clock_timestamp() "
+                "WHERE realm_uuid = $1 AND zulip_user_uuid = $2",
+                realm_uuid,
+                user_uuid,
+                NOTIFICATION_SETTINGS_GENERATION - 1,
+            )
+            continue
         topic_result = await _store_user_topic(
             connection,
             realm_uuid,
             user_uuid,
             topic,
+            snapshot_observed_at=observed_at,
+            retained_binding_uuids=retained_binding_uuids if replace_all else (),
         )
         if topic_result is None:
             if not replace_all:
@@ -3401,36 +4019,42 @@ async def _store_user_topics(
             continue
         topic_change, binding_uuid = topic_result
         changed += topic_change
-        retained_binding_uuids.append(binding_uuid)
+        retained_binding_uuids.add(binding_uuid)
 
     reset_binding_uuids: list[UUID] = []
-    if replace_all:
+    # The connection snapshot fence covers existing and future default rows;
+    # rewrite only explicit overrides, avoiding a sweep over generated defaults.
+    if observed_at is not None:
         rows = await connection.fetch(
             """
             SELECT topic_binding.uuid, topic_binding.zulip_stream_uuid,
                    topic_binding.topic_uuid, topic_binding.zulip_user_uuid,
-                   topic_binding.created_at,
-                   topic_binding.source_updated_at
+                   topic_binding.created_at, topic_binding.notification_mode
             FROM workspace_zulip_bridge.zulip_topic_bindings AS topic_binding
             JOIN workspace_zulip_bridge.zulip_streams AS stream
               ON stream.uuid = topic_binding.zulip_stream_uuid
             WHERE stream.realm_uuid = $1
               AND topic_binding.zulip_user_uuid = $2
               AND topic_binding.notification_mode <> 'default'
+              AND NOT (topic_binding.uuid = ANY($3::uuid[]))
+            ORDER BY topic_binding.uuid
+            FOR UPDATE OF topic_binding
             """,
             realm_uuid,
             user_uuid,
+            list(retained_binding_uuids),
         )
         for row in rows:
             status = await connection.execute(
                 """
                 UPDATE workspace_zulip_bridge.zulip_topic_bindings
                 SET notification_mode = 'default', content_hash = $2,
-                    source_updated_at = $3,
+                    source_updated_at = GREATEST(
+                        source_updated_at, date_trunc('second', $3::timestamptz)
+                    ),
                     updated_at = clock_timestamp()
-                WHERE uuid = $1 AND notification_mode <> 'default'
-                  AND NOT (uuid = ANY($4::uuid[]))
-                  AND ($3::timestamptz IS NULL OR source_updated_at <= $3)
+                WHERE uuid = $1 AND source_updated_at <= $3
+                  AND (updated_at <= $3 OR source_updated_at = 'epoch')
                 """,
                 row["uuid"],
                 _topic_binding_hash(
@@ -3440,11 +4064,10 @@ async def _store_user_topics(
                     "default",
                     row["created_at"],
                 ),
-                reset_observed_at,
-                retained_binding_uuids,
+                observed_at,
             )
-            changed += status == "UPDATE 1"
-            if status == "UPDATE 1":
+            if status == "UPDATE 1" and row["notification_mode"] != "default":
+                changed += 1
                 reset_binding_uuids.append(UUID(str(row["uuid"])))
         await _enqueue_workspace_upserts(
             connection,
@@ -3460,15 +4083,19 @@ async def _store_user_topic(
     realm_uuid: UUID,
     user_uuid: UUID,
     topic: ZulipUserTopic,
+    *,
+    snapshot_observed_at: datetime | None = None,
+    retained_binding_uuids: Collection[UUID] = (),
 ) -> tuple[int, UUID] | None:
     stream = await connection.fetchrow(
         """
-        SELECT stream.uuid
+        SELECT stream.uuid, stream.chat_key
         FROM workspace_zulip_bridge.zulip_streams AS stream
         JOIN workspace_zulip_bridge.zulip_stream_bindings AS binding
           ON binding.zulip_stream_uuid = stream.uuid
          AND binding.zulip_user_uuid = $3
         WHERE stream.realm_uuid = $1 AND stream.chat_key = $2
+        FOR UPDATE OF stream
         """,
         realm_uuid,
         f"channel:{topic.stream_id}",
@@ -3477,17 +4104,23 @@ async def _store_user_topic(
     if stream is None:
         return None
     stream_uuid = UUID(str(stream["uuid"]))
+    canonical_source_name, source_is_done = topic_state_from_display_name(
+        topic.topic_name
+    )
     existing_topic = await connection.fetchrow(
         """
-        SELECT topic.uuid, topic.name
+        SELECT topic.uuid, topic.name, topic.is_done,
+               identity.provider_topic_id AS catalog_provider_topic_id
         FROM workspace_zulip_bridge.zulip_topics AS topic
         LEFT JOIN workspace_zulip_bridge.zulip_topic_aliases AS alias
           ON alias.topic_uuid = topic.uuid
          AND alias.zulip_stream_uuid = topic.zulip_stream_uuid
          AND alias.active
+        LEFT JOIN workspace_zulip_bridge.zulip_topic_catalog_identities AS identity
+          ON identity.topic_uuid = topic.uuid
         WHERE topic.zulip_stream_uuid = $1
           AND (
-              lower(topic.name) = lower($2)
+              (lower(topic.name) = lower($3) AND topic.is_done = $4)
               OR lower(alias.alias) = lower($2)
           )
         ORDER BY (topic.name = $2) DESC,
@@ -3498,30 +4131,69 @@ async def _store_user_topic(
         """,
         stream_uuid,
         topic.topic_name,
+        canonical_source_name,
+        source_is_done,
     )
-    topic_uuid = (
-        UUID(str(existing_topic["uuid"]))
-        if existing_topic is not None
-        else stable_topic_uuid(stream_uuid, topic.topic_name)
+    catalog_provider_topic_id = (
+        f"{str(stream['chat_key']).removeprefix('channel:')}:{topic.topic_name}"
     )
+    if existing_topic is not None:
+        topic_uuid = UUID(str(existing_topic["uuid"]))
+        if existing_topic["catalog_provider_topic_id"] is not None:
+            catalog_provider_topic_id = str(existing_topic["catalog_provider_topic_id"])
+    else:
+        topic_uuid = stable_topic_uuid(stream_uuid, topic.topic_name)
+        identity_reserved = await connection.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM workspace_zulip_bridge.zulip_topics AS existing
+                WHERE existing.uuid = $1
+                UNION ALL
+                SELECT 1
+                FROM workspace_zulip_bridge.zulip_topic_catalog_identities
+                    AS identity
+                WHERE identity.topic_uuid = $1
+                   OR (identity.zulip_stream_uuid = $2
+                       AND identity.provider_topic_id = $3)
+            )
+            """,
+            topic_uuid,
+            stream_uuid,
+            catalog_provider_topic_id,
+        )
+        if identity_reserved:
+            topic_uuid = uuid5(
+                topic_uuid,
+                f"source-user-topic-incarnation\0{topic.last_updated}",
+            )
+            catalog_provider_topic_id = f"topic-uuid:{topic_uuid}"
+    binding_uuid = stable_topic_binding_uuid(topic_uuid, user_uuid)
+    if binding_uuid in retained_binding_uuids:
+        return 0, binding_uuid
     canonical_topic_name = (
-        str(existing_topic["name"]) if existing_topic is not None else topic.topic_name
+        str(existing_topic["name"])
+        if existing_topic is not None
+        else canonical_source_name
+    )
+    canonical_topic_is_done = (
+        bool(existing_topic["is_done"])
+        if existing_topic is not None
+        else source_is_done
     )
     topic_created_at = datetime.fromtimestamp(topic.last_updated, UTC)
     stored_topic_uuid = await connection.fetchval(
         """
         INSERT INTO workspace_zulip_bridge.zulip_topics (
-            uuid, zulip_stream_uuid, name, content_hash, created_at
-        ) VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (uuid) DO UPDATE
-        SET name = EXCLUDED.name, content_hash = EXCLUDED.content_hash,
-            updated_at = clock_timestamp()
-        WHERE zulip_topics.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+            uuid, zulip_stream_uuid, name, is_done, content_hash, created_at
+        ) VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (uuid) DO NOTHING
         RETURNING uuid
         """,
         topic_uuid,
         stream_uuid,
         canonical_topic_name,
+        canonical_topic_is_done,
         hashlib.sha256(canonical_topic_name.encode("utf-8")).digest(),
         topic_created_at,
     )
@@ -3532,6 +4204,35 @@ async def _store_user_topic(
             "topic",
             [UUID(str(stored_topic_uuid))],
         )
+    await connection.execute(
+        """
+        UPDATE workspace_zulip_bridge.zulip_topic_catalog_identities
+        SET topic_uuid = $1
+        WHERE zulip_stream_uuid = $2 AND provider_topic_id = $3
+          AND topic_uuid IS NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM workspace_zulip_bridge.zulip_topic_catalog_identities
+                  AS bound_identity
+              WHERE bound_identity.topic_uuid = $1
+          )
+        """,
+        topic_uuid,
+        stream_uuid,
+        catalog_provider_topic_id,
+    )
+    await connection.execute(
+        """
+        INSERT INTO workspace_zulip_bridge.zulip_topic_catalog_identities (
+            topic_uuid, zulip_stream_uuid, catalog_topic_key, provider_topic_id
+        ) VALUES ($1, $2, $3, $4)
+        ON CONFLICT DO NOTHING
+        """,
+        topic_uuid,
+        stream_uuid,
+        topic.topic_name,
+        catalog_provider_topic_id,
+    )
     await connection.execute(
         """
         INSERT INTO workspace_zulip_bridge.zulip_topic_aliases (
@@ -3547,17 +4248,21 @@ async def _store_user_topic(
     )
     mode = {0: "default", 1: "mute", 2: "unmute", 3: "follow"}[topic.visibility_policy]
     source_updated_at = datetime.fromtimestamp(topic.last_updated, UTC)
-    created_at = await connection.fetchval(
+    if snapshot_observed_at is not None:
+        source_updated_at = max(
+            source_updated_at, snapshot_observed_at.replace(microsecond=0)
+        )
+    previous = await connection.fetchrow(
         """
-        SELECT created_at
+        SELECT created_at, content_hash
         FROM workspace_zulip_bridge.zulip_topic_bindings
         WHERE topic_uuid = $1 AND zulip_user_uuid = $2
+        FOR UPDATE
         """,
         topic_uuid,
         user_uuid,
     )
-    if not isinstance(created_at, datetime):
-        created_at = topic_created_at
+    created_at = previous["created_at"] if previous is not None else topic_created_at
     content_hash = _topic_binding_hash(
         stream_uuid,
         topic_uuid,
@@ -3574,13 +4279,16 @@ async def _store_user_topic(
         ON CONFLICT (uuid) DO UPDATE
         SET notification_mode = EXCLUDED.notification_mode,
             content_hash = EXCLUDED.content_hash,
-            source_updated_at = EXCLUDED.source_updated_at,
+            source_updated_at = GREATEST(
+                zulip_topic_bindings.source_updated_at, EXCLUDED.source_updated_at
+            ),
             updated_at = clock_timestamp()
-        WHERE zulip_topic_bindings.source_updated_at <= EXCLUDED.source_updated_at
-          AND (zulip_topic_bindings.notification_mode
-                  IS DISTINCT FROM EXCLUDED.notification_mode
-           OR zulip_topic_bindings.content_hash
-                  IS DISTINCT FROM EXCLUDED.content_hash)
+        WHERE (date_trunc('second', zulip_topic_bindings.source_updated_at)
+                   <= EXCLUDED.source_updated_at
+               OR zulip_topic_bindings.source_updated_at <= $9)
+          AND ($9::timestamptz IS NULL
+               OR zulip_topic_bindings.updated_at <= $9
+               OR zulip_topic_bindings.source_updated_at = 'epoch')
         RETURNING uuid
         """,
         stable_topic_binding_uuid(topic_uuid, user_uuid),
@@ -3591,8 +4299,11 @@ async def _store_user_topic(
         content_hash,
         source_updated_at,
         created_at,
+        snapshot_observed_at,
     )
-    if stored_binding_uuid is None:
+    if stored_binding_uuid is None or (
+        previous is not None and previous["content_hash"] == content_hash
+    ):
         return 0, stable_topic_binding_uuid(topic_uuid, user_uuid)
     await _enqueue_workspace_upserts(
         connection,
@@ -3611,6 +4322,7 @@ async def _store_chats(
     chats: Sequence[ZulipChat],
     *,
     replace_catalog: bool,
+    observed_at: datetime | None = None,
 ) -> tuple[int, int]:
     linked_rows = await connection.fetch(
         """
@@ -3626,6 +4338,7 @@ async def _store_chats(
         str(row["zulip_external_key"]): UUID(str(row["workspace_uuid"]))
         for row in linked_rows
     }
+    observed_at = observed_at or datetime.now(UTC)
     stream_uuids = [
         linked_streams.get(chat.chat_key, stable_chat_uuid(endpoint, chat.chat_key))
         for chat in chats
@@ -3727,14 +4440,14 @@ async def _store_chats(
             INSERT INTO workspace_zulip_bridge.zulip_stream_bindings
                 (uuid, zulip_stream_uuid, zulip_user_uuid, role, membership_kind,
                  notification_mode, membership_parameters, content_hash,
-                 available_message_count, first_visible_message_id)
+                 available_message_count, first_visible_message_id, source_updated_at)
             SELECT candidate.binding_uuid, candidate.stream_uuid, $16,
                    candidate.role, candidate.membership_kind,
                    candidate.notification_mode,
                    candidate.membership_parameters,
                    candidate.membership_hash,
                    candidate.available_message_count,
-                   candidate.first_visible_message_id
+                   candidate.first_visible_message_id, $18
             FROM incoming AS candidate
             LEFT JOIN workspace_zulip_bridge.zulip_stream_bindings AS existing
               ON existing.zulip_stream_uuid = candidate.stream_uuid
@@ -3768,9 +4481,10 @@ async def _store_chats(
                 first_visible_message_id = CASE WHEN $17
                     THEN EXCLUDED.first_visible_message_id
                     ELSE zulip_stream_bindings.first_visible_message_id END,
-                source_updated_at = clock_timestamp(),
+                source_updated_at = EXCLUDED.source_updated_at,
                 updated_at = clock_timestamp()
-            WHERE zulip_stream_bindings.content_hash IS DISTINCT FROM
+            WHERE zulip_stream_bindings.source_updated_at <= EXCLUDED.source_updated_at
+              AND (zulip_stream_bindings.content_hash IS DISTINCT FROM
                   EXCLUDED.content_hash
                OR ($17 AND (
                     zulip_stream_bindings.available_message_count,
@@ -3778,12 +4492,13 @@ async def _store_chats(
                   ) IS DISTINCT FROM (
                     EXCLUDED.available_message_count,
                     EXCLUDED.first_visible_message_id
-                  ))
+                  )))
             RETURNING 1
         ), removed_bindings AS MATERIALIZED (
             SELECT binding.uuid, binding.zulip_stream_uuid
             FROM workspace_zulip_bridge.zulip_stream_bindings AS binding
             WHERE $17 AND binding.zulip_user_uuid = $16
+              AND binding.source_updated_at <= $18
               AND NOT (binding.zulip_stream_uuid = ANY($1::uuid[]))
         ), binding_tombstones AS (
             INSERT INTO workspace_zulip_bridge.sync_diffs (
@@ -3860,6 +4575,7 @@ async def _store_chats(
         realm_uuid,
         zulip_user_uuid,
         replace_catalog,
+        observed_at,
     )
     if row is None:
         raise RuntimeError("stream catalog query returned no row")
@@ -3902,5 +4618,9 @@ async def _store_chats(
             direct_stream_uuids,
             hashlib.sha256(b"General").digest(),
             realm_uuid,
+        )
+    if replace_catalog:
+        await _store_channel_notification_modes(
+            connection, realm_uuid, zulip_user_uuid, chats, observed_at=observed_at
         )
     return row["changed_count"], row["deleted_count"]

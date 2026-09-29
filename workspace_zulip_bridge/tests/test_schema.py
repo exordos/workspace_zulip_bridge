@@ -47,6 +47,7 @@ def test_schema_normalizes_workspace_like_entities_and_personal_state() -> None:
         "zulip_streams",
         "zulip_stream_bindings",
         "zulip_topics",
+        "zulip_topic_catalog_identities",
         "zulip_topic_aliases",
         "zulip_topic_bindings",
         "zulip_messages",
@@ -68,7 +69,8 @@ def test_schema_normalizes_workspace_like_entities_and_personal_state() -> None:
     assert "UNIQUE (realm_uuid, chat_key)" in schema
     assert "UNIQUE (zulip_stream_uuid, zulip_user_uuid)" in schema
     assert "first_visible_message_id bigint" in schema
-    assert "UNIQUE (zulip_stream_uuid, name)" in schema
+    assert "UNIQUE (zulip_stream_uuid, name, is_done)" in schema
+    assert "UNIQUE (zulip_stream_uuid, provider_topic_id)" in schema
     assert "zulip_topics_casefold_name_idx" in schema
     assert "zulip_topic_aliases_casefold_idx" in schema
     assert "reaction_users jsonb NOT NULL DEFAULT '{}'::jsonb" in schema
@@ -169,3 +171,5 @@ def test_schema_upgrades_preserve_older_persistent_volumes() -> None:
     assert "workspace_mirror_state" in upgrades
     assert "sync_diffs" in upgrades
     assert "ADD COLUMN IF NOT EXISTS projection_revision integer" in upgrades
+    assert "zulip_topic_catalog_identities" in upgrades
+    assert "assignment #> '{workspace_projection,topics}'" in upgrades

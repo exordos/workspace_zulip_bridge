@@ -420,7 +420,7 @@ def test_workspace_diff_worker_completes_only_after_empty_plan(
     asyncio.run(_run_workspace_diff_worker_completion_test(monkeypatch, tmp_path))
 
 
-def test_workspace_diff_worker_pauses_historical_plan_for_file_stage(
+def test_workspace_diff_worker_plans_dependencies_during_file_stage(
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
@@ -456,8 +456,9 @@ async def _run_workspace_diff_worker_file_stage_test(
         calls.append("direct_topics")
         return True
 
-    async def fail_plan() -> int:
-        raise AssertionError("historical planning ran during the file stage")
+    async def fake_plan() -> int:
+        calls.append("plan")
+        return 1
 
     monkeypatch.setattr(worker, "_link_realm", fake_link_realm)
     monkeypatch.setattr(worker, "_ensure_direct_topics", fake_ensure_direct_topics)
@@ -466,10 +467,10 @@ async def _run_workspace_diff_worker_file_stage_test(
         "_historical_file_work_pending",
         file_backfill_pending,
     )
-    monkeypatch.setattr(worker, "plan", fail_plan)
+    monkeypatch.setattr(worker, "plan", fake_plan)
 
-    assert await worker._plan_and_drain(object()) == 0  # type: ignore[arg-type]
-    assert calls == ["link", "direct_topics"]
+    assert await worker._plan_and_drain(object()) == 1  # type: ignore[arg-type]
+    assert calls == ["plan"]
 
 
 async def _run_workspace_diff_worker_completion_test(

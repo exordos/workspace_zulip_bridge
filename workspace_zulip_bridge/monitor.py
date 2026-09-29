@@ -55,6 +55,7 @@ class MonitorSnapshot:
     file_metadata_total: int = 0
     outbox_pending: int = 0
     total_event_types: dict[str, int] | None = None
+    import_pipeline: dict[str, Any] | None = None
 
     @property
     def queues_missing(self) -> int:
@@ -424,7 +425,113 @@ async def collect_snapshot(
         chat_user_table_bytes=summary["chat_user_table_bytes"],
         database_bytes=summary["database_bytes"],
         total_event_types=total_event_types,
+        import_pipeline=(
+            await collect_import_pipeline(connection, window_seconds=window_seconds)
+        )
+        if exact
+        else None,
     )
+
+
+async def collect_import_pipeline(
+    connection: asyncpg.Connection,
+    *,
+    window_seconds: float,
+) -> dict[str, Any]:
+    """Exact diagnostic counters; queue residence is not network latency."""
+    from workspace_zulip_bridge.workspace_file_transfer import (
+        CATALOG_PROJECTION_REVISION,
+    )
+
+    file_rows = await connection.fetch(
+        """
+        SELECT projection.delivery_priority, projection.processing_status,
+               CASE
+                   WHEN projection.processing_status = 'finalized' THEN 'confirmed'
+                   WHEN projection.processing_status = 'processing' THEN 'in_flight'
+                   WHEN projection.processing_status = 'blocked' THEN 'terminal'
+                   WHEN connection.uuid IS NULL OR NOT connection.sync_enabled
+                     THEN 'source_unavailable'
+                   WHEN catalog.processing_status IS DISTINCT FROM 'reported'
+                     OR catalog.projection_revision < $1 THEN 'catalog_dependency'
+                   WHEN projection.available_at > clock_timestamp() THEN 'retry_delay'
+                   ELSE 'ready'
+               END AS wait_reason,
+               count(*) AS count,
+               greatest(0, extract(epoch FROM clock_timestamp() - min(projection.created_at)))::float8
+                   AS oldest_seconds
+        FROM workspace_zulip_bridge.workspace_file_projections AS projection
+        JOIN workspace_zulip_bridge.zulip_streams AS stream
+          ON stream.uuid = projection.zulip_stream_uuid
+        LEFT JOIN workspace_zulip_bridge.zulip_connections AS connection
+          ON connection.uuid = stream.source_connection_uuid
+        LEFT JOIN workspace_zulip_bridge.workspace_chat_catalog_reports AS catalog
+          ON catalog.external_account_uuid = connection.external_account_uuid
+         AND catalog.zulip_stream_uuid = stream.uuid
+        GROUP BY 1, 2, 3 ORDER BY 1, 2, 3
+        """,
+        CATALOG_PROJECTION_REVISION,
+    )
+    confirmed = await connection.fetchrow(
+        """
+        SELECT count(*) / $1::float8 AS files_per_second,
+               COALESCE(sum(size_bytes), 0)::float8 / $1 AS bytes_per_second,
+               percentile_cont(ARRAY[0.5, 0.95, 0.99]) WITHIN GROUP (
+                   ORDER BY extract(epoch FROM finalized_at - created_at)::float8
+               ) AS queue_residence_seconds
+        FROM workspace_zulip_bridge.workspace_file_projections
+        WHERE processing_status = 'finalized'
+          AND finalized_at >= clock_timestamp() - make_interval(secs => $1)
+        """,
+        window_seconds,
+    )
+    catalogs = await connection.fetch(
+        """
+        SELECT processing_status, projection_revision, assignment_reconciled,
+               assignment_repair_last_error IS NOT NULL AS repair_deferred,
+               CASE WHEN last_error IN ('catalog_not_required_for_file_transfer', 'catalog_source_inactive')
+                    THEN last_error WHEN processing_status = 'blocked' THEN 'requires_review'
+                    ELSE NULL END AS reason,
+               count(*) AS count
+        FROM workspace_zulip_bridge.workspace_chat_catalog_reports
+        GROUP BY 1, 2, 3, 4, 5 ORDER BY 1, 2, 3, 4, 5
+        """
+    )
+    outbox = await connection.fetch(
+        """
+        SELECT entity_type, delivery_status, count(*) AS count,
+               greatest(0, extract(epoch FROM clock_timestamp() - min(created_at)))::float8 AS oldest_seconds
+        FROM workspace_zulip_bridge.workspace_outbox
+        WHERE delivery_status <> 'delivered'
+        GROUP BY 1, 2 ORDER BY 1, 2
+        """
+    )
+    diffs = await connection.fetch(
+        """
+        SELECT entity_type, delivery_priority, processing_status,
+               CASE WHEN processing_status IN ('pending', 'failed')
+                         AND available_at > clock_timestamp() THEN 'retry_delay'
+                    WHEN processing_status IN ('pending', 'failed') THEN 'ready'
+                    ELSE processing_status END AS wait_reason,
+               count(*) AS count,
+               greatest(0, extract(epoch FROM clock_timestamp() - min(created_at)))::float8
+                   AS oldest_seconds
+        FROM workspace_zulip_bridge.sync_diffs
+        WHERE processing_status NOT IN ('applied', 'skipped')
+        GROUP BY 1, 2, 3, 4 ORDER BY 1, 2, 3, 4
+        """
+    )
+    cursors = await connection.fetch(
+        "SELECT name, sequence FROM workspace_zulip_bridge.import_scan_cursors ORDER BY name"
+    )
+    return {
+        "files": [dict(row) for row in file_rows],
+        "file_confirmations": dict(confirmed) if confirmed else {},
+        "catalog": [dict(row) for row in catalogs],
+        "outbox": [dict(row) for row in outbox],
+        "diffs": [dict(row) for row in diffs],
+        "scan_cursors": [dict(row) for row in cursors],
+    }
 
 
 def format_snapshot(snapshot: MonitorSnapshot, *, as_json: bool) -> str:

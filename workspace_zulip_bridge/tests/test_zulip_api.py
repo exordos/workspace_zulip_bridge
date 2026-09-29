@@ -515,3 +515,24 @@ def _client(handler: object) -> ZulipApiClient:
         message_page_size=5000,
         transport=httpx.MockTransport(handler),  # type: ignore[arg-type]
     )
+
+
+@pytest.mark.parametrize("already_deleted", [False, True])
+def test_temporary_queue_delete_uses_supported_form_and_is_idempotent(already_deleted):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "DELETE"
+        assert request.url.path == "/api/v1/events"
+        assert parse_qs(request.content.decode()) == {
+            "queue_id": ["temporary-snapshot"]
+        }
+        if already_deleted:
+            return httpx.Response(
+                400, json={"result": "error", "code": "BAD_EVENT_QUEUE_ID"}
+            )
+        return httpx.Response(200, json={"result": "success"})
+
+    client = _client(handler)
+    try:
+        client.delete_queue("temporary-snapshot")
+    finally:
+        client.close()

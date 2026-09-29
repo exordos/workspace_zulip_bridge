@@ -28,7 +28,11 @@ from workspace_zulip_bridge.message_history import message_content_hash
 from workspace_zulip_bridge.message_history import message_flags_hash
 from workspace_zulip_bridge.message_history import message_state_hash
 from workspace_zulip_bridge.stable_ids import stable_external_chat_uuid
+from workspace_zulip_bridge.topic_state import topic_display_name
 from workspace_zulip_bridge.workspace_file_transfer import WorkspaceOutgoingFileReader
+from workspace_zulip_bridge.workspace_message_content import (
+    preserve_finalized_file_references,
+)
 from workspace_zulip_bridge.zulip_api import ZulipApiClient
 from workspace_zulip_bridge.zulip_api import ZulipApiError
 
@@ -433,7 +437,7 @@ class ZulipOutboundWriter:
         entity_uuid: UUID,
         source: dict[str, Any] | None,
         target: dict[str, Any] | None,
-        _target_updated_at: datetime | None,
+        target_updated_at: datetime | None,
     ) -> None:
         if target is None:
             raise ZulipOutboundError("Zulip topics cannot be deleted directly")
@@ -442,9 +446,15 @@ class ZulipOutboundWriter:
                 "Zulip topics are materialized only when their first message is sent"
             )
         desired_name = str(target["name"])
-        if bool(target.get("is_done")) and not desired_name.startswith("✔"):
-            desired_name = f"✔ {desired_name}"
-        if desired_name == source.get("name"):
+        desired_display_name = topic_display_name(
+            desired_name,
+            bool(target.get("is_done")),
+        )
+        source_display_name = topic_display_name(
+            str(source["name"]),
+            bool(source.get("is_done")),
+        )
+        if desired_display_name == source_display_name:
             return
         row = await self._pool.fetchrow(
             """
@@ -461,13 +471,21 @@ class ZulipOutboundWriter:
             return
         conflicting_topic_uuid = await self._pool.fetchval(
             """
-            SELECT uuid FROM workspace_zulip_bridge.zulip_topics
-            WHERE zulip_stream_uuid = $1
-              AND lower(name) = lower($2)
-              AND uuid <> $3
+            SELECT topic.uuid
+            FROM workspace_zulip_bridge.zulip_topics AS topic
+            LEFT JOIN workspace_zulip_bridge.zulip_topic_aliases AS alias
+              ON alias.topic_uuid = topic.uuid AND alias.active
+            WHERE topic.zulip_stream_uuid = $1
+              AND topic.uuid <> $3
+              AND (
+                  lower(CASE WHEN topic.is_done THEN '✔ ' || topic.name
+                             ELSE topic.name END) = lower($2)
+                  OR lower(alias.alias) = lower($2)
+              )
+            LIMIT 1
             """,
             row["stream_uuid"],
-            desired_name,
+            desired_display_name,
             entity_uuid,
         )
         if conflicting_topic_uuid is not None:
@@ -478,14 +496,15 @@ class ZulipOutboundWriter:
         await asyncio.to_thread(
             self._client(actor).update_message,
             int(row["zulip_message_id"]),
-            topic=desired_name,
+            topic=desired_display_name,
             propagate_mode="change_all",
         )
         await self._record_topic_rename(
             entity_uuid,
             row["stream_uuid"],
-            desired_name,
+            desired_display_name,
             target,
+            target_updated_at or datetime.now(UTC),
         )
 
     async def _record_topic_rename(
@@ -494,11 +513,12 @@ class ZulipOutboundWriter:
         stream_uuid: UUID,
         desired_name: str,
         target: dict[str, Any],
+        source_updated_at: datetime,
     ) -> None:
         async with self._pool.acquire() as connection, connection.transaction():
             topic = await connection.fetchrow(
                 """
-                SELECT name FROM workspace_zulip_bridge.zulip_topics
+                SELECT name, is_done FROM workspace_zulip_bridge.zulip_topics
                 WHERE uuid = $1 AND zulip_stream_uuid = $2
                 FOR UPDATE
                 """,
@@ -507,12 +527,24 @@ class ZulipOutboundWriter:
             )
             if topic is None:
                 raise ZulipOutboundError("Zulip topic identity is unavailable")
+            old_display_name = topic_display_name(
+                str(topic["name"]),
+                bool(topic["is_done"]),
+            )
             conflict = await connection.fetchval(
                 """
-                SELECT uuid FROM workspace_zulip_bridge.zulip_topics
-                WHERE zulip_stream_uuid = $1
-                  AND lower(name) = lower($2)
-                  AND uuid <> $3
+                SELECT topic.uuid
+                FROM workspace_zulip_bridge.zulip_topics AS topic
+                LEFT JOIN workspace_zulip_bridge.zulip_topic_aliases AS alias
+                  ON alias.topic_uuid = topic.uuid AND alias.active
+                WHERE topic.zulip_stream_uuid = $1
+                  AND topic.uuid <> $3
+                  AND (
+                      lower(CASE WHEN topic.is_done THEN '✔ ' || topic.name
+                                 ELSE topic.name END) = lower($2)
+                      OR lower(alias.alias) = lower($2)
+                  )
+                LIMIT 1
                 """,
                 stream_uuid,
                 desired_name,
@@ -532,7 +564,7 @@ class ZulipOutboundWriter:
                     updated_at = clock_timestamp()
                 """,
                 stream_uuid,
-                topic["name"],
+                old_display_name,
                 entity_uuid,
             )
             await connection.execute(
@@ -560,7 +592,9 @@ class ZulipOutboundWriter:
                 """
                 UPDATE workspace_zulip_bridge.zulip_topics
                 SET name = $3, is_done = $4, version = $5,
-                    content_hash = $6, updated_at = clock_timestamp()
+                    content_hash = $6,
+                    source_updated_at = GREATEST(source_updated_at, $7),
+                    updated_at = clock_timestamp()
                 WHERE uuid = $1 AND zulip_stream_uuid = $2
                 """,
                 entity_uuid,
@@ -569,6 +603,7 @@ class ZulipOutboundWriter:
                 bool(target.get("is_done")),
                 int(target.get("version", 0)),
                 hashlib.sha256(str(target["name"]).encode("utf-8")).digest(),
+                source_updated_at,
             )
 
     async def _apply_topic_bindings(
@@ -890,6 +925,10 @@ class ZulipOutboundWriter:
                         state_hash,
                         created_at,
                         target_updated_at or created_at,
+                    )
+                    await preserve_finalized_file_references(
+                        connection,
+                        [entity_uuid],
                     )
                 break
             except asyncpg.UniqueViolationError:

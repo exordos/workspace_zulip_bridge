@@ -140,8 +140,8 @@ skipped so they cannot block the inbox. Consecutive messages, flags, and
 reactions from one supplier are normalized in event order and written as one
 hash-guarded page, which removes per-event PostgreSQL round trips without
 changing the final state. The same processor periodically deletes terminal
-`applied`, `skipped`, and `failed` events more than 24 hours after collection.
-Cleanup uses bounded batches and leaves `pending` and `processing` rows intact,
+`applied` and `skipped` events more than 24 hours after collection.
+Cleanup uses bounded batches and preserves `pending`, `processing`, and `failed` rows,
 so a long outage cannot silently discard unprocessed changes. Stable UUIDs,
 state hashes, set-style flag/reaction changes, and provider event keys make
 retries idempotent.
@@ -233,7 +233,7 @@ deployment.
 | `WZB_EVENT_PROCESSOR_RETRY_BASE_SECONDS` | `0.25` | Initial transient Zulip event retry delay |
 | `WZB_EVENT_PROCESSOR_RETRY_CAP_SECONDS` | `30` | Maximum transient Zulip event retry delay |
 | `WZB_EVENT_PROCESSOR_BACKLOG_RETRY_CAP_SECONDS` | `300` | Maximum retry delay for old dependency events; recent realtime events keep the shorter cap |
-| `WZB_EVENT_RETENTION_SECONDS` | `86400` | Terminal event retention from collection time |
+| `WZB_EVENT_RETENTION_SECONDS` | `86400` | Applied/skipped event retention from collection time |
 | `WZB_EVENT_CLEANUP_INTERVAL_SECONDS` | `300` | Interval between caught-up retention passes |
 | `WZB_EVENT_CLEANUP_BATCH_SIZE` | `10000` | Rows deleted per short retention transaction |
 | `WZB_WORKSPACE_WEBSOCKET_URL` | disabled | Provider event WebSocket URL; enables the receiver with the next three settings |
@@ -327,3 +327,64 @@ peer-authenticated database role, and enables the daemon.
 
 The Workspace-side synchronization dependency and its owning source are
 documented in [docs/workspace_provider_entity_api.md](docs/workspace_provider_entity_api.md).
+
+
+### Import recovery and completion
+
+Historical file and entity workers serialize only their claim transactions with
+one advisory lock. An in-flight historical entity type drains before another type
+or historical files start. Concurrency within that type and the separate realtime
+lane remain available. Delayed retries and unavailable catalog dependencies do not
+own the historical stage; dependent messages still require every file projection
+to be finalized before delivery.
+
+File discovery scans at most 20,000 outbox entries per page using a persisted
+sequence cursor, including pages with no eligible projection. The completion sweep
+has its own 100-entry cursor. Both wrap after reaching the tail, so a newly ready
+dependency or an interrupted page is revisited. Claims use the ready-queue index
+order rather than sorting the entire source-file history. File workers heartbeat
+every 30 seconds; a ten-minute expired lease can be reclaimed, and immutable claim
+timestamps fence stale failures. Retryable file failures use exponential backoff
+and stop automatic retries after twelve attempts. Exhausted and permanent failures
+stay durable as blocked work; they are never acknowledged as delivered.
+
+Catalog publication and assignment repair have separate supervised loops. Repair
+visits current selected-source assignments in bounded 1,000-row pages, stores a
+checkpoint per entity type, and checks both message stream and topic mappings.
+A malformed assignment is retained with an error and a one-minute repair delay,
+allowing other reports to progress. Installing this scanner resets legacy repair
+checkpoints once because the old scan did not validate parent topics.
+
+Initial-import completion records a fixed `initial_sync_watermark_at` at its first
+completion attempt after source history becomes active. Old realtime work through that boundary, all historical work,
+and current assignment repair must finish. New realtime arrivals after the boundary
+have separate health counters and do not prevent historical completion forever.
+A new mirror generation or explicit historical reconciliation resets the watermark.
+Changed assignments invalidate completion while preserving the existing boundary;
+their new historical repair remains mandatory regardless of age through the
+internal outbox `import_required` marker. This timestamp
+is evidence about that import boundary, not a claim that realtime is permanently
+caught up or that a blocked record succeeded.
+
+`--once --exact --json` includes import queues split by priority, status and wait
+reason; oldest queue age; persisted scan positions; catalog revisions and deferred
+repairs; and confirmed file/byte rates. File p50/p95/p99 values describe queue
+residence through finalization, not network request latency. These exact diagnostics
+scan queue tables and should not be polled at a short interval on a large backlog.
+Unrecovered failed events are retained indefinitely for version-aware recovery;
+repairing code alone does not blindly replay old state changes.
+
+
+After diagnosing and fixing a file's cause, an operator can preview a bounded,
+explicit recovery selection with:
+
+```bash
+python -m workspace_zulip_bridge.import_recovery --projection "$PROJECTION_UUID" --reason source_fix
+```
+
+Add `--apply` to requeue that selection. At most 100 explicit UUIDs are accepted;
+only failed/blocked rows with a current catalog and enabled supplier are eligible.
+The transaction preserves previous status, attempt count and error in
+`file_projection_recoveries`, resets the retry budget, and keeps the same operation
+UUID. It does not acknowledge files, delete failure evidence, or replay old events.
+The cause/fix code must contain no private data. A dry run performs no mutations.

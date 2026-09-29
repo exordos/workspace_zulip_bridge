@@ -21,7 +21,7 @@ ChatType = Literal["channel", "direct", "group_direct"]
 MembershipKind = Literal["subscriber", "participant"]
 BindingRole = Literal["owner", "administrator", "moderator", "member", "guest"]
 
-NOTIFICATION_SETTINGS_GENERATION = 1
+NOTIFICATION_SETTINGS_GENERATION = 2
 
 
 @dataclass(frozen=True, slots=True)
