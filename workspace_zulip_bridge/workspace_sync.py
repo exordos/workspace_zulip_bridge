@@ -5788,11 +5788,20 @@ class WorkspaceDiffWorker:
                 external_chat_uuid = UUID(str(catalog_resource_uuid))
                 catalog = _json_object(row["catalog"])
                 assignment = _json_object(row["assignment"])
-                workspace_stream_uuid = _catalog_projection_stream_uuid(
-                    catalog,
-                    external_chat_uuid,
-                    assignment,
-                )
+                try:
+                    workspace_stream_uuid = _catalog_projection_stream_uuid(
+                        catalog,
+                        external_chat_uuid,
+                        assignment,
+                    )
+                except ValueError:
+                    # Assignments may lag a newly observed source entity.
+                    # Keep its diff pending until the backend supplies a valid
+                    # mapping instead of terminating the delivery worker.
+                    self._assignment_blocked_entities.add(
+                        (entity_type, source_entity_uuid)
+                    )
+                    continue
                 if "stream_uuid" in projected_data:
                     projected_data["stream_uuid"] = str(workspace_stream_uuid)
                 if entity_type == "streams":
@@ -5815,12 +5824,18 @@ class WorkspaceDiffWorker:
                             else None
                         ),
                     )
-                    workspace_topic_uuid = _catalog_projection_topic_uuid(
-                        catalog,
-                        external_chat_uuid,
-                        provider_topic_id,
-                        assignment,
-                    )
+                    try:
+                        workspace_topic_uuid = _catalog_projection_topic_uuid(
+                            catalog,
+                            external_chat_uuid,
+                            provider_topic_id,
+                            assignment,
+                        )
+                    except ValueError:
+                        self._assignment_blocked_entities.add(
+                            (entity_type, source_entity_uuid)
+                        )
+                        continue
                     if "topic_uuid" in projected_data:
                         projected_data["topic_uuid"] = str(workspace_topic_uuid)
                     if entity_type == "topics":
