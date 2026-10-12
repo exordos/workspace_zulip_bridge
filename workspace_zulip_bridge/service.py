@@ -2722,6 +2722,22 @@ class BridgeService:
                 f"zulip-file-import:{account_uuid}:{external_chat_uuid}:{provider_url}",
             )
             try:
+                sticker_uuid = converter.sticker_uuid_from_label(display_name)
+                if sticker_uuid is not None:
+                    sticker = self.file_client.resolve_sticker(
+                        sticker_uuid,
+                        uuid.UUID(account_uuid),
+                        uuid.UUID(external_chat_uuid),
+                    )
+                    if sticker is None:
+                        return None
+                    if (
+                        sticker["uuid"] == str(sticker_uuid)
+                        and sticker["size_bytes"] == len(downloaded.content)
+                        and sticker["sha256"]
+                        == hashlib.sha256(downloaded.content).hexdigest()
+                    ):
+                        return f"urn:sticker:{sticker_uuid}"
                 return self.file_client.import_file(
                     transfer_operation_uuid,
                     uuid.UUID(account_uuid),
@@ -2740,8 +2756,13 @@ class BridgeService:
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
                 retryable = status in {408, 425, 429} or status >= 500
+                code = (
+                    "invalid_record"
+                    if status in {400, 422}
+                    else "workspace_file_import_unavailable"
+                )
                 raise zulip_adapter.ZulipOperationError(
-                    "workspace_file_import_unavailable", retryable
+                    code, retryable
                 ) from exc
             except httpx.TransportError as exc:
                 raise zulip_adapter.ZulipOperationError(

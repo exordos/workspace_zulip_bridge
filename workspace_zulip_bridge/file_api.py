@@ -119,6 +119,26 @@ class FileApiClient:
         finalized = typing.cast(dict[str, object], finalize.json())
         return str(finalized["file_urn"])
 
+    def resolve_sticker(
+        self,
+        sticker_uuid: uuid.UUID,
+        account_uuid: uuid.UUID,
+        chat_uuid: uuid.UUID,
+    ) -> dict[str, object] | None:
+        response = self.client.get(
+            f"/v1/stickers/{sticker_uuid}",
+            # The private bridge HTTP server requires Content-Length even for GET.
+            headers={"Content-Length": "0"},
+            params={
+                "external_account_uuid": str(account_uuid),
+                "external_chat_uuid": str(chat_uuid),
+            },
+        )
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return typing.cast(dict[str, object], response.json())
+
     def export_file(
         self,
         transfer_uuid: uuid.UUID,
