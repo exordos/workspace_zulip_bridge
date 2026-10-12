@@ -287,7 +287,18 @@ class Scheduler:
         }
         if evidence.exact_match_count >= 1:
             assert evidence.selected_provider_id is not None
-            commit = TargetCommit(evidence.selected_provider_id, None)
+            selected_provider_id = evidence.selected_provider_id
+            # A local echo may have confirmed the Workspace message while its
+            # send result was lost. Content/time matching is weaker evidence:
+            # preserve that association when several equivalent sends exist.
+            mapping = self.store.workspace_mapping(
+                account_uuid, "message", str(operation["entity_uuid"])
+            )
+            if mapping is not None:
+                mapped_provider_id = str(mapping["provider_id"])
+                if mapped_provider_id in evidence.candidate_ids:
+                    selected_provider_id = mapped_provider_id
+            commit = TargetCommit(selected_provider_id, None)
             result = result_record(item.record, "committed", commit, None)
             self.store.complete(item, result, "committed")
             return True

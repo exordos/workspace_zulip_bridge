@@ -416,6 +416,10 @@ class QueueStore(typing.Protocol):
 
     def claim_uncertain(self, worker_id: str) -> QueuedOperation | None: ...
 
+    def workspace_mapping(
+        self, account_uuid: str, entity_kind: str, workspace_uuid: str
+    ) -> dict[str, object] | None: ...
+
     def schedule_reconciliation_check(
         self,
         item: QueuedOperation,
@@ -9243,8 +9247,20 @@ class RestAlchemyStore:
                      AND NOT account.deleted
                     LEFT JOIN scheduler_accounts AS scheduler
                       ON scheduler.account_uuid = operation.account_uuid
+                    LEFT JOIN causal_lane_state AS lane
+                      ON lane.origin = operation.origin
+                     AND lane.causal_lane = operation.causal_lane
                     WHERE operation.state = 'pending'
                       AND operation.available_at <= now()
+                      AND (
+                          operation.attempt > 1
+                          OR (
+                              operation.lane_sequence =
+                                  COALESCE(lane.last_sequence, 0) + 1
+                              AND operation.predecessor_operation_uuid
+                                  IS NOT DISTINCT FROM lane.last_operation_uuid
+                          )
+                      )
                       AND (
                           operation.expires_at <= now()
                           OR assignment.resource_uuid IS NULL

@@ -64,6 +64,9 @@ class FakeStore:
         item, self.item = self.item, None
         return item
 
+    def workspace_mapping(self, account_uuid, entity_kind, workspace_uuid):
+        return None
+
     def schedule_reconciliation_check(self, item, after, evidence):
         self.reconciliation_check = (item, after, evidence)
 

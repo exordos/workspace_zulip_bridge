@@ -3001,6 +3001,79 @@ def _bind_provider_record_projection(
     return record
 
 
+def test_terminal_claim_waits_for_unresolved_predecessor(postgres_store):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    head = _provider_record(account_uuid, project_uuid)
+    head["origin"] = "workspace"
+    head["operation_sha256"] = canonical.operation_digest(head)
+    assert postgres_store.enqueue(head, 1)
+    later = _provider_record(account_uuid, project_uuid, kind="read_state.set")
+    later["origin"] = "workspace"
+    later["operation_sha256"] = canonical.operation_digest(later)
+    assert postgres_store.enqueue(later, 0)
+    with postgres_store.session() as session:
+        session.execute(
+            "UPDATE bridge_operations SET state='uncertain' WHERE record_uuid=%s",
+            (head["record_uuid"],),
+        )
+        session.execute(
+            "UPDATE desired_resources SET generation=generation+1 "
+            "WHERE resource_type='external_chat_assignment'",
+        )
+    assert postgres_store.claim_terminal("worker") is None
+    item = storage.QueuedOperation(uuid.UUID(head["record_uuid"]), head, 1)
+    postgres_store.complete(
+        item, scheduler.result_record(head, "cancelled", None, "cancelled"), "cancelled"
+    )
+    terminal = postgres_store.claim_terminal("worker")
+    assert terminal is not None
+    assert terminal[0].record_uuid == uuid.UUID(later["record_uuid"])
+    postgres_store.complete(
+        terminal[0],
+        scheduler.result_record(later, "cancelled", None, "cancelled"),
+        "cancelled",
+    )
+
+
+def test_reconciliation_preserves_confirmed_mapping_among_equivalent_messages(
+    postgres_store,
+):
+    account_uuid, project_uuid = _insert_account_and_assignment(postgres_store)
+    record = _provider_record(account_uuid, project_uuid)
+    record["origin"] = "workspace"
+    record["operation_sha256"] = canonical.operation_digest(record)
+    assert postgres_store.enqueue(record, 1)
+    with postgres_store.session() as session:
+        session.execute(
+            "UPDATE bridge_operations SET state='uncertain', "
+            "provider_attempted_at=now(), reconciliation_after=now() "
+            "WHERE record_uuid=%s",
+            (record["record_uuid"],),
+        )
+        postgres_store._persist_committed_mapping(session, record, "601", None)
+
+    class Adapter:
+        def reconcile_message(self, operation, attempted_at, rendered=None):
+            return zulip_adapter.ReconciliationEvidence(
+                "now", ("602", "601"), 2, "602"
+            )
+
+    worker = scheduler.Scheduler(postgres_store, lambda _: Adapter(), "worker")
+    assert worker.reconcile_once()
+    with postgres_store.session() as session:
+        completed = session.execute(
+            "SELECT state,result_record->'result'->>'provider_entity_id' AS target "
+            "FROM bridge_operations WHERE record_uuid=%s",
+            (record["record_uuid"],),
+        ).fetchone()
+    assert completed == {"state": "committed", "target": "601"}
+    mapping = postgres_store.workspace_mapping(
+        account_uuid, "message", record["operation"]["entity_uuid"]
+    )
+    assert mapping["provider_id"] == "601"
+    assert postgres_store.provider_mapping(account_uuid, "message", "602") is None
+
+
 def _committed_result(
     record: dict[str, object],
     provider_entity_id: str | None = None,
